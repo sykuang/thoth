@@ -1,0 +1,101 @@
+# thoth Docker build context filter
+# Reviewed 2026-06-18: az acr build 的 dockerignore 對 `dirname/` 規則
+# 不一定遞迴排除大目錄, 改用 `**` glob + explicit path 寫法,
+# 並在最後 whitelist 真正要 ship 的 backend code。
+#
+# Goal: image context < 5MB (純 Python source + pyproject + Dockerfile)
+
+# ========================================================
+# WHOLE TREES TO EXCLUDE — biggest wins first
+# ========================================================
+
+# Frontend source is needed by Dockerfile.standalone; exclude generated/native trees.
+frontend/node_modules
+frontend/node_modules/**
+frontend/.expo
+frontend/.expo/**
+frontend/dist
+frontend/dist/**
+frontend/build
+frontend/build/**
+frontend/ios
+frontend/ios/**
+frontend/src-tauri
+frontend/src-tauri/**
+
+# Browser session cache & probes — 1GB+ 共
+backend/data
+backend/data/**
+backend/data_archive
+backend/data_archive/**
+backend/banks/_probes
+backend/banks/_probes/**
+
+# Dev tools / probes / scripts — 不進 prod
+backend/tools
+backend/tools/**
+scripts
+scripts/**
+
+# Tests — image runtime 不需要
+tests
+tests/**
+
+# Python venv / build artifacts
+.venv
+.venv/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.pytest_cache/**
+**/.ruff_cache
+**/.ruff_cache/**
+**/.mypy_cache
+**/.mypy_cache/**
+**/*.egg-info
+**/*.egg-info/**
+build
+dist
+
+# ========================================================
+# SECRETS — never ship
+# ========================================================
+.env
+.env.*
+cli/.env
+backend/server/.env
+deploy/.secrets.env
+deploy/.spike_state.json
+
+# ========================================================
+# Local Hermes / IDE / VCS / OS / Docs
+# ========================================================
+.hermes
+.hermes/**
+.git
+.git/**
+.github
+.github/**
+.vscode
+.idea
+.claude
+.cursor
+AGENTS.md
+CLAUDE.md
+**/AGENTS.md
+**/CLAUDE.md
+docs
+**/.DS_Store
+**/Thumbs.db
+**/.swp
+
+# ========================================================
+# Logs / cache
+# ========================================================
+*.log
+**/*.log
+.cache
+**/.cache

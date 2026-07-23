@@ -1,0 +1,55 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — 絕對不能上 git
+.env
+.env.local
+.env.*.local
+*.env.bak
+
+# 本機資料：瀏覽器 session（含 cookies/login token）、爬到的真實帳務資料
+# 舊路徑（reorg 前）+ 新路徑（reorg 後）
+data/
+backend/data/
+!data/.gitkeep
+!backend/data/.gitkeep
+
+# 危險檔（含已停用的 SCSB 重試 probe，記得不要再跑）
+*.DANGEROUS.bak
+
+# macOS
+.DS_Store
+
+# Stray sqlite at repo root（生產 DB 在 backend/data/，root 出現 *.db 八成是誤建）
+/*.db
+/*.sqlite
+/*.sqlite3
+
+# Agent / assistant internal workspace
+.hermes/
+.claude/
+.cursor/
+.continue/
+.windsurf/
+.aider*
+AGENTS.md
+CLAUDE.md
+.cursorrules
+# Deploy secrets and local spike artifacts
+deploy/.secrets.env
+deploy/.spike_state.json
+deploy/.ctbc_retry_*.log
+deploy/.multi_bank_spike.*
+
+# Local helper scripts that pull cloud secrets via az (gitignored to avoid
+# accidentally committing dev-machine helper code that wraps secret reads)
+.verify_cloud_db_endpoints.sh
+.whatif_kv_lock.sh

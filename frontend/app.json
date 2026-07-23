@@ -1,0 +1,64 @@
+{
+  "expo": {
+    "name": "Thoth",
+    "slug": "thoth",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "thoth",
+    "userInterfaceStyle": "automatic",
+    "icon": "./assets/images/icon.png",
+    "splash": {
+      "image": "./assets/images/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "bundleIdentifier": "com.kenkuang.thoth",
+      "appleTeamId": "C72TPR683L",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "解鎖 Thoth app",
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        },
+        "UIBackgroundModes": [
+          "remote-notification"
+        ]
+      }
+    },
+    "web": {
+      "output": "static"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "解鎖 Thoth app"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#3b82f6"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": false,
+      "router": {
+        "unstable_src_directory": "src"
+      }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "ff40ca37-9391-440e-992a-2b1fa05dff80"
+      }
+    },
+    "owner": "kenkuang"
+  }
+}

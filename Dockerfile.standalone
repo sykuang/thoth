@@ -1,0 +1,50 @@
+FROM node:20-bookworm-slim AS frontend-build
+
+WORKDIR /app/frontend
+RUN corepack enable && corepack prepare pnpm@10.33.3 --activate
+
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+COPY frontend/patches/ ./patches/
+RUN pnpm install --frozen-lockfile
+
+COPY frontend/ ./
+ENV EXPO_PUBLIC_API_URL=__THOTH_SAME_ORIGIN__ \
+    EXPO_PUBLIC_PUSH_PROVIDER=none
+RUN pnpm web:export
+
+
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    THOTH_STANDALONE=1 \
+    THOTH_FRONTEND_DIST=/app/frontend-dist \
+    DB_BACKEND=sqlite \
+    BANK_DATA_ROOT=/data \
+    PUSH_PROVIDER=none
+
+WORKDIR /app
+RUN pip install --no-cache-dir uv==0.5.11
+
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY backend/ ./backend/
+COPY cli/ ./cli/
+COPY migrations/ ./migrations/
+COPY --from=frontend-build /app/frontend/dist/ ./frontend-dist/
+
+RUN uv sync --frozen --no-dev \
+    && uv run patchright install chromium --with-deps \
+    && mkdir -p /data \
+    && chown -R pwuser:pwuser /app /data
+
+VOLUME ["/data"]
+EXPOSE 8000
+USER pwuser
+
+CMD ["uv", "run", "uvicorn", "backend.server.app:app", \
+     "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background: rounded square (iOS/Android app icon style) -->
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="#F4ECD8"/>
+
+  <!-- Single bold sickle/crescent arc — Thoth's lunar disk + ibis beak abstraction -->
+  <path d="M 140 380 Q 256 100 372 380"
+        fill="none"
+        stroke="#1A2B4D"
+        stroke-width="48"
+        stroke-linecap="round"/>
+
+  <!-- Gold dot at apex (Thoth's moon disk) — tucked snugly into the arc -->
+  <circle cx="256" cy="175" r="36" fill="#D4A744"/>
+</svg>

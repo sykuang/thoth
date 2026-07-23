@@ -1,0 +1,26 @@
+diff --git a/lib/module/runLoop/uiRuntime/setTimeoutPolyfill.js b/lib/module/runLoop/uiRuntime/setTimeoutPolyfill.js
+index c2eff60b45e5f0060480b7dd1ad0a4074eb959d0..7fbd6ec4c9813da0cbed49f4ebe4ffa8a7171d0e 100644
+--- a/lib/module/runLoop/uiRuntime/setTimeoutPolyfill.js
++++ b/lib/module/runLoop/uiRuntime/setTimeoutPolyfill.js
+@@ -24,7 +24,7 @@ export function setupSetTimeout() {
+   const clearTimeoutPolyfill = timeoutHandle => {
+     const rafHandle = timeoutHandleToRafHandle.get(timeoutHandle);
+     timeoutHandleToRafHandle.delete(timeoutHandle);
+-    cancelAnimationFrame(rafHandle);
++    globalThis.cancelAnimationFrame(rafHandle);
+   };
+   globalThis.setTimeout = setTimeoutPolyfill;
+   globalThis.clearTimeout = clearTimeoutPolyfill;
+diff --git a/src/runLoop/uiRuntime/setTimeoutPolyfill.ts b/src/runLoop/uiRuntime/setTimeoutPolyfill.ts
+index b312c1653a16eda04399cebff28f109a752872be..0a8c2327ef253636d0c55ba4b87e00df60cd6659 100644
+--- a/src/runLoop/uiRuntime/setTimeoutPolyfill.ts
++++ b/src/runLoop/uiRuntime/setTimeoutPolyfill.ts
+@@ -32,7 +32,7 @@ export function setupSetTimeout() {
+   const clearTimeoutPolyfill = (timeoutHandle: number) => {
+     const rafHandle = timeoutHandleToRafHandle.get(timeoutHandle);
+     timeoutHandleToRafHandle.delete(timeoutHandle);
+-    cancelAnimationFrame(rafHandle);
++    globalThis.cancelAnimationFrame(rafHandle);
+   };
+ 
+   globalThis.setTimeout = setTimeoutPolyfill as typeof setTimeout;

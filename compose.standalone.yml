@@ -1,0 +1,20 @@
+services:
+  thoth:
+    image: ${THOTH_IMAGE:-ghcr.io/sykuang/thoth:standalone}
+    container_name: thoth
+    restart: unless-stopped
+    ports:
+      - "${THOTH_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      THOTH_STANDALONE: "1"
+      THOTH_FRONTEND_DIST: /app/frontend-dist
+      DB_BACKEND: sqlite
+      BANK_DATA_ROOT: /data
+      PUSH_PROVIDER: none
+    volumes:
+      - thoth-data:/data
+
+volumes:
+  thoth-data:

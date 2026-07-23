@@ -1,0 +1,108 @@
+[project]
+name = "thoth"
+version = "0.3.69"
+description = "Thoth — Taiwan bank account aggregator. Python crawlers + FastAPI server + Expo web/iOS frontend. Named after the Egyptian god of writing, accounting, and record-keeping."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "scrapling[fetchers]>=0.4.9",
+    "cryptography>=43.0.0",
+    "ddddocr>=1.6.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-jose[cryptography]>=3.3.0",
+    "bcrypt>=4.2.0",
+    "python-multipart>=0.0.20",
+    "websockets>=14.0",
+    "email-validator>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "psycopg[binary,pool]>=3.2",
+    # 2026-06-22 (0.3.16): httpx 從 push-apns optional 抬進 main deps.
+    # Expo push provider (PUSH_PROVIDER=expo, B1 路徑) 用普通 HTTP/1.1 POST
+    # 不需要 http2,所以原 [push-apns] = httpx[http2] 的 extras 沒包到 expo;
+    # 結果 PUSH_PROVIDER=expo 預設 image 一 import expo.py 就 ModuleNotFoundError.
+    # httpx 已是 fastapi 生態幾乎人人裝 (TestClient 都用),搬主依賴成本可忽略.
+    "httpx>=0.27",
+    # 2026-06-22 (L12, 0.3.17): APScheduler — daily auto-sync 排程引擎.
+    # Container App in-process scheduler, minReplicas=1 防 scale-to-zero 殺掉.
+    "apscheduler>=3.10",
+    # W1 (2026-06-17): real-timeout regex engine for ReDoS protection.
+    # stdlib `re` 加 signal.SIGALRM 在 worker thread 失效，必須改用此 lib。
+    "regex>=2025.5.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "httpx2>=0.0.1",
+    "ruff>=0.15.0",
+]
+
+# Optional extras — 開源 user 想啟用對應 push provider 才 install。
+# Backend boot 不需要這些 (PUSH_PROVIDER=none default)。
+[project.optional-dependencies]
+# Direct APNs HTTP/2 push (Phase L11, 2026-06-22):
+#   pyjwt[crypto]     — ES256 簽 .p8 provider token
+#   httpx[http2]      — HTTP/2 connection to api.push.apple.com (Apple 強制)
+push-apns = [
+    "pyjwt[crypto]>=2.8",
+    "httpx[http2]>=0.27",
+]
+# Aggregate — 啟用所有 push provider extras
+push-all = [
+    "pyjwt[crypto]>=2.8",
+    "httpx[http2]>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*", "cli*"]
+exclude = ["backend.data*", "frontend*"]
+
+[tool.ruff]
+extend-exclude = [
+    ".venv/",
+    "backend/data/",
+]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Enabled rule groups:
+#   F  = pyflakes (real bugs: unused imports, undefined names)
+#   E  = pycodestyle errors (basic style)
+#   W  = pycodestyle warnings
+#   PTH = use pathlib not os.path (modern py3 idiom)
+#   PLR0402 = `from X.Y import Z` (manual-from-import)
+#   RUF005,015,019,022,046,100 = real cleanups (collection/cast/sorted-dunder/unused-noqa)
+#   SIM = simplifications (collapsible-if, contextlib.suppress, ternary, etc.)
+#
+# Disabled rule groups + rationale (suggestion-tier, intentional ignore):
+#   RUF001,002,003 — 繁體中文註解/docstring/字串有全形字元 (使用者代碼風格,不是噪音)
+#   PLR2004 magic-value-comparison — HTTP status 200/404 / SQL placeholder 等不該抽常數
+#   PLC0415 import-outside-top-level — fastapi router 故意 local import 防循環依賴
+#   BLE001 blind-except — startup/cleanup/log handler 的「最後一道防線」吞所有異常 by design
+#   PLR0911-0915 too-many-branches/statements/returns/arguments — 銀行 parser / fx_service
+#                動輒 10+ 分支, refactor 代價遠大於可讀性收益
+#   TRY003 raise-vanilla-args — `raise HTTPException(404, "中文錯誤訊息")` 是 FastAPI 慣例
+#   TRY300 try-consider-else — try block 內 return 經常是有意設計
+#   SIM105 contextlib.suppress 已收手動 ones, batch-fix 留個別 case
+#
+# Single-line rule disables:
+#   E501 line-too-long (use formatter instead)
+#   E701-E703 multi-statement-on-line (probe tools / one-liners)
+#   E731 lambda-assignment (sometimes intentional)
+#   E741 ambiguous-variable-name (l, I etc. are fine in throwaway loops)
+#   E402 module-import-not-at-top (probe scripts need conditional imports)
+select = ["F", "E", "W", "PTH", "PLR0402", "RUF005", "RUF015", "RUF019", "RUF022", "RUF046", "RUF100", "SIM"]
+ignore = [
+    "E501", "E701", "E702", "E703", "E731", "E741", "E402",
+    "SIM102",  # nested if 拆開有時更易讀 (AST visitor 場景)
+    "SIM105",  # contextlib.suppress 不強制
+    "SIM108",  # 不強制 ternary (有時 if/else 較易讀)
+]
+
+[tool.pytest.ini_options]
+# E2E playwright tests need a running browser and frontend — skip in CI.
+addopts = "--ignore=tests/test_e2e_playwright_web.py"
+testpaths = ["tests"]

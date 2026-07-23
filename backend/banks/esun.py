@@ -1,0 +1,1249 @@
+#!/usr/bin/env python3
+"""E.SUN Bank personal e-banking crawler.
+
+玉山銀行 E.SUN ebank 個人網銀抓取器。
+
+登入入口：https://ebank.esunbank.com.tw（JSF 框架，iframe 內 form）
+流程：開頁 → 找 iframe1 (`/fco/fco08001/FCO08001_Home.faces`) → 填 3 欄 → 點登入鈕
+
+⚠️ 鐵律（見 wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.md）：
+   login 失敗**絕不自動重打**——max_attempts=1 硬上限。
+   玉山表單**無驗證碼**（裝置/OTP 後端風控），login 後可能跳 OTP；headless 階段只 dump UI
+
+第一輪 collect 只先 navigate + dump endpoint，摸清 API 地圖再補 parse。
+預設行為：headless browser → 預設 headless=True。
+"""
+from __future__ import annotations
+
+import contextlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.banks._login_debug import snapshot as _login_snapshot
+from backend.core.creds import EsunCreds
+
+BASE = "https://ebank.esunbank.com.tw"
+IFRAME_HINT = "FCO08001_Home.faces"
+
+# 玉山 JSF 欄位 id (escape colon 用 attr selector)
+FIELD_NATIONAL_ID = "loginform:custid"   # text, maxlen=10
+FIELD_USER_CODE   = "loginform:name"     # password type, maxlen=15
+FIELD_PASSWORD    = "loginform:pxsswd"   # password type, maxlen=15 (注意是 pxsswd 不是 password)
+LOGIN_BTN_ID      = "loginform:linkCommand"  # <a class="login_btn">
+
+
+def _log(*a):
+    print(*a, file=sys.stderr)
+
+
+def _sel(field_id: str) -> str:
+    """JSF id 含 colon，用 attr selector 才不用 escape。"""
+    return f"[id='{field_id}']"
+
+
+class EsunLoginError(RuntimeError):
+    pass
+
+
+class EsunCrawler(BankCrawler):
+    def __init__(self):
+        super().__init__(name="esun")
+        self.creds = EsunCreds.load()
+
+    def _host_filter(self) -> str:
+        return "esunbank.com"
+
+    def _find_login_frame(self, page):
+        """找含 FCO08001 的 iframe。"""
+        for f in page.frames:
+            if IFRAME_HINT in (f.url or ""):
+                return f
+        return None
+
+    def _logged_in(self, page) -> bool:
+        """W (2026-06-17): positive signal 4 條件 AND（iframe 版，對齊 SCSB 鐵律）
+
+        1) urlOk: main page 仍在 esunbank.com 網域
+        2) noLoginForm: FCO08001_Home iframe 已消失（login iframe gone）
+        3) lenOk: main page innerText + iframe innerText 合計 >= 500
+        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
+
+        任一 fail → 視為未登入。失敗時 _log 所有 condition 細節（cathay pattern）。
+
+        2026-06-18 evidence-driven fix（job 79+0.1.36 retry 30 次都 noLoginForm=F）：
+        玉山登入後 main page 仍在 index.jsp，iframe FCO08001_Home 也仍掛著（只是
+        iframe 內容換成已登入 dashboard），_find_login_frame 永遠找到 → noLoginForm
+        永遠 False → 4-AND 永遠 fail。但 kwOk=True hit=13（13 個內銀關鍵字命中）+
+        lenOk=True txt_len=3454 = 登入「真的成功」的強訊號。
+        修法：加 strongLogin OR — urlOk + lenOk + hit >= 8 即視為已登入，繞過
+        noLoginForm 機械式判定。對齊 [[bank-crawler-post-login-friction-pattern]]
+        ubot passwordExpiryNag 思路（friction page 不是 login fail）。
+        """
+        url = (page.url or "").lower()
+        urlOk = "esunbank.com" in url
+        noLoginForm = self._find_login_frame(page) is None
+
+        # 收集 body 文字（main page + 所有 frame）
+        texts = []
+        try:
+            main_txt = page.evaluate("document.body && document.body.innerText || ''")
+            if main_txt:
+                texts.append(main_txt)
+        except Exception:
+            pass
+        for f in page.frames:
+            if f == page.main_frame:
+                continue
+            try:
+                ftxt = f.evaluate("document.body && document.body.innerText || ''")
+                if ftxt:
+                    texts.append(ftxt)
+            except Exception:
+                pass
+        joined = "\n".join(texts)
+        lenOk = len(joined) >= 500
+
+        KW = (
+            "訊息中心", "個人資訊", "登出", "帳戶總覽", "歡迎使用",
+            "存款", "轉帳", "信用卡", "台幣", "外幣",
+            "基金", "投資", "貸款", "繳費", "安全",
+        )
+        hit = sum(1 for k in KW if k in joined)
+        kwOk = hit >= 2
+
+        # strongLogin: kwOk hit >= 8 = 強訊號已登入（hit=13 cloud evidence 真實案例）
+        # 不靠 noLoginForm 機械式判定，繞過 iframe url 沒變 false-negative
+        strongLogin = urlOk and lenOk and hit >= 8
+
+        ok = (urlOk and noLoginForm and lenOk and kwOk) or strongLogin
+        if not ok:
+            _log(
+                f"[esun][login] _logged_in=False  "
+                f"urlOk={urlOk} noLoginForm={noLoginForm} "
+                f"lenOk={lenOk} kwOk={kwOk} strong={strongLogin} "
+                f"txt_len={len(joined)} hit={hit} "
+                f"url={page.url[:120]}",
+            )
+        elif strongLogin and not noLoginForm:
+            _log(
+                f"[esun][login] ✅ strongLogin (hit={hit}>=8) iframe 未消但內銀字夠強 "
+                f"url={page.url[:120]}",
+            )
+        return ok
+
+    def login(self, page) -> bool:
+        """玉山 ebank 登入——鐵律 max_attempts=1，失敗 raise EsunLoginError。"""
+        page.wait_for_timeout(10000)  # 玉山 iframe load 較慢
+        _log(f"[esun][login] 起始 url={page.url}")
+
+        # session 復用偵測：若 iframe 已不在 FCO08001 → 已登入
+        frame = self._find_login_frame(page)
+        if frame is None and "esunbank.com" in (page.url or ""):
+            _log("[esun][login] ✓ session 仍有效，跳過 login")
+            return True
+
+        if frame is None:
+            _log(f"[esun][login] 找不到 login iframe (hint={IFRAME_HINT})")
+            return False
+        _log(f"[esun][login] login iframe → {frame.url[:100]}")
+
+        # 填 3 欄
+        try:
+            frame.fill(_sel(FIELD_NATIONAL_ID), self.creds.national_id)
+            page.wait_for_timeout(200)
+            frame.fill(_sel(FIELD_USER_CODE), self.creds.user_code)
+            page.wait_for_timeout(200)
+            frame.fill(_sel(FIELD_PASSWORD), self.creds.password)
+            page.wait_for_timeout(300)
+            _log("[esun][login] 已填 3 欄（national_id/user_code/password）")
+        except Exception as e:
+            _log(f"[esun][login] 填欄位失敗: {e}")
+            return False
+
+        # 🚨 max_attempts=1
+        _log("[esun][login] 送出 login")
+        try:
+            # click 用 attr selector
+            frame.click(_sel(LOGIN_BTN_ID), timeout=8000)
+        except Exception as e:
+            _log(f"[esun][login] click 登入鈕失敗: {e}")
+            return False
+
+        page.wait_for_timeout(10000)
+
+        # 🚨 通用「重複登入」HTML modal 處理（base.py 預設 should_kick_other_session=True）
+        if self.handle_dup_login_modal(page):
+            _log("[esun][login] 重複登入 modal 已處理，等銀行 server 切 session 後再判定")
+            page.wait_for_timeout(3000)
+
+        # 2026-06-18 evidence-driven fix（job 79 確診）：
+        # cloud failure 證實 _logged_in 真因是 noLoginForm=False（iframe FCO08001 還在），
+        # urlOk/lenOk/kwOk 三條件都 ✅ 通過 — login 送出 server 端 SSO redirect 比 10s 慢。
+        # 對比 SCSB 0.1.33 fix 用 20s retry loop 才過（log 證實 14s 才 ✅）。
+        # esun 改成 retry loop 30s 上限，每秒重判，給 server SSO redirect 足夠時間。
+        # 對齊 wiki/concepts/bank-crawler-login-positive-signal-rule.md SCSB/DBS pattern。
+        for _i in range(30):
+            if self._logged_in(page):
+                _log(f"[esun][login] ✅ 登入成功 ({10 + _i}s) -> {page.url}")
+                return True
+            page.wait_for_timeout(1000)
+
+        # 沒馬上判定登入成功 → dump 細節 + 截圖，但不馬上 raise
+        # 玉山可能 (a) login 成功但 iframe url 沒換 (b) 跳到訊息中心頁 (c) 真失敗
+        from backend.core.store import _data_root
+        debug_dir = _data_root() / "esun_collect"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            page.screenshot(path=str(debug_dir / "after_login.png"), full_page=True)
+            _log("[esun][login] 截圖 → after_login.png")
+        except Exception as e:
+            _log(f"[esun][login] 截圖失敗: {e}")
+
+        # dump 所有 frame text + main page text
+        all_text = []
+        try:
+            main_txt = (page.evaluate("document.body.innerText") or "")[:2000]
+            all_text.append(("main", page.url, main_txt))
+        except Exception:
+            pass
+        for f in page.frames:
+            if f == page.main_frame:
+                continue
+            try:
+                ftxt = (f.evaluate("document.body.innerText") or "")[:2000]
+                all_text.append(("frame", f.url, ftxt))
+            except Exception:
+                pass
+        _log(f"[esun][login] dump {len(all_text)} pages/frames")
+        for kind, url, txt in all_text:
+            _log(f"[esun][login][{kind}] url={url[:80]}")
+            _log(f"[esun][login][{kind}] text={txt[:500]}")
+
+        # 看 main page 是否含「重複登入 / 重複登錄 / OTP / 簡訊 / 認證」字串 → 不是失敗
+        main_full = " ".join(t for _, _, t in all_text)
+        if any(k in main_full for k in ("重複登入", "重複登錄", "您已登入", "已從", "OTP", "簡訊驗證", "裝置綁定", "安全認證")):
+            _log("[esun][login] ⚠️ 偵測到二階段認證/重複登入訊號，視為 login 進行中（不視為失敗，交由 collect 處理）")
+            return True
+
+        # 否則才真失敗
+        errs = []
+        with contextlib.suppress(Exception):
+            errs = [t for _, _, t in all_text if any(k in t for k in ("錯誤", "失敗", "鎖", "無效", "invalid", "error"))][:5]
+        # Internal policy: max_attempts=1, MUST NOT auto-retry.
+        # See wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.
+        msg = (
+            f"玉山登入失敗。請檢查帳號、密碼是否正確。"
+            f"\n  url={page.url}\n  錯誤訊息/全文摘要: {errs}\n"
+            f"  可能原因：(a) 帳號或密碼錯誤 (b) 跳出 OTP / 裝置綁定確認 (c) 帳號已被鎖定。\n"
+            f"{_login_snapshot(page)}"
+        )
+        _log(f"[esun][login] ❌ {msg}")
+        raise EsunLoginError(msg)
+
+    # ---------- 抓取 ----------
+    def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
+        """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
+        out: dict = {}
+        page.wait_for_timeout(8000)
+
+        from backend.core.store import _data_root
+        debug_dir = _data_root() / "esun_collect"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        # 第 1 階段：首頁帳戶總覽 dump
+        out["final_url"] = page.url
+        try:
+            out["main_text"] = (page.evaluate("document.body.innerText") or "")[:5000]
+        except Exception:
+            out["main_text"] = ""
+
+        frames_data = []
+        for f in page.frames:
+            if f == page.main_frame:
+                continue
+            try:
+                txt = f.evaluate("() => document.body.innerText.slice(0, 8000)")
+                frames_data.append({
+                    "url": f.url[:200],
+                    "text_preview": txt,
+                })
+            except Exception:
+                pass
+        out["frames"] = frames_data
+
+        # 從 frame text 抽帳戶總覽（regex）
+        out["accounts"] = self._parse_account_overview(frames_data)
+        _log(f"[esun][collect] 解析到 {len(out['accounts'])} 個帳戶")
+
+        with contextlib.suppress(Exception):
+            page.screenshot(path=str(debug_dir / "home.png"), full_page=True)
+
+        # 第 1b 階段：navigate 臺幣「存款交易明細查詢」
+        # 2026-06-30: 補 account drilldown 真正資料源。玉山 menu 裡 TWD / FX 都有
+        # 同名「存款交易明細查詢」，_navigate_menu 會避開我的最愛並優先點第一個
+        # actionable 候選；目前首頁左側順序第一個就是「臺幣存匯 → 臺幣帳戶查詢」。
+        try:
+            twd_nav = self._navigate_menu(page, "存款交易明細查詢", debug_dir, "twd_txn_form.png")
+            out["twd_txn_nav_probe"] = twd_nav
+            twd_clicked = any(
+                fr.get("result", {}).get("clicked") for fr in twd_nav.get("frames", [])
+            )
+            if not twd_clicked:
+                out["twd_txn_frames"] = []
+                out["twd_txn_results"] = []
+                _log("[esun][collect] 存款交易明細查詢 menu 未點到，跳過")
+            else:
+                # 對每個臺幣帳戶提交近一個月查詢。玉山 JSF combo 的 visible select
+                # 需要 select_option 讓前端 helper 更新 hidden JSON value；radio label click
+                # 比直接 checked 更穩，跟信用卡 FCM01004 pattern 一致。
+                twd_results = []
+                submitted_accounts: set[str] = set()
+                query_frame = None
+                for f in page.frames:
+                    try:
+                        has_form = f.evaluate("""() => Boolean(
+                            document.querySelector('select[id="fao01002:dract"]') &&
+                            document.querySelector('input[name="fao01002:linkCommand"]')
+                        )""")
+                        if has_form:
+                            query_frame = f
+                            break
+                    except Exception:
+                        pass
+                if query_frame is not None:
+                    try:
+                        acct_options = query_frame.evaluate(r"""() => {
+                            const s = document.querySelector('select[id="fao01002:dract"]');
+                            if (!s) return [];
+                            return [...s.options].map((o, index) => ({
+                                index,
+                                text: (o.textContent || '').trim(),
+                                value: o.value || '',
+                            }));
+                        }""")
+                    except Exception:
+                        acct_options = []
+                    for opt in acct_options:
+                        text = opt.get("text") or ""
+                        if "臺幣" not in text and "台幣" not in text:
+                            continue
+                        account_no = "".join(ch for ch in text if ch.isdigit())[:13]
+                        if not account_no or account_no in submitted_accounts:
+                            continue
+                        submitted_accounts.add(account_no)
+                        try:
+                            query_frame.locator("select[id='fao01002:dract']").select_option(index=int(opt["index"]), timeout=8000)
+                            page.wait_for_timeout(800)
+                            # 自訂近一年：使用者這個玉山帳戶有跨月卡款/轉入資料，account drilldown
+                            # 需要歷史明細。FAO01002 官方保留近一年，直接查最大可用窗口。
+                            clicked_period = query_frame.evaluate(r"""() => {
+                                const r = document.querySelector('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]');
+                                if (!r) return {ok: false, error: 'no intervalrdo4'};
+                                const label = r.closest('label');
+                                if (label) {
+                                    try { label.click(); } catch (e) {}
+                                }
+                                r.checked = true;
+                                r.dispatchEvent(new Event('change', {bubbles: true}));
+                                r.dispatchEvent(new Event('click', {bubbles: true}));
+                                for (const other of document.querySelectorAll('input[name="fao01002:intervalrdo"]')) {
+                                    if (other !== r) other.checked = false;
+                                }
+                                for (const lbl of document.querySelectorAll('.radiobutton-group label')) {
+                                    lbl.classList.toggle('checked', lbl.contains(r));
+                                }
+                                const todayText = (document.querySelector('#sysInfo')?.textContent || '').match(/"today":"(\d{4}\/\d{2}\/\d{2})"/)?.[1] || '';
+                                const today = todayText ? new Date(todayText.replaceAll('/', '-') + 'T00:00:00') : new Date();
+                                const start = new Date(today);
+                                start.setFullYear(start.getFullYear() - 1);
+                                start.setDate(start.getDate() + 1); // minDate -1Y inclusive safety
+                                const fmt = (d) => `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+                                const s = document.querySelector('input[id="fao01002:startDate"]');
+                                const e = document.querySelector('input[id="fao01002:endDate"]');
+                                if (s) {
+                                    s.value = fmt(start);
+                                    s.dispatchEvent(new Event('change', {bubbles: true}));
+                                }
+                                if (e) {
+                                    e.value = fmt(today);
+                                    e.dispatchEvent(new Event('change', {bubbles: true}));
+                                }
+                                return {ok: true, via: 'custom-one-year', checked: r.checked, start: s?.value || '', end: e?.value || ''};
+                            }""")
+                            page.wait_for_timeout(500)
+                            query_frame.evaluate(r"""() => {
+                                const r = document.querySelector('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]');
+                                if (r) {
+                                    r.checked = true;
+                                    r.dispatchEvent(new Event('change', {bubbles: true}));
+                                }
+                            }""")
+                            submit_info = query_frame.evaluate(r"""() => {
+                                // FAO01002 的 JSF linkCommand 是 hidden/text command target；
+                                // 直接 cmd.click() 只會留下預設「最近一星期」qryresult，不會送出
+                                // 畫面上的橘色「查詢」。必須優先點可見查詢按鈕/連結。
+                                const log = [];
+                                const visible = (el) => {
+                                    const r = el.getBoundingClientRect();
+                                    const st = window.getComputedStyle(el);
+                                    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                                };
+                                for (const el of document.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')) {
+                                    const t = (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim();
+                                    if (t === '查詢' && visible(el)) {
+                                        el.click();
+                                        return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: t};
+                                    }
+                                }
+                                // 退而求其次：有些 JSF 版面把 command target 做成 hidden/text input；
+                                // 這不是首選，但至少保留舊路徑並把 probe 寫進 raw。
+                                const cmd = document.querySelector('input[name="fao01002:linkCommand"]');
+                                if (!cmd) throw new Error('no fao01002:linkCommand');
+                                cmd.click();
+                                return {clicked: 'hidden-command-fallback', tag: cmd.tagName, id: cmd.id || '', name: cmd.name || '', type: cmd.type || ''};
+                            }""")
+                            page.wait_for_timeout(9000)
+                            result_text = ""
+                            result_url = ""
+                            result_snapshot = {}
+                            for rf in page.frames:
+                                try:
+                                    snap = rf.evaluate(r"""() => {
+                                        const bodyText = document.body ? document.body.textContent.slice(0, 60000) : '';
+                                        const grid = document.querySelector('[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]');
+                                        const gridText = grid ? (grid.textContent || '') : '';
+                                        return {
+                                            href: location.href,
+                                            bodyText,
+                                            gridText,
+                                            hasGrid: !!grid,
+                                            gridHtml: grid ? grid.outerHTML.slice(0, 20000) : '',
+                                            qryResult: [...document.querySelectorAll('.qryresult, [class*=qryresult], [id*=qry]')].map((el) => ({
+                                                id: el.id || '', cls: (el.className || '').toString(), visible: el.offsetParent !== null,
+                                                text: (el.textContent || '').slice(0, 20000),
+                                                html: el.outerHTML.slice(0, 20000),
+                                            })).slice(0, 10),
+                                            tables: [...document.querySelectorAll('table')].map((t, idx) => ({
+                                                idx, id: t.id || '', cls: (t.className || '').toString(), visible: t.offsetParent !== null,
+                                                text: (t.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 4000),
+                                                html: t.outerHTML.slice(0, 12000),
+                                            })).filter(t => /交易|日期|金額|餘額|摘要|明細|TWD|查詢/.test(t.text) || t.id.includes('fao01002')).slice(0, 30),
+                                        };
+                                    }""")
+                                    txt = snap.get("bodyText") or ""
+                                    if "存款交易明細查詢" in txt and ("查詢時間" in txt or "交易" in txt):
+                                        result_text = txt
+                                        result_url = snap.get("href") or rf.url[:200]
+                                        result_snapshot = {k: v for k, v in snap.items() if k != "bodyText"}
+                                        break
+                                except Exception:
+                                    pass
+                            twd_results.append({
+                                "account_no": account_no,
+                                "selected_text": text,
+                                "period": "近一年",
+                                "clicked_period": clicked_period,
+                                "submit": submit_info,
+                                "url": result_url,
+                                "text": result_text[:50000],
+                                "snapshot": result_snapshot,
+                            })
+                            _log(f"[esun][collect][twd] {account_no[-4:]} 近一年 submit={submit_info.get('clicked')} text_len={len(result_text)}")
+                        except Exception as qe:
+                            twd_results.append({
+                                "account_no": account_no,
+                                "selected_text": text,
+                                "period": "近一年",
+                                "error": str(qe),
+                            })
+                            _log(f"[esun][collect][twd] {account_no[-4:]} query failed: {qe}")
+                out["twd_txn_results"] = twd_results
+
+                twd_frames = []
+                for f in page.frames:
+                    try:
+                        txt = f.evaluate("() => document.body.textContent.slice(0, 50000)")
+                        if not txt or len(txt.strip()) < 30:
+                            continue
+                        # 只保留可能的交易明細 widget / form，而不是整個首頁 menu dump。
+                        if any(k in txt for k in ("交易明細", "查詢期間", "起訖日期", "交易日", "帳務日", "存入", "支出", "餘額")):
+                            twd_frames.append({
+                                "url": f.url[:200],
+                                "text_preview": txt[:40000],
+                                "page_url": page.url[:120],
+                                "txt_len": len(txt),
+                                "is_main": f == page.main_frame,
+                            })
+                    except Exception:
+                        pass
+                out["twd_txn_frames"] = twd_frames
+                out["twd_txn_form_controls"] = []
+                for f in page.frames:
+                    try:
+                        controls = f.evaluate(r"""() => ({
+                            url: location.href,
+                            selects: [...document.querySelectorAll('select')].map((s, si) => ({
+                                index: si, id: s.id, name: s.name, value: s.value,
+                                visible: s.offsetParent !== null,
+                                text: (s.closest('td,tr,div,label')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+                                options: [...s.options].map((o, oi) => ({index: oi, value: o.value || '', text: (o.textContent || '').trim()})).slice(0, 30),
+                            })),
+                            inputs: [...document.querySelectorAll('input')].map((i, ii) => ({
+                                index: ii, id: i.id, name: i.name, type: i.type, value: i.value,
+                                visible: i.offsetParent !== null,
+                                checked: i.checked,
+                                placeholder: i.placeholder || '',
+                                text: (i.closest('td,tr,div,label')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+                            })).slice(0, 120),
+                            buttons: [...document.querySelectorAll('button,a,input[type=button],input[type=submit]')].map((b, bi) => ({
+                                index: bi, tag: b.tagName, id: b.id, name: b.name || '', cls: (b.className || '').toString().slice(0, 80),
+                                value: b.value || '', text: (b.textContent || '').replace(/\s+/g, ' ').trim(),
+                                onclick: b.getAttribute('onclick') || '', visible: b.offsetParent !== null,
+                            })).filter(b => b.text || b.value || b.onclick).slice(0, 160),
+                        })""")
+                        if controls and (controls.get("selects") or controls.get("inputs") or controls.get("buttons")):
+                            out["twd_txn_form_controls"].append(controls)
+                    except Exception:
+                        pass
+                with contextlib.suppress(Exception):
+                    page.screenshot(path=str(debug_dir / "twd_txn_probe.png"), full_page=True)
+                _log(f"[esun][collect] twd_txn_frames={len(twd_frames)} form_controls={len(out['twd_txn_form_controls'])}")
+        except Exception as e:
+            _log(f"[esun][collect] 存款交易明細 navigate 失敗: {e}")
+            out["twd_txn_frames"] = []
+            out["twd_txn_results"] = []
+            out["twd_txn_nav_probe"] = {"error": str(e)}
+
+        # 第 2 階段：navigate 信用卡帳單資訊（hover mega menu，禁用我的最愛）
+        # 玉山是 widget 切換（_leftMenuLoadWidget），不是新分頁——點完後 iframe 內 widget 替換
+        try:
+            nav_info = self._navigate_credit_card_bill(page, debug_dir)
+            out["card_nav_probe"] = nav_info
+            # 玉山 widget 載入慢且可能掛新 iframe — 等 10 秒讓 Playwright 註冊新 frame
+            page.wait_for_timeout(10000)
+
+            # debug: 對比 page.frames vs DOM iframe 真實數
+            try:
+                dom_iframe_count = page.evaluate("() => document.querySelectorAll('iframe').length")
+                _log(f"[esun][collect] DOM iframe count={dom_iframe_count} vs page.frames={len(page.frames)}")
+                # 各 frame iframe count
+                for f in page.frames:
+                    try:
+                        sub = f.evaluate("() => document.querySelectorAll('iframe').length")
+                        sub_srcs = f.evaluate("() => [...document.querySelectorAll('iframe')].map(e => (e.src || e.id || '').slice(0, 150))")
+                        _log(f"[esun][collect][nest] {f.url[:60]} sub_iframes={sub} srcs={sub_srcs[:3]}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                _log(f"[esun][collect] iframe count debug failed: {e}")
+
+            # debug: dump 所有 frame URL + body innerText 長度
+            all_frames_meta = []
+            for f in page.frames:
+                try:
+                    url = f.url[:200]
+                    # 用 textContent（不受 CSS hidden / visibility 影響）+ innerText 兩種對比
+                    txt_inner = f.evaluate("() => document.body.innerText.slice(0, 15000)")
+                    txt_content = f.evaluate("() => document.body.textContent.slice(0, 20000)")
+                    all_frames_meta.append({
+                        "url": url,
+                        "inner_len": len(txt_inner),
+                        "content_len": len(txt_content),
+                        "has_card_kw_inner": any(k in txt_inner for k in ("歸戶信用額度", "預借現金額度")),
+                        "has_card_kw_content": any(k in txt_content for k in ("歸戶信用額度", "預借現金額度")),
+                        "first_200": txt_inner[:200],
+                    })
+                except Exception as e:
+                    all_frames_meta.append({"url": getattr(f, "url", "?")[:80], "error": str(e)})
+            out["card_all_frames_meta"] = all_frames_meta
+            for m in all_frames_meta:
+                _log(f"[esun][collect][meta] {m.get('url', '')[:60]} inner_len={m.get('inner_len')} content_len={m.get('content_len')} card_kw inner={m.get('has_card_kw_inner')} content={m.get('has_card_kw_content')}")
+
+            card_frames = []
+            for f in page.frames:
+                if f == page.main_frame:
+                    continue
+                try:
+                    url = f.url[:200]
+                    # 改用 textContent 而非 innerText（widget 可能在 overflow:hidden 容器內）
+                    txt = f.evaluate("() => document.body.textContent.slice(0, 30000)")
+                    # 收集真正帶信用卡帳單資料的 frame（嚴格 keyword，排掉只有選單名稱的）
+                    if any(k in txt for k in ("歸戶信用額度", "本期繳款截止", "預借現金額度", "e point", "應繳總金額", "ATM 繳款編號")):
+                        card_frames.append({
+                            "url": url,
+                            "text_preview": txt,
+                            "page_url": page.url[:120],
+                        })
+                except Exception:
+                    pass
+            out["card_frames"] = card_frames
+
+            # 從 card_frames 解析信用卡 summary + 帳單列表
+            if card_frames:
+                full_text = card_frames[0].get("text_preview", "")
+                out["card_summary"] = self._parse_card_summary(full_text)
+                out["card_bills"] = self._parse_card_bills(full_text)
+                _log(f"[esun][collect] card_summary={out['card_summary']}")
+                _log(f"[esun][collect] card_bills count={len(out['card_bills'])}")
+            with contextlib.suppress(Exception):
+                page.screenshot(path=str(debug_dir / "card.png"), full_page=True)
+            _log(f"[esun][collect] card_frames={len(card_frames)} (widget mode)")
+        except Exception as e:
+            _log(f"[esun][collect] 信用卡 navigate 失敗: {e}")
+            out["card_frames"] = []
+            out["card_nav_probe"] = {"error": str(e)}
+
+        # 第 3 階段：navigate 信用卡消費明細查詢（設計規範：每家銀行都要抓信用卡明細）
+        try:
+            txn_nav = self._navigate_menu(page, "信用卡消費明細查詢", debug_dir, "card_txn_form.png")
+            out["card_txn_nav_probe"] = txn_nav
+            txn_clicked = any(
+                fr.get("result", {}).get("clicked") for fr in txn_nav.get("frames", [])
+            )
+            if not txn_clicked:
+                out["card_txn_frames"] = []
+                _log("[esun][collect] 信用卡消費明細查詢 menu 未點到，跳過")
+            else:
+                # 2026-06-13 升級：迭代 query 三個期間累積 transactions
+                # 「最近一個月」抓最新，「最近二個月」抓更早，「最近一星期」備用驗證
+                # Esun widget mode 每次 query 後 frame 內容會 replace，不能並行
+                all_txns: list[dict] = []
+                seen_keys: set = set()  # dedup: (date, merchant, billed_amount)
+                periods_results = []
+                for period_label in ("最近一個月", "最近二個月"):
+                    page.wait_for_timeout(5000)  # 等表單回到查詢狀態（不重點選表單）
+                    form_submitted = self._submit_card_txn_query(page, debug_dir, period_label)
+                    periods_results.append({"period": period_label, "submitted": form_submitted})
+                    if not form_submitted.get("strategy"):
+                        _log(f"[esun][collect] {period_label} 表單未提交，跳過")
+                        continue
+                    page.wait_for_timeout(8000)  # 等查詢結果載入
+
+                    # 從 frame 抽 transactions
+                    for f in page.frames:
+                        if f == page.main_frame:
+                            continue
+                        try:
+                            txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                            if any(k in txt for k in ("消費日", "請款日", "入帳日", "消費金額", "授權碼", "特店名稱", "消費明細")):
+                                txns_this_round = self._parse_card_transactions(txt)
+                                for t in txns_this_round:
+                                    key = (t.get("consume_date"), t.get("merchant"), t.get("billed_amount"))
+                                    if key in seen_keys:
+                                        continue
+                                    seen_keys.add(key)
+                                    all_txns.append(t)
+                                break
+                        except Exception:
+                            pass
+                    _log(f"[esun][collect] {period_label} 累計 transactions={len(all_txns)}")
+
+                out["card_txn_form_submitted"] = periods_results  # 多 period 結果
+                out["card_transactions"] = all_txns
+                _log(f"[esun][collect] card_transactions 總計 (dedup) count={len(all_txns)}")
+
+                # card_txn_frames 仍用最後一輪 frame snapshot 給 daily_metric
+                card_txn_frames = []
+                for f in page.frames:
+                    if f == page.main_frame:
+                        continue
+                    try:
+                        url = f.url[:200]
+                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        if any(k in txt for k in ("消費日", "請款日", "入帳日", "消費金額", "授權碼", "特店名稱", "消費明細")):
+                            card_txn_frames.append({
+                                "url": url,
+                                "text_preview": txt,
+                                "page_url": page.url[:120],
+                            })
+                    except Exception:
+                        pass
+                out["card_txn_frames"] = card_txn_frames
+                with contextlib.suppress(Exception):
+                    page.screenshot(path=str(debug_dir / "card_txn_results.png"), full_page=True)
+                _log(f"[esun][collect] card_txn_frames={len(card_txn_frames)} (widget mode, 累計)")
+        except Exception as e:
+            _log(f"[esun][collect] 信用卡消費明細 navigate 失敗: {e}")
+            out["card_txn_frames"] = []
+            out["card_txn_nav_probe"] = {"error": str(e)}
+
+        # 第 4 階段：navigate 信用卡額度查詢（信用卡 > 信用卡帳單/明細 > 信用卡額度查詢）
+        # 玉山的「已使用額度 / 可用餘額」官方數字在此頁，不是帳單頁。
+        # 2026-06-18 新增：原本 used_credit 從 card_transactions sum 已入帳，會少算未入帳 +
+        # 上期未繳，導致顯示 NT$2,085 而使用者實際 used=-807 (溢繳)。改為直接抓原生欄位 (B 路線)。
+        # widget onclick: _leftMenuLoadWidget(event,'FCM01006','FCM','MFCM0204')
+        # 重要 pitfall (2026-06-18 第三輪):
+        # 玉山這個 widget **塞進 main DOM，不是 iframe**！原本 collect 程式 `for f in
+        # page.frames if f != main_frame` 會跳過 main，永遠抓不到 widget 內容。
+        # 必須 include main_frame, 且 widget 是替換 main DOM (frame URL 不變)，要靠
+        # textContent 內含「已用額度」「可用餘額」label 來辨識。
+        try:
+            quota_nav = self._navigate_menu(page, "信用卡額度查詢", debug_dir, "card_quota_form.png")
+            out["card_quota_nav_probe"] = quota_nav
+            quota_clicked = any(
+                fr.get("result", {}).get("clicked") for fr in quota_nav.get("frames", [])
+            )
+            if not quota_clicked:
+                out["card_quota_frames"] = []
+                out["card_quota"] = {}
+                _log("[esun][collect] 信用卡額度查詢 menu 未點到，跳過")
+            else:
+                # 玉山 widget 載入很慢，前次 8 秒不夠 — 拉到 15 秒
+                page.wait_for_timeout(15000)
+                quota_frames = []
+                # 收集所有 candidate frame **含 main_frame**，挑「最像額度資料頁」的
+                # 條件：textContent 內**同時**含「已用額度」**和**「可用餘額」+ 數字
+                # 排掉 home 頁的 menu noscript（只有 menu 字串，沒實際表格）
+                import re as _re_quota
+                for f in page.frames:  # ← include main_frame (widget 在 main DOM)
+                    try:
+                        url = f.url[:200]
+                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        # strict: 必須**同時**有「已用額度」+「可用餘額」label
+                        # menu 列表不可能同時有這兩個 label，自動排除
+                        has_both_labels = "已用額度" in txt and "可用餘額" in txt
+                        # 必須有逗號數字 (e.g. 400,807) 或負號開頭數字 (-807)
+                        has_number = bool(_re_quota.search(r"-?\d{1,3}(?:,\d{3})+|\b-\d+\b", txt))
+                        if has_both_labels and has_number:
+                            quota_frames.append({
+                                "url": url,
+                                "text_preview": txt,
+                                "page_url": page.url[:120],
+                                "txt_len": len(txt),
+                                "is_main": f == page.main_frame,
+                            })
+                    except Exception:
+                        pass
+                out["card_quota_frames"] = quota_frames
+                if quota_frames:
+                    # 多個 candidate 取 textContent 最長那個（widget 主內容通常最豐富）
+                    best = max(quota_frames, key=lambda x: x.get("txt_len", 0))
+                    full_text = best.get("text_preview", "")
+                    out["card_quota"] = self._parse_card_quota(full_text)
+                    _log(f"[esun][collect] card_quota={out['card_quota']}")
+                else:
+                    out["card_quota"] = {}
+                    _log("[esun][collect] 信用卡額度查詢 frame 沒抓到 (已用額度+可用餘額+number)")
+                with contextlib.suppress(Exception):
+                    page.screenshot(path=str(debug_dir / "card_quota_results.png"), full_page=True)
+                _log(f"[esun][collect] card_quota_frames={len(quota_frames)} (widget mode)")
+        except Exception as e:
+            _log(f"[esun][collect] 信用卡額度查詢 navigate 失敗: {e}")
+            out["card_quota_frames"] = []
+            out["card_quota"] = {}
+            out["card_quota_nav_probe"] = {"error": str(e)}
+
+        # 第 5 階段：navigate 信用卡繳款明細查詢 (2026-06-22 使用者指出 frames menu 有此 item)
+        # menu path: 信用卡 > 信用卡帳單/明細 > 信用卡繳款明細查詢
+        # 預期內含「繳款日 + 繳款金額」歷史 record list (跟 ubot F0801001 同性質).
+        # 跟 quota / txn step 同 pattern: navigate → 等 widget load → dump frames text.
+        # 用 raw dump 留底, 不在此 hard-code parser; persist 端用 defensive regex.
+        try:
+            pay_nav = self._navigate_menu(
+                page, "信用卡繳款明細查詢", debug_dir, "card_pay_form.png",
+            )
+            out["card_pay_nav_probe"] = pay_nav
+            pay_clicked = any(
+                fr.get("result", {}).get("clicked") for fr in pay_nav.get("frames", [])
+            )
+            if not pay_clicked:
+                out["card_pay_frames"] = []
+                out["card_pay_history"] = {}
+                _log("[esun][collect] 信用卡繳款明細查詢 menu 未點到，跳過")
+            else:
+                # 玉山 widget pattern (跟 quota 同), wait 15s
+                page.wait_for_timeout(15000)
+                pay_frames = []
+                # 收 main_frame + 所有 iframe textContent, 留 raw 給明早 PG probe
+                for f in page.frames:
+                    try:
+                        url = f.url[:200]
+                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        if not txt or len(txt.strip()) < 30:
+                            continue
+                        # 留 raw frame 進 dump, 明早從 daily_metric 撈出來看真實 shape
+                        pay_frames.append({
+                            "url": url,
+                            "text_preview": txt[:30000],  # 30k 足容 menu(2.7k) + 表格(實測表格在 5000+ 後)
+                            "page_url": page.url[:120],
+                            "txt_len": len(txt),
+                            "is_main": f == page.main_frame,
+                        })
+                    except Exception:
+                        pass
+                out["card_pay_frames"] = pay_frames
+                # 2026-06-23 v2 (local crawl 確認 shape): 從 frames text 解析繳款表格.
+                # 真實 shape (text block):
+                #   繳款日期\n繳款方式\n繳款行庫\n幣別\n應繳款金額\n繳款金額\n
+                #   2026/03/30\n玉山自動扣繳　\n玉山自動轉帳\n臺幣 TWD\n65,714\n65,714\n
+                #   2026/03/06\n玉山自動扣繳　\n玉山自動轉帳\n臺幣 TWD\n12,792\n12,792\n
+                # records 排序新→舊 (page 預設), records[0] 是最新一筆.
+                full_text = "\n".join(
+                    f.get("text_preview", "") for f in pay_frames
+                )
+                out["card_pay_history"] = self._parse_card_pay_history(full_text)
+                with contextlib.suppress(Exception):
+                    page.screenshot(
+                        path=str(debug_dir / "card_pay_results.png"), full_page=True,
+                    )
+                _log(f"[esun][collect] card_pay_frames={len(pay_frames)} "
+                     f"records={len(out['card_pay_history'].get('records', []))}")
+        except Exception as e:
+            _log(f"[esun][collect] 信用卡繳款明細查詢 navigate 失敗: {e}")
+            out["card_pay_frames"] = []
+            out["card_pay_history"] = {}
+            out["card_pay_nav_probe"] = {"error": str(e)}
+
+        out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
+        out["_endpoint_count"] = len(out["_all_endpoints"])
+        _log(f"[esun][collect] 攔到 {out['_endpoint_count']} 個 API endpoint")
+        return BankCollectResult(**out)
+
+    @staticmethod
+    def _parse_card_pay_history(text: str) -> dict:
+        """從「信用卡繳款明細查詢」頁 textContent 抽繳款 records.
+
+        2026-06-23 (使用者 local crawl 驗證): 玉山 widget 表格 text 結構:
+          繳款日期\\n繳款方式\\n繳款行庫\\n幣別\\n應繳款金額\\n繳款金額\\n
+          2026/03/30\\n玉山自動扣繳　\\n玉山自動轉帳\\n臺幣 TWD\\n65,714\\n65,714
+          2026/03/06\\n玉山自動扣繳　\\n玉山自動轉帳\\n臺幣 TWD\\n12,792\\n12,792
+
+        records 排序新→舊 (page 預設), records[0] 是最新一筆.
+        本查詢僅提供最近半年資料 (玉山官方提醒).
+
+        回傳 {"records": [{post_date, method, bank, currency, due_amount, paid_amount}]}
+        """
+        import re as _re
+        records = []
+        # 抓「YYYY/MM/DD\n方式\n行庫\n幣別 CCY\n應繳\n已繳」pattern
+        # 方式 / 行庫 可能含全形空白 \u3000, 用 \S+ 抓詞 (不含換行)
+        for m in _re.finditer(
+            r"(?P<date>\d{4}/\d{2}/\d{2})\s*\n"
+            r"\s*(?P<method>\S+)\s*\n"
+            r"\s*(?P<bank>\S+)\s*\n"
+            r"\s*\S+\s+(?P<ccy>[A-Z]{3})\s*\n"
+            r"\s*(?P<due>[\d,]+)\s*\n"
+            r"\s*(?P<paid>[\d,]+)",
+            text,
+        ):
+            try:
+                due_amt = int(m.group("due").replace(",", "") or 0)
+                paid_amt = int(m.group("paid").replace(",", "") or 0)
+            except ValueError:
+                continue
+            # YYYY/MM/DD → ISO (slash → dash)
+            date_iso = m.group("date").replace("/", "-")
+            records.append({
+                "post_date": date_iso,
+                "method": m.group("method").strip(),
+                "bank": m.group("bank").strip(),
+                "currency": m.group("ccy"),
+                "due_amount": due_amt,
+                "paid_amount": paid_amt,
+            })
+        return {"records": records}
+
+    @staticmethod
+    def _parse_card_quota(text: str) -> dict:
+        """從「信用卡額度查詢」頁 textContent 抽額度欄位。
+
+        玉山「信用卡額度查詢」實際表格結構 (2026-06-18 vision 確認):
+
+          信用卡額度查詢
+          查詢時間：2026/06/18 18:08:16
+          ┌──────────┬──────────┬──────────┐
+          │ 信用狀態  │ 已用額度  │ 可用餘額  │
+          ├──────────┼──────────┼──────────┤
+          │ 歸戶      │   -807    │ 400,807  │   ← 整戶層 (可能是負數=溢繳)
+          ├──────────┼──────────┼──────────┤
+          │ 指定額度  │ 已用額度  │ (空白)   │   ← per-card 表頭, 下方是各卡 row
+          └──────────┴──────────┴──────────┘
+
+        textContent flattened 後:
+          信用卡額度查詢
+          查詢時間：2026/06/18 18:08:16
+          信用狀態
+          已用額度
+          可用餘額
+          歸戶
+          -807
+          400,807
+          指定額度
+          已用額度
+          ...
+
+        策略：
+          1) 找「歸戶」row 後緊接的兩個數字 = (used_credit, available_credit)
+          2) used + available = credit_limit (歸戶總額度 = 已用 + 可用)
+             玉山這頁不直接顯示「歸戶信用額度」，要靠 used+available 算出來
+
+        Returns:
+          {
+            "used_credit_twd": -807,             # 可能為負 (溢繳)
+            "available_credit_twd": 400807,
+            "credit_limit_twd": 400000,          # = used + available (玉山這頁不顯示)
+            "raw_text_sample": "...",
+          }
+        """
+        import re as _re
+        out: dict = {}
+
+        # 找「歸戶」後緊接的兩個數字
+        # textContent 範例: "...信用狀態\n已用額度\n可用餘額\n歸戶\n-807\n400,807\n指定額度..."
+        # pattern: 「歸戶」 + (數字1) + (數字2), 中間允許空白/換行
+        # 數字格式: 可選負號 + 1-3 digit + (,3digit)* 或裸 -digit
+        num_pat = r"(-?\d{1,3}(?:,\d{3})*)"
+        m = _re.search(
+            rf"歸戶\s*\n?\s*{num_pat}\s*\n?\s*{num_pat}",
+            text,
+        )
+        if m:
+            try:
+                used = int(m.group(1).replace(",", ""))
+                available = int(m.group(2).replace(",", ""))
+                out["used_credit_twd"] = used
+                out["available_credit_twd"] = available
+                out["credit_limit_twd"] = used + available
+            except ValueError:
+                pass
+
+        # debug：永遠留 sample，命中失敗時使用者才能 audit
+        out["raw_text_sample"] = text[:500]
+        return out
+
+    # ---------- 解析帳戶 ----------
+    @staticmethod
+    def _parse_account_overview(frames_data: list[dict]) -> list[dict]:
+        """從 frame text 抽臺幣/外幣帳戶總覽。
+
+        玉山頁面結構（tab-separated）：
+          臺幣帳戶總覽
+          帳號類別  帳號  帳戶餘額  功能
+          臺幣綜存  0900000097060  臺幣綜存  1  ===請選擇===
+          總計  1
+
+          外幣帳戶總覽
+          帳號類別  帳號  帳戶餘額  功能
+          外幣活存  0900000107061  外幣活存  USD 0.00  ===請選擇===
+        """
+        import re as _re
+        accounts: list[dict] = []
+        for fd in frames_data:
+            text = fd.get("text_preview") or ""
+            # 抓所有 13 碼帳號 + 上下文
+            for m in _re.finditer(r"(?P<cat>臺幣綜存|臺幣活存|外幣活存|外幣綜存|外幣定存|臺幣定存|定期儲蓄存款|薪資戶)\s*\n\s*(?P<acct>\d{13})\s*\n", text):
+                acct_no = m.group("acct")
+                category = m.group("cat")
+                # 從 acct 後面再 grep 餘額（接著找到下個換行 + 數字 或 USD/TWD pattern）
+                after = text[m.end():m.end() + 200]
+                # 餘額 pattern：純數字、或「USD/TWD 0.00」
+                bal_match = _re.search(r"(?:USD|TWD|JPY|EUR|GBP|CNY|HKD|AUD|CAD|CHF|NZD|SGD|THB|ZAR|SEK)?\s*([\d,]+(?:\.\d+)?)", after)
+                bal_str = bal_match.group(1).replace(",", "") if bal_match else "0"
+                # 幣別判定：臺幣帳戶強制 TWD（不被後文 USD 字串汙染），外幣帳戶才 grep
+                if "臺幣" in category:
+                    currency = "TWD"
+                else:
+                    currency = "USD"
+                    ccy_match = _re.search(r"\b(USD|JPY|EUR|GBP|CNY|HKD|AUD|CAD|CHF|NZD|SGD|THB|ZAR|SEK)\b", after)
+                    if ccy_match:
+                        currency = ccy_match.group(1)
+                try:
+                    balance = float(bal_str)
+                except ValueError:
+                    balance = 0.0
+                # 去重（同帳號可能在「臺幣帳戶總覽 / 我的最愛」雙處出現）
+                if any(a["account_no"] == acct_no for a in accounts):
+                    continue
+                accounts.append({
+                    "account_no": acct_no,
+                    "category": category,
+                    "currency": currency,
+                    "balance": balance,
+                    "source_frame": fd.get("url", "")[:80],
+                })
+        return accounts
+
+    # ---------- 解析信用卡帳單 ----------
+    @staticmethod
+    def _parse_card_summary(text: str) -> dict:
+        """從信用卡帳單頁 textContent 抽 summary 欄位。
+
+        玉山頁面 pattern：
+          歸戶信用額度-臺幣\n 400,000\n
+          目前e point\n 1,042\n
+          預借現金額度-臺幣\n 40,000\n
+          本期繳款截止日\n115/05/28\n
+          ATM繳款編號\n9977701加身分證編號後９位數字\n
+        """
+        import re as _re
+        out: dict = {}
+        patterns = {
+            "credit_limit_twd": r"歸戶信用額度-?臺幣\s*([\d,]+)",
+            "epoint": r"目前\s*e\s*point\s*([\d,]+)",
+            "cash_advance_limit_twd": r"預借現金額度-?臺幣\s*([\d,]+)",
+            "payment_due_date_roc": r"本期繳款截止日\s*(\d{3}/\d{2}/\d{2})",
+            "atm_payment_prefix": r"ATM\s*繳款編號\s*(\d+)",
+        }
+        for key, pat in patterns.items():
+            m = _re.search(pat, text)
+            if m:
+                val = m.group(1).replace(",", "")
+                try:
+                    out[key] = int(val) if val.isdigit() else val
+                except ValueError:
+                    out[key] = val
+        return out
+
+    @staticmethod
+    def _parse_card_bills(text: str) -> list[dict]:
+        """從信用卡帳單頁 textContent 抽帳單列表。
+
+        玉山 row pattern (tab-separated)：
+          0115/04\n臺幣 TWD\n0\n0\n 明細
+          0115/03\n臺幣 TWD\n0\n0\n 明細
+          0115/02\n臺幣 TWD\n65,714\n65,714\n 明細
+
+        帳單月份格式 = 0YYY/MM（民國年）
+        """
+        import re as _re
+        bills = []
+        # 抓「0XXX/XX\n幣別 CCY\n金額\n金額」pattern
+        for m in _re.finditer(
+            r"(?P<bill_month>0\d{3}/\d{2})\s*\n\s*(?P<ccy_name>\S+)\s+(?P<ccy>[A-Z]{3})\s*\n\s*(?P<due>[\d,]+)\s*\n\s*(?P<paid>[\d,]+)",
+            text,
+        ):
+            roc_month = m.group("bill_month")
+            # 0115/04 → 民國 115 年 04 月 → 西元 2026 年 04 月
+            # （民國年 = 西元年 - 1911；115 → 2026）
+            try:
+                roc_y = int(roc_month[:4])
+                month_num = int(roc_month[5:7])
+                bill_month = f"{roc_y + 1911}-{month_num:02d}"
+            except ValueError:
+                bill_month = roc_month
+            bills.append({
+                "bill_month_roc": roc_month,
+                "bill_month": bill_month,
+                "currency": m.group("ccy"),
+                "due_amount": int(m.group("due").replace(",", "") or 0),
+                "paid_amount": int(m.group("paid").replace(",", "") or 0),
+            })
+        return bills
+
+    @staticmethod
+    def _parse_card_transactions(text: str) -> list[dict]:
+        """從信用卡消費明細頁 textContent 抽交易列表。
+
+        玉山消費明細 6 欄結構（textContent 用 \\n 分隔）：
+          消費日期\\n商店\\n消費幣別 金額\\n繳款幣別 金額\\n卡號(5242-XXXX-XXXX-XXXX)\\n狀態(未入帳/已入帳)
+
+        e.g.
+          2026/06/08\\n街口電支－【中油條碼】台灣中油\\nTWD 1,727\\nTWD 1,727\\n9064-XXXX-XXXX-7032\\n未入帳
+        """
+        import re as _re
+        txns = []
+        pattern = _re.compile(
+            r"(?P<date>20\d{2}/\d{2}/\d{2})\s*\n"
+            r"\s*(?P<merchant>[^\n]{2,80})\s*\n"
+            r"\s*(?P<ccy1>[A-Z]{3})\s+(?P<amt1>[\d,]+(?:\.\d+)?)\s*\n"
+            r"\s*(?P<ccy2>[A-Z]{3})\s+(?P<amt2>[\d,]+(?:\.\d+)?)\s*\n"
+            r"\s*(?P<card>[\d\-X]{16,25})\s*\n"
+            r"\s*(?P<status>未入帳|已入帳|入帳中)",
+        )
+        for m in pattern.finditer(text):
+            card_raw = m.group("card")
+            last4 = card_raw[-4:] if card_raw[-4:].isdigit() else None
+            try:
+                consume_amt = float(m.group("amt1").replace(",", ""))
+                billed_amt = float(m.group("amt2").replace(",", ""))
+            except ValueError:
+                continue
+            txns.append({
+                "consume_date": m.group("date"),
+                "merchant": m.group("merchant").strip(),
+                "consume_currency": m.group("ccy1"),
+                "consume_amount": consume_amt,
+                "billed_currency": m.group("ccy2"),
+                "billed_amount": billed_amt,
+                "card_no": card_raw,
+                "card_last4": last4,
+                "status": m.group("status"),
+            })
+        return txns
+
+    # ---------- 通用 menu navigate ----------
+    def _navigate_menu(self, page, label: str, debug_dir, screenshot_name: str | None = None) -> dict:
+        """通用主選單 navigation：找文字為 label 的可點 element 並 click。
+
+        設計需求「禁用我的最愛」+「li 純 wrapper 陷阱」+「AJAX widget swap」→
+        所有銀行的 menu navigation 都該走這條 helper。
+
+        策略：
+          1. 蒐集所有 textContent === label 的候選，排除 ancestor 含 favorite/shortcut/bookmark/sidebar
+          2. 找有 onclick/href 屬性的 actionable 元素 → click
+          3. fallback: 任一可見非 fav 元素 → click（謹慎用，可能是 <li> 純 wrapper）
+        """
+        probe_info = {"label": label, "frames": []}
+        for f in page.frames:
+            try:
+                result = f.evaluate(
+                    """
+                    (label) => {
+                      const isFavoriteAncestor = (el) => {
+                        let cur = el;
+                        for (let i = 0; i < 12 && cur && cur !== document.body; i++) {
+                          const id = (cur.id || '').toLowerCase();
+                          const cls = (cur.className || '').toString().toLowerCase();
+                          if (/favorite|favor|shortcut|bookmark|sidebar|portlet|widget|mark|aside/.test(id+' '+cls)) {
+                            return true;
+                          }
+                          cur = cur.parentElement;
+                        }
+                        return false;
+                      };
+                      const candidates = [];
+                      for (const el of document.querySelectorAll('a,button,li,span,div')) {
+                        if ((el.textContent || '').trim() !== label) continue;
+                        const r = el.getBoundingClientRect();
+                        candidates.push({
+                          el, rect: r,
+                          visible: r.width > 0 && r.height > 0,
+                          isFav: isFavoriteAncestor(el),
+                          tag: el.tagName, id: el.id || null,
+                          cls: (el.className || '').toString().slice(0, 60),
+                          href: el.getAttribute('href'),
+                          onclick: el.getAttribute('onclick'),
+                        });
+                      }
+                      const dump = candidates.map(c => ({
+                        tag: c.tag, id: c.id, cls: c.cls,
+                        href: c.href, onclick: c.onclick,
+                        visible: c.visible, isFav: c.isFav,
+                        x: Math.round(c.rect.x), y: Math.round(c.rect.y),
+                      }));
+                      // 策略 1: 有 onclick/href 的可點元素
+                      const actionable = candidates.filter(c => c.visible && !c.isFav && (c.href || c.onclick));
+                      if (actionable.length > 0) {
+                        actionable[0].el.click();
+                        return {clicked: 'actionable', dump, target: actionable[0].tag, onclick: actionable[0].onclick};
+                      }
+                      // 策略 1b: fallback
+                      const ready = candidates.filter(c => c.visible && !c.isFav);
+                      if (ready.length > 0) {
+                        ready[0].el.click();
+                        return {clicked: 'fallback', dump, target: ready[0].tag};
+                      }
+                      return {clicked: null, dump, fail: 'no_actionable_candidate'};
+                    }
+                    """,
+                    label,
+                )
+                probe_info["frames"].append({"url": f.url[:120], "result": result})
+                _log(f"[esun][collect][nav][{label}] {f.url[:50]} clicked={result and result.get('clicked')!r}")
+                if result and result.get("clicked"):
+                    if screenshot_name:
+                        with contextlib.suppress(Exception):
+                            page.screenshot(path=str(debug_dir / screenshot_name), full_page=True)
+                    return probe_info
+            except Exception as e:
+                _log(f"[esun][collect][nav][{label}] frame {f.url[:60]} 失敗: {e}")
+                probe_info["frames"].append({"url": f.url[:120], "error": str(e)})
+                continue
+        return probe_info
+
+    # ---------- 信用卡 navigate（用通用 helper）----------
+    def _navigate_credit_card_bill(self, page, debug_dir) -> dict:
+        """navigate 信用卡帳單資訊（背後用 _navigate_menu）。"""
+        return self._navigate_menu(page, "信用卡帳單資訊", debug_dir, "card.png")
+
+    def _submit_card_txn_query(self, page, debug_dir, period_label: str = "最近一個月") -> dict:
+        """玉山「信用卡消費明細查詢」表單 widget 自動點期間 + 查詢。
+
+        玉山 form id = `fcm01004`，查詢期間 radio 通常用 `:intervalrdo1/2/3/4` 序列：
+          1=最近一星期、2=最近一個月、3=最近二個月、4=其它期間
+        改用 textContent 找 radio label + 「查詢」按鈕（不依賴脆弱 id）。
+
+        2026-06-13 升級：period_label 參數化，支援 "最近一星期" / "最近一個月" / "最近二個月"
+        （"其它期間" 因要填日期欄較複雜，暫不支援）
+        """
+        info = {"strategy": None, "errors": [], "period_label": period_label}
+        for f in page.frames:
+            try:
+                result = f.evaluate("""
+                    (wanted) => {
+                      const log = [];
+                      // 1) 找指定期間 radio label 並點
+                      let monthClicked = false;
+                      for (const lbl of document.querySelectorAll('label,span,div')) {
+                        const t = (lbl.textContent || '').trim();
+                        if (t === wanted) {
+                          const r = lbl.getBoundingClientRect();
+                          if (r.width > 0 && r.height > 0) {
+                            lbl.click();
+                            monthClicked = true;
+                            log.push('clicked label ' + wanted);
+                            break;
+                          }
+                        }
+                      }
+                      // 2) 退而求其次：找 input[type=radio][value="2"] 或 :intervalrdo2
+                      if (!monthClicked && wanted === '最近一個月') {
+                        const radio = document.querySelector('input[type=radio][id*="intervalrdo2"], input[type=radio][value="2"]');
+                        if (radio) {
+                          radio.checked = true;
+                          radio.dispatchEvent(new Event('change', {bubbles: true}));
+                          monthClicked = true;
+                          log.push('checked radio fallback intervalrdo2');
+                        }
+                      }
+                      // 3) 找「查詢」button
+                      let queryClicked = false;
+                      for (const btn of document.querySelectorAll('button,a,input[type=button],input[type=submit]')) {
+                        const t = (btn.textContent || btn.value || '').trim();
+                        if (t === '查詢' || t === '查 詢') {
+                          const r = btn.getBoundingClientRect();
+                          if (r.width > 0 && r.height > 0) {
+                            btn.click();
+                            queryClicked = true;
+                            log.push('clicked 查詢');
+                            break;
+                          }
+                        }
+                      }
+                      return {monthClicked, queryClicked, log, frame_url: location.href};
+                    }
+                """, period_label)
+                if result and (result.get("monthClicked") or result.get("queryClicked")):
+                    info["strategy"] = result
+                    _log(f"[esun][collect][txn-form] {f.url[:60]} {result.get('log')}")
+                    with contextlib.suppress(Exception):
+                        page.screenshot(path=str(debug_dir / "card_txn_after_submit.png"), full_page=True)
+                    return info
+            except Exception as e:
+                info["errors"].append({"url": f.url[:80], "error": str(e)})
+                continue
+        _log("[esun][collect][txn-form] 無 frame 能點到表單（probe 已存）")
+        return info
+
+
+if __name__ == "__main__":
+    import json
+    crawler = EsunCrawler()
+    try:
+        result = crawler.run(login_url=BASE, headless=True)
+    except EsunLoginError as e:
+        result = {"error": "login_failed_stop", "detail": str(e)}
+
+    out_file = Path(__file__).resolve().parents[1] / "data" / "esun_collected.json"
+    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log(f"\n[esun][done] 已存: {out_file}")
+
+    if result.get("error"):
+        _log(f"  ❌ error: {result['error']}")
+    else:
+        data = result.get("data", {})
+        _log(f"  url: {data.get('final_url')}")
+        _log(f"  frames: {len(data.get('frames', []))}")
+        _log(f"  endpoints: {data.get('_all_endpoints', [])}")

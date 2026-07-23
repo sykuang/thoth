@@ -1,0 +1,145 @@
+# 訂閱服務白名單 — Phase 6 (2026-06-15)
+#
+# 詳見 wiki [[personal-finance-transaction-category-taxonomy]] § 5.4 / § 5.5
+#
+# classifier 對每筆 txn 做 case-insensitive substring match desc against
+# keywords. 命中即 is_subscription=1.
+#
+# 維護指南:
+# - 每個 entry 是「品牌/服務名字面」(任何 desc 裡可能出現的字串)
+# - 不必含完整商家名,「Netflix」就會匹配「Netflix Taiwan」「NETFLIX.COM」
+# - 中文常用名也加 (麻布記帳會吐中文 desc)
+# - 順序無關 (用 set match)
+# - 加新 entry 不必動 code, 改完這檔 reload 即生效 (cache 在 module level)
+
+keywords:
+  # === 影音串流 ===
+  - Netflix
+  - Disney+
+  - DisneyPlus
+  - HBO
+  - MAX
+  - Hulu
+  - YouTube Premium
+  - YouTube Music
+  - YT Premium
+  - Apple TV+
+  - Apple TV
+  - Amazon Prime
+  - Prime Video
+  - friDay影音
+  - LINE TV
+  - KKTV
+  - Catchplay
+  - Hami Video
+  - Twitch
+  - Crunchyroll
+
+  # === 音樂 ===
+  - Spotify
+  - Apple Music
+  - KKBOX
+  - YouTube Music
+  - Tidal
+  - SoundCloud
+
+  # === 雲端儲存 ===
+  - iCloud
+  - Google One
+  - Google Storage
+  - Dropbox
+  - OneDrive
+  - Box.com
+  - Mega
+
+  # === 生產力 / 文書 ===
+  - Office 365
+  - Office365
+  - Microsoft 365
+  - Microsoft365
+  - Google Workspace
+  - GSuite
+  - Notion
+  - Evernote
+  - Bear
+  - Roam
+  - Obsidian Sync
+  - Todoist
+  - TickTick
+
+  # === 開發者工具 ===
+  - GitHub
+  - GitLab
+  - JetBrains
+  - 1Password
+  - Bitwarden Premium
+  - LastPass
+  - Linear
+  - Figma
+  - Vercel
+  - Netlify
+  - Cloudflare
+  - AWS
+  - Azure
+  - Google Cloud
+  - DigitalOcean
+
+  # === AI 訂閱 ===
+  - ChatGPT
+  - OpenAI
+  - Claude
+  - Anthropic
+  - Perplexity
+  - Midjourney
+  - Cursor
+  - GitHub Copilot
+  - Copilot
+
+  # === 通訊 / 社交 ===
+  - LINE Pay 訂閱
+  - Discord Nitro
+  - Slack
+  - Zoom
+
+  # === 健身 / 健康 ===
+  - Strava
+  - Apple Fitness
+  - Calm
+  - Headspace
+  - Peloton
+
+  # === 新聞 / 閱讀 ===
+  - 天下雜誌
+  - 商業周刊
+  - 經濟學人
+  - The Economist
+  - NYTimes
+  - New York Times
+  - WSJ
+  - Wall Street Journal
+  - Bloomberg
+  - Medium
+  - Substack
+  - Kindle Unlimited
+  - Audible
+
+  # === 遊戲 / 娛樂 ===
+  - PlayStation Plus
+  - PS Plus
+  - Xbox Game Pass
+  - Nintendo Online
+  - Steam
+  - EA Play
+  - Apple Arcade
+
+  # === VPN / 安全 ===
+  - NordVPN
+  - ExpressVPN
+  - Surfshark
+  - Mullvad
+
+  # === 中文常用 ===
+  - 訂閱
+  - 月費
+  - 月扣
+  - 自動續訂

@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+ * Dark mode transition (web only).
+ *
+ * NativeWind 'class' dark mode 只把 root <html> 加/拿 .dark class,
+ * 我們對所有 element 加 200ms transition,讓 light↔dark 切換時
+ * background / color / border 都漸變,不會 instant flash。
+ *
+ * 只跑 web (rules 不會打到 RN 的 inline style)。
+ * 動畫 prefer-reduced-motion 則略過。
+ * ============================================================ */
+@layer base {
+  :root {
+    --theme-transition: background-color 200ms ease,
+      color 200ms ease, border-color 200ms ease, fill 200ms ease,
+      stroke 200ms ease, box-shadow 200ms ease;
+  }
+
+  /* 適用所有 element + before/after pseudo */
+  *,
+  *::before,
+  *::after {
+    transition: var(--theme-transition);
+  }
+
+  /* 輸入元件不要被全域 transition 影響到 caret / focus ring */
+  input,
+  textarea,
+  select,
+  button {
+    transition: var(--theme-transition), transform 100ms ease,
+      opacity 150ms ease;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0ms !important;
+    }
+  }
+}

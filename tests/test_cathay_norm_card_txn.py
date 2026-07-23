@@ -1,0 +1,118 @@
+"""CathayCrawler._norm_card_txn unit test — 防 consume_currency 空字串 bug 復發。
+
+2026-06-13 發現 cathay DB 4 筆 billed `consume_currency=''` 是因為 cathay 帳單
+API 對台幣消費根本沒給 `consumeCurrency` 欄,直接 `t.get("consumeCurrency")`
+回 None,經過某轉換變成 `''` 寫進 DB → 之後跨銀行查外幣交易會撞到髒資料。
+
+修法在 cathay._norm_card_txn:
+  • 有 consumeAmount + consumeCurrency 非空 → 外幣（保留）
+  • 否則 → 統一 TWD，consume_amount=None
+
+這份 test 鎖住規範化規則,將來 cathay collect 或 API 結構改了不會偷偷退化。
+"""
+from __future__ import annotations
+
+import pytest
+
+from backend.banks.cathay import CathayCrawler
+
+
+@pytest.fixture
+def crawler(monkeypatch):
+    """繞過 CathayCrawler.__init__ 的 cred 載入。"""
+    c = CathayCrawler.__new__(CathayCrawler)
+    # _norm_card_txn 會呼叫 self.mask_card(); 給個簡化版
+    c.mask_card = lambda num: f"****{str(num)[-4:]}" if num else ""
+    return c
+
+
+def test_twd_consumption_no_consume_currency_field(crawler):
+    """台幣消費: cathay API 沒給 consumeCurrency → 必填 TWD, consume_amount=None。"""
+    out = crawler._norm_card_txn({
+        "cardNo": "9000000000367037",
+        "consumeDate": "2026-05-01",
+        "transDesc": "全聯",
+        "amount": 500,
+        "currency": "TWD",
+        # 注意: 故意不放 consumeCurrency/consumeAmount
+    })
+    assert out["consume_currency"] == "TWD"
+    assert out["consume_amount"] is None
+    assert out["currency"] == "TWD"
+    assert out["card_no"] == "****7037"
+
+
+def test_foreign_consumption_preserved(crawler):
+    """外幣消費: consumeCurrency + consumeAmount 都有 → 原值保留。"""
+    out = crawler._norm_card_txn({
+        "cardNo": "9000000000367037",
+        "consumeDate": "2026-05-02",
+        "transDesc": "Apple Store",
+        "amount": 3200,
+        "currency": "TWD",
+        "consumeCurrency": "USD",
+        "consumeAmount": 99.99,
+        "consumeCountry": "US",
+    })
+    assert out["consume_currency"] == "USD"
+    assert out["consume_amount"] == 99.99
+    assert out["consume_country"] == "US"
+    assert out["currency"] == "TWD"           # 入帳幣別仍是台幣
+    assert out["amount"] == 3200
+
+
+def test_empty_string_consume_currency_normalized(crawler):
+    """consumeCurrency='' (空字串) → 視為台幣, 不寫進 DB 變污染。"""
+    out = crawler._norm_card_txn({
+        "cardNo": "9000000000367037",
+        "consumeDate": "2026-05-03",
+        "transDesc": "X",
+        "amount": 100,
+        "currency": "TWD",
+        "consumeCurrency": "",       # ← bug 來源
+        "consumeAmount": 0,
+    })
+    assert out["consume_currency"] == "TWD", \
+        f"空字串 consumeCurrency 應該被當 TWD, 不該污染 DB; got {out['consume_currency']!r}"
+    assert out["consume_amount"] is None
+
+
+def test_summary_row_no_card_no(crawler):
+    """「上期帳單總額」「自動扣繳」沒 cardNo → card_no='' 但 currency 必填 TWD。"""
+    out = crawler._norm_card_txn({
+        "consumeDate": None,
+        "transDesc": "上期帳單總額",
+        "amount": 2130,
+    })
+    assert out["card_no"] == ""
+    assert out["consume_currency"] == "TWD"
+    assert out["consume_amount"] is None
+
+
+def test_consume_currency_with_zero_amount_treated_as_twd(crawler):
+    """consumeCurrency='USD' 但 consumeAmount=0 → 看作台幣(避免假外幣污染)。"""
+    out = crawler._norm_card_txn({
+        "cardNo": "9000000000367037",
+        "consumeDate": "2026-05-04",
+        "transDesc": "退款 0",
+        "amount": 0,
+        "currency": "TWD",
+        "consumeCurrency": "USD",
+        "consumeAmount": 0,           # ← 邊界
+    })
+    # 沒實際外幣金額 → 視為台幣
+    assert out["consume_currency"] == "TWD"
+    assert out["consume_amount"] is None
+
+
+def test_country_empty_string_normalized_to_none(crawler):
+    """consumeCountry='' → None (避免空字串污染)。"""
+    out = crawler._norm_card_txn({
+        "cardNo": "9000000000367037",
+        "consumeDate": "2026-05-05",
+        "transDesc": "X",
+        "amount": 100,
+        "currency": "TWD",
+        "consumeCountry": "",
+    })
+    assert out["consume_country"] is None

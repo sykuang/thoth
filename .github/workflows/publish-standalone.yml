@@ -1,0 +1,86 @@
+name: Publish standalone Docker image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-standalone-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build all-in-one image
+        run: docker build --file Dockerfile.standalone --tag thoth-standalone:test .
+
+      - name: Smoke test frontend, backend, and persistent SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="thoth-smoke-${GITHUB_RUN_ID}"
+          container="thoth-smoke-${GITHUB_RUN_ID}"
+          jwt_secret="$(openssl rand -hex 32)"
+          fernet_key="$(openssl rand -base64 32 | tr '+/' '-_')"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+
+          start_container() {
+            docker run -d --name "$container" -p 18000:8000 \
+              -e JWT_SECRET="$jwt_secret" \
+              -e SERVER_FERNET_KEY="$fernet_key" \
+              -v "$volume:/data" \
+              thoth-standalone:test >/dev/null
+          }
+          wait_ready() {
+            for _ in {1..60}; do
+              curl -fsS http://127.0.0.1:18000/api/healthz >/dev/null && return
+              sleep 2
+            done
+            docker logs "$container"
+            return 1
+          }
+
+          start_container
+          wait_ready
+          curl -fsS http://127.0.0.1:18000/login | grep -q '<div id="root">'
+          curl -fsS -X POST http://127.0.0.1:18000/api/auth/register \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"standalone-ci@palace.example","password":"SyntheticDockerPassword01!"}' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["token"]'
+          docker exec "$container" test -s /data/server.sqlite
+
+          docker rm -f "$container" >/dev/null
+          start_container
+          wait_ready
+          curl -fsS -X POST http://127.0.0.1:18000/api/auth/login \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'username=standalone-ci@palace.example' \
+            --data-urlencode 'password=SyntheticDockerPassword01!' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["access_token"]'
+
+      - name: Publish to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_tag="standalone-${GITHUB_SHA::7}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag thoth-standalone:test "$image:standalone"
+          docker tag thoth-standalone:test "$image:$sha_tag"
+          docker push "$image:standalone"
+          docker push "$image:$sha_tag"
+          echo "Published $image:standalone and $image:$sha_tag"

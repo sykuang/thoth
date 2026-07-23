@@ -1,0 +1,149 @@
+name: CI
+
+# Runs on every push and pull request — must pass before merging.
+# 每次 push 或 PR 都會跑，必須全綠才能 merge。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual trigger from Actions tab
+  # 允許從 Actions 頁手動觸發
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same ref when a new push arrives.
+# 同一個 branch 有新 push 時，自動取消還在跑的舊 run（省 runner 時間）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # Job 1: Backend (Python) — ruff lint + pytest
+  # ============================================================
+  backend:
+    name: Backend (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python 3.12 is the project's minimum (pyproject.toml requires-python)
+        # 3.12 是專案最低 Python 版本（pyproject 強制要求）
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv (fast Python package manager)
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        # `uv sync` reads pyproject.toml and creates .venv with prod + dev deps.
+        # `uv sync` 讀 pyproject.toml 建 .venv，含 prod + dev 依賴。
+        run: uv sync --all-extras --dev
+
+      - name: Ruff lint (informational for now — will become strict)
+        # Currently informational: pre-existing WIP files have F401/F841 that
+        # will be fixed in upcoming commits. Once the WIP lands, flip
+        # `continue-on-error` to `false` to enforce strict lint on every PR.
+        # 目前 informational：WIP 還有 F401/F841 待修。WIP commit 完後改 strict。
+        continue-on-error: true
+        run: uv run ruff check backend/ cli/ tests/
+
+      - name: Pytest (all tests, exclude playwright e2e)
+        # pyproject.toml's [tool.pytest.ini_options] auto-excludes e2e tests.
+        # Each test uses tmp_path + monkeypatch for full isolation (see conftest.py),
+        # so no global env setup is needed.
+        # pyproject 已設定自動排除 e2e；conftest 用 tmp_path 完全隔離 DB/secret。
+        run: uv run pytest -v --tb=short
+
+  # ============================================================
+  # Job 2: Frontend (TypeScript / Expo) — typecheck + lint
+  # ============================================================
+  frontend:
+    name: Frontend (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node 20 LTS — Expo SDK 56 recommends 18+
+        # Node 20 LTS — Expo SDK 56 要求 Node 18+
+        node-version: ["20"]
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Keep CI aligned with EAS builders and the committed lockfile format.
+          version: 10.33.3
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        # `--frozen-lockfile` fails if pnpm-lock.yaml is out of sync — prevents
+        # accidental dep drift between local and CI.
+        # 鎖檔嚴格模式：lockfile 跟 package.json 不同步就 fail，防止 dep drift。
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript typecheck (strict — fail on errors)
+        # `tsc --noEmit` validates all .ts/.tsx against tsconfig.json strictness.
+        # Type errors block the build (real bugs).
+        # 型別檢查不通過直接 block — 型別錯誤就是 bug。
+        run: pnpm typecheck
+
+      - name: ESLint (informational — does not block CI)
+        # `expo lint` runs ESLint with expo-config. Currently surfaces some React
+        # warnings (setState in useEffect, etc.) that are pre-existing and not
+        # blocking. Once cleaned up, change `continue-on-error` to `false`.
+        # 目前 lint 有些 pre-existing warning，先 informational。清乾淨後改 strict。
+        continue-on-error: true
+        run: pnpm lint
+
+  # ============================================================
+  # Job 3: Summary — single status check for branch protection
+  # ============================================================
+  # Use this single job as the required status check in branch protection
+  # rules, instead of pinning to specific matrix jobs. If the matrix expands,
+  # nothing breaks.
+  # 用這個 summary job 當 branch protection 的 required check，matrix 擴增不會壞。
+  ci-summary:
+    name: CI Summary
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all required jobs passed
+        # If any required job failed, this step fails — making the summary red.
+        # 任何 required job 失敗，summary 就紅。
+        run: |
+          if [[ "${{ needs.backend.result }}" != "success" ]]; then
+            echo "::error::Backend job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.frontend.result }}" != "success" ]]; then
+            echo "::error::Frontend job failed"
+            exit 1
+          fi
+          echo "✓ All required CI jobs passed."
