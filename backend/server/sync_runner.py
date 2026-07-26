@@ -32,7 +32,7 @@ CARDS_TAB_ROUTE = "/(tabs)/cards"
 # 白名單：與 cli/cli.py 的 BANKS 一致（雖然不 import cli 避免 boot 連環）
 SUPPORTED_BANKS = frozenset({
     "cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon",
-    "dbs", "scb", "linebank",
+    "dbs", "scb", "linebank", "rakuten",
 })
 
 # Phase 1 全域 dispatch lock — 同一時刻只跑一個 job（Scrapling 並非真 thread-safe）
@@ -520,6 +520,7 @@ _BANK_LABELS = {
     "dbs": "星展銀行",
     "scb": "渣打銀行",
     "linebank": "LINE Bank",
+    "rakuten": "樂天國際銀行",
 }
 
 
@@ -560,6 +561,7 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
         "dbs":     ("backend.banks.dbs",     "DbsCrawler",     None),
         "scb":     ("backend.banks.scb",     "ScbCrawler",     None),
         "linebank": ("backend.banks.linebank", "LinebankCrawler", None),
+        "rakuten":  ("backend.banks.rakuten",  "RakutenCrawler",  None),
     }
     if bank not in crawler_module_map:
         raise ValueError(f"unknown bank: {bank!r}")
@@ -616,6 +618,9 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
         elif bank == "linebank":
             from backend.core.persist import persist_linebank
             delta = persist_linebank(data, store, rules=rules)
+        elif bank == "rakuten":
+            from backend.core.persist import persist_rakuten
+            delta = persist_rakuten(data, store, rules=rules)
         else:  # pragma: no cover
             raise RuntimeError(f"unknown persist: {bank}")
         stats = store.stats()

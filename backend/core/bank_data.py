@@ -18,7 +18,7 @@ from backend.core import bank_pg
 
 KNOWN_BANKS = (
     "cathay", "ctbc", "dbs", "esun", "fubon", "hsbc",
-    "linebank", "scb", "scsb", "sinopac", "taishin", "ubot",
+    "linebank", "rakuten", "scb", "scsb", "sinopac", "taishin", "ubot",
 )
 
 

@@ -479,6 +479,7 @@ class BankCrawler(ABC):
     }
     FETCH_LOCALE: ClassVar[str] = "zh-TW"
     FETCH_INIT_SCRIPT: ClassVar[str] = MACOS_SPOOF_JS
+    FETCH_REAL_CHROME: ClassVar[bool] = False
 
     def _build_fetch_kwargs(self) -> dict:
         """組裝 StealthyFetcher.fetch 額外參數，把 init script 寫成臨時檔。
@@ -504,6 +505,8 @@ class BankCrawler(ABC):
             def _cleanup(path=f.name):
                 with contextlib.suppress(OSError): Path(path).unlink()
             cleanups.append(_cleanup)
+        if self.FETCH_REAL_CHROME:
+            kw["real_chrome"] = True
         kw["__cleanups__"] = cleanups
         return kw
 

@@ -12,6 +12,7 @@ from backend.core.persist.fubon import persist_fubon
 from backend.core.persist.generic import persist_generic_dump
 from backend.core.persist.hsbc import persist_hsbc
 from backend.core.persist.linebank import persist_linebank
+from backend.core.persist.rakuten import persist_rakuten
 from backend.core.persist.scb import persist_scb
 from backend.core.persist.scsb import persist_scsb
 from backend.core.persist.sinopac import persist_sinopac
@@ -27,6 +28,7 @@ __all__ = [
     "persist_generic_dump",
     "persist_hsbc",
     "persist_linebank",
+    "persist_rakuten",
     "persist_scb",
     "persist_scsb",
     "persist_sinopac",

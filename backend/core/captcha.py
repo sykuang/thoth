@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 import sys
 import threading
@@ -47,6 +48,14 @@ def _ocr_classification(data: bytes, *, probability: bool = False):
 
 def _log(*a):
     print(*a, file=sys.stderr)
+
+
+def _finite_confidence(value: object) -> float | None:
+    try:
+        confidence = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    return confidence if math.isfinite(confidence) else None
 
 
 def solve_captcha(
@@ -92,10 +101,12 @@ def solve_captcha(
                     conf = rp.get("confidence")
                 else:
                     raw = rp
-            except Exception:
-                raw = _ocr_classification(data)
+            except Exception as e:
+                _log(f"[captcha] probability inference 失敗，confidence gate fail closed: {e}")
+                return None
         else:
             raw = _ocr_classification(data)
+        conf = _finite_confidence(conf)
         text = str(raw).strip()
         if alnum_only:
             text = re.sub(r"[^0-9a-zA-Z]", "", text)
@@ -106,9 +117,13 @@ def solve_captcha(
         if expected_len and len(text) != expected_len:
             _log(f"[captcha] 長度 {len(text)} != 預期 {expected_len}，可能誤判")
             return None
-        if min_confidence > 0 and conf is not None and conf < min_confidence:
-            _log(f"[captcha] 信心 {conf:.3f} < {min_confidence}，捨棄換圖")
-            return None
+        if min_confidence > 0:
+            if conf is None:
+                _log("[captcha] 缺少 confidence，捨棄換圖")
+                return None
+            if conf < min_confidence:
+                _log(f"[captcha] 信心 {conf:.3f} < {min_confidence}，捨棄換圖")
+                return None
         return text or None
     except Exception as e:
         _log(f"[captcha] OCR 失敗: {e}")
@@ -137,10 +152,12 @@ def ocr_bytes(
                     conf = rp.get("confidence")
                 else:
                     raw = rp
-            except Exception:
-                raw = _ocr_classification(data)
+            except Exception as e:
+                _log(f"[captcha] probability inference 失敗，confidence gate fail closed: {e}")
+                return None
         else:
             raw = _ocr_classification(data)
+        conf = _finite_confidence(conf)
         text = str(raw).strip()
         if alnum_only:
             text = re.sub(r"[^0-9a-zA-Z]", "", text)
@@ -149,7 +166,7 @@ def ocr_bytes(
             return None
         if expected_len and len(text) != expected_len:
             return None
-        if min_confidence > 0 and conf is not None and conf < min_confidence:
+        if min_confidence > 0 and (conf is None or conf < min_confidence):
             return None
         return text or None
     except Exception as e:

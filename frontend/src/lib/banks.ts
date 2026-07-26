@@ -32,6 +32,7 @@ export const BANK_META: Record<SupportedBank, BankMeta> = {
   fubon:    { short: '富邦', color: '#00754a', fg: 'white', primary: 'mixed' },         // 富邦綠
   hsbc:     { short: '滙豐', color: '#db0011', fg: 'white', primary: 'credit_card' },   // HSBC red
   linebank: { short: 'LINE', color: '#06c755', fg: 'white', primary: 'deposit' },       // LINE green
+  rakuten:  { short: '樂天', color: '#bf0000', fg: 'white', primary: 'deposit' },       // Rakuten red
   scb:      { short: '渣打', color: '#0473ea', fg: 'white', primary: 'mixed' },         // 渣打藍
   scsb:     { short: '上海', color: '#a2231d', fg: 'white', primary: 'mixed' },         // 上海商銀 (百年實體綜合, 1915 創立, 非數位)
   sinopac:  { short: '永豐', color: '#005bac', fg: 'white', primary: 'mixed' },         // 永豐藍

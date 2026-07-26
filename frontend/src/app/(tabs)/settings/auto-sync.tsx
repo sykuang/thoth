@@ -35,7 +35,7 @@ const BANK_LABEL: Record<string, string> = {
   cathay: '國泰世華', ubot: '聯邦銀行', hsbc: '匯豐銀行',
   ctbc: '中國信託', sinopac: '永豐銀行', scsb: '上海商銀',
   esun: '玉山銀行', taishin: '台新銀行', fubon: '富邦銀行',
-  dbs: '星展銀行', scb: '渣打銀行', linebank: 'LINE Bank',
+  dbs: '星展銀行', scb: '渣打銀行', linebank: 'LINE Bank', rakuten: '樂天國際銀行',
 };
 
 const HOURS = Array.from({ length: 24 }, (_, i) => i);

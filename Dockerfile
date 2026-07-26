@@ -39,13 +39,14 @@ RUN uv sync --frozen --no-dev
 
 # Phase 9: patchright 1.60.1 expects /ms-playwright/chromium-1223/...
 # but the base image's chromium-1222 was installed for playwright 1.60.0.
-# Re-install patchright's bundled chromium into the same /ms-playwright tree.
+# Re-install patchright's bundled Chromium and branded Chrome. Rakuten opts into
+# channel="chrome" because Incapsula rejects the bundled Chromium fingerprint.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN uv run patchright install chromium --with-deps 2>&1 | tail -20
+RUN uv run patchright install chromium chrome --with-deps 2>&1 | tail -20
 
-# Verify Chromium is reachable through scrapling. Build-time check catches
-# broken images before they ever start.
+# Verify both the default Chromium and Rakuten's real-Chrome channel are usable.
 RUN uv run python -c "from scrapling import StealthyFetcher; print('scrapling OK:', StealthyFetcher)"
+RUN uv run python -c "from scrapling.engines._browsers._stealth import StealthySession; s=StealthySession(real_chrome=True, headless=True); s.start(); p=s.context.new_page(); print('scrapling real Chrome OK:', p.evaluate('navigator.userAgent')); p.close(); s.close()"
 
 # 2026-06-22 (0.3.16 incident hardening): verify push providers actually import
 # in this --no-dev prod image. Catches "httpx in optional-deps" / "expo.py

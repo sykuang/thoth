@@ -38,7 +38,7 @@ PRODUCTION_DATA_ROOT = Path(__file__).resolve().parents[1] / "backend" / "data"
 # Banks that currently exist in production (extend when new banks ship).
 PRODUCTION_BANKS = (
     "cathay", "ubot", "ctbc", "sinopac", "taishin",
-    "dbs", "esun", "linebank", "scsb", "hsbc", "fubon", "scb",
+    "dbs", "esun", "linebank", "rakuten", "scsb", "hsbc", "fubon", "scb",
 )
 
 # SQL LIKE patterns that match the fixture vocabulary used across tests.

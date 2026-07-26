@@ -38,9 +38,12 @@ COPY migrations/ ./migrations/
 COPY --from=frontend-build /app/frontend/dist/ ./frontend-dist/
 
 RUN uv sync --frozen --no-dev \
-    && uv run patchright install chromium --with-deps \
+    && uv run patchright install chromium chrome --with-deps \
     && mkdir -p /data \
     && chown -R pwuser:pwuser /app /data
+
+# Rakuten opts into Playwright channel="chrome" for Incapsula.
+RUN uv run python -c "from scrapling.engines._browsers._stealth import StealthySession; s=StealthySession(real_chrome=True, headless=True); s.start(); p=s.context.new_page(); print('scrapling real Chrome OK:', p.evaluate('navigator.userAgent')); p.close(); s.close()"
 
 VOLUME ["/data"]
 EXPOSE 8000

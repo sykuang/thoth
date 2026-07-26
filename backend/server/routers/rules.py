@@ -36,7 +36,7 @@ router = APIRouter(prefix="/rules", tags=["rules"])
 SUPPORTED_BANKS = (
     "cathay", "ubot", "hsbc", "ctbc", "sinopac",
     "scsb", "esun", "taishin", "fubon",
-    "dbs", "scb", "linebank",
+    "dbs", "scb", "linebank", "rakuten",
 )
 
 CATEGORIZED_TABLES = ("twd_transactions", "card_billed_txns", "card_pending_txns")

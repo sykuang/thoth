@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from backend.core.bank_data import KNOWN_BANKS
+
 # Note: client/TestClient/app fixtures all come from conftest.py to ensure
 # JWT_SECRET / Fernet key / tmp_path isolation. Do NOT add local `client`
 # fixture here — see comment near auth_headers below.
@@ -338,7 +340,7 @@ def test_summary_empty_when_no_databases(temp_data_root, client, auth_headers):
     assert body["current_month_spending"] == 0
     assert body["net_worth"] == 0
     assert body["by_bank"] == []
-    assert len(body["skipped"]) == 12
+    assert set(body["skipped"]) == set(KNOWN_BANKS)
 
 
 def test_summary_requires_auth(temp_data_root, client):

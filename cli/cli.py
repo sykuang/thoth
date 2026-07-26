@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.core.store import BankStore
 
-BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank"}
+BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank", "rakuten"}
 
 
 def _get_crawler(bank: str):
@@ -62,6 +62,9 @@ def _get_crawler(bank: str):
     if bank == "linebank":
         from backend.banks.linebank import LinebankCrawler, BASE
         return LinebankCrawler(), BASE
+    if bank == "rakuten":
+        from backend.banks.rakuten import RakutenCrawler, BASE
+        return RakutenCrawler(), BASE
     raise SystemExit(f"未支援的銀行: {bank}（目前支援: {sorted(BANKS)}）")
 
 
@@ -117,6 +120,9 @@ def cmd_sync(args):
     elif args.bank == "linebank":
         from backend.core.persist import persist_linebank
         delta = persist_linebank(data, store)
+    elif args.bank == "rakuten":
+        from backend.core.persist import persist_rakuten
+        delta = persist_rakuten(data, store)
     else:
         raise SystemExit(f"未支援的入庫: {args.bank}")
     stats = store.stats()

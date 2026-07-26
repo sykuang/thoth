@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""樂天國際銀行個人網銀 crawler。
+
+登入頁是 Angular SPA；帳密由銀行前端自行做 E2E 加密後送出。本 crawler 只操作
+真實表單，登入後從「臺幣存款」頁的已解密 DOM 讀取帳戶、餘額與六個月交易。
+"""
+from __future__ import annotations
+
+import contextlib
+import re
+import time
+from urllib.parse import urlparse
+
+from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.captcha import solve_captcha, wait_captcha_stable
+from backend.core.creds import RakutenCreds
+
+BASE = "https://www.rakuten-bank.com.tw/ebank/cgn/cgnot0001/010"
+TWD_URL = "https://www.rakuten-bank.com.tw/ebank/ctw/ctwqu0001/010"
+LOGIN_PATH_HINT = "/cgn/cgnot0001/010"
+CAPTCHA_IMG = "captcha-image img"
+LOADER_SELECTOR = "modal-loader .modal_loading"
+QUERY_PATH = "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
+
+
+def _endpoint_key(url: str) -> str:
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    if len(parts) >= 2 and parts[-2].isupper():
+        return f"{parts[-2]}_{parts[-1]}"
+    return parts[-1] if parts else "unknown"
+
+
+def _account_number(label: str) -> str | None:
+    match = re.search(r"(?<!\d)\d(?:[ -]?\d){9,15}(?!\d)", label)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(0))
+    return digits if 10 <= len(digits) <= 16 else None
+
+
+def _month_labels(labels: list[str]) -> list[str]:
+    out: list[str] = []
+    for label in labels:
+        match = re.fullmatch(r"\s*(\d{4}/(?:0[1-9]|1[0-2]))\s+活存明細\s*", label)
+        if not match:
+            continue
+        canonical = f"{match.group(1)} 活存明細"
+        if canonical not in out:
+            out.append(canonical)
+    return out
+
+
+def _six_month_labels(labels: list[str]) -> list[str]:
+    months = _month_labels(labels)
+    if len(months) != 6:
+        raise RuntimeError("樂天月份選單不是預期六個月份")
+    return months
+
+
+def _row_from_dom(cells: list[str]) -> dict | None:
+    if len(cells) < 6:
+        return None
+    date_time = cells[0].split()
+    descriptions = [line.strip() for line in cells[1].splitlines() if line.strip()]
+    income = cells[2].strip()
+    expend = cells[3].strip()
+    if not date_time or not descriptions or not (income or expend):
+        return None
+    return {
+        "sysDate": date_time[0],
+        "sysTime": date_time[1] if len(date_time) > 1 else "",
+        "txDesc": descriptions[0],
+        "nickNameOrAcct": descriptions[1] if len(descriptions) > 1 else None,
+        "amt": income or expend,
+        "amtSign": bool(income),
+        "balance": cells[4].strip(),
+        "memo": cells[5].strip(),
+    }
+
+
+def _selection_matches(root: str, selected: str, expected: str) -> bool:
+    if root == "simple-dropdown2":
+        number = _account_number(expected)
+        return number is not None and _account_number(selected) == number
+    return selected.strip() == expected.strip()
+
+
+def _unique_option_index(labels: list[str], expected: str) -> int | None:
+    matches = [
+        index
+        for index, label in enumerate(labels)
+        if label.strip() == expected.strip()
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _click_visible_login(page) -> bool:
+    candidates = page.locator("a.btn.btn-primary:visible").filter(
+        has_text=re.compile(r"^\s*登入\s*$"),
+    )
+    if candidates.count() != 1:
+        return False
+    button = candidates.first
+    classes = button.get_attribute("class") or ""
+    if not button.is_visible() or "disabled" in classes.split():
+        return False
+    button.click()
+    return True
+
+
+def _is_twd_query_request(request) -> bool:
+    parsed = urlparse(request.url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "www.rakuten-bank.com.tw"
+        and parsed.path == QUERY_PATH
+        and not parsed.params
+        and not parsed.query
+        and request.method == "POST"
+    )
+
+
+
+def _view_ready(before_rows: str | None, state: dict) -> bool:
+    rows = str(state.get("rows") or "")
+    no_data = bool(state.get("noData"))
+    if before_rows is not None:
+        return (bool(rows) and rows != before_rows) or (not rows and no_data)
+    return bool(rows) or no_data
+
+
+class RakutenLoginError(RuntimeError):
+    """樂天登入送出後未成功；不得自動重送帳密。"""
+
+
+class RakutenOtpRequired(RuntimeError):
+    """樂天要求簡訊或信箱 OTP，需使用者互動。"""
+
+
+class RakutenCrawler(BankCrawler):
+    FETCH_REAL_CHROME = True  # Imperva/Incapsula 會擋 bundled Chromium。
+    DUP_LOGIN_KICK_BTN_TEXTS = ("是，我要登入", *BankCrawler.DUP_LOGIN_KICK_BTN_TEXTS)
+
+    def __init__(self) -> None:
+        super().__init__(name="rakuten")
+        self.creds = RakutenCreds.load()
+
+    def _host_filter(self) -> str:
+        return "rakuten-bank.com.tw"
+
+    def _logged_in(self, page) -> bool:
+        try:
+            url = (page.url or "").lower()
+            if "rakuten-bank.com.tw/ebank" not in url or LOGIN_PATH_HINT in url:
+                return False
+            return bool(page.evaluate("""() => {
+                const visible = e => !!e && !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+                const noLogin = !visible(document.querySelector('#custNo'))
+                    && !visible(document.querySelector('#userNo'))
+                    && !visible(document.querySelector('#pcode'));
+                const body = document.body?.innerText || '';
+                const words = ['登出', '首頁', '臺幣存款', '轉帳', '貸款', '設定'];
+                return noLogin && body.length >= 300
+                    && words.filter(word => body.includes(word)).length >= 2;
+            }"""))
+        except Exception:
+            return False
+
+    def _otp_visible(self, page) -> bool:
+        return bool(page.evaluate("""() => [...document.querySelectorAll('input[name="otpCode"]')]
+            .some(e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length))"""))
+
+    def login(self, page) -> bool:
+        page.wait_for_timeout(5000)
+        if self._logged_in(page):
+            return True
+
+        for selector in ("#custNo", "#userNo", "#pcode"):
+            page.wait_for_selector(selector, timeout=15000)
+
+        captcha = ""
+        if page.locator(CAPTCHA_IMG).is_visible():
+            wait_captcha_stable(page, CAPTCHA_IMG, tmp_path=self.captcha_tmp)
+            captcha = solve_captcha(
+                page,
+                CAPTCHA_IMG,
+                expected_len=4,
+                min_confidence=0.85,
+                tmp_path=self.captcha_tmp,
+            ) or ""
+            if not captcha:
+                with contextlib.suppress(Exception):
+                    old_src = page.locator(CAPTCHA_IMG).get_attribute("src") or ""
+                    captcha_group = page.locator("captcha-image").locator(
+                        "xpath=ancestor::div[contains(@class,'form-group')][1]",
+                    )
+                    captcha_group.locator("a:has(.icon-restart)").click()
+                    page.wait_for_function(
+                        "old => (document.querySelector('captcha-image img')?.getAttribute('src') || '') !== old",
+                        arg=old_src,
+                        timeout=5000,
+                    )
+                    wait_captcha_stable(page, CAPTCHA_IMG, tmp_path=self.captcha_tmp)
+                    captcha = solve_captcha(
+                        page,
+                        CAPTCHA_IMG,
+                        expected_len=4,
+                        min_confidence=0.85,
+                        tmp_path=self.captcha_tmp,
+                    ) or ""
+            if not captcha:
+                raise RakutenLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+
+        fields = (
+            ("#custNo", self.creds.national_id),
+            ("#userNo", self.creds.user_code),
+            ("#pcode", self.creds.password),
+            ("#captcha", captcha),
+        )
+        for selector, value in fields:
+            if not value and selector == "#captcha":
+                continue
+            locator = page.locator(selector)
+            locator.click()
+            locator.press("ControlOrMeta+A")
+            locator.press("Backspace")
+            locator.press_sequentially(value, delay=60)
+
+        lengths = page.evaluate("""() => Object.fromEntries(
+            ['custNo', 'userNo', 'pcode', 'captcha'].map(id => [id, document.getElementById(id)?.value.length || 0])
+        )""")
+        expected = {
+            "custNo": len(self.creds.national_id),
+            "userNo": len(self.creds.user_code),
+            "pcode": len(self.creds.password),
+            "captcha": len(captcha),
+        }
+        if any(lengths.get(key) != value for key, value in expected.items()):
+            raise RakutenLoginError("登入欄位輸入長度不符；未送出登入")
+
+        if not _click_visible_login(page):
+            raise RakutenLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+
+        for _ in range(20):
+            page.wait_for_timeout(1000)
+            if self._otp_visible(page):
+                raise RakutenOtpRequired("樂天要求 OTP 驗證；目前不自動填寫")
+            if self._logged_in(page):
+                return True
+            if self.handle_dup_login_modal(page) and self._logged_in(page):
+                return True
+
+        raise RakutenLoginError(f"送出後未登入成功（url={page.url}）")
+
+    def logout(self, page) -> bool:
+        pattern = re.compile(r"^\s*(?:安全)?登出\s*$")
+        for frame in page.frames:
+            candidates = frame.locator("a, button").filter(has_text=pattern)
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if candidate.is_visible():
+                    candidate.click()
+                    page.wait_for_timeout(1000)
+                    return True
+        return False
+
+    @staticmethod
+    def _scrape_twd_page(page, account_no: str | None = None) -> dict:
+        snapshot = page.evaluate(r"""() => {
+            const visible = e => !!e && !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+            const selected = document.querySelector('simple-dropdown2 a.txt_dropdown');
+            const accountLabel = selected?.innerText || document.querySelector('simple-dropdown2')?.innerText || '';
+            const balance = document.querySelector('.card-title-money')?.innerText || '';
+            const rows = [...document.querySelectorAll('table.tb_mul tbody tr')]
+                .filter(visible)
+                .map(row => [...row.querySelectorAll(':scope > td')].map(cell => cell.innerText || ''));
+            return {accountLabel, balance, rows};
+        }""")
+        account_label = str(snapshot.pop("accountLabel", "") or "")
+        raw_balance = snapshot.pop("balance", "")
+        number = account_no or _account_number(account_label)
+        snapshot["txDetails"] = [
+            parsed
+            for cells in snapshot.pop("rows", [])
+            if (parsed := _row_from_dom(cells)) is not None
+        ]
+        snapshot["account_no"] = number
+        snapshot["accounts"] = [{
+            "acctNo": number,
+            "balance": raw_balance,
+        }] if number else []
+        return snapshot
+
+    @staticmethod
+    def _selected_label(page, root: str) -> str:
+        if root == "simple-dropdown2":
+            return page.locator(f"{root} a.txt_dropdown").inner_text().strip()
+        return page.locator(f"{root} button.input-select").inner_text().strip()
+
+    @staticmethod
+    def _open_dropdown(page, root: str) -> None:
+        trigger = (
+            page.locator(f"{root} a.txt_dropdown")
+            if root == "simple-dropdown2"
+            else page.locator(f"{root} button.input-select")
+        )
+        trigger.click()
+
+    @staticmethod
+    def _visible_labels(page, root: str) -> list[str]:
+        RakutenCrawler._open_dropdown(page, root)
+        page.wait_for_timeout(200)
+        options = page.locator(f"{root} combo-item:visible")
+        labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
+        page.keyboard.press("Escape")
+        return [label for label in labels if label]
+
+    @staticmethod
+    def _twd_view_state(page) -> dict:
+        return page.evaluate(r"""() => {
+            const visible = e => !!e && !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+            const rows = [...document.querySelectorAll('table.tb_mul tbody tr')]
+                .filter(visible)
+                .map(row => (row.innerText || '').trim())
+                .filter(Boolean)
+                .join('\n');
+            const account = document.querySelector('simple-dropdown2 a.txt_dropdown')?.innerText || '';
+            const month = document.querySelector('simple-dropdown button.input-select')?.innerText || '';
+            const balance = document.querySelector('.card-title-money')?.innerText || '';
+            const noData = [...document.querySelectorAll('.page-result.pic-card .pic-card-title')]
+                .some(e => visible(e) && (e.innerText || '').trim() === '此月份沒有任何交易明細。');
+            return {rows, account, month, balance, noData};
+        }""")
+
+    def _wait_for_twd_view(
+        self,
+        page,
+        *,
+        selected_root: str | None = None,
+        selected_label: str | None = None,
+        before_rows: str | None = None,
+        timeout_seconds: int = 20,
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        last_ready: tuple[str, str, str, str, str] | None = None
+        stable_count = 0
+        while time.monotonic() < deadline:
+            if selected_root and selected_label:
+                selected = self._selected_label(page, selected_root)
+                if not _selection_matches(selected_root, selected, selected_label):
+                    page.wait_for_timeout(250)
+                    continue
+            state = self._twd_view_state(page)
+            signature = (
+                str(state.get("rows") or ""),
+                str(state.get("account") or ""),
+                str(state.get("month") or ""),
+                str(state.get("balance") or ""),
+                str(bool(state.get("noData"))),
+            )
+            if _view_ready(before_rows, state):
+                stable_count = stable_count + 1 if signature == last_ready else 1
+                last_ready = signature
+                if stable_count >= 3:
+                    return
+            else:
+                last_ready = None
+                stable_count = 0
+            page.wait_for_timeout(300)
+        kind = "initial" if not selected_root else (
+            "account" if selected_root == "simple-dropdown2" else "month"
+        )
+        raise RuntimeError(f"樂天臺幣頁資料未完成（kind={kind}）")
+
+    def _select_label(self, page, root: str, label: str) -> None:
+        self._open_dropdown(page, root)
+        page.wait_for_timeout(100)
+        options = page.locator(f"{root} combo-item:visible")
+        labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
+        target_index = _unique_option_index(labels, label)
+        if target_index is None:
+            kind = "account" if root == "simple-dropdown2" else "month"
+            raise RuntimeError(f"找不到唯一可見的樂天下拉選項（kind={kind}）")
+        target = options.nth(target_index)
+        before_rows = str(self._twd_view_state(page).get("rows") or "")
+        page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=20000)
+        with page.expect_request(_is_twd_query_request, timeout=20000) as request_info:
+            target.click()
+            page.wait_for_selector(LOADER_SELECTOR, state="visible", timeout=3000)
+        try:
+            response = request_info.value.response()
+            if response is None or not 200 <= response.status < 300:
+                raise RuntimeError("樂天臺幣查詢回應狀態失敗")
+            response.finished()
+        except Exception as e:
+            raise RuntimeError("樂天臺幣查詢 request 未成功") from e
+        page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=20000)
+        self._wait_for_twd_view(
+            page,
+            selected_root=root,
+            selected_label=label,
+            before_rows=before_rows,
+        )
+
+    def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
+        page.goto(TWD_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_selector(
+            "simple-dropdown2 a.txt_dropdown",
+            state="visible",
+            timeout=60000,
+        )
+        page.wait_for_selector(
+            "simple-dropdown button.input-select",
+            state="visible",
+            timeout=60000,
+        )
+        page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=60000)
+        if not self._logged_in(page):
+            raise RakutenLoginError("進入臺幣存款頁後 session 無效")
+        self._wait_for_twd_view(page, timeout_seconds=30)
+
+        account_root = "simple-dropdown2"
+        current_account = self._selected_label(page, account_root)
+        account_labels = [current_account, *self._visible_labels(page, account_root)]
+        accounts: list[tuple[str, str]] = []
+        seen_accounts: set[str] = set()
+        for label in account_labels:
+            number = _account_number(label)
+            if number and number not in seen_accounts:
+                accounts.append((number, label))
+                seen_accounts.add(number)
+        if not accounts:
+            raise RuntimeError("樂天帳戶選單沒有可辨識的帳號")
+
+        results: list[dict] = []
+        for account_no, account_label in accounts:
+            selected_account = self._selected_label(page, account_root)
+            if _account_number(selected_account) != account_no:
+                self._select_label(page, account_root, account_label)
+
+            month_root = "simple-dropdown"
+            current_month = self._selected_label(page, month_root)
+            month_labels = _six_month_labels([
+                current_month,
+                *self._visible_labels(page, month_root),
+            ])
+            for month_label in month_labels:
+                selected_month = self._selected_label(page, month_root)
+                if selected_month != month_label:
+                    self._select_label(page, month_root, month_label)
+                results.append(self._scrape_twd_page(page, account_no))
+
+        endpoints = sorted({
+            _endpoint_key(hit.url)
+            for hit in collector.hits
+            if "/channel-" in hit.url
+        })
+        return BankCollectResult(
+            bank="rakuten",
+            final_url=page.url,
+            twd_txn_results=results,
+            _all_endpoints=endpoints,
+        )
+
+
+if __name__ == "__main__":
+    crawler = RakutenCrawler()
+    result = crawler.run(BASE, headless=False)
+    print({"error": result.get("error"), "final_url": result.get("final_url")})

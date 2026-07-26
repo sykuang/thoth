@@ -34,6 +34,7 @@ EXPECTED_PERSIST = {
     "dbs":     "persist_dbs",
     "scb":     "persist_scb",
     "linebank": "persist_linebank",
+    "rakuten":  "persist_rakuten",
 }
 
 

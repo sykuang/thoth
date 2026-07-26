@@ -388,6 +388,15 @@ class LinebankCreds(BankCreds):
     password: str = ""
 
 
+@dataclass
+class RakutenCreds(BankCreds):
+    """樂天國際銀行。env: RAKUTEN_NATIONAL_ID / RAKUTEN_USER_CODE / RAKUTEN_PASSWORD"""
+    BANK: ClassVar[str] = "RAKUTEN"
+    national_id: str = ""
+    user_code: str = ""
+    password: str = ""
+
+
 # ============================================================
 # 註冊表：給 CLI 列舉用
 # ============================================================
@@ -395,5 +404,5 @@ class LinebankCreds(BankCreds):
 ALL_CREDS = [
     CathayCreds, UbotCreds, HsbcCreds, CtbcCreds, ScsbCreds, SinopacCreds,
     EsunCreds, TaishinCreds, TaipeiFubonCreds, DbsCreds, ScbCreds,
-    LinebankCreds,
+    LinebankCreds, RakutenCreds,
 ]
