@@ -1,0 +1,20 @@
+{
+  "_source": "real rakuten ebank /ctw/ctwqu0001/010 DOM, 2026-07-28; account number redacted",
+  "month_dropdown_html": "<simple-dropdown><div class=\"dropdown dropdown-lg\"><button aria-expanded=\"false\" class=\"input-select\" data-toggle=\"dropdown\" type=\"button\"><!----><!----><span class=\"\">2026/07 活存明細</span><!----><i class=\"icon-arrow-down\"></i></button><div class=\"dropdown-menu\" style=\"width: auto; position: absolute; transform: translate3d(0px, 40px, 0px); top: 0px; left: 0px; will-change: transform;\" x-placement=\"bottom-start\"><!----><!----><a class=\"dropdown-item\" href=\"\" tabindex=\"0\" type=\"combo-item\" prevent=\"\"><!---->2026/07 活存明細<!----></a><a class=\"dropdown-item\" href=\"\" tabindex=\"0\"><!---->2026/06 活存明細<!----></a><a class=\"dropdown-item\" href=\"\" tabindex=\"0\"><!---->2026/05 活存明細<!----></a><a class=\"dropdown-item\" href=\"\" tabindex=\"0\"><!---->2026/04 活存明細<!----></a><a class=\"dropdown-item\" href=\"\" tabindex=\"0\"><!---->2026/03 活存明細<!----></a><a class=\"dropdown-item\" href=\"\" tabindex=\"0\"><!---->2026/02 活存明細<!----></a></div></div></simple-dropdown>",
+  "account_dropdown_html": "<simple-dropdown2 class=\"show\"><!----><a aria-expanded=\"true\" aria-haspopup=\"true\" class=\"txt_dropdown notab\" data-toggle=\"dropdown\"> 活存總額 0081200000000000<i class=\"icon-arrow-down\" hidden=\"\"></i><div class=\"dropdown-menu show\" hidden=\"\" x-placement=\"bottom-start\" style=\"position: absolute; transform: translate3d(148px, 39px, 0px); top: 0px; left: 0px; will-change: transform;\"><!----><a class=\"dropdown-item\" tabindex=\"0\" type=\"combo-item\"><!---->0081200000000000<!----></a></div></a><!----></simple-dropdown2>",
+  "table_head_html": "<table class=\"tb_mul\"><thead><tr><th class=\"lt\" width=\"10%\">交易時間</th><th class=\"lt\">交易說明<br>對方帳號或暱稱</th><th class=\"rt\" width=\"15%\">轉入</th><th class=\"rt\" width=\"15%\">轉出</th><th class=\"rt\" width=\"15%\">帳戶餘額</th><th class=\"rt\" width=\"15%\">備註</th><th width=\"5%\"></th></tr></thead>",
+  "month_selected": "2026/07 活存明細",
+  "month_options": [
+    "2026/07 活存明細",
+    "2026/06 活存明細",
+    "2026/05 活存明細",
+    "2026/04 活存明細",
+    "2026/03 活存明細",
+    "2026/02 活存明細"
+  ],
+  "account_selected": "活存總額 0081200000000000",
+  "account_options": [
+    "活存總額 0081200000000000",
+    "0081200000000000"
+  ]
+}

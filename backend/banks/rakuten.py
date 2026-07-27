@@ -17,6 +17,7 @@ from backend.core.creds import RakutenCreds
 
 BASE = "https://www.rakuten-bank.com.tw/ebank/cgn/cgnot0001/010"
 TWD_URL = "https://www.rakuten-bank.com.tw/ebank/ctw/ctwqu0001/010"
+TWD_PATH_HINT = "/ctw/ctwqu0001/"
 LOGIN_PATH_HINT = "/cgn/cgnot0001/010"
 CAPTCHA_IMG = "captcha-image img"
 LOADER_SELECTOR = "modal-loader .modal_loading"
@@ -160,8 +161,10 @@ class RakutenCrawler(BankCrawler):
                     && !visible(document.querySelector('#pcode'));
                 const body = document.body?.innerText || '';
                 const words = ['登出', '首頁', '臺幣存款', '轉帳', '貸款', '設定'];
-                return noLogin && body.length >= 300
-                    && words.filter(word => body.includes(word)).length >= 2;
+                // 不設 body 長度門檻：樂天臺幣存款頁在該月 0 筆交易時 innerText 僅 272 字，
+                // 舊的 >=300 門檻會把已登入頁誤判成未登入（2026-07-28 real-account 實證）。
+                // 「無登入欄 + 命中 >=2 個登入後導覽字」已足以區分登入頁與內頁。
+                return noLogin && words.filter(word => body.includes(word)).length >= 2;
             }"""))
         except Exception:
             return False
@@ -310,7 +313,7 @@ class RakutenCrawler(BankCrawler):
     def _visible_labels(page, root: str) -> list[str]:
         RakutenCrawler._open_dropdown(page, root)
         page.wait_for_timeout(200)
-        options = page.locator(f"{root} combo-item:visible")
+        options = page.locator(f"{root} .dropdown-menu a.dropdown-item:visible")
         labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
         page.keyboard.press("Escape")
         return [label for label in labels if label]
@@ -375,7 +378,7 @@ class RakutenCrawler(BankCrawler):
     def _select_label(self, page, root: str, label: str) -> None:
         self._open_dropdown(page, root)
         page.wait_for_timeout(100)
-        options = page.locator(f"{root} combo-item:visible")
+        options = page.locator(f"{root} .dropdown-menu a.dropdown-item:visible")
         labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
         target_index = _unique_option_index(labels, label)
         if target_index is None:
@@ -402,8 +405,20 @@ class RakutenCrawler(BankCrawler):
             before_rows=before_rows,
         )
 
+    def _goto_twd(self, page) -> None:
+        """走真實 UI 導覽進臺幣存款頁。
+
+        樂天是 Angular SPA：直接 `page.goto(TWD_URL)` 會做整頁 reload，session
+        不會被 SPA 還原，結果被踢回登入頁（2026-07-28 real-account probe 實證，
+        final_url 落在 /cgn/cgnot0001/010）。只能點側邊導覽。
+        """
+        page.get_by_role("link", name="存款", exact=True).first.click()
+        page.wait_for_selector("a.sub-nav-link:has-text('臺幣存款')", state="visible", timeout=15000)
+        page.locator("a.sub-nav-link", has_text="臺幣存款").first.click()
+        page.wait_for_url(lambda url: TWD_PATH_HINT in url, timeout=30000)
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
-        page.goto(TWD_URL, wait_until="domcontentloaded", timeout=30000)
+        self._goto_twd(page)
         page.wait_for_selector(
             "simple-dropdown2 a.txt_dropdown",
             state="visible",
