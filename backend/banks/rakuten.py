@@ -52,6 +52,10 @@ def _month_labels(labels: list[str]) -> list[str]:
 
 
 def _six_month_labels(labels: list[str]) -> list[str]:
+    # ponytail: 樂天臺幣明細頁只提供最近 6 個月下拉，無日期區間輸入、無「更早」入口
+    # （2026-07-28 real-account DOM 實證：dropdown 恰 6 個 a.dropdown-item）。
+    # 這裡的 !=6 是 fail-closed 偵測 UI 改版，不是自訂上限。
+    # 要抓更早期間，需另探未使用的 endpoint（CHMQU0001_010 / CCMQU0003_02x，皆未實證）。
     months = _month_labels(labels)
     if len(months) != 6:
         raise RuntimeError("樂天月份選單不是預期六個月份")
