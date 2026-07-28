@@ -216,16 +216,10 @@ from backend.server.routers.sync_preference import router as sync_preference_rou
 from backend.server.routers.sync_ws import router as sync_ws_router
 from backend.server.routers.transactions import router as transactions_router
 
-# 2026-07-28 一次性 taxonomy migration 端點。跑完即連同 router 檔一起刪除。
-# 存在理由：Azure PG 是 VNet-only，且 `az containerapp exec` 是 interactive-only
-# （非 TTY 會 termios.error），自動化環境唯一看得見輸出的執行路徑是 HTTP。
-from backend.server.routers.admin_migration import router as admin_migration_router
-
 for _r in (
     auth_router, creds_router, sync_router, sync_preference_router, sync_ws_router,
     fx_router, rules_router,
     accounts_router, cache_router, transactions_router,
-    admin_migration_router,
     # auto_debit 必須在 cards 之前 — /cards/auto-debit/* 是 specific path，
     # 否則 cards_router 的 /cards/{bank}/{card_no} 會 greedy match 變 404.
     auto_debit_router, cards_router, preferences_router,
