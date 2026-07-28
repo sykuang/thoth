@@ -84,45 +84,56 @@ def cmd_sync(args):
 
     # 增量入庫
     store = BankStore(args.bank)
+    # 2026-07-28: CLI 原本 13 個分支全都沒傳 rules → category/subcategory 永遠 NULL,
+    # 連帶 flow_type/income_category 也拿不到分類訊號 (樂天「存款利息」只能落到
+    # income/other 而非 interest_dividend)。server sync_runner 一直有傳 (見
+    # sync_runner.py:547), 只有 CLI 漏掉。user_id=1 對齊 BankStore 預設單人模式。
+    # server.sqlite 尚未 seed 過該 user 時 fallback 到 DEFAULT_RULES —— CLI 是單人
+    # 工具, 沒 rule 就等於整個 taxonomy 失效, 不該靜默降級。
+    from backend.server import rules_repo
+    from backend.server.seed_rules import DEFAULT_RULES
+    rules = rules_repo.list_rules(user_id=1, enabled_only=True)
+    if not rules:
+        rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
     if args.bank == "cathay":
         from backend.core.persist import persist_cathay
-        delta = persist_cathay(data, store)
+        delta = persist_cathay(data, store, rules=rules)
     elif args.bank == "ubot":
         from backend.core.persist import persist_ubot
-        delta = persist_ubot(data, store)
+        delta = persist_ubot(data, store, rules=rules)
     elif args.bank == "hsbc":
         from backend.core.persist import persist_hsbc
-        delta = persist_hsbc(data, store)
+        delta = persist_hsbc(data, store, rules=rules)
     elif args.bank == "ctbc":
         from backend.core.persist import persist_ctbc
-        delta = persist_ctbc(data, store)
+        delta = persist_ctbc(data, store, rules=rules)
     elif args.bank == "sinopac":
         from backend.core.persist import persist_sinopac
-        delta = persist_sinopac(data, store)
+        delta = persist_sinopac(data, store, rules=rules)
     elif args.bank == "scsb":
         from backend.core.persist import persist_scsb
-        delta = persist_scsb(data, store)
+        delta = persist_scsb(data, store, rules=rules)
     elif args.bank == "esun":
         from backend.core.persist import persist_esun
-        delta = persist_esun(data, store)
+        delta = persist_esun(data, store, rules=rules)
     elif args.bank == "taishin":
         from backend.core.persist import persist_taishin
-        delta = persist_taishin(data, store)
+        delta = persist_taishin(data, store, rules=rules)
     elif args.bank == "fubon":
         from backend.core.persist import persist_fubon
-        delta = persist_fubon(data, store)
+        delta = persist_fubon(data, store, rules=rules)
     elif args.bank == "dbs":
         from backend.core.persist import persist_dbs
-        delta = persist_dbs(data, store)
+        delta = persist_dbs(data, store, rules=rules)
     elif args.bank == "scb":
         from backend.core.persist import persist_scb
-        delta = persist_scb(data, store)
+        delta = persist_scb(data, store, rules=rules)
     elif args.bank == "linebank":
         from backend.core.persist import persist_linebank
-        delta = persist_linebank(data, store)
+        delta = persist_linebank(data, store, rules=rules)
     elif args.bank == "rakuten":
         from backend.core.persist import persist_rakuten
-        delta = persist_rakuten(data, store)
+        delta = persist_rakuten(data, store, rules=rules)
     else:
         raise SystemExit(f"未支援的入庫: {args.bank}")
     stats = store.stats()

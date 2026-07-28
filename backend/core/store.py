@@ -115,6 +115,60 @@ def _categorizer_text(t: dict) -> str:
     return " | ".join(out)
 
 
+# seed_rules 的 category → (flow_type, income_category)。
+# 未列出的 category (飲食/交通/購物/…) 一律 expense + income_category=None。
+# income_category 只在 flow_type='income' 有意義 (schema 註記), 其餘一律 None。
+_FLOW_BY_CATEGORY: dict[str, tuple[str, str | None]] = {
+    "薪資": ("income", "salary"),
+    "獎金": ("income", "bonus"),
+    "利息股息": ("income", "interest_dividend"),
+    "投資收益": ("income", "investment_gain"),
+    "轉帳": ("transfer", None),
+    "還款": ("transfer", None),
+    "投資": ("investment", None),
+}
+
+
+def _flow_fields(
+    category: str | None,
+    subcategory: str | None,
+    amount: int | float | None,
+    txn_type: str | None = None,
+) -> tuple[str, str | None]:
+    """category / txn_type (+金額方向) → (flow_type, income_category)。
+
+    2026-07-28: 三個 upsert_* 的 INSERT 從來沒寫過這兩欄, 全靠 schema
+    `DEFAULT 'expense'` — 所以連「存款利息 +$4」都被記成支出,
+    passive_income / amount_by_flow_type 永遠是 0。root cause 在此統一補。
+
+    規則 (依序):
+      1. 信用卡 txn_type 優先 — 跟 routers/transactions._transaction_cashflow 同一組:
+         cashback/refund/fee_waiver → income (但 income_category=None, 不算 FIRE),
+         payment (卡費還款) → transfer。
+      2. category 命中 _FLOW_BY_CATEGORY → 用該映射。
+      3. 「其他/退稅」是政府退款, category 太泛不能整類當收入, 只認這個 subcategory。
+      4. 都沒命中但金額為正 (台幣存款 income 欄) → income/other。
+         台幣交易的 amount 由 caller 傳 income-expend, 方向可信。
+         信用卡 caller 傳 None → 不走這條, 維持 expense。
+    """
+    if txn_type in ("cashback", "refund", "fee_waiver"):
+        return ("income", None)
+    if txn_type == "payment":
+        return ("transfer", None)
+    if txn_type in ("spending", "fee", "annual_fee", "installment"):
+        # 2026-07-28: txn_type 必須壓過 category。真實案例 HSBC
+        # 「減少消費款利息 -241 txn_type=fee」被 category『利息股息』誤判成收入,
+        # 但那是利息「支出」。銀行給的 txn_type 比 keyword rule 權威。
+        return ("expense", None)
+    if category in _FLOW_BY_CATEGORY:
+        return _FLOW_BY_CATEGORY[category]
+    if category == "其他" and subcategory == "退稅":
+        return ("income", "other")
+    if amount is not None and amount > 0:
+        return ("income", "other")
+    return ("expense", None)
+
+
 def _with_occurrence(content_keys: list[str]) -> list[str]:
     """對一批 content key 附加「同鍵出現序號」。
 
@@ -578,17 +632,20 @@ class BankStore:
         for t, key in zip(txns, dedup_keys, strict=True):
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
+            # 台幣: amount 方向可信 (income - expend), 給 _flow_fields 當 fallback
+            net = (t.get("income") or 0) - (t.get("expend") or 0)
+            flow, income_cat = _flow_fields(cat, sub, net)
             self.conn.execute(
                 """INSERT INTO twd_transactions
                    (user_id, account_no, txn_datetime, account_date, description, expend, income,
                     balance, counterparty_bank, counterparty_acct, memo, first_seen, dedup_key,
-                    category, subcategory, auto_excluded)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    category, subcategory, auto_excluded, flow_type, income_category)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
                  t.get("desc"), t.get("expend"), t.get("income"), t.get("balance"),
                  t.get("counterparty_bank"), t.get("counterparty_acct"), t.get("memo"),
-                 now, key, cat, sub, 1 if auto_ex else 0),
+                 now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat),
             )
         self.conn.commit()
         return self.conn.total_changes - before
@@ -625,19 +682,22 @@ class BankStore:
             description_overwrite = tags_overwrite = None
             if metadata_rows:
                 cat, sub, description_overwrite, tags_overwrite, auto_ex = metadata_rows.pop(0)
+            # 信用卡: amount=None 讓 _flow_fields 不走「正值即收入」fallback
+            # (帳單視角的正負跟 user cashflow 方向不一致, 只信 txn_type/category)
+            flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
             self.conn.execute(
                 """INSERT INTO card_billed_txns
                    (user_id, card_no, bill_date, currency, consume_date, post_date, description,
                     amount, consume_country, consume_currency, consume_amount, first_seen,
                     dedup_key, category, subcategory, txn_type, auto_excluded,
-                    description_overwrite, tags_overwrite)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    description_overwrite, tags_overwrite, flow_type, income_category)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
                  post_date, t.get("desc"), t.get("amount"), t.get("consume_country"),
                  t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
                  t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite),
+                 description_overwrite, tags_overwrite, flow, income_cat),
             )
             # 2026-06-13: 對齊「顯示誠實」鐵律 — 寫 billed 同時把 pending 對應筆清掉。
             # 銀行 billed 出帳後，pending 通常 1-3 天才會從未出帳清單移除；過渡期 UI
@@ -788,20 +848,21 @@ class BankStore:
             description_overwrite = tags_overwrite = None
             if metadata_rows:
                 cat, sub, description_overwrite, tags_overwrite, auto_ex = metadata_rows.pop(0)
+            flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
             self.conn.execute(
                 """INSERT INTO card_pending_txns
                    (user_id, scope, card_no, consume_date, post_date, description, amount, currency,
                     consume_country, consume_currency, consume_amount,
                     refreshed_at, category, subcategory, txn_type, auto_excluded,
-                    description_overwrite, tags_overwrite)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    description_overwrite, tags_overwrite, flow_type, income_category)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.user_id, scope, t.get("card_no"), t.get("date"),
                  t.get("post_date") or t.get("date"), t.get("desc"),
                  t.get("amount"), t.get("currency"),
                  t.get("consume_country"), t.get("consume_currency"),
                  t.get("consume_amount"),
                  now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite),
+                 description_overwrite, tags_overwrite, flow, income_cat),
             )
 
         # Phase 8.5 (2026-06-18) — 結帳跨表去重:
