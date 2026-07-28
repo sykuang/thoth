@@ -205,6 +205,16 @@ DEFAULT_RULES: list[dict] = [
     {"name": "信用卡年費",
      "pattern": r"年費|Annual Fee|ANNUAL MEMBERSHIP|Annual Membership|ANNUAL MEMBER|Annual Member|MEMBER FEE|Member Fee",
      "category": "金融", "subcategory": "年費", "priority": 95},
+    # 2026-07-28: 「國外交易手續費」必須高於所有商家 rule。
+    # recategorize migration dry-run 抓到: HSBC 的手續費 row description 是
+    # 「國外交易手續費ＡＬＰ＊Ｔａｏｂａｏ」(手續費 + 原始商家名黏在一起),
+    # 被 priority 110「中國電商」搶走判成『購物/網購』, 但那筆 NT$17 是手續費不是
+    # 淘寶消費。同型還有「國外交易手續費ＴＲＥＮＩＴＡＬＩＡ」→ 誤判旅遊/機票、
+    # 「國外交易手續費ＨＯＴＥＬＧＲＥＥＮＰＬ」→ 誤判旅遊/住宿。
+    # priority 300 高於所有商家 rule (最高 110) 與收入類 (最高 250)。
+    {"name": "國外交易手續費",
+     "pattern": r"國外交易手續費|海外交易手續費|國際交易手續費|Foreign Transaction Fee|FOREIGN TXN FEE",
+     "category": "金融", "subcategory": "手續費", "priority": 300},
     {"name": "手續費",
      "pattern": r"手續費|管理費|Fee|跨行費|匯費",
      "category": "金融", "subcategory": "手續費", "priority": 80},

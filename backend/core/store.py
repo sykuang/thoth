@@ -169,6 +169,22 @@ def _flow_fields(
     return ("expense", None)
 
 
+def _is_subscription(subcategory: str | None) -> bool:
+    """subcategory == '訂閱' → is_subscription=1。
+
+    2026-07-28: 跟 flow_type 同一批死欄位 — 三個 INSERT 從沒寫過 is_subscription,
+    dashboard 訂閱卡永遠 0。`backend/subscriptions.yml` 有 110+ 關鍵字但**零 Python
+    引用** (Phase 6 的 loader 在 5da42db 被當死碼刪掉)。
+
+    這裡不重新引入 YAML loader — seed_rules 已有 priority 110 的「訂閱服務」rule
+    (Netflix|Spotify|iCloud|ChatGPT|Adobe|Notion|...) 寫 subcategory='訂閱',
+    直接讀它即可。單一 source of truth, 不維護兩份關鍵字表。
+    # ponytail: 綁 seed rule 的 subcategory; 若日後需要「同金額月扣 ≥3 期」
+    # auto-detect (spec § 5.4 提過), 再引入 subscriptions.yml loader。
+    """
+    return subcategory == "訂閱"
+
+
 def _with_occurrence(content_keys: list[str]) -> list[str]:
     """對一批 content key 附加「同鍵出現序號」。
 
@@ -639,13 +655,15 @@ class BankStore:
                 """INSERT INTO twd_transactions
                    (user_id, account_no, txn_datetime, account_date, description, expend, income,
                     balance, counterparty_bank, counterparty_acct, memo, first_seen, dedup_key,
-                    category, subcategory, auto_excluded, flow_type, income_category)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    category, subcategory, auto_excluded, flow_type, income_category,
+                    is_subscription)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
                  t.get("desc"), t.get("expend"), t.get("income"), t.get("balance"),
                  t.get("counterparty_bank"), t.get("counterparty_acct"), t.get("memo"),
-                 now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat),
+                 now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
+                 1 if _is_subscription(sub) else 0),
             )
         self.conn.commit()
         return self.conn.total_changes - before
@@ -690,14 +708,16 @@ class BankStore:
                    (user_id, card_no, bill_date, currency, consume_date, post_date, description,
                     amount, consume_country, consume_currency, consume_amount, first_seen,
                     dedup_key, category, subcategory, txn_type, auto_excluded,
-                    description_overwrite, tags_overwrite, flow_type, income_category)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    description_overwrite, tags_overwrite, flow_type, income_category,
+                    is_subscription)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
                  post_date, t.get("desc"), t.get("amount"), t.get("consume_country"),
                  t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
                  t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite, flow, income_cat),
+                 description_overwrite, tags_overwrite, flow, income_cat,
+                 1 if _is_subscription(sub) else 0),
             )
             # 2026-06-13: 對齊「顯示誠實」鐵律 — 寫 billed 同時把 pending 對應筆清掉。
             # 銀行 billed 出帳後，pending 通常 1-3 天才會從未出帳清單移除；過渡期 UI
@@ -854,15 +874,17 @@ class BankStore:
                    (user_id, scope, card_no, consume_date, post_date, description, amount, currency,
                     consume_country, consume_currency, consume_amount,
                     refreshed_at, category, subcategory, txn_type, auto_excluded,
-                    description_overwrite, tags_overwrite, flow_type, income_category)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    description_overwrite, tags_overwrite, flow_type, income_category,
+                    is_subscription)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.user_id, scope, t.get("card_no"), t.get("date"),
                  t.get("post_date") or t.get("date"), t.get("desc"),
                  t.get("amount"), t.get("currency"),
                  t.get("consume_country"), t.get("consume_currency"),
                  t.get("consume_amount"),
                  now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite, flow, income_cat),
+                 description_overwrite, tags_overwrite, flow, income_cat,
+                 1 if _is_subscription(sub) else 0),
             )
 
         # Phase 8.5 (2026-06-18) — 結帳跨表去重:

@@ -117,3 +117,49 @@ def test_card_pending_row_gets_flow_type(store):
         "SELECT flow_type FROM card_pending_txns",
     ).fetchone()
     assert row["flow_type"] == "expense"
+
+
+def test_subscription_row_gets_flagged(store):
+    """is_subscription 跟 flow_type 同一批死欄位, 2026-07-28 一併補。"""
+    store.upsert_card_billed([{
+        "card_no": "1234", "bill_date": "2026-02-01", "currency": "TWD",
+        "date": "2026-01-15", "post_date": "2026-01-16",
+        "desc": "Netflix", "amount": -390, "txn_type": "spending",
+    }], rules=_rules())
+    row = store.conn.execute(
+        "SELECT subcategory, is_subscription FROM card_billed_txns",
+    ).fetchone()
+    assert row["subcategory"] == "訂閱"
+    assert row["is_subscription"] == 1
+
+
+def test_non_subscription_row_not_flagged(store):
+    store.upsert_card_billed([{
+        "card_no": "1234", "bill_date": "2026-02-01", "currency": "TWD",
+        "date": "2026-01-15", "post_date": "2026-01-16",
+        "desc": "全家便利商店", "amount": -120, "txn_type": "spending",
+    }], rules=_rules())
+    row = store.conn.execute(
+        "SELECT is_subscription FROM card_billed_txns",
+    ).fetchone()
+    assert row["is_subscription"] == 0
+
+
+def test_foreign_txn_fee_beats_merchant_rule(store):
+    """「國外交易手續費ＡＬＰ＊Ｔａｏｂａｏ」不可被『中國電商』搶成 購物/網購。
+
+    HSBC 真實 row: 手續費金額與原始商家名黏在同一個 description。
+    priority 300 的「國外交易手續費」必須壓過 priority 110 的商家 rule。
+    """
+    store.upsert_card_billed([{
+        "card_no": "1234", "bill_date": "2026-02-01", "currency": "TWD",
+        "date": "2026-01-15", "post_date": "2026-01-16",
+        "desc": "國外交易手續費ＡＬＰ＊Ｔａｏｂａｏ", "amount": -17,
+        "txn_type": "fee",
+    }], rules=_rules())
+    row = store.conn.execute(
+        "SELECT category, subcategory, flow_type FROM card_billed_txns",
+    ).fetchone()
+    assert row["category"] == "金融"
+    assert row["subcategory"] == "手續費"
+    assert row["flow_type"] == "expense"
