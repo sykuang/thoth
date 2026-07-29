@@ -125,6 +125,9 @@ export const TxnRow = React.memo(
             <View className="flex-row items-baseline justify-between">
               <View className="flex-1 mr-2">
                 <Text className="text-ink-900 dark:text-ink-50 text-small" numberOfLines={1}>
+                  {t.split_of != null ? (
+                    <Text className="text-ink-400 dark:text-ink-500">✂️ </Text>
+                  ) : null}
                   {t.category ? (
                     <Text className="text-brand-600 dark:text-brand-400 font-semibold">
                       {t.category}
@@ -229,8 +232,10 @@ export const TxnRow = React.memo(
         <View className="w-20 px-3 py-2 items-start">
           {t.category ? (
             <Text className="text-brand-600 dark:text-brand-400 text-micro font-semibold">
-              {t.category}
+              {t.split_of != null ? '✂️ ' : ''}{t.category}
             </Text>
+          ) : t.split_of != null ? (
+            <Text className="text-ink-400 dark:text-ink-500 text-micro">✂️</Text>
           ) : null}
         </View>
         <View className="w-32 px-3 py-2 items-end">

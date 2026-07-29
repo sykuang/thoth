@@ -44,7 +44,11 @@ type TagsMode = 'no_change' | 'replace' | 'add';
 export type BulkTarget = {
   bank: string;
   kind: 'twd' | 'billed' | 'pending';
-  id: number;
+  /**
+   * Phase 10 (2026-07-29): 跟 Transaction.id 同型 —— 拆帳子項是
+   * "{母id}#{序號}" 字串。批次編輯不支援子項, 送出時擋掉並提示。
+   */
+  id: number | string;
 };
 
 type Props = {
@@ -148,6 +152,13 @@ export function BulkEditSheet({ visible, targets, onClose, onSuccess }: Props) {
       let done = 0;
       const results = await Promise.allSettled(
         targets.map(async (t) => {
+          // Phase 10 (2026-07-29): 拆帳子項 id 是 "{母id}#{序號}", backend 不認。
+          // 批次編輯改的是母筆分類 —— 對已拆帳的交易而言母筆分類已被子項蓋過,
+          // 改了也不會反映在統計上, 會給使用者「有改到」的錯覺。
+          // 故直接拒絕, 訊息指向正確做法 (開該筆編輯拆帳明細)。
+          if (typeof t.id === 'string' && t.id.includes('#')) {
+            throw new Error('此筆已拆帳, 請點開該筆單獨編輯拆帳明細');
+          }
           const r = await api(
             `/transactions/${t.bank}/${t.kind}/${t.id}`,
             { method: 'PATCH', body: patch },

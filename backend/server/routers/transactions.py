@@ -250,6 +250,158 @@ def _normalize_tags_input(raw: Any) -> list[str]:
     return out
 
 
+# ============================================================
+# Phase 10 (2026-07-29) — 分類拆帳 (splits_overwrite)
+# ============================================================
+# 設計: overlay column pattern, 同 description_overwrite / tags_overwrite。
+#   - raw amount / category 永不變動 (使用者鐵則「修正≠刪除」)
+#   - splits 子項 amount 一律「正數絕對值」, 方向沿用母筆 cashflow_direction
+#     (母筆是支出 → 每個子項都是支出; 不允許一筆內同時有收入與支出子項,
+#      那是兩筆不同交易, 不是拆帳)
+#   - 子項和必須等於母筆 |cashflow_amount| — 分類拆帳的定義就是「不改總額,
+#     只改分類歸屬」。和對不上代表使用者算錯, 必須擋下而非默默吞掉。
+#   - 每個子項可獨立 auto_excluded → 該份不進收支統計桶 (皇上明確要求)
+#   - NULL / [] = 未拆帳, 統計照母筆算 (完全 backward compatible)
+
+MAX_SPLITS = 20
+"""單筆最多拆幾份。跟 tags 上限同量級, 純防呆/防攻擊面, 非業務限制。"""
+
+
+def _parse_splits_overwrite(raw: Any) -> list[dict[str, Any]]:
+    """splits_overwrite 欄 (TEXT JSON array) → list[dict]. 壞資料一律回 []."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            amount = int(item.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "amount": abs(amount),
+            "category": item.get("category") or None,
+            "subcategory": item.get("subcategory") or None,
+            "note": item.get("note") or None,
+            "auto_excluded": bool(item.get("auto_excluded")),
+        })
+    return out
+
+
+def _split_opt_str(item: dict[str, Any], key: str, limit: int = 100) -> str | None:
+    """單一 split 物件的選填字串欄位驗證。空字串 → None。"""
+    v = item.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError(f"split {key} 必須是字串")
+    v = v.strip()
+    if not v:
+        return None
+    if len(v) > limit:
+        raise ValueError(f"split {key} 不可超過 {limit} 字")
+    return v
+
+
+def _normalize_splits_input(raw: Any, parent_amount: int) -> list[dict[str, Any]]:
+    """PATCH body splits 欄輸入正規化 + 驗證。
+
+    `parent_amount` 是母筆 |cashflow_amount| (絕對值整數)。
+    回 [] 代表取消拆帳。任何不合法輸入 raise ValueError (router 轉 400)。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("splits 必須是陣列")
+    if not raw:
+        return []
+    if len(raw) > MAX_SPLITS:
+        raise ValueError(f"單筆交易最多拆成 {MAX_SPLITS} 份")
+    if len(raw) < 2:
+        raise ValueError("拆帳至少要兩份 (只有一份請直接改該筆分類)")
+
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("splits 內每個值必須是物件")
+        unknown = set(item.keys()) - {
+            "amount", "category", "subcategory", "note", "auto_excluded",
+        }
+        if unknown:
+            raise ValueError(f"split 不支援的欄位: {sorted(unknown)}")
+        raw_amount = item.get("amount")
+        if raw_amount is None or isinstance(raw_amount, bool):
+            raise ValueError("split amount 必須是整數")
+        try:
+            amount = int(raw_amount)
+        except (TypeError, ValueError):
+            raise ValueError("split amount 必須是整數") from None
+        if amount <= 0:
+            raise ValueError("split amount 必須大於 0 (方向沿用母筆, 不用負號)")
+
+        out.append({
+            "amount": amount,
+            "category": _split_opt_str(item, "category"),
+            "subcategory": _split_opt_str(item, "subcategory"),
+            "note": _split_opt_str(item, "note", 200),
+            "auto_excluded": bool(item.get("auto_excluded")),
+        })
+
+    total = sum(s["amount"] for s in out)
+    if total != parent_amount:
+        raise ValueError(
+            f"拆帳金額總和 {total} 與原交易金額 {parent_amount} 不符 "
+            f"(差 {total - parent_amount})",
+        )
+    return out
+
+
+def _expand_splits(t: dict[str, Any]) -> list[dict[str, Any]]:
+    """把一筆已拆帳的 transaction 展開成 N 筆子項; 未拆帳原樣回 [t].
+
+    子項繼承母筆全部欄位, 只覆寫:
+      id           → "{母id}#{序號}" (字串, 供 frontend key; 子項不可再 PATCH)
+      amount / cashflow_amount / display_amount → 該份金額 (方向沿用母筆)
+      category / subcategory / auto_excluded    → 該份自己的
+      split_of     → 母筆 id (frontend 可回溯/摺疊顯示)
+      split_index  → 第幾份 (0-based)
+      splits       → [] (子項不再帶 splits, 避免遞迴展開)
+    """
+    splits = t.get("splits") or []
+    if not splits:
+        return [t]
+    parent_id = t.get("id")
+    direction = t.get("cashflow_direction")
+    out: list[dict[str, Any]] = []
+    for i, s in enumerate(splits):
+        child = dict(t)
+        amount = int(s["amount"])
+        child["id"] = f"{parent_id}#{i}"
+        # amount 沿用母筆符號: 支出為負, 收入為正 (跟母筆 transform 的慣例一致)
+        child["amount"] = -amount if (t.get("amount") or 0) < 0 else amount
+        child["cashflow_amount"] = amount
+        child["display_amount"] = amount
+        child["cashflow_direction"] = direction
+        child["category"] = s.get("category")
+        child["subcategory"] = s.get("subcategory")
+        # 子項的 auto_excluded 是「該份是否納入統計」— 皇上要求可分別設定。
+        # 母筆若整筆已 auto_excluded, 子項一律跟著排除 (母筆優先, OR 邏輯)。
+        child["auto_excluded"] = bool(t.get("auto_excluded")) or bool(s.get("auto_excluded"))
+        child["split_of"] = parent_id
+        child["split_index"] = i
+        child["split_note"] = s.get("note")
+        child["splits"] = []
+        out.append(child)
+    return out
+
+
 def _transaction_cashflow(
     amount: int | float,
     txn_type: str | None,
@@ -349,6 +501,8 @@ def _twd_to_transaction(
         "auto_excluded": bool(_row_get(r, "auto_excluded") or 0),
         # Phase 9 (2026-06-16): user 自定義 tags (overlay column pattern, raw 不動)
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
+        # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
+        "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
         "raw": dict(r),
     }
 
@@ -422,6 +576,8 @@ def _billed_to_transaction(
         "auto_excluded": bool(_row_get(r, "auto_excluded") or 0),
         # Phase 9 (2026-06-16): user 自定義 tags
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
+        # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
+        "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
         "raw": dict(r),
     }
 
@@ -515,6 +671,8 @@ def _pending_to_transaction(
         "auto_excluded": bool(_row_get(r, "auto_excluded") or 0),
         # Phase 9 (2026-06-16): user 自定義 tags
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
+        # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
+        "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
         "raw": dict(r),
     }
 
@@ -609,6 +767,36 @@ def _stat_cashflow_amount(row: Any) -> int:
     return 0
 
 
+def _expand_stat_split_rows(rows: list[Any]) -> list[Any]:
+    """Stats fast path 版的 _expand_splits — 對 TxnStatRow 展開分類拆帳。
+
+    列表路徑走 dict (_expand_splits), stats fast path 走 pydantic TxnStatRow,
+    兩條路都必須展開否則 dashboard 與交易列表口徑不一致 (已拆帳的交易在
+    dashboard 仍照母筆的單一分類計)。
+
+    stat row 的 `amount` 已是使用者視角 (支出負值), 所以子項沿用母筆符號。
+    """
+    out: list[Any] = []
+    for r in rows:
+        splits = _parse_splits_overwrite(_item_get(r, "splits_overwrite"))
+        if not splits:
+            out.append(r)
+            continue
+        parent_amount = _item_get(r, "amount") or 0
+        sign = -1 if parent_amount < 0 else 1
+        parent_excluded = bool(_item_get(r, "auto_excluded"))
+        for s in splits:
+            out.append(r.model_copy(update={
+                "amount": sign * int(s["amount"]),
+                "category": s.get("category"),
+                "subcategory": s.get("subcategory"),
+                # 母筆整筆排除 → 子項一律排除 (OR, 母筆優先); 同 _expand_splits
+                "auto_excluded": parent_excluded or bool(s.get("auto_excluded")),
+                "splits_overwrite": None,
+            }))
+    return out
+
+
 def _collect_transaction_stat_rows(
     banks: list[str],
     kinds: list[str],
@@ -646,7 +834,8 @@ def _collect_transaction_stat_rows(
         ):
             rows.append(row)
     return _apply_stat_filters(
-        rows, since=since, until=until, q=q, card_date_basis=card_date_basis,
+        _expand_stat_split_rows(rows),
+        since=since, until=until, q=q, card_date_basis=card_date_basis,
     )
 
 
@@ -689,6 +878,15 @@ def _collect_transactions(
                 items.append(_pending_to_transaction(bank, txn_row, bank_excluded_cards))
 
     items = [_apply_card_date_basis(t, card_date_basis) for t in items]
+
+    # Phase 10 (2026-07-29) 分類拆帳: 已拆帳的母筆展開成 N 筆子項取代之。
+    # 放在 filter 之前 — 子項各有自己的 category, 必須讓 category filter 看得到;
+    # 若先 filter 再展開, 「篩餐飲」會漏掉母筆分類為日用品但有餐飲子項的交易。
+    # 未拆帳 (splits=[]) 的 row 原樣通過, 完全 backward compatible。
+    expanded: list[dict[str, Any]] = []
+    for t in items:
+        expanded.extend(_expand_splits(t))
+    items = expanded
 
     # In-memory filter (txn 量級在 backend tests 上千都 OK; 真正大才 push to SQL)
     if since:
@@ -1220,7 +1418,7 @@ def update_transaction(
     # 白名單欄位 (Phase 8.2: 開放 category + subcategory + Phase 9: tags +
     # Phase 9.3 2026-06-17: auto_excluded — 使用者可手動勾「忽略這筆 / 不納入收支統計」.
     # 共用 rule auto_excluded 同欄, 不額外設 manual_excluded — 統計層只看一個 flag.)
-    ALLOWED = {"category", "subcategory", "description_overwrite", "tags", "tags_mode", "auto_excluded"}
+    ALLOWED = {"category", "subcategory", "description_overwrite", "tags", "tags_mode", "auto_excluded", "splits"}
     unknown = set(body.keys()) - ALLOWED
     if unknown:
         raise HTTPException(
@@ -1271,6 +1469,30 @@ def update_transaction(
                 status.HTTP_400_BAD_REQUEST,
                 "auto_excluded 只接受 true/false",
             )
+
+    if "splits" in body:
+        # Phase 10 (2026-07-29) 分類拆帳: 子項總和必須等於母筆金額, 所以要先讀母筆。
+        # 用 transform 後的 cashflow_amount 而非 raw amount — 信用卡 raw 是帳單視角
+        # (消費為正), transform 後才是使用者視角的絕對值金額, 跟 UI 顯示的數字一致,
+        # 使用者在畫面上看到 1200 就該填 1200。
+        parent_row = db_api.get_txn(
+            bank=bank, kind=kind, txn_id=txn_id, user_id=user["id"],
+        )
+        if parent_row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此筆交易")
+        parent = transform(bank, parent_row)
+        parent_amount = abs(int(parent.get("cashflow_amount") or 0))
+        if parent_amount <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "此筆交易金額為 0 或無法認列現金流, 無法拆帳",
+            )
+        try:
+            update_kwargs["splits"] = _normalize_splits_input(
+                body.get("splits"), parent_amount,
+            )
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
 
     try:
         with db_api.transaction(bank=bank) as tx:

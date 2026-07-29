@@ -526,6 +526,16 @@ class BankStore:
         #                           跟 description_overwrite 同 overlay pattern,
         #                           raw row 沒對應 tags 欄, 完全 user 自加. NULL = 無標籤.
         #                           empty `[]` = 顯式清空. 跨銀行 filter / 跨主類 mark.
+        # Phase 10 (2026-07-29) — splits_overwrite (分類拆帳):
+        #   splits_overwrite      — 使用者把單筆交易拆成多個分類的 JSON array, e.g.
+        #                           [{"amount":800,"category":"餐飲","subcategory":null,
+        #                             "note":"","auto_excluded":false}, ...]
+        #                           跟 description_overwrite / tags_overwrite 同 overlay
+        #                           pattern: raw amount/category 永遠不動 (「修正≠刪除」)。
+        #                           amount 一律正數 (絕對值), 方向沿用母筆 cashflow_direction。
+        #                           子項和必須等於母筆 |cashflow_amount| — router 層驗。
+        #                           每個子項可獨立 auto_excluded (該份不納入收支統計)。
+        #                           NULL / [] = 未拆帳, 統計照母筆算。
         for tbl in ("twd_transactions", "card_billed_txns", "card_pending_txns"):
             tbl_cols = {r["name"] for r in self.conn.execute(
                 f"PRAGMA table_info({tbl})").fetchall()}
@@ -538,6 +548,7 @@ class BankStore:
                 ("description_overwrite", f"ALTER TABLE {tbl} ADD COLUMN description_overwrite TEXT"),
                 ("auto_excluded", f"ALTER TABLE {tbl} ADD COLUMN auto_excluded INTEGER NOT NULL DEFAULT 0"),
                 ("tags_overwrite", f"ALTER TABLE {tbl} ADD COLUMN tags_overwrite TEXT"),
+                ("splits_overwrite", f"ALTER TABLE {tbl} ADD COLUMN splits_overwrite TEXT"),
             ]:
                 if col not in tbl_cols:
                     self.conn.execute(ddl)
@@ -612,7 +623,7 @@ class BankStore:
         """Snapshot user-edited fields before pending rows are replaced or promoted."""
         sql = (
             "SELECT card_no, consume_date, amount, description, category, subcategory, "
-            "description_overwrite, tags_overwrite, auto_excluded "
+            "description_overwrite, tags_overwrite, auto_excluded, splits_overwrite "
             "FROM card_pending_txns WHERE user_id = ?"
         )
         args: tuple = (self.user_id,)
@@ -627,7 +638,7 @@ class BankStore:
             )
             snapshots.setdefault(key, []).append((
                 row["category"], row["subcategory"], row["description_overwrite"],
-                row["tags_overwrite"], row["auto_excluded"],
+                row["tags_overwrite"], row["auto_excluded"], row["splits_overwrite"],
             ))
         return snapshots
 
@@ -697,9 +708,10 @@ class BankStore:
                 metadata_rows = pending_metadata.get((
                     t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"),
                 ))
-            description_overwrite = tags_overwrite = None
+            description_overwrite = tags_overwrite = splits_overwrite = None
             if metadata_rows:
-                cat, sub, description_overwrite, tags_overwrite, auto_ex = metadata_rows.pop(0)
+                (cat, sub, description_overwrite, tags_overwrite, auto_ex,
+                 splits_overwrite) = metadata_rows.pop(0)
             # 信用卡: amount=None 讓 _flow_fields 不走「正值即收入」fallback
             # (帳單視角的正負跟 user cashflow 方向不一致, 只信 txn_type/category)
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
@@ -709,15 +721,15 @@ class BankStore:
                     amount, consume_country, consume_currency, consume_amount, first_seen,
                     dedup_key, category, subcategory, txn_type, auto_excluded,
                     description_overwrite, tags_overwrite, flow_type, income_category,
-                    is_subscription)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    is_subscription, splits_overwrite)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
                  post_date, t.get("desc"), t.get("amount"), t.get("consume_country"),
                  t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
                  t.get("txn_type"), 1 if auto_ex else 0,
                  description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0),
+                 1 if _is_subscription(sub) else 0, splits_overwrite),
             )
             # 2026-06-13: 對齊「顯示誠實」鐵律 — 寫 billed 同時把 pending 對應筆清掉。
             # 銀行 billed 出帳後，pending 通常 1-3 天才會從未出帳清單移除；過渡期 UI
@@ -865,9 +877,10 @@ class BankStore:
             metadata_rows = pending_metadata.get((
                 t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"),
             ))
-            description_overwrite = tags_overwrite = None
+            description_overwrite = tags_overwrite = splits_overwrite = None
             if metadata_rows:
-                cat, sub, description_overwrite, tags_overwrite, auto_ex = metadata_rows.pop(0)
+                (cat, sub, description_overwrite, tags_overwrite, auto_ex,
+                 splits_overwrite) = metadata_rows.pop(0)
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
             self.conn.execute(
                 """INSERT INTO card_pending_txns
@@ -875,8 +888,8 @@ class BankStore:
                     consume_country, consume_currency, consume_amount,
                     refreshed_at, category, subcategory, txn_type, auto_excluded,
                     description_overwrite, tags_overwrite, flow_type, income_category,
-                    is_subscription)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    is_subscription, splits_overwrite)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.user_id, scope, t.get("card_no"), t.get("date"),
                  t.get("post_date") or t.get("date"), t.get("desc"),
                  t.get("amount"), t.get("currency"),
@@ -884,7 +897,7 @@ class BankStore:
                  t.get("consume_amount"),
                  now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
                  description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0),
+                 1 if _is_subscription(sub) else 0, splits_overwrite),
             )
 
         # Phase 8.5 (2026-06-18) — 結帳跨表去重:

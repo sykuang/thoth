@@ -38,10 +38,18 @@ import {
   type CardDateBasis,
   type SupportedBank,
   type Transaction,
+  type TransactionSplit,
   type TransactionsListResponse,
   type TransactionsStatsResponse,
   BANK_LABELS,
 } from '@/types/api';
+import {
+  SplitEditor,
+  toApiSplits,
+  toDraftSplits,
+  validateDrafts,
+  type DraftSplit,
+} from '@/components/transactions/SplitEditor';
 
 export type TxnDetailModalProps = {
   txn: Transaction | null;
@@ -62,6 +70,7 @@ export function TxnDetailModal({
   const [editDesc, setEditDesc] = useState('');  // Phase 8.2: description_overwrite
   const [editTags, setEditTags] = useState<string[]>([]);  // Phase 9: tags
   const [editIgnored, setEditIgnored] = useState(false);  // Phase 9.3: 忽略不納入統計
+  const [editSplits, setEditSplits] = useState<DraftSplit[]>([]);  // Phase 10: 分類拆帳
   const [tagPickerVisible, setTagPickerVisible] = useState(false);  // Phase 9.1
   const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
 
@@ -90,41 +99,74 @@ export function TxnDetailModal({
     staleTime: 60_000,
   });
 
+  // Phase 10 (2026-07-29) 分類拆帳:
+  // 列表回的是「展開後的子項」, 子項 id 是 "{母id}#{序號}" 且不帶 splits。
+  // 使用者點子項要編輯時, 必須改的是母筆 —— 這裡把 txn 正規化成「編輯目標」:
+  //   子項 → 用 split_of 撈母筆 (帶完整 splits)
+  //   母筆 → 直接用
+  const isSplitChild = txn?.split_of != null;
+  const editTargetId = isSplitChild ? txn?.split_of : txn?.id;
+  const parentQ = useQuery<Transaction, ApiError>({
+    queryKey: ['transactions', 'detail', txn?.bank, txn?.kind, editTargetId],
+    queryFn: () =>
+      api<Transaction>(`/transactions/${txn!.bank}/${txn!.kind}/${editTargetId}`),
+    enabled: txn !== null && isSplitChild,
+    staleTime: 10_000,
+  });
+  // 子項在母筆載回前先用自己顯示 (避免閃爍), 但編輯欄位以母筆為準
+  const editTarget = isSplitChild ? (parentQ.data ?? null) : txn;
+
   // txn 變了重設輸入框（每次開新 modal）— 必須 useEffect 因為純 setState side effect
   useEffect(() => {
     // W (2026-06-17): set-state-in-effect — modal init pattern.
-    // txn prop 變化 (新 row 開 modal) 時 reset 6 個 form state.
+    // txn prop 變化 (新 row 開 modal) 時 reset form state.
     // 不能用 useMemo (state 是 user 編輯後可變的), 不能用 key 重 mount
     // (modal animation 會炸). 標準 derived-state-reset pattern.
-    if (txn) {
+    // Phase 10: 依 editTarget (子項時是母筆) 初始化, 不是 txn 本身。
+    if (editTarget) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setEditCat(txn.category ?? '');
+      setEditCat(editTarget.category ?? '');
        
-      setEditSub(txn.subcategory ?? '');
+      setEditSub(editTarget.subcategory ?? '');
        
-      setEditDesc(txn.description_overwrite ?? '');  // Phase 8.2
+      setEditDesc(editTarget.description_overwrite ?? '');  // Phase 8.2
        
-      setEditTags(txn.tags ?? []);  // Phase 9
+      setEditTags(editTarget.tags ?? []);  // Phase 9
        
-      setEditIgnored(txn.auto_excluded ?? false);  // Phase 9.3: 沿用 backend flag
+      setEditIgnored(editTarget.auto_excluded ?? false);  // Phase 9.3: 沿用 backend flag
+       
+      setEditSplits(toDraftSplits(editTarget.splits));  // Phase 10
        
       setTagPickerVisible(false);  // Phase 9.1: 重置 picker
        
       setStatus(null);
     }
-  }, [txn]);
+  }, [editTarget]);
 
   const patchMut = useMutation<
     Transaction,
     ApiError,
-    { category: string; subcategory: string; description_overwrite: string; tags: string[]; auto_excluded: boolean },
+    {
+      category: string;
+      subcategory: string;
+      description_overwrite: string;
+      tags: string[];
+      auto_excluded: boolean;
+      splits: TransactionSplit[];
+      /** 這次送出有沒有動到拆帳 — 有的話跳過 optimistic (見下). */
+      splitsChanged: boolean;
+    },
     { listSnaps: [readonly unknown[], unknown][]; statsSnaps: [readonly unknown[], unknown][] }
   >({
-    mutationFn: ({ category, subcategory, description_overwrite, tags, auto_excluded }) => {
-      if (!txn) throw new Error('no txn');
+    mutationFn: ({ category, subcategory, description_overwrite, tags, auto_excluded, splits }) => {
+      if (!txn || editTargetId == null) throw new Error('no txn');
+      // Phase 10: 一律 PATCH 母筆 (子項 id 帶 '#' 後綴, backend 不認)
       return api<Transaction>(
-        `/transactions/${txn.bank}/${txn.kind}/${txn.id}`,
-        { method: 'PATCH', body: { category, subcategory, description_overwrite, tags, auto_excluded } },
+        `/transactions/${txn.bank}/${txn.kind}/${editTargetId}`,
+        {
+          method: 'PATCH',
+          body: { category, subcategory, description_overwrite, tags, auto_excluded, splits },
+        },
       );
     },
     // Phase 10 (2026-06-19, 使用者指示): write-through optimistic update — 改 cat 不再等
@@ -141,11 +183,15 @@ export function TxnDetailModal({
     //   ❌ auto_excluded 不 optimistic — 牽動 amount_by_month + total_income/expense
     //      + portfolio.summary, delta 複雜易錯
     //   ❌ amount_by_month / total_* 不動 — 改 cat 不影響金流方向
+    //   ❌ Phase 10 (2026-07-29): 動到 splits 時整段跳過 optimistic —— 拆帳會讓
+    //      「1 個 row 變 N 個 row」且每份金額/分類/是否計入都不同, 這種 cache
+    //      重塑無法用 delta 表達, 硬算必錯。直接讓 onSettled 的 invalidate 拿
+    //      server truth (多等 ~300ms, 但拆帳本來就是低頻操作)。
     //
     // 安全網: onSettled 仍 invalidate, server truth 在 ~300ms 後回來覆蓋 optimistic,
     // 任何小算錯都會 self-heal.
     onMutate: async (vars) => {
-      if (!txn) return { listSnaps: [], statsSnaps: [] };
+      if (!txn || vars.splitsChanged) return { listSnaps: [], statsSnaps: [] };
 
       await qc.cancelQueries({ queryKey: ['transactions'] });
 
@@ -261,16 +307,42 @@ export function TxnDetailModal({
     txn.consume_amount !== 0;
 
   // 比對原 txn 判斷是否「有改動」(submit button enabled state)
-  const origTags = txn.tags ?? [];
+  // Phase 10: 一律比對 editTarget (子項時是母筆), 因為送出的也是母筆。
+  // editTarget 為 null = 子項的母筆還在載入 → 先不讓存。
+  const base = editTarget;
+  const origTags = base?.tags ?? [];
   const tagsDiffer =
     editTags.length !== origTags.length ||
     editTags.some((t, i) => t !== origTags[i]);
+
+  // Phase 10 分類拆帳
+  // 母筆金額 (絕對值) — 拆帳總和必須等於它。用 cashflow_amount (使用者視角),
+  // 不用 raw amount (信用卡 raw 是帳單視角, 跟畫面顯示的數字不一致)。
+  const splitParentAmount = Math.abs(
+    base?.cashflow_amount ?? base?.amount ?? 0,
+  );
+  const origSplits = toDraftSplits(base?.splits);
+  const splitsChanged =
+    editSplits.length !== origSplits.length ||
+    editSplits.some((d, i) => {
+      const o = origSplits[i];
+      return (
+        d.amount !== o.amount ||
+        d.category !== o.category ||
+        d.note !== o.note ||
+        d.auto_excluded !== o.auto_excluded
+      );
+    });
+  const splitError = validateDrafts(editSplits, splitParentAmount);
+
   const hasChange =
-    editCat !== (txn.category ?? '') ||
-    editSub !== (txn.subcategory ?? '') ||
-    editDesc.trim() !== (txn.description_overwrite ?? '') ||
+    base != null &&
+    (editCat !== (base.category ?? '') ||
+      editSub !== (base.subcategory ?? '') ||
+      editDesc.trim() !== (base.description_overwrite ?? '') ||
     tagsDiffer ||
-    editIgnored !== (txn.auto_excluded ?? false);
+      editIgnored !== (base.auto_excluded ?? false) ||
+      splitsChanged);
 
   // body content — 兩個分支 (iOS pageSheet / web 浮動) 共用
   const bodyContent = (
@@ -526,6 +598,18 @@ export function TxnDetailModal({
             </Pressable>
           </View>
 
+          {/* Phase 10 (2026-07-29): 分類拆帳 — 一筆拆多類, 每份可獨立決定計不計入統計.
+              整筆「忽略這筆」已勾時拆帳無意義 (子項一律被母筆蓋過), 故隱藏. */}
+          {!editIgnored && splitParentAmount > 0 ? (
+            <SplitEditor
+              drafts={editSplits}
+              onChange={setEditSplits}
+              parentAmount={splitParentAmount}
+              categoryOptions={categoryOptions}
+              categoriesLoading={categoriesQ.isLoading}
+            />
+          ) : null}
+
           {/* Status */}
           {status && (
             <View
@@ -565,11 +649,13 @@ export function TxnDetailModal({
                   description_overwrite: editDesc.trim(),
                   tags: editTags,
                   auto_excluded: editIgnored,
+                  splits: toApiSplits(editSplits),
+                  splitsChanged,
                 })
               }
-              disabled={patchMut.isPending || !hasChange}
+              disabled={patchMut.isPending || !hasChange || splitError !== null}
               className={`flex-1 py-3 rounded-xl bg-brand-600 active:bg-brand-500 ${
-                patchMut.isPending || !hasChange ? 'opacity-40' : ''
+                patchMut.isPending || !hasChange || splitError !== null ? 'opacity-40' : ''
               }`}
               testID="txn-detail-save-btn"
             >

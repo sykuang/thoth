@@ -216,6 +216,10 @@ class TxnStatRow(BaseModel):
     card_no: str | None = None
     excluded: bool = False
     auto_excluded: bool = False
+    # Phase 10 (2026-07-29) 分類拆帳: raw JSON, 由 router 的 _expand_stat_splits 展開。
+    # stats fast path 也必須看得到, 否則已拆帳的交易在 dashboard 仍照母筆算 —
+    # 跟 /transactions 列表的口徑會不一致。
+    splits_overwrite: str | None = None
 
 
 class TagAggRow(BaseModel):
@@ -359,6 +363,7 @@ class TransactionsReadMixin(_BaseHelpers):
                 is_subscription_expr = "COALESCE(is_subscription, 0)" if "is_subscription" in cols else "0"
                 income_category_expr = "income_category" if "income_category" in cols else "NULL"
                 auto_excluded_expr = "COALESCE(auto_excluded, 0)" if "auto_excluded" in cols else "0"
+                splits_expr = "splits_overwrite" if "splits_overwrite" in cols else "NULL"
                 if kind == "twd":
                     account_expr = "account_no" if "account_no" in cols else "NULL"
                     amount_expr = "COALESCE(income, 0) - COALESCE(expend, 0)"
@@ -391,7 +396,8 @@ class TransactionsReadMixin(_BaseHelpers):
                         {income_category_expr} AS income_category,
                         {account_expr} AS account_no,
                         {card_expr} AS card_no,
-                        {auto_excluded_expr} AS auto_excluded
+                        {auto_excluded_expr} AS auto_excluded,
+                        {splits_expr} AS splits_overwrite
                     FROM {table}
                     WHERE user_id = ?{date_filter}
                     ORDER BY {date_col} DESC
@@ -433,6 +439,7 @@ class TransactionsReadMixin(_BaseHelpers):
                             or bool(card_no and card_no in excluded_cards)
                         ),
                         auto_excluded=bool(r["auto_excluded"] or 0),
+                        splits_overwrite=r["splits_overwrite"],
                     ))
                 build_ms = (time.perf_counter() - build_started) * 1000
                 perf_log.info(
@@ -889,6 +896,7 @@ class TransactionsWriteMixin(_BaseHelpers):
         tags: Any = UNSET,
         tags_mode: str = "replace",  # 'replace' or 'add'
         auto_excluded: Any = UNSET,
+        splits: Any = UNSET,
     ) -> TxnUpdateResult:
         """Update a single txn row. Each kwarg uses UNSET sentinel as default
         so caller can distinguish 'not given' from 'set to None' (clear).
@@ -966,6 +974,18 @@ class TransactionsWriteMixin(_BaseHelpers):
                 )
             sets.append("auto_excluded = ?")
             params.append(1 if auto_excluded else 0)
+
+        if splits is not UNSET:
+            # Phase 10 (2026-07-29) 分類拆帳. Router 已驗過 shape + 金額總和,
+            # 這層只負責序列化。空 list / None → NULL (取消拆帳, 回歸母筆統計).
+            if "splits_overwrite" not in cols:
+                self._con.execute(
+                    f"ALTER TABLE {table} ADD COLUMN splits_overwrite TEXT",
+                )
+            sets.append("splits_overwrite = ?")
+            params.append(
+                json.dumps(splits, ensure_ascii=False) if splits else None,
+            )
 
         if not sets:
             # No-op update — return current row

@@ -100,9 +100,34 @@ export type TriggerSyncResponse = {
 
 export type TransactionKind = 'twd' | 'billed' | 'pending';
 
+/**
+ * Phase 10 (2026-07-29) — 分類拆帳的單一子項。
+ *
+ * `amount` 一律正數 (絕對值), 方向沿用母筆 cashflow_direction —
+ * 一筆交易不可能同時有收入與支出子項, 那是兩筆不同交易而非拆帳。
+ * `auto_excluded` 讓使用者對「這一份」單獨決定要不要納入收支統計
+ * (e.g. 一筆 1200 的家庭採買, 其中 400 是幫同事代墊 → 該份不算自己的支出)。
+ */
+export type TransactionSplit = {
+  /** 該份金額, 正整數. 所有子項相加必須等於母筆 |cashflow_amount|. */
+  amount: number;
+  category: string | null;
+  subcategory?: string | null;
+  /** 該份備註, 最長 200 字 (e.g.「同事代墊」). */
+  note?: string | null;
+  /** true = 這一份不納入收支統計 (仍在列表可見, 反灰). */
+  auto_excluded?: boolean;
+};
+
 export type Transaction = {
-  /** SQLite rowid in the bank's DB. Required for detail / PATCH endpoints. */
-  id: number;
+  /**
+   * SQLite rowid in the bank's DB. Required for detail / PATCH endpoints.
+   *
+   * Phase 10 (2026-07-29): 分類拆帳的子項 id 是 `"{母id}#{序號}"` 字串,
+   * 不可送去 detail / PATCH endpoint — 要編輯請用 `split_of` 拿母筆 id。
+   * 用 `isSplitChild(t)` 判斷。
+   */
+  id: number | string;
   bank: string;
   kind: TransactionKind;
   date: string | null;
@@ -162,6 +187,20 @@ export type Transaction = {
    * 空陣列 = 無標籤 (NULL 與 [] 等價). 跨銀行 / 跨主類 mark.
    */
   tags?: string[];
+  /**
+   * Phase 10 (2026-07-29) — 分類拆帳子項 (母筆才有, [] = 未拆帳).
+   * Backend 存在 splits_overwrite TEXT 欄 (JSON array), raw amount/category 不動。
+   * 子項和必須等於母筆 |cashflow_amount| — PATCH 時 backend 驗, 不符回 400。
+   * 注意: 列表 API 回的是「展開後的子項」, 母筆不會出現; 這欄只在
+   * detail endpoint (GET /transactions/{bank}/{kind}/{id}) 拿母筆時看得到。
+   */
+  splits?: TransactionSplit[];
+  /** 拆帳子項 — 母筆的 rowid (只有子項有此欄). */
+  split_of?: number | null;
+  /** 拆帳子項 — 第幾份 (0-based). */
+  split_index?: number | null;
+  /** 拆帳子項 — 該份備註 (e.g.「同事代墊」). */
+  split_note?: string | null;
   /** 信用卡交易日期認列 (消費日 / 入帳日). */
   consume_date?: string | null;
   /** 信用卡 billed/pending — 入帳日 */
