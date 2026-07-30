@@ -379,7 +379,15 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
                     "currency": t.get("Currency") or "TWD",
                     "txn_type": classify.classify_by_desc_and_sign(desc, amt),
                 })
-    delta["card_unbilled"] = store.refresh_card_pending("unbilled", unb_rows, rules=rules)
+    latest_raw = unb.get("latest_tx") if isinstance(unb, dict) else None
+    latest_result = latest_raw.get("Result") if isinstance(latest_raw, dict) else None
+    latest_ok = (isinstance(latest_raw, dict)
+                 and str(latest_raw.get("ResultCode")) == "00"
+                 and latest_raw.get("Error") in (None, "")
+                 and isinstance(latest_result, dict)
+                 and isinstance(latest_result.get("Items"), list))
+    delta["card_unbilled"] = store.refresh_card_pending(
+        "unbilled", unb_rows, rules=rules, fetch_ok=latest_ok)
     delta["card_current"] = 0
 
     store.log_sync(delta)

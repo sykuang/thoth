@@ -406,7 +406,8 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # qu006/011 已有 purchaseDt/postingDt/description/purchaseAmt, 是可顯示的真實
     # unbilled source；只忽略 qu041 placeholder, parse qu006.
     pending_rows = []
-    qu006_detail = card_api.get("/twrbc-card/qu006/011") or {}
+    qu006_raw = card_api.get("/twrbc-card/qu006/011")
+    qu006_detail = qu006_raw if isinstance(qu006_raw, dict) else {}
     for t in (qu006_detail.get("allItems") or []) if isinstance(qu006_detail, dict) else []:
         if not isinstance(t, dict):
             continue
@@ -476,7 +477,14 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
 
     # 永遠 call refresh_card_pending 即使 pending_rows=[]:
     # 用 DELETE+INSERT semantics 來 sweep 升級前殘留的 pending row (本次 INSERT 0 筆).
-    store.refresh_card_pending("unbilled", pending_rows, rules=rules)
+    # fetch_ok: qu006/011 必須明示 allItems list；任意 error dict 不算成功，
+    # pending_rows 空也不可拿來做消失比對。
+    qu006_ok = (isinstance(qu006_raw, dict)
+                and not any(qu006_raw.get(key) for key in ("error", "Error", "errorMessage"))
+                and isinstance(qu006_raw.get("allItems"), list))
+    pending_n = store.refresh_card_pending(
+        "unbilled", pending_rows, rules=rules,
+        fetch_ok=qu006_ok)
 
     if months_summary:
         store.put_daily_metric("ctbc_bill_months_summary", months_summary, today)
@@ -489,7 +497,7 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
 
     delta["cards"] = cards_n
     delta["card_billed_new"] = billed_n
-    delta["card_unbilled"] = len(pending_rows)  # 永遠 0
+    delta["card_unbilled"] = pending_n
     delta["bill_months"] = len(months_summary)
 
     store.log_sync(delta)

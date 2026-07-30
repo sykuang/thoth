@@ -27,6 +27,7 @@ class DummyRawConn:
     def __init__(self):
         self.sql: list[tuple[str, tuple]] = []
         self.commits = 0
+        self.rollbacks = 0
         self.closed = False
 
     def execute(self, sql: str, params: tuple = ()):  # mimics psycopg cursor return
@@ -48,7 +49,7 @@ class DummyRawConn:
         self.commits += 1
 
     def rollback(self) -> None:
-        pass
+        self.rollbacks += 1
 
     def close(self) -> None:
         self.closed = True
@@ -98,6 +99,7 @@ def test_bank_pg_connection_checks_out_from_pool_and_returns_on_close(monkeypatc
     conn.close()
 
     assert exits == [(None, None, None)]
+    assert raw.rollbacks == 1, "close must rollback uncommitted transition before pool return"
     assert raw.closed is False, "pooled checkout must be returned to pool, not physically closed"
 
 

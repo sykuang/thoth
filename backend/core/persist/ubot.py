@@ -152,7 +152,8 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
     delta["card_billed_new"] = billed_new
 
     # --- 信用卡未出帳（refresh-by-scope）---
-    unb = data.get("card_unbilled") or {}
+    unb_raw = data.get("card_unbilled")
+    unb = unb_raw if isinstance(unb_raw, dict) else {}
     unb_rows = []
     if isinstance(unb, dict):
         for t in unb.get("CardList", []):
@@ -161,10 +162,18 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
             unb_rows.append({
                 "card_no": t.get("cardNo"), "date": _ubot_date(t.get("effectiveDate")),
                 "desc": desc, "amount": amt,
-                "currency": (t.get("Currency") or "").strip() or "TWD",
+                "currency": "TWD",  # amount=txAmt 是台幣估算/入帳金額
+                "consume_currency": (t.get("Currency") or "").strip() or "TWD",
+                "consume_amount": _num_real(t.get("oriAmt")),
                 "txn_type": classify.classify_ubot(t.get("txCode"), desc, amt),
             })
-    delta["card_unbilled"] = store.refresh_card_pending("unbilled", unb_rows, rules=rules)
+    # fetch_ok: card_unbilled 要是 dict 才算真的抓到未出帳清單。非 dict (None/缺 key)
+    # = API 沒回, 此時 unb_rows 空是「假消失」, 不可做消失比對。
+    delta["card_unbilled"] = store.refresh_card_pending(
+        "unbilled", unb_rows, rules=rules,
+        fetch_ok=(isinstance(unb_raw, dict)
+                  and not any(unb_raw.get(key) for key in ("error", "Error", "errorMessage"))
+                  and isinstance(unb_raw.get("CardList"), list)))
     delta["card_current"] = 0
 
     # --- cards 表 UPSERT（從 billed/unbilled 卡號推斷，設計規範）---

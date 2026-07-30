@@ -12,6 +12,15 @@ from backend.core.store import BankStore
 from backend.core.persist._common import _num, _num_real
 
 
+def _scsb_page_error(text: str) -> bool:
+    lower = text.lower()
+    return any(marker in lower for marker in (
+        "系統錯誤", "系統忙碌", "請稍後再試", "連線逾時", "連線已逾時", "請重新登入", "登入失效",
+        "system error", "try again later", "session expired", "login required", "timed out",
+        "timeout", "log in again", "login again", "unexpected error",
+    ))
+
+
 def _scsb_parse_card_rows(text: str, scope: str) -> list:
     """SCSB Credit Card 表格 row 解析。
 
@@ -175,44 +184,64 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
         # 1) unbilled：「You currently have no new transactions」=  確認使用者目前無未入帳
         unb = leaves.get("unbilled", {})
         unb_text = (unb.get("text_final") or unb.get("text") or "")
-        if unb_text:
+        unb_nav_ok = isinstance(unb.get("nav"), dict) and unb["nav"].get("ok") is True
+        unb_refreshed = False
+        if unb_text and unb_nav_ok and not _scsb_page_error(unb_text):
             no_txn = "no new transactions" in unb_text.lower() or "have not yet been recorded" in unb_text.lower()
             store.put_daily_metric("scsb_card_unbilled", {
                 "url": unb.get("url"),
                 "empty": no_txn,
                 "snippet": unb_text[unb_text.find("Unbilled Transaction Details"):][:600] if "Unbilled" in unb_text else unb_text[:600],
-            }, today)
+            }, today, commit=False)
             # 無未入帳 → refresh empty list 清掉舊 pending
             if no_txn:
-                store.refresh_card_pending("unbilled", [], rules=rules)
-                card_unbilled = 0
+                card_unbilled = store.refresh_card_pending(
+                    "unbilled", [], rules=rules, fetch_ok=True, commit=False)
+                unb_refreshed = True
             else:
                 # 嘗試解析（未來若使用者有刷卡才會走到這）
                 unb_rows = _scsb_parse_card_rows(unb_text, scope="unbilled")
                 if unb_rows:
-                    store.refresh_card_pending("unbilled", unb_rows, rules=rules)
-                    card_unbilled = len(unb_rows)
+                    card_unbilled = store.refresh_card_pending(
+                        "unbilled", unb_rows, rules=rules, fetch_ok=True,
+                        commit=False)
+                    unb_refreshed = True
                     for r in unb_rows:
                         if r.get("card_no"):
                             seen_card_nos.add(r["card_no"])
 
+        if not unb_refreshed:
+            card_unbilled = store.refresh_card_pending(
+                "unbilled", [], rules=rules, fetch_ok=False, commit=False)
+
         # 2) current (即時 7 天)：表格 header 在 + 解析 data rows
         cur = leaves.get("current", {})
         cur_text = (cur.get("text_final") or cur.get("text") or "")
-        if cur_text:
+        cur_nav_ok = isinstance(cur.get("nav"), dict) and cur["nav"].get("ok") is True
+        cur_refreshed = False
+        if cur_text and cur_nav_ok and not _scsb_page_error(cur_text):
+            lower_cur = cur_text.lower()
+            explicit_empty = ("no real-time transaction" in lower_cur
+                              or "no transaction records" in lower_cur)
             store.put_daily_metric("scsb_card_current", {
                 "url": cur.get("url"),
                 "snippet": cur_text[cur_text.find("Real-Time Transaction Records"):][:600] if "Real-Time" in cur_text else cur_text[:600],
-            }, today)
+            }, today, commit=False)
             cur_rows = _scsb_parse_card_rows(cur_text, scope="current")
             if cur_rows:
-                store.refresh_card_pending("current", cur_rows, rules=rules)
-                card_current = len(cur_rows)
+                card_current = store.refresh_card_pending(
+                    "current", cur_rows, rules=rules, fetch_ok=True)
+                cur_refreshed = True
                 for r in cur_rows:
                     if r.get("card_no"):
                         seen_card_nos.add(r["card_no"])
-            else:
-                store.refresh_card_pending("current", [], rules=rules)
+            elif explicit_empty:
+                card_current = store.refresh_card_pending(
+                    "current", [], rules=rules, fetch_ok=True)
+                cur_refreshed = True
+        if not cur_refreshed:
+            card_current = store.refresh_card_pending(
+                "current", [], rules=rules, fetch_ok=False)
 
         # 3) statement：抽 account_no (A99999****) + 帳單金額 + 月份迭代
         stmt = leaves.get("statement", {})
@@ -221,7 +250,7 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
             store.put_daily_metric("scsb_card_statement", {
                 "url": stmt.get("url"),
                 "snippet": stmt_text[stmt_text.find("Statement Inquiry"):][:1200] if "Statement Inquiry" in stmt_text else stmt_text[:1200],
-            }, today)
+            }, today, commit=False)
             # ⚠️ 2026-06-14 移除「從 statement 抽 masked account 當卡號」的邏輯：
             # 原 regex `[A-Z]\d{4,8}\*+` 會匹到身分證 masked (例 "A12651****"
             # = 身分證 A12651* + 4 顆星)，導致使用者 SCSB 沒辦任何信用卡，cards 表

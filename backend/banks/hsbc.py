@@ -419,7 +419,9 @@ class HsbcCrawler(BankCrawler):
             entry["posted"] = self._fetch_paged(page, cid, "posted", token)
             # 未出帳（陣列）
             unp = self._fetch_json(page, f"cards/{cid}/transactions/unposted?pageSize=200", token)
-            entry["unposted"] = unp if isinstance(unp, list) else (unp or [])
+            unposted_rows = unp if isinstance(unp, list) else []
+            entry["unposted_ok"] = isinstance(unp, list)
+            entry["unposted"] = unposted_rows
             details[tail] = entry
             n_posted = len(entry["posted"])
             n_unp = len(entry["unposted"])

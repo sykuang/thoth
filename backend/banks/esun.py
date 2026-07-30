@@ -612,11 +612,15 @@ class EsunCrawler(BankCrawler):
                 all_txns: list[dict] = []
                 seen_keys: set = set()  # dedup: (date, merchant, billed_amount)
                 periods_results = []
+                all_periods_ok = True
                 for period_label in ("最近一個月", "最近二個月"):
                     page.wait_for_timeout(5000)  # 等表單回到查詢狀態（不重點選表單）
                     form_submitted = self._submit_card_txn_query(page, debug_dir, period_label)
-                    periods_results.append({"period": period_label, "submitted": form_submitted})
+                    period_result = {"period": period_label, "submitted": form_submitted,
+                                     "result_seen": False}
+                    periods_results.append(period_result)
                     if not form_submitted.get("strategy"):
+                        all_periods_ok = False
                         _log(f"[esun][collect] {period_label} 表單未提交，跳過")
                         continue
                     page.wait_for_timeout(8000)  # 等查詢結果載入
@@ -628,6 +632,7 @@ class EsunCrawler(BankCrawler):
                         try:
                             txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
                             if any(k in txt for k in ("消費日", "請款日", "入帳日", "消費金額", "授權碼", "特店名稱", "消費明細")):
+                                period_result["result_seen"] = True
                                 txns_this_round = self._parse_card_transactions(txt)
                                 for t in txns_this_round:
                                     key = (t.get("consume_date"), t.get("merchant"), t.get("billed_amount"))
@@ -638,9 +643,12 @@ class EsunCrawler(BankCrawler):
                                 break
                         except Exception:
                             pass
+                    if not period_result["result_seen"]:
+                        all_periods_ok = False
                     _log(f"[esun][collect] {period_label} 累計 transactions={len(all_txns)}")
 
                 out["card_txn_form_submitted"] = periods_results  # 多 period 結果
+                out["card_transactions_ok"] = all_periods_ok
                 out["card_transactions"] = all_txns
                 _log(f"[esun][collect] card_transactions 總計 (dedup) count={len(all_txns)}")
 

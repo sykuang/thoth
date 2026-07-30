@@ -31,6 +31,7 @@ def test_esun_pure_twd_no_consume_currency(store):
     """case 1+3: 純台幣 transactions → consume_currency=None。"""
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",
@@ -63,6 +64,7 @@ def test_esun_foreign_currency_preserved(store):
     """case 2: 外幣 USD → consume_currency + consume_amount 保留原值。"""
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/05/15",
@@ -94,6 +96,7 @@ def test_esun_unbilled_goes_to_pending_not_billed(store):
     """case 4: status='未入帳' → 走 pending 不寫 billed。"""
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/10",
@@ -121,6 +124,7 @@ def test_esun_billed_status_goes_to_billed(store):
     """status='已入帳' → 走 billed 不寫 pending。"""
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",
@@ -183,6 +187,7 @@ def test_esun_card_billed_card_no_normalized_to_last4_format(store):
     """
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",
@@ -233,6 +238,7 @@ def test_esun_card_billed_fallback_to_raw_when_last4_missing(store):
     """
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",

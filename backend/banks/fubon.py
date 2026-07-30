@@ -660,6 +660,8 @@ class FubonCrawler(BankCrawler):
             }
             return {ok: false, error: 'no_pending_tab'};
         }""")
+        out["pending_click_ok"] = (
+            isinstance(pending_click, dict) and pending_click.get("ok") is True)
         _log(f"[fubon][collect] 未出帳單 click: {pending_click}")
         page.wait_for_timeout(6000)
         with contextlib.suppress(Exception):

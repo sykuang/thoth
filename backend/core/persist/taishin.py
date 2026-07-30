@@ -157,7 +157,8 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
         except Exception:
             return s.replace("/", "-")
 
-    parsed = data.get("credit_card_parsed") or {}
+    parsed_raw = data.get("credit_card_parsed")
+    parsed = parsed_raw if isinstance(parsed_raw, dict) else {}
     if isinstance(parsed, dict) and not parsed.get("error"):
         # Step 2 (2026-06-14): Taishin per-card 沒 limit, 整戶 qryRealTime.crlimit
         # + billing_period.{pay_due_date, statement_date} 套到每張卡 (通常 1 張).
@@ -296,9 +297,11 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
                 })
             except Exception:
                 continue
-        if pending_payload:
-            store.refresh_card_pending("realtime", pending_payload, rules=rules)
-            cc_pending_n = len(pending_payload)
+        fetch_ok = (isinstance(parsed_raw, dict)
+                    and parsed_raw.get("fetch_ok") is True
+                    and not parsed_raw.get("error"))
+        cc_pending_n = store.refresh_card_pending(
+            "realtime", pending_payload, rules=rules, fetch_ok=fetch_ok)
 
         # 各類 summary → daily_metrics（SCSB 模式）
         top = parsed.get("top_summary") or {}

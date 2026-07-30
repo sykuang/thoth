@@ -567,6 +567,10 @@ class CathayCrawler(BankCrawler):
         result = {}
         # 常見容器名
         for k, v in content.items():
+            if isinstance(v, list) and not v and "consume" in k.lower():
+                # 明確成功空清單也要保留 key，persist 才能區分零筆與 error dict。
+                result[k] = []
+                continue
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 # 若元素本身就是交易
                 if any(kk in v[0] for kk in ["transDesc", "amount", "consumeDate"]):

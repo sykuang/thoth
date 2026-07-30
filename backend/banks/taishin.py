@@ -423,8 +423,20 @@ class TaishinCrawler(BankCrawler):
           }
         """
         import re
-        out: dict = {"cards": [], "pending_txns": [], "billed_txns": [],
-                     "summary": {}, "top_summary": {}, "billing_period": {}}
+        error_text = text.lower()
+        error_markers = (
+            "系統錯誤", "系統忙碌", "請稍後再試", "登入逾時", "連線逾時",
+            "連線已逾時", "請重新登入", "登入失效",
+            "system error", "try again later", "session expired", "login required",
+            "timed out", "timeout", "log in again", "login again", "unexpected error",
+        )
+        realtime_headers = ("即時消費紀錄", "消費日期", "消費時間", "消費明細", "授權結果")
+        out: dict = {
+            "fetch_ok": (not any(marker in error_text for marker in error_markers)
+                         and all(header in text for header in realtime_headers)),
+            "cards": [], "pending_txns": [], "billed_txns": [],
+            "summary": {}, "top_summary": {}, "billing_period": {},
+        }
 
         # ─── [5] 卡名 + 末四碼 ───
         # 「Richart卡(原FlyGo鈦金商務) (卡號末四碼:1409)」

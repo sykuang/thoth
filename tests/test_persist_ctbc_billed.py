@@ -203,13 +203,8 @@ def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
     assert [r[8] for r in rows] == ["spending", "spending"]
 
 
-def test_ctbc_persist_sweeps_existing_pending_rows(store):
-    """既有 prod 已有殘留 pending row, 升級到此版後第一次 sync 應該自動 sweep 清空.
-
-    機制: persist_ctbc 仍 call store.refresh_card_pending("unbilled", [], ...) 空 batch,
-    refresh_card_pending 先 DELETE 整 scope 再 INSERT (這次 INSERT 0 筆) → 殘留全清.
-    """
-    # 預塞 3 筆殘留 (模擬升級前的歷史 row)
+def test_ctbc_missing_unbilled_endpoint_preserves_existing_pending_rows(store):
+    """qu006 根本沒回，不等於「真的零筆」；必須 fail-closed 保留舊 pending。"""
     conn = store.conn
     for i in range(3):
         conn.execute(
@@ -220,23 +215,33 @@ def test_ctbc_persist_sweeps_existing_pending_rows(store):
             (f"****344{i}", f"2026-06-0{i+1}", f"舊殘留-{i}", 100 + i),
         )
     conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 3
-
-    # 跑一次 persist (qu041 還是有資料, 但新版不該寫)
     fixture = {
         "card_api_dump": {
-            "/twrbc-card/qu041/010": {
-                "allItems": [
-                    {"txnDate": "20260611", "cardNoSuffixFour": "7036",
-                     "merchName": "中華航空", "txnAmt": 8292,
-                     "origCurCode": "", "origTxnAmt": None},
-                ],
-            },
+            "/twrbc-card/qu041/010": {"allItems": []},  # qu006 缺失 = 抓取失敗／不完整
         },
         "summary": {}, "twd_deposit": {},
     }
     persist_ctbc(fixture, store)
-    # 殘留全清, 新 batch 也沒寫進去
+    assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 3
+
+
+def test_ctbc_successful_empty_unbilled_endpoint_sweeps_existing_pending_rows(store):
+    """qu006 明確成功回 allItems=[] 才代表真的零筆，應 sweep 舊 pending。"""
+    conn = store.conn
+    conn.execute(
+        """INSERT INTO card_pending_txns
+           (user_id, scope, card_no, consume_date, description, amount, currency, refreshed_at)
+           VALUES (1, 'unbilled', '****3443', '2026-06-01', '舊殘留', 100,
+                   'TWD', '2026-06-19T00:00:00')""",
+    )
+    conn.commit()
+    fixture = {
+        "card_api_dump": {
+            "/twrbc-card/qu006/011": {"allItems": [], "totalRow": "0"},
+        },
+        "summary": {}, "twd_deposit": {},
+    }
+    persist_ctbc(fixture, store)
     assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
 
 

@@ -477,8 +477,14 @@ class Connection:
     def close(self) -> None:
         if self._closed:
             return
-        self._checkout_cm.__exit__(None, None, None)
-        self._closed = True
+        # Pool connection context 在 __exit__(None, …) 會 commit。BankStore.close() 常在
+        # sync_runner finally 執行，若 persist 中途拋錯，不能把未完成的 billed→pending
+        # transition 當正常離場提交；已 commit 的正常路徑 rollback 是 no-op。
+        try:
+            self._conn.rollback()
+        finally:
+            self._checkout_cm.__exit__(None, None, None)
+            self._closed = True
 
 
 def connect(bank: str) -> Connection:

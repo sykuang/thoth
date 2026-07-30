@@ -450,6 +450,22 @@ def _parse_fubon_credit_card(data: dict) -> dict:
                 "currency": "TWD",
             })
     out["pending_txns"] = pending_txns
+    # 只有 URL 確認在 CCCQU004 且內容是明確空狀態或未出帳交易表，才算可信。
+    # 任意非空文字可能是舊頁／錯誤頁，不能拿來清空 pending。
+    pending_url = str(data.get("pending_page_url") or "").lower()
+    pending_lower = pending_text.lower()
+    error_markers = (
+        "系統錯誤", "系統忙碌", "請稍後再試", "連線逾時", "連線已逾時", "請重新登入", "登入失效",
+        "system error", "try again later", "session expired", "login required", "timed out",
+        "timeout", "log in again", "login again", "unexpected error",
+    )
+    pending_error = any(marker in pending_lower for marker in error_markers)
+    explicit_empty = "查無相關資料" in pending_text
+    transaction_table = all(k in pending_text for k in ("消費日期", "消費說明", "臺幣金額"))
+    out["pending_page_ok"] = (not pending_error
+                              and data.get("pending_click_ok") is True
+                              and "/cccqu004/" in pending_url
+                              and (explicit_empty or transaction_table))
 
     # === E. points (好多金) ===
     points: dict = {}
@@ -607,9 +623,12 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
             "currency": p.get("currency") or "TWD",
             "txn_type": classify.classify_by_desc_and_sign(desc, amt),
         })
-    if pending_payload:
-        store.refresh_card_pending("realtime", pending_payload, rules=rules)
-        cc_pending_n = len(pending_payload)
+    # fetch_ok: 未出帳頁真的抓到文字才算可信 (含「查無相關資料」= 確實沒有未出帳)。
+    # 頁面沒抓到 (登入失敗/timeout) 時 pending_payload 空是「假消失」, 不可比對。
+    # 必須無條件 call: 空 payload 時仍要 refresh 才能 sweep 掉已入帳的殘留 row。
+    cc_pending_n = store.refresh_card_pending(
+        "realtime", pending_payload, rules=rules,
+        fetch_ok=bool(parsed.get("pending_page_ok")))
 
     # 富邦存款交易明細（CDSQU001）— collector 對每個帳戶送近 1 個月查詢。
     twd_txn_rows = _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])

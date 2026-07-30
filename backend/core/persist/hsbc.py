@@ -200,7 +200,10 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # --- 逐卡明細 ---
     billed_new = 0
     unbilled_rows_all = []
-    for tail, entry in (data.get("card_detail") or {}).items():
+    detail_metrics = []
+    card_detail_raw = data.get("card_detail")
+    card_details = card_detail_raw if isinstance(card_detail_raw, dict) else {}
+    for tail, entry in card_details.items():
         masked = entry.get("masked", "")
         # 已出帳（append-only）
         posted = entry.get("posted") or []
@@ -227,11 +230,25 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         # 卡片詳情（額度/繳款/紅利）存每日快照
         det = entry.get("detail")
         if isinstance(det, dict):
-            store.put_daily_metric(f"card_detail_{tail}", det, today)
+            detail_metrics.append((f"card_detail_{tail}", det))
 
     delta["card_billed_new"] = billed_new
-    delta["card_unbilled"] = store.refresh_card_pending("unbilled", unbilled_rows_all, rules=rules)
+    expected_tails = {
+        (c.get("maskedCardNumber") or "").replace("-", "")[-4:]
+        for c in cards if c.get("id") and c.get("maskedCardNumber")
+    }
+    fetch_ok = bool(expected_tails) and isinstance(card_detail_raw, dict) and all(
+        tail in card_details and card_details[tail].get("unposted_ok") is True
+        for tail in expected_tails
+    )
+    # 每張有 id 的卡都必須帶 collector 明示 unposted_ok=True；aggregate 非空不代表完整。
+    delta["card_unbilled"] = store.refresh_card_pending(
+        "unbilled", unbilled_rows_all, rules=rules, fetch_ok=fetch_ok)
     delta["card_current"] = 0
+
+    # 必須在 billed→pending atomic transition commit 後才寫 metrics（put_daily_metric 會 commit）。
+    for category, payload in detail_metrics:
+        store.put_daily_metric(category, payload, today)
 
     # 卡片彙總快照（應繳/額度）
     if cards:

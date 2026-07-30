@@ -264,3 +264,25 @@ def test_f0801001_real_datelist_shape(store):
     # 最新一筆 (postDate 排序最大) = 2026/06/22 / 38,647
     assert card["last_payment_amount"] == 38647.0, "逗號數字 '38,647' 該解成 38647.0"
     assert card["last_payment_date"] == "2026-06-22", "YYYY/MM/DD 該轉 YYYY-MM-DD"
+
+
+def test_ubot_unbilled_preserves_original_currency_amount(store):
+    """聯邦 pending 必須保留 Currency/oriAmt，供結匯後用原幣 identity 配對。"""
+    data = _base_data()
+    data["card_unbilled"] = {
+        "CardSum": "3200",
+        "DispStmtAmt": "3200",
+        "CardList": [{
+            "cardNo": "****1234", "effectiveDate": "20260701",
+            "txDesc": "AMAZON JP", "txAmt": "3200",
+            "Currency": "USD", "oriAmt": "100.20", "txCode": "",
+        }],
+    }
+    persist_ubot(data, store, rules=None)
+
+    row = store.conn.execute(
+        "SELECT currency, consume_currency, consume_amount FROM card_pending_txns"
+    ).fetchone()
+    assert row["currency"] == "TWD"
+    assert row["consume_currency"] == "USD"
+    assert row["consume_amount"] == 100.2

@@ -44,6 +44,7 @@ def test_esun_persist_does_not_set_post_date_in_row(store, monkeypatch):
 
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",
@@ -78,6 +79,7 @@ def test_esun_store_fallback_writes_post_date_equal_to_consume(store):
     """
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/08",
@@ -107,6 +109,7 @@ def test_esun_pending_row_unaffected_by_post_date_change(store):
     """未入帳交易不該有 post_date 影響（pending 本來就無 post_date 欄位）。"""
     data = {
         "accounts": [],
+        "card_transactions_ok": True,
         "card_transactions": [
             {
                 "consume_date": "2026/06/15",

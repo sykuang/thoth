@@ -422,9 +422,11 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
     if billed_txns:
         n = store.upsert_card_billed(billed_txns, rules=rules)
         delta["card_billed_new"] = n
-    if pending_txns:
-        n = store.refresh_card_pending("unbilled", pending_txns, rules=rules)
-        delta["card_unbilled"] = len(pending_txns)
+    # collector 必須明示兩個期間皆成功提交且看到結果 frame；只看到 [] 不足以證明零筆。
+    n = store.refresh_card_pending(
+        "unbilled", pending_txns, rules=rules,
+        fetch_ok=data.get("card_transactions_ok") is True)
+    delta["card_unbilled"] = n
     if card_txns:
         # 同時保留原始 JSON 在 daily_metrics 做 debug
         store.put_daily_metric("esun_card_transactions",

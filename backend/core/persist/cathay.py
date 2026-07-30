@@ -198,8 +198,19 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     # 主要 filter 在 collector `_parse_consume`（治本），這層補一道防禦 + telemetry。
     # 物理 invariant: 真實刷卡至少要有金額或描述。
     # 詳見 wiki [[card-billed-pending-cross-table-consistency-lesson]] Bug 5。
-    unb = cc.get("unbilled_detail") or {}
-    unb_txns_raw = [t for lst in unb.values() for t in lst]
+    unb_raw = cc.get("unbilled_detail")
+    unb = unb_raw if isinstance(unb_raw, dict) else {}
+    unb_ok = (isinstance(unb_raw, dict)
+              and not any(unb_raw.get(key) for key in ("error", "Error", "errorMessage"))
+              and any(
+        isinstance(value, list) and (
+            "consume" in str(key).lower()
+            or (value and isinstance(value[0], dict)
+                and any(field in value[0] for field in ("amount", "desc", "date")))
+        )
+        for key, value in unb_raw.items()
+    ))
+    unb_txns_raw = [t for lst in unb.values() if isinstance(lst, list) for t in lst]
     unb_skipped = 0
     unb_txns = []
     for t in unb_txns_raw:
@@ -210,12 +221,28 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             continue
         t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
         unb_txns.append(t)
-    delta["card_unbilled"] = store.refresh_card_pending("unbilled", unb_txns, rules=rules)
+    # fetch_ok: collector 明確帶回 unbilled_detail dict 才算可信；空 dict 是成功零筆，
+    # key 缺失／非 dict 才是抓取失敗，必須保留舊 pending。
+    delta["card_unbilled"] = store.refresh_card_pending(
+        "unbilled", unb_txns, rules=rules,
+        fetch_ok=unb_ok,
+        commit=False)
     if unb_skipped:
         delta["card_unbilled_skipped_placeholder"] = unb_skipped
 
-    cur_d = cc.get("current_detail") or {}
-    cur_txns_raw = [t for lst in cur_d.values() for t in lst]
+    cur_raw = cc.get("current_detail")
+    cur_d = cur_raw if isinstance(cur_raw, dict) else {}
+    cur_ok = (isinstance(cur_raw, dict)
+              and not any(cur_raw.get(key) for key in ("error", "Error", "errorMessage"))
+              and any(
+        isinstance(value, list) and (
+            "consume" in str(key).lower()
+            or (value and isinstance(value[0], dict)
+                and any(field in value[0] for field in ("amount", "desc", "date")))
+        )
+        for key, value in cur_raw.items()
+    ))
+    cur_txns_raw = [t for lst in cur_d.values() if isinstance(lst, list) for t in lst]
     cur_skipped = 0
     cur_txns = []
     for t in cur_txns_raw:
@@ -226,7 +253,10 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             continue
         t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
         cur_txns.append(t)
-    delta["card_current"] = store.refresh_card_pending("current", cur_txns, rules=rules)
+    # current_detail 同樣以 key 存在＋dict type 判可信，空 dict 可安全清 stale current。
+    delta["card_current"] = store.refresh_card_pending(
+        "current", cur_txns, rules=rules,
+        fetch_ok=cur_ok)
     if cur_skipped:
         delta["card_current_skipped_placeholder"] = cur_skipped
 
