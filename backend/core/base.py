@@ -251,6 +251,7 @@ class BankCollectResult:
     card_summary: Any = None
     card_text: Any = None
     card_transactions: Any = None
+    card_transactions_ok: bool | None = None
     card_txn_form_submitted: Any = None
     card_txn_frames: Any = None
     card_txn_nav_probe: Any = None
@@ -298,6 +299,7 @@ class BankCollectResult:
     overview_text: Any = None
     overview_url: Any = None
     payment_due_date: Any = None
+    pending_click_ok: bool | None = None
     pending_page_text: Any = None
     pending_page_url: Any = None
     pending_txns: Any = None

@@ -40,6 +40,39 @@ def test_all_bank_collect_methods_return_bank_collect_result_annotation():
     assert offenders == []
 
 
+def test_collect_out_fields_are_declared_on_bank_collect_result():
+    declared = set(BankCollectResult.__dataclass_fields__)
+    offenders: list[str] = []
+    for path in BANK_MODULES:
+        for cls_name, fn in _collect_methods(path):
+            keys: set[str] = set()
+            for node in ast.walk(fn):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "out"
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        keys.add(target.slice.value)
+                    elif (
+                        isinstance(target, ast.Name)
+                        and target.id == "out"
+                        and isinstance(node.value, ast.Dict)
+                    ):
+                        keys.update(
+                            key.value for key in node.value.keys
+                            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                        )
+            for key in sorted(keys - declared):
+                offenders.append(f"{path}:{cls_name}.collect out[{key!r}]")
+    assert offenders == []
+
+
 def test_bank_collect_result_has_no_raw_field():
     assert "raw" not in BankCollectResult.__dataclass_fields__
 
@@ -83,6 +116,18 @@ def test_bank_collect_result_has_typed_normalized_fields_and_explicit_transition
     assert serialized["daily_metrics"][0]["category"] == "demo"
     assert serialized["_collect_telemetry"] == {"duration_ms": 123}
     assert "bank" not in serialized
+
+
+def test_bank_collect_result_serializes_pending_fetch_evidence():
+    result = BankCollectResult(
+        card_transactions_ok=False,
+        pending_click_ok=True,
+    )
+
+    assert result.to_dict() == {
+        "card_transactions_ok": False,
+        "pending_click_ok": True,
+    }
 
 
 @pytest.mark.parametrize(
