@@ -109,6 +109,40 @@ def test_cache_changes_returns_only_rows_newer_than_cursor(client, tmp_path, mon
     assert [t["kind"] for t in body["transactions"]] == ["billed"]
 
 
+def test_cache_snapshot_expands_splits_and_hides_parent(client, tmp_path, monkeypatch) -> None:
+    """交易頁讀 /cache/snapshot；拆帳必在這條 canonical path 展開。"""
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    token = _register(client, email="cache-split@palace.example")
+    headers = _auth(token)
+    assert client.post(
+        "/accounts", json={"bank": "cathay", "label": "測試"}, headers=headers,
+    ).status_code == 201
+    _seed_cache_bank(tmp_path, "cathay")
+
+    before = client.get("/cache/snapshot", headers=headers).json()["transactions"]
+    parent = next(t for t in before if t["kind"] == "billed")
+    r = client.patch(
+        f"/transactions/cathay/billed/{parent['id']}",
+        json={"splits": [
+            {"amount": 70, "category": "金融"},
+            {"amount": 50, "category": "還款", "auto_excluded": True},
+        ]},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    after = client.get("/cache/snapshot", headers=headers).json()["transactions"]
+    billed = [t for t in after if t["kind"] == "billed"]
+    assert len(billed) == 2
+    assert {t["id"] for t in billed} == {f"{parent['id']}#0", f"{parent['id']}#1"}
+    assert {t["split_of"] for t in billed} == {parent["id"]}
+    assert {(t["category"], t["cashflow_amount"]) for t in billed} == {
+        ("金融", 70),
+        ("還款", 50),
+    }
+    assert next(t for t in billed if t["category"] == "還款")["auto_excluded"] is True
+
+
 def test_cache_snapshot_same_date_order_stays_stable_after_tag_edit(client, tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     token = _register(client, email="cache-order@palace.example")

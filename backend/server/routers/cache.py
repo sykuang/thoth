@@ -18,6 +18,7 @@ from backend.server.routers.cards import _card_to_response
 from backend.server.routers.portfolio import portfolio_accounts
 from backend.server.routers.transactions import (
     _billed_to_transaction,
+    _expand_splits,
     _pending_to_transaction,
     _twd_to_transaction,
 )
@@ -82,11 +83,17 @@ def _collect_cache_payload(user_id: int, *, since: str | None = None) -> dict[st
             if since and (row_cursor or "") <= since:
                 continue
             if txn_row.kind == "twd":
-                transactions.append(_twd_to_transaction(bank, txn_row, bank_excluded_accounts))
+                transactions.extend(_expand_splits(
+                    _twd_to_transaction(bank, txn_row, bank_excluded_accounts),
+                ))
             elif txn_row.kind == "billed":
-                transactions.append(_billed_to_transaction(bank, txn_row, bank_excluded_cards))
+                transactions.extend(_expand_splits(
+                    _billed_to_transaction(bank, txn_row, bank_excluded_cards),
+                ))
             elif txn_row.kind == "pending":
-                transactions.append(_pending_to_transaction(bank, txn_row, bank_excluded_cards))
+                transactions.extend(_expand_splits(
+                    _pending_to_transaction(bank, txn_row, bank_excluded_cards),
+                ))
 
     transactions.sort(key=lambda t: (t.get("date") or "0000-00-00", t.get("datetime") or ""), reverse=True)
     return {
