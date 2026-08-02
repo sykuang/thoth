@@ -155,7 +155,13 @@ docker run -d \
   ghcr.io/sykuang/thoth:standalone
 ```
 
-開啟 `http://localhost:8000`。升級 image 時保留同一個 `thoth-data` volume 與 `.env`；**不可遺失或任意更換 `SERVER_FERNET_KEY`**，否則既有銀行憑證將無法解密。
+開啟 `http://localhost:8000`。環境變數使用 Docker 原生 `--env-file`／Compose `env_file` 注入，不需要掛載 `.env`。SQLite 預設使用 `thoth-data` named volume；若要掛載自己的目錄：
+
+```bash
+THOTH_DATA_SOURCE=/path/to/thoth-data docker compose -f compose.standalone.yml up -d
+```
+
+升級 image 時保留同一個 SQLite volume 與 `.env`；**不可遺失或任意更換 `SERVER_FERNET_KEY`**，否則既有銀行憑證將無法解密。
 
 若不使用 GHCR，也可直接本機建置：
 

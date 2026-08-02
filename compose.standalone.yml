@@ -14,7 +14,7 @@ services:
       BANK_DATA_ROOT: /data
       PUSH_PROVIDER: none
     volumes:
-      - thoth-data:/data
+      - "${THOTH_DATA_SOURCE:-thoth-data}:/data"
 
 volumes:
   thoth-data:
