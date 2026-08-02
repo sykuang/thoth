@@ -142,6 +142,95 @@ def test_persist_multi_card_share_same_last_payment(store):
     assert card1["last_payment_date"] == card2["last_payment_date"] == "2026-06-01"
 
 
+def test_persist_refreshes_shared_used_credit_for_cards_absent_from_latest_activity(store):
+    """整戶額度須更新所有既有卡，且 used = credit limit - available limit。"""
+    store.upsert_cards([
+        {
+            "number": "9000000000387027", "name": "聯邦悠遊吉鶴卡",
+            "used_credit": 45814, "active": False,
+        },
+        {"number": "9000000000407057", "name": "舊卡名", "used_credit": 86918},
+    ])
+    data = _base_data(card_no="9000000000407057")
+    data["card_limit"]["CardList"][0].update({
+        "crLmt": "300000",
+        "avalCrLmt": "299874",
+        "unsettleAmt": "86918",
+    })
+
+    persist_ubot(data, store, rules=None)
+
+    rows = store.conn.execute(
+        "SELECT card_no, name, used_credit, active FROM cards "
+        "WHERE user_id=? ORDER BY card_no",
+        (store.user_id,),
+    ).fetchall()
+    assert [
+        (row["card_no"], row["name"], row["used_credit"], row["active"])
+        for row in rows
+    ] == [
+        ("9000000000387027", "聯邦悠遊吉鶴卡", 126.0, 0),
+        ("9000000000407057", "聯邦悠遊吉鶴卡", 126.0, 1),
+    ]
+
+
+def test_persist_shared_metadata_is_user_scoped(store):
+    """整戶額度更新不得碰同銀行其他 user 的卡。"""
+    other = BankStore("ubot", user_id=2)
+    other.upsert_cards([{
+        "number": "9000000000999999",
+        "name": "其他使用者聯邦卡",
+        "used_credit": 777,
+    }])
+    other.close()
+
+    data = _base_data()
+    data["card_limit"]["CardList"][0].update({
+        "crLmt": "300000", "avalCrLmt": "299874",
+    })
+    persist_ubot(data, store, rules=None)
+
+    other = BankStore("ubot", user_id=2)
+    row = other.conn.execute(
+        "SELECT used_credit FROM cards WHERE user_id=?",
+        (2,),
+    ).fetchone()
+    other.close()
+    assert row is not None
+    assert row["used_credit"] == 777.0
+
+
+@pytest.mark.parametrize(
+    ("limit_available", "summary_available", "expected_used"),
+    [
+        ("", "299874", 126.0),
+        ("not-a-number", "299874", 126.0),
+        ("0", "299874", 300000.0),
+        ("344282", "299874", -44282.0),
+        (None, None, 86918.0),
+    ],
+)
+def test_persist_available_limit_falls_back_after_parse_failure(
+    store, limit_available, summary_available, expected_used,
+):
+    """可用額度依解析結果 fallback，保留合法零與負數。"""
+    data = _base_data()
+    data["card_limit"]["CardList"][0].update({
+        "crLmt": "300000",
+        "avalCrLmt": limit_available,
+        "unsettleAmt": "86918",
+    })
+    data["card_summary"]["CardList"][0]["avalCrLmt"] = summary_available
+
+    persist_ubot(data, store, rules=None)
+
+    row = store.conn.execute(
+        "SELECT used_credit FROM cards WHERE user_id=?",
+        (store.user_id,),
+    ).fetchone()
+    assert row["used_credit"] == expected_used
+
+
 def test_persist_card_only_in_unbilled_also_gets_metadata(store):
     """只出現在 card_unbilled (沒 billed) 的卡也該套整戶 metadata."""
     data = _base_data(last_pay_amt="5000", last_pay_date="20260601")

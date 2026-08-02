@@ -185,7 +185,16 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
     cs_summary = ((data.get("card_summary") or {}).get("CardList") or [{}])[0]
     # 整戶字段 fallback: card_limit 優先 (含 crLmt 總額度), card_summary 次之
     ubot_credit_limit = _num_to_float(cl_summary.get("crLmt"))
-    ubot_used = _num_to_float(cl_summary.get("unsettleAmt"))
+    ubot_available = _num_to_float(cl_summary.get("avalCrLmt"))
+    if ubot_available is None:
+        ubot_available = _num_to_float(cs_summary.get("avalCrLmt"))
+    # 聯邦的 unsettleAmt 是未結算交易，不是實際佔用額度；額度口徑應直接用
+    # 銀行提供的「總額度 - 可用額度」，並保留溢繳造成的負數。
+    ubot_used = (
+        ubot_credit_limit - ubot_available
+        if ubot_credit_limit is not None and ubot_available is not None
+        else _num_to_float(cl_summary.get("unsettleAmt"))
+    )
     ubot_due = _yyyymmdd_to_iso(cl_summary.get("dueDate") or cs_summary.get("dueDate"))
     # 結帳日從 billed[0].CardHeader.stmtDate 拿 (最新一期)
     ubot_stmt = None
@@ -271,6 +280,15 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                         ubot_last_pay_amt = parsed
                         break
 
+    shared_card_fields = {
+        "credit_limit": ubot_credit_limit,
+        "used_credit": ubot_used,
+        "statement_close_date": ubot_stmt,
+        "payment_due_date": ubot_due,
+        "bill_due_amount": ubot_bill_due,
+        "last_payment_amount": ubot_last_pay_amt,
+        "last_payment_date": ubot_last_pay_date,
+    }
     seen_ubot_cards: dict[str, dict] = {}
     for body in data.get("card_billed") or []:
         for t in (body.get("CardList") or []):
@@ -283,14 +301,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "association": None,
                 "type": "credit",
                 "is_cube": False,
-                # Step 2: 整戶層 aggregate 套到每張 (UBOT 唯一 user 假設, 多卡都共用)
-                "credit_limit": ubot_credit_limit,
-                "used_credit": ubot_used,
-                "statement_close_date": ubot_stmt,
-                "payment_due_date": ubot_due,
-                "bill_due_amount": ubot_bill_due,
-                "last_payment_amount": ubot_last_pay_amt,
-                "last_payment_date": ubot_last_pay_date,
+                **shared_card_fields,
             }
     for t in (unb.get("CardList") or []):
         cn = t.get("cardNo")
@@ -301,14 +312,22 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "association": None,
                 "type": "credit",
                 "is_cube": False,
-                "credit_limit": ubot_credit_limit,
-                "used_credit": ubot_used,
-                "statement_close_date": ubot_stmt,
-                "payment_due_date": ubot_due,
-                "bill_due_amount": ubot_bill_due,
-                "last_payment_amount": ubot_last_pay_amt,
-                "last_payment_date": ubot_last_pay_date,
+                **shared_card_fields,
             }
+    # card_limit/card_summary 是整戶資料；即使某張既有卡本期沒有交易，也必須更新，
+    # 否則每張卡會停在各自最後一次出現於明細時的歷史額度。
+    for row in store.list_cards():
+        if row["card_no"] in seen_ubot_cards:
+            continue
+        seen_ubot_cards[row["card_no"]] = {
+            "number": row["card_no"],
+            "name": row["name"],
+            "association": row["association"],
+            "type": row["type"],
+            "is_cube": bool(row["is_cube"]),
+            "active": bool(row["active"]),
+            **shared_card_fields,
+        }
     if seen_ubot_cards:
         store.upsert_cards(list(seen_ubot_cards.values()))
 

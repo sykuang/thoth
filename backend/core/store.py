@@ -1445,6 +1445,17 @@ class BankStore:
         return len(accts)
 
     # ---- 6. 卡片狀態：UPSERT ----
+    def list_cards(self) -> list[dict]:
+        """回傳本 user 既有卡片 metadata，供銀行整戶欄位同步。"""
+        return [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT card_no, name, association, type, is_cube, active "
+                "FROM cards WHERE user_id = ?",
+                (self.user_id,),
+            )
+        ]
+
     def upsert_cards(self, cards: list[dict]) -> int:
         """Step 2 (2026-06-14): 接 credit_limit / used_credit /
         statement_close_date / payment_due_date 四欄 (各家 collector 分階段補).

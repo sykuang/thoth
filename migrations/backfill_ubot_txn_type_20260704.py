@@ -73,7 +73,6 @@ from backend.core.classify import (
     PAYMENT,
     REFUND,
     SPENDING,
-    UNKNOWN,
     classify_by_desc_and_sign,
 )
 
