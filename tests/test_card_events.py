@@ -16,6 +16,7 @@ from backend.server.card_events import (
 def _snap(
     card_no: str = "9000000000357050",
     bill: float | None = None,
+    due: str | None = None,
     pay_amt: float | None = None,
     pay_date: str | None = None,
     nickname: str | None = None,
@@ -26,6 +27,7 @@ def _snap(
         card_no=card_no,
         nickname=nickname,
         bill_due_amount=bill,
+        payment_due_date=due,
         last_payment_amount=pay_amt,
         last_payment_date=pay_date,
     )
@@ -87,6 +89,69 @@ class TestNewBill:
         after = [_snap(bill=5000.0)]
         events_bills = [e for e in diff_snapshots(before, after) if e.kind == "new_bill"]
         assert events_bills == []
+
+    def test_non_hsbc_shared_bill_is_merged_at_bank_level(self) -> None:
+        """整戶帳單複寫到多卡只是一個 source fact，不得推三則卡片帳單。"""
+        before = [
+            _snap(card_no="1111", bill=0.0),
+            _snap(card_no="2222", bill=0.0),
+            _snap(card_no="3333", bill=0.0),
+        ]
+        after = [
+            _snap(card_no="1111", bill=27916.0),
+            _snap(card_no="2222", bill=27916.0),
+            _snap(card_no="3333", bill=27916.0),
+        ]
+
+        events = [e for e in diff_snapshots(before, after) if e.kind == "new_bill"]
+
+        assert len(events) == 1
+        assert events[0].bank == "cathay"
+        assert events[0].card_no is None
+        assert events[0].nickname is None
+        assert events[0].amount == 27916.0
+
+    def test_hsbc_bills_remain_per_card(self) -> None:
+        before = [
+            _snap(bank="hsbc", card_no="1111", bill=0.0),
+            _snap(bank="hsbc", card_no="2222", bill=0.0),
+        ]
+        after = [
+            _snap(bank="hsbc", card_no="1111", bill=12729.0),
+            _snap(bank="hsbc", card_no="2222", bill=12729.0),
+        ]
+
+        events = [e for e in diff_snapshots(before, after) if e.kind == "new_bill"]
+
+        assert [event.card_no for event in events] == ["1111", "2222"]
+
+    def test_non_hsbc_same_amount_different_due_dates_remain_distinct(self) -> None:
+        before = [
+            _snap(card_no="1111", bill=0.0, due="2026-07-05"),
+            _snap(card_no="2222", bill=0.0, due="2026-08-05"),
+        ]
+        after = [
+            _snap(card_no="1111", bill=27916.0, due="2026-07-05"),
+            _snap(card_no="2222", bill=27916.0, due="2026-08-05"),
+        ]
+
+        events = [e for e in diff_snapshots(before, after) if e.kind == "new_bill"]
+
+        assert len(events) == 2
+        assert [event.amount for event in events] == [27916.0, 27916.0]
+
+    def test_non_hsbc_new_cycle_emits_when_amount_is_unchanged(self) -> None:
+        before = [
+            _snap(card_no="1111", bill=27916.0, due="2026-08-05"),
+        ]
+        after = [
+            _snap(card_no="1111", bill=27916.0, due="2026-09-05"),
+        ]
+
+        events = [e for e in diff_snapshots(before, after) if e.kind == "new_bill"]
+
+        assert len(events) == 1
+        assert events[0].amount == 27916.0
 
 
 # ============================================================
@@ -226,7 +291,7 @@ class TestCombined:
         ]
         events = diff_snapshots(before, after)
         kinds = [(e.kind, e.card_no) for e in events]
-        assert ("new_bill", "9000000000337001") in kinds
+        assert ("new_bill", None) in kinds
         assert ("new_payment", None) in kinds
         assert len(events) == 2
 
@@ -300,4 +365,32 @@ def test_bank_level_payment_notification_omits_fake_card_label(monkeypatch) -> N
 
     assert len(calls) == 1
     assert calls[0][1].body == "2026-06-23 繳款 NT$4,500"
+    assert "card_no" not in calls[0][1].data
+
+
+def test_bank_level_bill_notification_omits_fake_card_label(monkeypatch) -> None:
+    from backend.server import sync_runner
+    from backend.server.push.base import NotifyResult
+
+    calls = []
+
+    class _Notifier:
+        def send_to_user(self, *, user_id, payload):
+            calls.append((user_id, payload))
+            return NotifyResult(delivered_count=1)
+
+    monkeypatch.setattr("backend.server.push.get_notifier", lambda: _Notifier())
+    event = CardEvent(
+        kind="new_bill",
+        bank="ctbc",
+        card_no=None,
+        nickname=None,
+        amount=27916.0,
+        date=None,
+    )
+
+    sync_runner._send_card_event_notification(user_id=1, event=event)
+
+    assert len(calls) == 1
+    assert calls[0][1].body == "本期應繳 NT$27,916"
     assert "card_no" not in calls[0][1].data

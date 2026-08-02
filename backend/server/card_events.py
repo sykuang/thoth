@@ -30,6 +30,7 @@ class CardSnapshot:
     card_no: str
     nickname: str | None
     bill_due_amount: float | None  # 本期應繳 (None / 0 / 正數)
+    payment_due_date: str | None  # 非 HSBC 整戶帳單 fact identity 的 cycle boundary
     last_payment_amount: float | None  # 最近一次繳款金額
     last_payment_date: str | None  # 最近一次繳款日 ISO
 
@@ -39,7 +40,7 @@ class CardEvent:
     """A detected change worth notifying the user about."""
     kind: str  # "new_bill" | "new_payment"
     bank: str
-    card_no: str | None  # 非 HSBC 的整戶層繳款事件沒有單一卡號
+    card_no: str | None  # 非 HSBC 的整戶帳單／繳款事件沒有單一卡號
     nickname: str | None
     amount: float  # 帳單金額 or 繳款金額
     date: str | None  # 繳款日 (new_payment only)
@@ -66,6 +67,7 @@ def snapshot_cards(*, bank: str, user_id: int) -> list[CardSnapshot]:
             card_no=c.card_no,
             nickname=c.nickname_overwrite or c.name,
             bill_due_amount=_safe_float(c.bill_due_amount),
+            payment_due_date=c.payment_due_date,
             last_payment_amount=_safe_float(c.last_payment_amount),
             last_payment_date=c.last_payment_date,
         ))
@@ -82,18 +84,26 @@ def diff_snapshots(
       * 新帳單 = before.bill_due_amount 不存在 / 為 0  AND  after.bill_due_amount > 0
                  OR after.bill_due_amount > before.bill_due_amount * 1.05
                  (帳單一旦出爐就是穩定值, 多 5% buffer 防 fx round noise)
+      * 新帳單 = 非 HSBC 以銀行層 (due date, amount) fact 比較，HSBC 逐卡比較。
       * 新繳款 = (last_payment_date, last_payment_amount) 事實在 before 不存在；
                  非 HSBC 以銀行層集合比較，HSBC 逐卡比較。
 
-    新卡 (before 沒這張) — bill > 0 算新帳單；非 HSBC 的既有整戶繳款不重發。
+    新卡 (before 沒這張) — HSBC bill > 0 算新帳單；非 HSBC 已存在的
+    整戶帳單／繳款不因新增卡或卡號格式改變而重發。
     """
     by_no_before: dict[str, CardSnapshot] = {c.card_no: c for c in before}
+    before_shared_bills = {
+        (c.bank, c.payment_due_date or "", c.bill_due_amount or 0.0)
+        for c in before
+        if c.bank != "hsbc" and (c.bill_due_amount or 0.0) > 0
+    }
     before_shared_payments = {
         (c.bank, c.last_payment_date, c.last_payment_amount or 0.0)
         for c in before
         if c.bank != "hsbc" and c.last_payment_date and (c.last_payment_amount or 0.0) > 0
     }
     events: list[CardEvent] = []
+    seen_shared_bills: set[tuple[str, str, float]] = set()
     seen_shared_payments: set[tuple[str, str, float]] = set()
 
     for a in after:
@@ -101,12 +111,38 @@ def diff_snapshots(
         # 新帳單偵測
         a_bill = a.bill_due_amount or 0.0
         b_bill = (b.bill_due_amount or 0.0) if b else 0.0
-        if a_bill > 0 and (b is None or b_bill <= 0 or a_bill > b_bill * 1.05):
+        shared_bill = a.bank != "hsbc"
+        bill_key = (a.bank, a.payment_due_date or "", a_bill)
+        if shared_bill:
+            same_cycle_amounts = {
+                amount
+                for bank, due, amount in before_shared_bills
+                if bank == a.bank and due == (a.payment_due_date or "")
+            }
+            is_new_bill = (
+                a_bill > 0
+                and bill_key not in seen_shared_bills
+                and (
+                    not same_cycle_amounts
+                    or (
+                        a_bill not in same_cycle_amounts
+                        and a_bill > max(same_cycle_amounts) * 1.05
+                    )
+                )
+            )
+        else:
+            is_new_bill = (
+                a_bill > 0
+                and (b is None or b_bill <= 0 or a_bill > b_bill * 1.05)
+            )
+        if is_new_bill:
+            if shared_bill:
+                seen_shared_bills.add(bill_key)
             events.append(CardEvent(
                 kind="new_bill",
                 bank=a.bank,
-                card_no=a.card_no,
-                nickname=a.nickname,
+                card_no=None if shared_bill else a.card_no,
+                nickname=None if shared_bill else a.nickname,
                 amount=a_bill,
                 date=None,
                 prev_amount=b_bill if b_bill > 0 else None,

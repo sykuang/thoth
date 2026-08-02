@@ -47,7 +47,7 @@ export function PaymentRemindersCard({ reminders }: Props) {
 
         return (
           <Pressable
-            key={`${r.card_bank}-${r.card_no}`}
+            key={`${r.card_bank}-${r.card_no}-${r.payment_due_date}-${r.bill_due_amount}`}
             onPress={() => router.push('/(tabs)/cards')}
             className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-2 flex-row overflow-hidden active:opacity-80"
             testID={`payment-reminder-${r.card_bank}-${r.card_no}`}

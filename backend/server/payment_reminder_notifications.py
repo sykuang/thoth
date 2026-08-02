@@ -49,6 +49,20 @@ def _local_date(tz: str) -> date:
     return datetime.now(zone).date()
 
 
+def _claim_card_key(reminder: dict[str, Any]) -> str:
+    """Map API card identity to the existing NOT NULL DB dedupe column.
+
+    Non-HSBC whole-bank reminders intentionally expose ``card_no=''`` so UI/push
+    cannot pretend the bill belongs to one card.  The DB key still needs the
+    amount because two distinct facts can share bank, due date, and reason.
+    """
+    card_no = str(reminder.get("card_no") or "")
+    if card_no:
+        return card_no
+    amount = round(float(reminder["bill_due_amount"]), 2)
+    return f"__bank__:{amount:.2f}"
+
+
 def _claim_once_today(
     *,
     user_id: int,
@@ -69,7 +83,7 @@ def _claim_once_today(
                 (
                     user_id,
                     reminder["card_bank"],
-                    reminder["card_no"],
+                    _claim_card_key(reminder),
                     reminder["payment_due_date"],
                     reminder["reason"],
                     reminder_date,

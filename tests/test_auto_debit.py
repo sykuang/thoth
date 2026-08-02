@@ -232,6 +232,104 @@ def test_reminder_no_account_when_due_in_3_days_and_no_setting(
     assert rem["account_bank"] is None
 
 
+def test_non_hsbc_shared_bank_bill_emits_one_bank_level_reminder(
+    client: TestClient,
+) -> None:
+    """非 HSBC 的整戶帳單複寫到多卡時，只能提醒一次且不可冒充任一卡。"""
+    user_id, token = _register(client)
+    _setup_bank_data("ctbc", user_id, cards=[{
+        "number": "****3433", "name": "英雄聯盟卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 27916.0,
+    }, {
+        "number": "****3443", "name": "中華航空聯名卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 27916.0,
+    }, {
+        "number": "****5733", "name": "中油聯名卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 27916.0,
+    }])
+
+    r = client.get("/cards/auto-debit/reminders", headers=_auth(token))
+
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "reason": "no_account",
+        "card_bank": "ctbc",
+        "card_no": "",
+        "card_name": None,
+        "bill_due_amount": 27916.0,
+        "payment_due_date": _today_plus(3),
+        "days_until_due": 3,
+        "account_bank": None,
+        "account_no": None,
+        "account_balance": None,
+        "shortfall": None,
+    }]
+
+
+def test_hsbc_same_due_date_and_amount_remain_per_card_reminders(
+    client: TestClient,
+) -> None:
+    """HSBC 的帳單是 per-card；即使日期與金額相同也不可合併。"""
+    user_id, token = _register(client)
+    _setup_bank_data("hsbc", user_id, cards=[{
+        "number": "****3254", "name": "滙豐旅人無限卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 12729.0,
+    }, {
+        "number": "****8926", "name": "滙豐 Live+ 現金回饋卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 12729.0,
+    }])
+
+    r = client.get("/cards/auto-debit/reminders", headers=_auth(token))
+
+    assert r.status_code == 200, r.text
+    reminders = r.json()
+    assert len(reminders) == 2
+    assert {row["card_no"] for row in reminders} == {"****3254", "****8926"}
+    assert {row["card_name"] for row in reminders} == {
+        "滙豐旅人無限卡", "滙豐 Live+ 現金回饋卡",
+    }
+
+
+def test_non_hsbc_shared_bill_compares_balance_once_without_multiplying_due(
+    client: TestClient,
+) -> None:
+    """實際截圖路徑：多卡共用 27,916，只能算一次 shortfall，不能乘卡數。"""
+    user_id, token = _register(client)
+    _setup_bank_data("ctbc", user_id, cards=[{
+        "number": "****3433", "name": "英雄聯盟卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 27916.0,
+    }, {
+        "number": "****3443", "name": "中華航空聯名卡",
+        "payment_due_date": _today_plus(3),
+        "bill_due_amount": 27916.0,
+    }])
+    _setup_bank_data("sinopac", user_id, accounts=[{
+        "account_no": "TWD1", "currency": "TWD", "type": "活儲",
+        "raw_balance": 10000.0, "raw_balance_date": _today_plus(-1),
+    }])
+    client.put(
+        "/cards/auto-debit/settings/ctbc",
+        headers=_auth(token),
+        json={"account_bank": "sinopac", "account_no": "TWD1"},
+    )
+
+    r = client.get("/cards/auto-debit/reminders", headers=_auth(token))
+
+    assert r.status_code == 200, r.text
+    reminders = r.json()
+    assert len(reminders) == 1
+    assert reminders[0]["reason"] == "insufficient"
+    assert reminders[0]["card_no"] == ""
+    assert reminders[0]["bill_due_amount"] == 27916.0
+    assert reminders[0]["shortfall"] == 17916.0
+
+
 def test_reminder_insufficient_when_balance_below_due(client: TestClient) -> None:
     """C3+F2 'insufficient': balance < bill_due_amount → 提醒 + shortfall."""
     user_id, token = _register(client)
@@ -336,7 +434,7 @@ def test_reminder_includes_due_today_zero_days(client: TestClient) -> None:
 
 
 def test_reminders_sorted_by_urgency_then_amount(client: TestClient) -> None:
-    """sort: days_until_due asc, then bill_due_amount desc."""
+    """不同帳單事實保留，再按 days_until_due / bill_due_amount 排序。"""
     user_id, token = _register(client)
     _setup_bank_data("ctbc", user_id, cards=[{
         "number": "****7015",
@@ -356,7 +454,7 @@ def test_reminders_sorted_by_urgency_then_amount(client: TestClient) -> None:
     r = client.get("/cards/auto-debit/reminders", headers=_auth(token))
     reminders = r.json()
     assert len(reminders) == 3
-    # 1 day → 1 day → 3 day; 同 1 day 內金額大的在前
+    # 金額不同就不是同一帳單事實，不可硬合併。
     assert reminders[0]["days_until_due"] == 1
     assert reminders[0]["bill_due_amount"] == 30000.0
     assert reminders[1]["days_until_due"] == 1

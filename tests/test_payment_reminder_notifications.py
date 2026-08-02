@@ -150,7 +150,8 @@ def test_daily_payment_reminder_sends_aggregated_push_once(client, monkeypatch):
     call = fake.calls[0]
     assert call.user_id == user_id
     assert call.title == "繳費提醒"
-    assert "國泰世華・國泰世界卡 今天到期" in call.body
+    assert "國泰世華 今天到期" in call.body
+    assert "國泰世界卡" not in call.body
     assert "另 1 筆" in call.body
     assert call.category == "payment_reminder"
     assert call.data["deep_link"] == "/(tabs)/cards"
@@ -184,6 +185,31 @@ def test_daily_payment_reminder_no_rows_when_no_reminders(client, monkeypatch):
 
     assert result == {"sent": 0, "skipped": 0, "total": 0}
     assert fake.calls == []
+
+
+def test_daily_claim_keeps_distinct_bank_level_amount_facts(client):
+    """同銀行同到期日但金額不同的 bank-level facts 不可被空 card_no UNIQUE 誤合併。"""
+    from backend.server import payment_reminder_notifications as prn
+
+    user_id, _token = _register(client, email="bank-fact-claim@palace.example")
+    base = {
+        "card_bank": "cathay",
+        "card_no": "",
+        "payment_due_date": "2026-08-05",
+        "reason": "no_account",
+    }
+    smaller = {**base, "bill_due_amount": 8000.0}
+    larger = {**base, "bill_due_amount": 30000.0}
+
+    assert prn._claim_once_today(
+        user_id=user_id, reminder=smaller, reminder_date="2026-08-02",
+    ) is True
+    assert prn._claim_once_today(
+        user_id=user_id, reminder=larger, reminder_date="2026-08-02",
+    ) is True
+    assert prn._claim_once_today(
+        user_id=user_id, reminder=smaller, reminder_date="2026-08-02",
+    ) is False
 
 
 def test_daily_payment_reminder_sweep_covers_users_without_auto_sync(client, monkeypatch):

@@ -66,7 +66,7 @@ class EligibleAccountOut(BaseModel):
 
 
 class PaymentReminderOut(BaseModel):
-    """Dashboard reminder entry."""
+    """Dashboard reminder entry; 非 HSBC 整戶帳單用空 card_no + null card_name."""
     reason: str = Field(..., description="'no_account' 或 'insufficient'")
     card_bank: str
     card_no: str
@@ -253,10 +253,19 @@ def build_payment_reminders(user_id: int, today: date | None = None) -> list[dic
         OR (setting + balance < bill_due_amount → reason='insufficient')
 
     過期 (today > due_date) 走 cards router 的 bill_status='overdue', 不在這裡.
+
+    Source scope:
+      * HSBC 是 per-card bill，保留逐卡提醒。
+      * 其他銀行是整戶帳單複寫到多卡，依 (bank, due_date, amount) 去重，
+        金額只取一次而非相加，輸出也不冒充任一卡。
     """
     today = today or _local_date(_reminder_tz())
     settings = repo.settings_by_card_bank(user_id)
     reminders: list[dict[str, Any]] = []
+    # 除 HSBC 外，native bill_due_amount / payment_due_date 是整戶帳單，persist
+    # 只是把同一事實複寫到每張卡。依 source identity 去重，不能相加（否則
+    # CTBC 四卡 27,916 會被誤算成 111,664），也不能冒充任一卡。
+    seen_shared_bills: set[tuple[str, str, float]] = set()
 
     for bank in _user_banks(user_id):
         try:
@@ -275,14 +284,24 @@ def build_payment_reminders(user_id: int, today: date | None = None) -> list[dic
             if days < 0 or days > 3:  # D3: 0..3 含今天，過期另計
                 continue
 
+            shared_bill = bank != "hsbc"
+            if shared_bill:
+                bill_key = (bank, due.isoformat(), float(card.bill_due_amount))
+                if bill_key in seen_shared_bills:
+                    continue
+                seen_shared_bills.add(bill_key)
+
+            reminder_card_no = "" if shared_bill else card.card_no
+            reminder_card_name = None if shared_bill else card.name
+
             setting = settings.get(bank)
             if setting is None:
                 # E1+F2: no setting → 'no_account'
                 reminders.append({
                     "reason": "no_account",
                     "card_bank": bank,
-                    "card_no": card.card_no,
-                    "card_name": card.name,
+                    "card_no": reminder_card_no,
+                    "card_name": reminder_card_name,
                     "bill_due_amount": card.bill_due_amount,
                     "payment_due_date": card.payment_due_date,
                     "days_until_due": days,
@@ -310,8 +329,8 @@ def build_payment_reminders(user_id: int, today: date | None = None) -> list[dic
                 reminders.append({
                     "reason": "insufficient",
                     "card_bank": bank,
-                    "card_no": card.card_no,
-                    "card_name": card.name,
+                    "card_no": reminder_card_no,
+                    "card_name": reminder_card_name,
                     "bill_due_amount": card.bill_due_amount,
                     "payment_due_date": card.payment_due_date,
                     "days_until_due": days,

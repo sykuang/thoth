@@ -129,7 +129,8 @@ def _exec_sync(job_id: int) -> None:
 
     # L14 (2026-06-23 使用者指示): sync 前 snapshot 該 user 全部 cards 的
     # (bill_due_amount, last_payment_date) — sync 後 diff 偵測「新帳單」/「新繳款」
-    # 帳單逐卡；繳款除 HSBC 外按整戶事實合併 (除了既有 sync_done push 之外).
+    # 帳單／繳款除 HSBC 外按整戶事實合併；HSBC 保留逐卡
+    # (除了既有 sync_done push 之外).
     cards_before: list = []
     try:
         from backend.server.card_events import snapshot_cards
@@ -424,16 +425,18 @@ def _send_card_event_notification(*, user_id: int, event) -> None:
         if event.kind == "new_bill":
             title = f"{bank_label} 新帳單"
             if event.prev_amount:
-                body = f"{card_disp} 本期應繳 {amt_str} (上次 {_fmt_amount(event.prev_amount)})"
+                bill_text = f"本期應繳 {amt_str} (上次 {_fmt_amount(event.prev_amount)})"
             else:
-                body = f"{card_disp} 本期應繳 {amt_str}"
+                bill_text = f"本期應繳 {amt_str}"
+            body = f"{card_disp} {bill_text}" if card_disp else bill_text
             data = {
                 "deep_link": CARDS_TAB_ROUTE,
                 "kind": "new_bill",
                 "bank": event.bank,
-                "card_no": event.card_no,
                 "amount": str(event.amount),
             }
+            if event.card_no:
+                data["card_no"] = event.card_no
             category = "new_bill"
         elif event.kind == "new_payment":
             title = f"{bank_label} 已繳款"
