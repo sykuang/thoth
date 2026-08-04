@@ -1445,6 +1445,26 @@ def test_stats_passive_income_total_is_interest_plus_invest(client, data_root):
     assert body.get("passive_income_total") == 15907
 
 
+def test_stats_rejects_stale_income_category_on_expense_row(client, data_root):
+    """Persisted income 標籤若與使用者視角方向衝突，不得進收入或 FIRE 分子。"""
+    token = _register(client, email="passive-direction@p.com")
+    client.post("/accounts", json={"bank": "scsb", "label": "x"}, headers=_auth(token))
+    _seed_bank_db(data_root, "scsb", twd=[
+        {"account_no": "1", "datetime": "2026-07-24 09:00",
+         "desc": "放款利息", "expend": 38395,
+         "flow_type": "income", "income_category": "interest_dividend"},
+        {"account_no": "1", "datetime": "2026-07-25 09:00",
+         "desc": "存款利息", "income": 31,
+         "flow_type": "income", "income_category": "interest_dividend"},
+    ])
+
+    body = client.get("/transactions/stats", headers=_auth(token)).json()
+
+    assert body["amount_by_income_category"]["interest_dividend"] == 31
+    assert body["passive_income_total"] == 31
+    assert body["passive_income_by_month"] == {"2026-07": 31}
+
+
 def test_stats_passive_income_pct_calculated(client, data_root):
     """passive_income_pct = passive_income / total_income * 100 (1 位小數)."""
     token = _register(client, email="passive-pct@p.com")

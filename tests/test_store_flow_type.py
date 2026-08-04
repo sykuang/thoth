@@ -32,6 +32,7 @@ def _rules() -> list[dict]:
     ("投資", None, -100, None, ("investment", None)),
     ("其他", "退稅", 3000, None, ("income", "other")),
     ("飲食", None, -120, None, ("expense", None)),
+    ("利息股息", None, -38395, None, ("expense", None)),
     (None, None, 777, None, ("income", "other")),      # 未分類但正值 → 收入
     (None, None, -777, None, ("expense", None)),
     # 信用卡: txn_type 優先, amount 一律 None (帳單視角正負不可信)
@@ -66,6 +67,24 @@ def test_twd_interest_row_lands_as_income(store):
     assert row["category"] == "利息股息"
     assert row["flow_type"] == "income"
     assert row["income_category"] == "interest_dividend"
+
+
+def test_twd_loan_interest_row_stays_expense(store):
+    """上海商銀真實案例：放款利息是貸款成本，不是存款利息收入。"""
+    store.upsert_twd_txns([{
+        "account_no": "loan-1",
+        "datetime": "2026-07-24T00:00:00",
+        "desc": "放款利息",
+        "expend": 38395, "income": None, "balance": -38395,
+    }], rules=_rules())
+    row = store.conn.execute(
+        "SELECT category, subcategory, flow_type, income_category "
+        "FROM twd_transactions",
+    ).fetchone()
+    assert row["category"] == "金融"
+    assert row["subcategory"] == "貸款利息"
+    assert row["flow_type"] == "expense"
+    assert row["income_category"] is None
 
 
 def test_twd_expense_row_stays_expense(store):

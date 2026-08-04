@@ -1130,9 +1130,9 @@ def _compute_transactions_stats(
             if m:
                 subscription_by_month[m] = subscription_by_month.get(m, 0) + v
         # Phase 7 (Income 5 類) income_category aggregate (FIRE 指標基礎)
-        # 鐵則: 只計 flow_type='income' 的 row, 避免污染 (信用卡 refund row flow_type=income
-        # 但 income_category=None by-design, 故不算)
-        if flow_type == "income":
+        # 鐵則: persisted taxonomy 與使用者視角方向都必須是 income。任一 writer
+        # 誤標（例如「放款利息」支出）都 fail closed，不得進收入或 FIRE 分子。
+        if flow_type == "income" and cashflow_direction == "income":
             ic = _item_get(t, "income_category")
             if ic in amount_by_income_category:
                 v = abs_cashflow

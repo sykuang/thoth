@@ -247,7 +247,12 @@ def _flow_fields(
         # 但那是利息「支出」。銀行給的 txn_type 比 keyword rule 權威。
         return ("expense", None)
     if category in _FLOW_BY_CATEGORY:
-        return _FLOW_BY_CATEGORY[category]
+        flow, income_category = _FLOW_BY_CATEGORY[category]
+        # 台幣 income/expend 是使用者視角的權威方向；寬鬆描述規則不可把
+        # 「放款利息」等支出升格成收入。信用卡 amount=None，不受此 guard 影響。
+        if flow == "income" and amount is not None and amount <= 0:
+            return ("expense", None)
+        return (flow, income_category)
     if category == "其他" and subcategory == "退稅":
         return ("income", "other")
     if amount is not None and amount > 0:

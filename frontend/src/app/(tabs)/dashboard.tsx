@@ -452,15 +452,26 @@ function PassiveIncomeCard({
   stats: StatsForKpi | undefined;
   bp: { isLg: boolean; isMd: boolean };
 }) {
-  if (!stats?.passive_income_total) return null;  // 0 或 undefined 不顯示
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonthKey = `${currentYear}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const byMonth = stats?.passive_income_by_month ?? {};
+  const amountByMonth = stats?.amount_by_month ?? {};
+  const passive = byMonth[currentMonthKey] ?? 0;
+  if (!passive) return null;  // 本月 0 或 undefined 不顯示
 
-  const passive = stats.passive_income_total;
-  const passivePct = stats.passive_income_pct ?? 0;
-  const totalIncome = stats.total_income ?? 0;
-  const byMonth = stats.passive_income_by_month ?? {};
-  const ytdPassive = Object.values(byMonth).reduce((a, b) => a + b, 0);
-  const ytdPct = totalIncome > 0
-    ? Math.round((ytdPassive / totalIncome) * 1000) / 10
+  const monthIncome = amountByMonth[currentMonthKey]?.income ?? 0;
+  const passivePct = monthIncome > 0
+    ? Math.round((passive / monthIncome) * 1000) / 10
+    : 0;
+  const ytdPassive = Object.entries(byMonth)
+    .filter(([month]) => month.startsWith(`${currentYear}-`))
+    .reduce((sum, [, amount]) => sum + amount, 0);
+  const ytdIncome = Object.entries(amountByMonth)
+    .filter(([month]) => month.startsWith(`${currentYear}-`))
+    .reduce((sum, [, bucket]) => sum + bucket.income, 0);
+  const ytdPct = ytdIncome > 0
+    ? Math.round((ytdPassive / ytdIncome) * 1000) / 10
     : 0;
 
   return (
