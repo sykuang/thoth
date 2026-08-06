@@ -185,7 +185,7 @@ def test_persist_sinopac_loan_updates_account_and_liability_snapshot(tmp_path, m
             "currency": "TWD",
             "type": "信用貸款",
             "product_type": "loan",
-            "raw_balance": 900000.0,
+            "raw_balance": -900000.0,
         }
         assert balance["loan_balance"] == 900000
         assert json.loads(metric["payload_json"]) == {

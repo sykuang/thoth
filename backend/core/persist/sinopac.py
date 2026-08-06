@@ -133,10 +133,10 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
                 "interest_rate": record.get("LoanRate"),
             } for record in records)
             balances = [
-                value for value in (_num_real(r.get("LoanBalance")) for r in records)
+                abs(value) for value in (_num_real(r.get("LoanBalance")) for r in records)
                 if value is not None
             ]
-            raw_balance = sum(balances) if balances else None
+            raw_balance = -sum(balances) if balances else None
             loan_balances.extend(balances)
             first = records[0] if records else {}
             cur = first.get("Currency") or "TWD"
