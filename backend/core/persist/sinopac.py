@@ -71,13 +71,14 @@ def _mmyy_expired(s: str | None, today_yyyy_mm: str | None = None) -> bool:
         return False
 
 def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
-    """永豐 collect() 結構 → store 7 表增量。
+    """永豐 collect() 結構 → store 各業務表增量。
 
-    映射（第一輪：餘額 + 信用卡彙總 + 全卡 + 資產分析；台幣明細 dropdown 待破）：
+    映射：
       bank_balance[].SubInfo → accounts(UPSERT) + balance_history(每日快照)
+      loan.details[].records → accounts + balance_history.loan_balance + daily_metrics
       all_cards.Result.Items → cards(UPSERT)
       card_summary / asset_chart / card_billing / debit_accounts → daily_metrics
-      （twd_transactions / card_billed 待 #divDebitAccount dropdown 破解後補）
+      twd_transactions / card_statements / card_unbilled → 交易明細表
     """
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {}
@@ -109,44 +110,63 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
                 twd_total += bal
             elif bal is not None:
                 fx_total += bal
-    # 貸款帳戶：data.debit_accounts （理財透支貸款等）— 使用者鐵律
-    debit = data.get("debit_accounts")
-    if isinstance(debit, dict):
-        # debit_accounts 結構未明（使用者實測為 None）；先做 defensive 解析
-        for key in ("SubInfo", "accounts", "list", "items"):
-            sub = debit.get(key) if isinstance(debit, dict) else None
-            if isinstance(sub, list):
-                for a in sub:
-                    if not isinstance(a, dict):
-                        continue
-                    acct_no = (a.get("AcctValue") or a.get("AcctValueFormat")
-                               or a.get("accountNo") or a.get("account_no"))
-                    if not acct_no:
-                        continue
-                    cur = a.get("Curr") or a.get("currency") or "TWD"
-                    raw = {**a, "_source": "debit_accounts", "currency": cur}
-                    # 餘額欄位 defensive：先試 AvailBalance、再 balance、loanBalance
-                    bal_raw = (a.get("AvailBalance") or a.get("balance")
-                               or a.get("loanBalance") or a.get("Balance"))
-                    accts.append({
-                        "account_no": acct_no, "currency": cur,
-                        "branch": None, "nickname": a.get("AcctText"),
-                        "type": a.get("AcctText") or "貸款",
-                        "product_type": account_classify.classify_account("sinopac", raw),
-                        "raw_balance": _num_real(bal_raw),
-                        "raw_balance_date": today,
-                    })
-                break
+    # 貸款帳戶：ws_loanaccount + 每帳號 ws_loaninfo 真實明細。
+    loan = data.get("loan") or {}
+    loan_total = None
+    loan_metric_records = []
+    if isinstance(loan, dict) and loan.get("fetch_ok") is True:
+        loan_balances = []
+        for detail in loan.get("details") or []:
+            if not isinstance(detail, dict) or not detail.get("account"):
+                continue
+            records = [r for r in detail.get("records") or [] if isinstance(r, dict)]
+            loan_metric_records.extend({
+                "loan_kind": record.get("LoanKind"),
+                "repayment_method": record.get("PayName"),
+                "sub_account": record.get("Sub1_Sub2"),
+                "currency": record.get("Currency"),
+                "begin_loan_date": record.get("BeginLoanDate"),
+                "loan_date": record.get("LoanDate"),
+                "maturity_date": record.get("MatureDate"),
+                "original_principal": _num_real(record.get("LoanAmt")),
+                "principal_balance": _num_real(record.get("LoanBalance")),
+                "interest_rate": record.get("LoanRate"),
+            } for record in records)
+            balances = [
+                value for value in (_num_real(r.get("LoanBalance")) for r in records)
+                if value is not None
+            ]
+            raw_balance = sum(balances) if balances else None
+            loan_balances.extend(balances)
+            first = records[0] if records else {}
+            cur = first.get("Currency") or "TWD"
+            loan_type = first.get("LoanKind") or "貸款"
+            raw = {"AcctText": loan_type, "currency": cur}
+            accts.append({
+                "account_no": detail["account"],
+                "currency": cur,
+                "branch": None,
+                "nickname": first.get("LoanAcctCName") or loan_type,
+                "type": loan_type,
+                "product_type": account_classify.classify_account("sinopac", raw),
+                "raw_balance": raw_balance,
+                "raw_balance_date": today,
+            })
+        if loan_balances:
+            loan_total = round(sum(loan_balances))
     if accts:
         store.upsert_accounts(accts)
-    if twd_total or fx_total:
+    if twd_total or fx_total or loan_total is not None:
         store.upsert_balance_history([{
             "snapshotDate": today,
             "twdBalance": twd_total if twd_total else None,
             "fxBalance": fx_total if fx_total else None,
+            "loanBalance": loan_total,
         }])
         delta["balance_days"] = 1
-        store.put_daily_metric("balance_latest", {"twd": twd_total, "fx_raw": fx_total}, today)
+        store.put_daily_metric(
+            "balance_latest", {"twd": twd_total, "fx_raw": fx_total, "loan": loan_total}, today,
+        )
 
     # --- 信用卡清單（UPSERT）---
     # Step 2 (2026-06-14): all_cards.Result.Items 沒給 limit/已用/帳單日,
@@ -271,12 +291,14 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
         if cards:
             store.upsert_cards(cards)
 
-    # --- 每日快照：信用卡彙總 / 帳單 / 資產分析 / 扣款帳戶清單 ---
+    # --- 每日快照：信用卡彙總 / 帳單 / 資產分析 / 扣款帳戶 / 貸款明細 ---
     for key, mtag in [("card_summary", "card_summary"), ("card_billing", "card_billing"),
                        ("asset_chart", "asset_chart"), ("debit_accounts", "debit_accounts")]:
         v = data.get(key)
         if v:
             store.put_daily_metric(mtag, v, today)
+    if loan_metric_records:
+        store.put_daily_metric("loan", {"records": loan_metric_records}, today)
 
     # --- 台幣交易明細（永豐 ws_transdetailMerge.ashx，欄位 DataText1~11）---
     # DataText 對應：

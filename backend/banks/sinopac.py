@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -26,6 +27,7 @@ from backend.core.creds import SinopacCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
 
 BASE = "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
+LOAN_DETAIL_URL = "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_detail.aspx"
 SEL_CAP_IMG = "#imgCode"
 
 JS_CLOSE_COOKIE = (
@@ -297,7 +299,7 @@ class SinopacCrawler(BankCrawler):
 
     # ---------- 抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
-        """登入後抓帳戶餘額 / 信用卡彙總 / 信用卡帳單 / 全卡片 / 資產分析。
+        """登入後抓帳戶餘額 / 貸款明細 / 信用卡彙總與帳單 / 全卡片 / 資產分析。
 
         永豐 MMA 資產總覽頁登入後自動觸發 ws_bankbal/cardsum/cardbilling_sp/
         AllCards/ws_mychart，巡訪「資產分析 / 信用卡總覽」頁也會補打。
@@ -335,6 +337,9 @@ class SinopacCrawler(BankCrawler):
         out["asset_chart"] = self._latest_json(collector, "ws_mychart.ashx")         # 資產分佈圓餅
         out["alert_info"] = self._latest_json(collector, "ws_alertinfo.ashx")        # 帳戶通知
 
+        # === 貸款明細：每個貸款帳號查本金餘額 / 利率 / 到期日 ===
+        out["loan"] = self._collect_loans(page, collector)
+
         # === 台幣交易明細（jQuery dropdown 破解後，每帳戶查 1 次）===
         out["twd_transactions"] = self._collect_transactions(page, collector)
 
@@ -350,6 +355,82 @@ class SinopacCrawler(BankCrawler):
         out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         return BankCollectResult(**out)
+
+    def _collect_loans(self, page, collector: ResponseCollector) -> dict:
+        """逐帳號觸發 ws_loaninfo，回傳銀行原生貸款明細。"""
+        page.goto(LOAN_DETAIL_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(8000)
+
+        account_raw = self._latest_json(collector, "ws_loanaccount.ashx")
+        if not (isinstance(account_raw, list) and account_raw
+                and isinstance(account_raw[0], dict)
+                and isinstance(account_raw[0].get("SubInfo"), list)):
+            raise RuntimeError("永豐貸款帳號 API 未回傳預期結構")
+        accounts = account_raw[0]["SubInfo"]
+        details = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                raise RuntimeError("永豐貸款帳號資料格式錯誤")
+            account_no = account.get("AcctValue")
+            formatted = account.get("AcctValueFormat")
+            if not account_no or not formatted:
+                raise RuntimeError("永豐貸款帳號缺少 AcctValue/AcctValueFormat")
+
+            before = len(collector.by_endpoint("ws_loaninfo.ashx"))
+            clicked = page.evaluate(
+                """args => {
+                  const account = document.querySelector('#AcctValue');
+                  const formatted = document.querySelector('#AcctValueFormat');
+                  const button = document.querySelector('#btnQuery');
+                  if (!account || !formatted || !button) return false;
+                  account.value = args.account;
+                  formatted.value = args.formatted;
+                  for (const el of [account, formatted]) {
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                  }
+                  button.click();
+                  return true;
+                }""",
+                {"account": account_no, "formatted": formatted},
+            )
+            if not clicked:
+                raise RuntimeError("永豐貸款查詢控制項不存在")
+            page.wait_for_timeout(5000)
+
+            hits = collector.by_endpoint("ws_loaninfo.ashx")[before:]
+            matching_hits = []
+            for hit in hits:
+                if not isinstance(hit.req_body, str):
+                    continue
+                params = parse_qs(hit.req_body, keep_blank_values=True)
+                if (params.get("AcctValue") == [account_no]
+                        and params.get("AcctValueFormat") == [formatted]):
+                    matching_hits.append(hit)
+            if not matching_hits:
+                raise RuntimeError("永豐貸款查詢未收到對應 API 回應")
+            hit = matching_hits[-1]
+            if not 200 <= hit.status < 300:
+                raise RuntimeError("永豐貸款明細 API HTTP 回應失敗")
+            info_raw = hit.resp_json
+            if not (isinstance(info_raw, list) and info_raw
+                    and isinstance(info_raw[0], dict)
+                    and isinstance(info_raw[0].get("SubInfo"), list)):
+                raise RuntimeError("永豐貸款明細 API 未回傳預期結構")
+            body = info_raw[0]
+            records = body["SubInfo"]
+            required = ("LoanKind", "Currency", "LoanBalance")
+            if body.get("Message") or not records or any(
+                not isinstance(record, dict)
+                or any(record.get(key) in (None, "") for key in required)
+                for record in records
+            ):
+                raise RuntimeError("永豐貸款明細缺少必要欄位或銀行回覆失敗")
+            details.append({
+                "account": account_no,
+                "records": records,
+            })
+        return {"details": details, "fetch_ok": True}
 
     def _collect_transactions(self, page, collector) -> list:
         """進往來明細頁、每個帳戶設 hidden inputs + 按 #btnQuery、攔 ws_transdetailMerge.ashx。

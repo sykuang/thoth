@@ -1,0 +1,38 @@
+{
+  "account_response": [
+    {
+      "SubInfo": [
+        {
+          "AcctText": "0123456789012【測試分行】",
+          "AcctValue": "0123456789012",
+          "AcctValueFormat": "012-345-6789012"
+        }
+      ],
+      "MemoUrl": null,
+      "Header": "",
+      "Message": ""
+    }
+  ],
+  "info_response": [
+    {
+      "SubInfo": [
+        {
+          "LoanKind": "信用貸款",
+          "PayName": "平均攤還本息",
+          "Sub1_Sub2": "99-0001",
+          "LoanAcctCName": "測試貸款",
+          "Currency": "TWD",
+          "BeginLoanDate": "20260806",
+          "LoanDate": "20260806",
+          "MatureDate": "20330806",
+          "LoanAmt": "1,000,000",
+          "LoanBalance": "900,000",
+          "LoanRate": "3.00%"
+        }
+      ],
+      "MemoUrl": null,
+      "Header": "",
+      "Message": ""
+    }
+  ]
+}
