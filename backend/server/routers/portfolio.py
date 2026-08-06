@@ -135,15 +135,19 @@ def _latest_loan_balance(bank: str, user_id: int) -> tuple[str, int | None] | No
     if not loan_accts:
         return None
     account_total = 0
-    account_dates = []
+    account_dates: list[str | None] = []
+    account_balances_complete = True
     for account in loan_accts:
         twd_magnitude = _liability_to_twd(account.raw_balance, account.currency)
         if twd_magnitude is None:
-            continue
+            account_balances_complete = False
+            break
         account_total += twd_magnitude
-        account_dates.append(account.raw_balance_date or account.updated_at or "")
-    if account_dates:
-        return (max(account_dates), account_total)
+        account_dates.append(account.raw_balance_date)
+    if account_balances_complete:
+        dated = [date for date in account_dates if date]
+        aggregate_date = min(dated) if len(dated) == len(account_dates) else ""
+        return (aggregate_date, account_total)
     latest = _latest_payload(bank, "balance_latest", user_id)
     if not latest:
         return None

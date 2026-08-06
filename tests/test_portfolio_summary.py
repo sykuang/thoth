@@ -126,12 +126,12 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
         for a in loan_accounts:
             con.execute(
                 """INSERT INTO accounts (account_no, currency, branch, nickname, type, product_type,
-                                          raw_balance, excluded, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                          raw_balance, raw_balance_date, excluded, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (a["account_no"], a.get("currency", "TWD"), a.get("branch"),
                  a.get("nickname"), a.get("type"),
                  a.get("product_type", "loan"),
-                 a.get("balance"),
+                 a.get("balance"), a.get("raw_balance_date"),
                  1 if a.get("excluded") else 0, now),
             )
     if card_summary_category and card_summary_payload is not None:
@@ -485,6 +485,147 @@ def test_loan_fallback_sums_account_balances_without_snapshot(
     assert body["total_loan"] == 500_000
     assert body["total_liabilities"] == 500_000
     assert body["net_worth"] == -400_000
+
+
+def test_partial_account_loan_balances_use_complete_metric_fallback(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        balance=100_000,
+        loan_accounts=[
+            {"account_no": "DBS-L1", "product_type": "loan", "balance": 300_000},
+            {"account_no": "DBS-L2", "product_type": "loan", "balance": None},
+        ],
+        card_summary_category="balance_latest",
+        card_summary_payload={"loan": 800_000},
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["total_loan"] == 800_000
+
+
+def test_undated_account_loan_balance_stays_stale(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        loan_accounts=[
+            {"account_no": "DBS-L1", "product_type": "loan", "balance": 300_000},
+        ],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    dbs = next(row for row in body["by_bank"] if row["bank"] == "dbs")
+
+    assert dbs["loan_balance"] == 300_000
+    assert dbs["as_of"] is None
+    assert dbs["stale"] is True
+
+
+def test_partial_account_loan_balances_without_metric_return_unknown(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        balance=100_000,
+        loan_accounts=[
+            {"account_no": "DBS-L1", "product_type": "loan", "balance": 300_000},
+            {"account_no": "DBS-L2", "product_type": "loan", "balance": None},
+        ],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    dbs = next(row for row in body["by_bank"] if row["bank"] == "dbs")
+
+    assert dbs["loan_balance"] is None
+    assert body["total_loan"] == 0
+
+
+def test_failed_fx_loan_conversion_uses_complete_metric_fallback(
+    temp_data_root, client, auth_headers, monkeypatch
+):
+    from backend.server import fx_service
+
+    monkeypatch.setattr(fx_service, "convert_to_twd", lambda _amount, _currency: None)
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        balance=100_000,
+        loan_accounts=[
+            {"account_no": "DBS-L1", "product_type": "loan", "balance": 300_000},
+            {
+                "account_no": "DBS-L2",
+                "currency": "USD",
+                "product_type": "loan",
+                "balance": 10_000,
+            },
+        ],
+        card_summary_category="balance_latest",
+        card_summary_payload={"loan": 800_000},
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["total_loan"] == 800_000
+
+
+def test_mixed_dated_and_undated_account_loans_stay_stale(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        loan_accounts=[
+            {
+                "account_no": "DBS-L1",
+                "product_type": "loan",
+                "balance": 100_000,
+                "raw_balance_date": "2026-08-06",
+            },
+            {"account_no": "DBS-L2", "product_type": "loan", "balance": 200_000},
+        ],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    dbs = next(row for row in body["by_bank"] if row["bank"] == "dbs")
+
+    assert dbs["loan_balance"] == 300_000
+    assert dbs["as_of"] is None
+    assert dbs["stale"] is True
+
+
+def test_account_loan_aggregate_uses_oldest_balance_date(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        loan_accounts=[
+            {
+                "account_no": "DBS-L1",
+                "product_type": "loan",
+                "balance": 100_000,
+                "raw_balance_date": "2026-08-01",
+            },
+            {
+                "account_no": "DBS-L2",
+                "product_type": "loan",
+                "balance": 200_000,
+                "raw_balance_date": "2026-08-06",
+            },
+        ],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    dbs = next(row for row in body["by_bank"] if row["bank"] == "dbs")
+
+    assert dbs["loan_balance"] == 300_000
+    assert dbs["as_of"] == "2026-08-01"
 
 
 def test_no_loan_data_zero_loan_field(temp_data_root, client, auth_headers):
