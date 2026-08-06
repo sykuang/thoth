@@ -401,7 +401,7 @@ def test_loan_balance_from_balance_history(temp_data_root, client, auth_headers)
     """貸款餘額存在 balance_history.loan_balance → 走 fast path."""
     _seed_bank_db(temp_data_root, "scsb",
                   balance=13_065,           # 真實活儲（小額）
-                  loan_balance=20_589_800,  # 房貸（被誤算成資產的那筆）
+                  loan_balance=-20_589_800,  # legacy signed row 讀取時須正規化為負債規模
                   )
     r = client.get("/portfolio/summary", headers=auth_headers)
     body = r.json()
@@ -467,6 +467,26 @@ def test_loan_fallback_from_accounts_table(temp_data_root, client, auth_headers)
     assert cathay["loan_balance"] == 800_000
 
 
+def test_loan_fallback_sums_account_balances_without_snapshot(
+    temp_data_root, client, auth_headers
+):
+    _seed_bank_db(
+        temp_data_root,
+        "dbs",
+        balance=100_000,
+        loan_accounts=[
+            {"account_no": "DBS-L1", "product_type": "loan", "balance": 300_000},
+            {"account_no": "DBS-L2", "product_type": "mortgage", "balance": -200_000},
+        ],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["total_loan"] == 500_000
+    assert body["total_liabilities"] == 500_000
+    assert body["net_worth"] == -400_000
+
+
 def test_no_loan_data_zero_loan_field(temp_data_root, client, auth_headers):
     """完全沒貸款資料 → total_loan=0, by_bank.loan_balance=None."""
     _seed_bank_db(temp_data_root, "cathay", balance=500_000)
@@ -480,6 +500,58 @@ def test_no_loan_data_zero_loan_field(temp_data_root, client, auth_headers):
 # ============================================================
 # fx_assets_twd — 外幣帳戶 TWD 估值（使用者 2026-06-14 「總資產要加入外幣」）
 # ============================================================
+
+def test_foreign_currency_loan_is_not_counted_as_fx_asset(
+    temp_data_root, client, auth_headers, monkeypatch
+):
+    from backend.server import fx_service
+
+    monkeypatch.setattr(fx_service, "get_rate", lambda _currency: 30.0)
+    monkeypatch.setattr(fx_service, "convert_to_twd", lambda amount, _currency: round(amount * 30))
+    _seed_bank_db(
+        temp_data_root,
+        "cathay",
+        balance=100_000,
+        loan_accounts=[{
+            "account_no": "LOAN-USD",
+            "currency": "USD",
+            "product_type": "loan",
+            "balance": 10_000,
+        }],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["fx_assets_twd"] == 0
+    assert body["total_loan"] == 300_000
+    assert body["net_worth_with_fx"] == -200_000
+
+
+def test_excluded_foreign_currency_loan_is_removed_in_twd(
+    temp_data_root, client, auth_headers, monkeypatch
+):
+    from backend.server import fx_service
+
+    monkeypatch.setattr(fx_service, "convert_to_twd", lambda amount, _currency: round(amount * 30))
+    _seed_bank_db(
+        temp_data_root,
+        "cathay",
+        balance=100_000,
+        loan_accounts=[{
+            "account_no": "LOAN-USD",
+            "currency": "USD",
+            "product_type": "loan",
+            "balance": 10_000,
+            "excluded": True,
+        }],
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["fx_assets_twd"] == 0
+    assert body["total_loan"] == 0
+    assert body["net_worth_with_fx"] == 100_000
+
 
 def test_fx_assets_twd_zero_when_no_fx_accounts(
     temp_data_root, client, auth_headers, monkeypatch

@@ -27,7 +27,7 @@ from datetime import datetime, UTC
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
 
-from backend.core import bank_pg
+from backend.core import account_classify, bank_pg
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -1400,6 +1400,9 @@ class BankStore:
         before = self.conn.total_changes
         now = _now()
         for r in rows:
+            loan_balance = account_classify.normalize_liability_magnitude(
+                r.get("loanBalance"),
+            )
             self.conn.execute(
                 """INSERT INTO balance_history
                        (user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at)
@@ -1410,7 +1413,7 @@ class BankStore:
                                  loan_balance=excluded.loan_balance,
                                  updated_at=excluded.updated_at""",
                 (self.user_id, r.get("snapshotDate"), r.get("twdBalance"), r.get("fxBalance"),
-                 r.get("loanBalance"), now),
+                 loan_balance, now),
             )
         self.conn.commit()
         return self.conn.total_changes - before
@@ -1422,6 +1425,7 @@ class BankStore:
         新增欄位（使用者鐵律：所有爬蟲都該抓帳號級餘額）：
           - raw_balance (REAL): 帳號餘額（爬蟲層直接抓的，非 twd_txn 推算）
               0 跟 None 有意義區別：0=真實 0 餘額（顯示 $0）、None=爬不到（顯示 —）
+              負債類 product_type 統一存成負值；資產類保留銀行原值。
           - raw_balance_date (TEXT): 該餘額的 snapshot 日期，ISO YYYY-MM-DD
         既有 caller 不帶這兩欄就傳 None（不覆蓋之前抓到的）— UPSERT 用 COALESCE
         保護舊值，避免某次爬蟲忘了帶 raw_balance 就把歷史餘額沖掉。
@@ -1430,6 +1434,9 @@ class BankStore:
         for a in accts:
             if not a.get("account_no"):
                 continue
+            raw_balance = account_classify.normalize_account_balance(
+                a.get("product_type"), a.get("raw_balance"),
+            )
             self.conn.execute(
                 """INSERT INTO accounts
                        (user_id, account_no, currency, branch, nickname, type, product_type,
@@ -1443,7 +1450,7 @@ class BankStore:
                      updated_at=excluded.updated_at""",
                 (self.user_id, a.get("account_no"), a.get("currency"), a.get("branch"), a.get("nickname"),
                  a.get("type"), a.get("product_type"),
-                 a.get("raw_balance"), a.get("raw_balance_date"),
+                 raw_balance, a.get("raw_balance_date"),
                  now),
             )
         self.conn.commit()

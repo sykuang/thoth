@@ -80,6 +80,7 @@ def test_persist_scsb_first_deposit_remains_asset_not_loan(tmp_path, monkeypatch
     assert got["90000000167058"]["product_type"] == "deposit"
     assert got["90000000167058"]["raw_balance"] == 73500
     assert got["90000000247044"]["product_type"] == "loan"
+    assert got["90000000247044"]["raw_balance"] == -20589800
 
 
 def test_scsb_twd_inquiry_accepts_chinese_menu_labels():

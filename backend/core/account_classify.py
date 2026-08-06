@@ -68,6 +68,27 @@ def is_liability_type(product_type: str | None) -> bool:
     return product_type in LIABILITY_TYPES
 
 
+def normalize_liability_magnitude(
+    balance: int | float | None,
+) -> int | float | None:
+    """統一 aggregate liability：永遠用正數規模供 assets - liabilities。"""
+    return abs(balance) if balance is not None else None
+
+
+def normalize_account_balance(
+    product_type: str | None,
+    balance: int | float | None,
+) -> int | float | None:
+    """統一帳戶餘額符號：負債帳戶為負，其他類型保留銀行原值。
+
+    只處理 account-level balance；`loan_balance` / `total_liabilities` 是供
+    aggregate 扣除的正數規模，不走這個 helper。
+    """
+    if balance is None:
+        return None
+    return -abs(balance) if is_liability_type(product_type) else balance
+
+
 # ============================================================
 # Per-bank classifiers
 # ============================================================

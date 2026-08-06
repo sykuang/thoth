@@ -43,7 +43,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from backend.core import bank_data
+from backend.core import account_classify, bank_data
 from backend.server.deps import current_user
 from backend.server import fx_service
 from backend.server.dashboard_cache import (
@@ -83,6 +83,20 @@ def _to_int(val: Any) -> int | None:
         return None
 
 
+def _liability_to_twd(balance: int | float | None, currency: str | None) -> int | None:
+    """Canonical liability magnitude converted to TWD; unavailable FX stays unknown."""
+    magnitude = account_classify.normalize_liability_magnitude(balance)
+    if magnitude is None:
+        return None
+    normalized_currency = (currency or "TWD").upper()
+    if normalized_currency == "TWD":
+        return round(magnitude)
+    try:
+        return fx_service.convert_to_twd(magnitude, normalized_currency)
+    except Exception:
+        return None
+
+
 def _latest_payload(bank: str, category: str, user_id: int) -> tuple[str, dict] | None:
     """撈某 bank 某 category 最新 snapshot 的 payload_json (parse 完). None = 沒資料.
 
@@ -114,19 +128,32 @@ def _latest_loan_balance(bank: str, user_id: int) -> tuple[str, int | None] | No
     # 1. 優先 balance_history.loan_balance
     lb = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
     if lb is not None:
-        return (lb.snapshot_date, lb.loan_balance)
+        magnitude = account_classify.normalize_liability_magnitude(lb.loan_balance)
+        return (lb.snapshot_date, int(magnitude) if magnitude is not None else None)
     # 2. fallback：accounts 有 product_type 為 loan/mortgage 才進 daily_metrics 撈
     loan_accts = db_api.list_loan_accounts(bank=bank, user_id=user_id)
     if not loan_accts:
         return None
+    account_total = 0
+    account_dates = []
+    for account in loan_accts:
+        twd_magnitude = _liability_to_twd(account.raw_balance, account.currency)
+        if twd_magnitude is None:
+            continue
+        account_total += twd_magnitude
+        account_dates.append(account.raw_balance_date or account.updated_at or "")
+    if account_dates:
+        return (max(account_dates), account_total)
     latest = _latest_payload(bank, "balance_latest", user_id)
     if not latest:
         return None
     snapshot_date, payload = latest
-    loan = _to_int(payload.get("loan"))
-    if loan is None or loan <= 0:
+    loan = account_classify.normalize_liability_magnitude(
+        _to_int(payload.get("loan")),
+    )
+    if loan is None or loan == 0:
         return None
-    return (snapshot_date, loan)
+    return (snapshot_date, int(loan))
 
 
 def _is_stale(snapshot_iso: str | None) -> bool:
@@ -448,7 +475,6 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         # 鐵則: 用 _bank_accounts() 同邏輯抓 per-account balance, 過濾 currency!=TWD,
         # 用 fx_service.convert_to_twd 換 TWD; 抓不到 rate 該帳戶 skip
         # Phase 6 (excluded): 跳過使用者手動標「不納入淨資產統計」的帳戶
-        LOAN_TYPES = ("loan", "mortgage", "credit_line")
         bank_fx_twd = 0
         twd_excluded_deduct = 0    # 台幣存款 excluded → 從 assets 扣
         loan_excluded_deduct = 0   # 貸款 excluded → 從 loan_balance 扣
@@ -459,10 +485,12 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
             for acc in bank_accounts:
                 cur = (acc.currency or "TWD").upper()
                 ptype = (acc.product_type or "").lower()
-                # 貸款類 excluded — 不管什麼幣別 (理論上都 TWD), 從 loan_balance 扣
-                if acc.excluded and ptype in LOAN_TYPES:
-                    if acc.balance is not None:
-                        loan_excluded_deduct += round(abs(acc.balance))
+                # 負債帳戶永遠不進 FX 資產；excluded 才從負債 aggregate 扣除。
+                if account_classify.is_liability_type(ptype):
+                    if acc.excluded and acc.balance is not None:
+                        excluded_twd = _liability_to_twd(acc.balance, acc.currency)
+                        if excluded_twd is not None:
+                            loan_excluded_deduct += excluded_twd
                     continue
                 if cur == "TWD":
                     # 台幣存款 excluded (非貸款) → 從 assets 扣
@@ -601,6 +629,7 @@ def _bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
       2. twd_transactions 最新一筆 balance — 舊邏輯 fallback
       3. balance_history.loan_balance — 貸款帳戶 fallback
       4. None — fall through
+      最後統一符號：loan/mortgage/credit_line balance 一律為負。
 
     Plan B B4: 全 SQL 走 db_facade. Caller 不再傳 con.
     """
@@ -634,11 +663,13 @@ def _bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
             tb = txn_balances[account_no]
             balance = tb.balance
             snapshot_date = _normalize_iso_date(tb.txn_datetime)
-        elif product_type in ("loan", "mortgage", "credit_line") and loan_balance_total is not None:
+        elif account_classify.is_liability_type(product_type) and loan_balance_total is not None:
             balance = loan_balance_total
             snapshot_date = loan_balance_date
         else:
             snapshot_date = _normalize_iso_date(a.updated_at)
+
+        balance = account_classify.normalize_account_balance(product_type, balance)
 
         currency = (a.currency or "TWD").upper()
 

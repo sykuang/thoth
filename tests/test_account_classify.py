@@ -9,6 +9,8 @@ from backend.core.account_classify import (
     classify_by_keyword,
     is_asset_type,
     is_liability_type,
+    normalize_account_balance,
+    normalize_liability_magnitude,
 )
 
 
@@ -34,6 +36,57 @@ class TestHelpers:
         assert is_liability_type(ProductType.CREDIT_LINE)
         assert not is_liability_type(ProductType.DEPOSIT)
         assert not is_liability_type(ProductType.INVESTMENT)
+
+    @pytest.mark.parametrize("product_type", [
+        ProductType.LOAN,
+        ProductType.MORTGAGE,
+        ProductType.CREDIT_LINE,
+    ])
+    def test_normalize_account_balance_makes_liabilities_negative(self, product_type):
+        assert normalize_account_balance(product_type, 1234.5) == -1234.5
+        assert normalize_account_balance(product_type, -1234.5) == -1234.5
+        assert normalize_account_balance(product_type, 0) == 0
+        assert normalize_account_balance(product_type, None) is None
+
+    def test_normalize_account_balance_preserves_non_liabilities(self):
+        assert normalize_account_balance(ProductType.DEPOSIT, 1234.5) == 1234.5
+        assert normalize_account_balance(ProductType.DEPOSIT, -1234.5) == -1234.5
+
+    def test_normalize_liability_magnitude_is_always_positive(self):
+        assert normalize_liability_magnitude(1234.5) == 1234.5
+        assert normalize_liability_magnitude(-1234.5) == 1234.5
+        assert normalize_liability_magnitude(0) == 0
+        assert normalize_liability_magnitude(None) is None
+
+
+    def test_bank_store_applies_canonical_liability_signs(self, tmp_path, monkeypatch):
+        from backend.core.store import BankStore
+
+        monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+        store = BankStore("sign_test")
+        try:
+            store.upsert_accounts([{
+                "account_no": "LOAN-1",
+                "product_type": ProductType.LOAN,
+                "raw_balance": 1234.5,
+            }])
+            store.upsert_balance_history([{
+                "snapshotDate": "2026-08-06",
+                "loanBalance": -1234,
+            }])
+            account = store.conn.execute(
+                "SELECT raw_balance FROM accounts WHERE account_no='LOAN-1'"
+            ).fetchone()
+            snapshot = store.conn.execute(
+                "SELECT loan_balance FROM balance_history WHERE snapshot_date='2026-08-06'"
+            ).fetchone()
+        finally:
+            store.close()
+
+        assert account is not None
+        assert snapshot is not None
+        assert account["raw_balance"] == -1234.5
+        assert snapshot["loan_balance"] == 1234
 
 
 # ============================================================

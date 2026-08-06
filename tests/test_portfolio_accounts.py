@@ -706,7 +706,7 @@ def test_portfolio_accounts_loan_fallback_when_no_raw_balance(
     assert r.status_code == 200
     rows = r.json()
     assert len(rows) == 1
-    assert rows[0]["balance"] == 500_000
+    assert rows[0]["balance"] == -500_000
     assert rows[0]["product_type"] == "loan"
 
 
@@ -735,7 +735,7 @@ def test_portfolio_accounts_raw_balance_beats_loan_fallback(
     r = client.get("/portfolio/accounts", headers=auth_headers)
     rows = r.json()
     # 用 raw_balance 不是 balance_history
-    assert rows[0]["balance"] == 20589800
+    assert rows[0]["balance"] == -20589800
     assert rows[0]["snapshot_date"] == "2026-06-14"
 
 
@@ -774,7 +774,7 @@ def test_portfolio_accounts_raw_balance_multi_bank_integration(
         ])
     r = client.get("/portfolio/accounts", headers=auth_headers)
     rows = r.json()
-    # 5 個帳戶都應出現，各自 raw_balance 正確
+    # 5 個帳戶都應出現；貸款在共用 canonical seam 統一為負值
     by_acct = {f"{r['bank']}|{r['account_no']}": r for r in rows}
     assert by_acct["ubot|U1"]["balance"] == 15
     assert by_acct["sinopac|S1"]["balance"] == 1088367
@@ -782,5 +782,5 @@ def test_portfolio_accounts_raw_balance_multi_bank_integration(
     assert by_acct["sinopac|S2"]["currency"] == "JPY"
     assert by_acct["sinopac|S2"]["twd_estimate"] == 240277  # 1201387 * 0.2
     assert by_acct["scsb|11101"]["balance"] == 13065
-    assert by_acct["scsb|57263"]["balance"] == 20589800
+    assert by_acct["scsb|57263"]["balance"] == -20589800
     assert by_acct["scsb|57263"]["product_type"] == "loan"

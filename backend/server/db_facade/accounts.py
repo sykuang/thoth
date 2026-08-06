@@ -76,6 +76,8 @@ class LoanAccountRow(BaseModel):
     account_no: str
     currency: str | None = None
     product_type: str | None = None
+    raw_balance: float | None = None
+    raw_balance_date: str | None = None
     updated_at: str | None = None
 
 
@@ -197,7 +199,8 @@ class AccountsReadMixin(_BaseHelpers):
         try:
             try:
                 rows = con.execute(
-                    """SELECT account_no, currency, product_type, updated_at
+                    """SELECT account_no, currency, product_type,
+                              raw_balance, raw_balance_date, updated_at
                        FROM accounts WHERE user_id = ? AND product_type IN ('loan', 'mortgage', 'credit_line')""",
                     (user_id,),
                 ).fetchall()
@@ -205,11 +208,14 @@ class AccountsReadMixin(_BaseHelpers):
                 return []
             out: list[LoanAccountRow] = []
             for r in rows:
+                raw_balance = r["raw_balance"]
                 out.append(LoanAccountRow(
                     bank=bank,
                     account_no=r["account_no"] or "",
                     currency=r["currency"],
                     product_type=r["product_type"],
+                    raw_balance=float(raw_balance) if raw_balance is not None else None,
+                    raw_balance_date=r["raw_balance_date"],
                     updated_at=r["updated_at"],
                 ))
             return out
