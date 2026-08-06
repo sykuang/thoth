@@ -231,6 +231,7 @@ export default function AccountsTabScreen() {
       qc.invalidateQueries({ queryKey: ['portfolio'] });
       qc.invalidateQueries({ queryKey: ['cards'] });
       qc.invalidateQueries({ queryKey: ['accounts'] });
+      qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
     }
     prevHasRunningRef.current = hasRunning;
   }, [hasRunning, qc]);

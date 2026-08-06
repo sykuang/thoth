@@ -12,11 +12,11 @@
  */
 import '../../global.css';
 
-import { QueryClientProvider } from '@tanstack/react-query';
+import { focusManager, QueryClientProvider } from '@tanstack/react-query';
 import { router, Stack } from 'expo-router';
 import { useColorScheme } from 'nativewind';
 import { useEffect } from 'react';
-import { ActivityIndicator, View } from 'react-native';
+import { ActivityIndicator, AppState, Platform, View } from 'react-native';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { authenticate } from '@/lib/biometric';
@@ -41,6 +41,18 @@ export default function RootLayout() {
   useEffect(() => {
     setColorScheme(themeMode); // 'system' | 'light' | 'dark' 三種值都吃
   }, [themeMode, setColorScheme]);
+
+  // React Query 在 React Native 不會自行收到 browser window focus 事件。
+  // 把 AppState 接到 focusManager，讓日期衍生 query（例如繳費提醒）能在
+  // app 跨日後回到前景時重新取得今天的狀態；web 仍沿用 browser adapter。
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    focusManager.setFocused(AppState.currentState === 'active');
+    const subscription = AppState.addEventListener('change', (status) => {
+      focusManager.setFocused(status === 'active');
+    });
+    return () => subscription.remove();
+  }, []);
 
   // Biometric unlock — opt-in only. User toggles in Settings → 安全性 → 生物識別.
   // 預設 false → fresh install 不會跳 Face ID 權限 / 解鎖框。

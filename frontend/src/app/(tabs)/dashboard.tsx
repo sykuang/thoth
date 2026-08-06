@@ -98,6 +98,8 @@ export default function Dashboard() {
   const remindersQ = useQuery<PaymentReminder[]>({
     queryKey: ['auto-debit', 'reminders'],
     queryFn: () => api<PaymentReminder[]>('/cards/auto-debit/reminders'),
+    // days_until_due 是日期衍生值；app 跨日後回前景時不能沿用昨天的 cache。
+    refetchOnWindowFocus: 'always',
   });
 
   // W (2026-06-17): 砍 lastJobByAccount — UI 已沒 per-account 最後同步時間顯示
@@ -146,6 +148,7 @@ export default function Dashboard() {
       qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
       qc.invalidateQueries({ queryKey: ['accounts'] });
       qc.invalidateQueries({ queryKey: ['cards'] });
+      qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
     }
     prevHasRunningRef.current = hasRunningJob;
   }, [hasRunningJob, qc]);
