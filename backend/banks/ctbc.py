@@ -68,6 +68,11 @@ def _close_entry_announcement(page) -> bool:
     return True
 
 
+def _submit_login_once(page) -> None:
+    """送出登入一次；任何 click 例外都 fail closed，禁止 fallback 再點。"""
+    page.click(SEL_SUBMIT, timeout=8000)
+
+
 # 「確認訊息」彈窗的「確認登入」按鈕（前次未正常登出時跳出）
 JS_CONFIRM_LOGIN = (
     "(() => { const b=[...document.querySelectorAll('button,a,[role=button]')]"
@@ -262,13 +267,7 @@ class CtbcCrawler(BankCrawler):
         page.wait_for_timeout(300)
         page.fill(SEL_PWD, self.creds.password)
         page.wait_for_timeout(300)
-        try:
-            page.click(SEL_SUBMIT, timeout=8000)
-        except Exception:
-            page.evaluate(
-                "(() => { const a=document.querySelector('a.btn_submit')"
-                "||[...document.querySelectorAll('a,button')].find(x=>/登入/.test(x.textContent||'')); if(a) a.click(); })()",
-            )
+        _submit_login_once(page)
         _log("[login] 已送出，等登入結果…")
         page.wait_for_timeout(5000)
 

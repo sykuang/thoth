@@ -22,6 +22,7 @@ from backend.banks.ctbc import (
     _build_qu002_011_post_body,
     _close_entry_announcement,
     _filter_valid_ctbc_details,
+    _submit_login_once,
 )
 
 
@@ -118,6 +119,31 @@ def test_close_entry_announcement_targets_only_matching_visible_modal():
         assert _close_entry_announcement(page) is True
         assert page.evaluate("window.clicked") == "announcement"
         browser.close()
+
+
+class _SubmitPage:
+    def __init__(self) -> None:
+        self.submit_clicks = 0
+        self.evaluate_calls = 0
+
+    def click(self, selector: str, *, timeout: int) -> None:
+        assert selector == "a.btn_submit"
+        assert timeout == 8000
+        self.submit_clicks += 1
+        raise TimeoutError("navigation timed out after click was dispatched")
+
+    def evaluate(self, _script: str) -> None:
+        self.evaluate_calls += 1
+
+
+def test_submit_timeout_never_falls_back_to_second_click():
+    page = _SubmitPage()
+
+    with pytest.raises(TimeoutError, match="navigation timed out"):
+        _submit_login_once(page)
+
+    assert page.submit_clicks == 1
+    assert page.evaluate_calls == 0
 
 
 # ============================================================
