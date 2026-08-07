@@ -14,6 +14,8 @@ Collector 該 skip + log, 不該往下游 persist 送結構不全的 dict.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from backend.banks.ctbc import (
@@ -76,6 +78,8 @@ def test_close_entry_announcement_targets_only_matching_visible_modal():
     from patchright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_content(
