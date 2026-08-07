@@ -36,6 +36,38 @@ SEL_USER = 'input[formcontrolname="userIxd"]'  # 使用者代號
 SEL_PWD = 'input[formcontrolname="pxd"]'       # 網銀密碼
 SEL_SUBMIT = "a.btn_submit"
 
+
+def _close_entry_announcement(page) -> bool:
+    """關閉入口頁可見的公告 modal，並確認登入表單已顯示。"""
+    clicked = page.evaluate(
+        """
+        () => {
+          const visible = (e) => {
+            if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) {
+              return false;
+            }
+            const style = getComputedStyle(e);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const modal = [...document.querySelectorAll('.modal')]
+            .find(e => visible(e) && /重要公告/.test(e.innerText || ''));
+          const close = modal && [...modal.querySelectorAll('a.btn_close')].find(visible);
+          if (!close) return false;
+          close.click();
+          return true;
+        }
+        """,
+    )
+    if not clicked:
+        return False
+    page.wait_for_timeout(500)
+    try:
+        page.wait_for_selector(SEL_ID, state="visible", timeout=5000)
+    except Exception:
+        return False
+    return True
+
+
 # 「確認訊息」彈窗的「確認登入」按鈕（前次未正常登出時跳出）
 JS_CONFIRM_LOGIN = (
     "(() => { const b=[...document.querySelectorAll('button,a,[role=button]')]"
@@ -207,6 +239,8 @@ class CtbcCrawler(BankCrawler):
           CtbcLoginError: 登入表單沒出現 + 不在內銀區，或送出後 ~20s 仍未進內銀區
         """
         page.wait_for_timeout(3500)
+        if _close_entry_announcement(page):
+            _log("[login] 已關閉入口重要公告，登入表單已顯示")
         if self._enter_overview_if_interstitial(page) or self._logged_in(page):
             _log(f"[login] ✅ session 還在，免登入 -> {page.url}")
             return True

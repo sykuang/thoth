@@ -16,7 +16,104 @@ from __future__ import annotations
 
 import pytest
 
-from backend.banks.ctbc import _build_qu002_011_post_body, _filter_valid_ctbc_details
+from backend.banks.ctbc import (
+    _build_qu002_011_post_body,
+    _close_entry_announcement,
+    _filter_valid_ctbc_details,
+)
+
+
+class _AnnouncementPage:
+    def __init__(self, *, visible: bool, form_after_click: bool = True) -> None:
+        self.visible = visible
+        self.form_after_click = form_after_click
+        self.clicked = 0
+        self.waited = 0
+
+    def evaluate(self, script: str):
+        assert "/重要公告/" in script
+        if not self.visible:
+            return False
+        self.visible = False
+        self.clicked += 1
+        return True
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waited += ms
+
+    def wait_for_selector(self, selector: str, *, state: str, timeout: int) -> None:
+        assert selector == 'input[formcontrolname="custIxd"]'
+        assert state == "visible"
+        assert timeout == 5000
+        if not self.form_after_click:
+            raise TimeoutError("form missing")
+
+
+def test_close_entry_announcement_reveals_login_form():
+    page = _AnnouncementPage(visible=True)
+
+    assert _close_entry_announcement(page) is True
+    assert page.clicked == 1
+    assert page.waited == 500
+
+
+def test_close_entry_announcement_is_noop_without_visible_close():
+    page = _AnnouncementPage(visible=False)
+
+    assert _close_entry_announcement(page) is False
+    assert page.clicked == 0
+    assert page.waited == 0
+
+
+def test_close_entry_announcement_does_not_claim_success_without_form():
+    page = _AnnouncementPage(visible=True, form_after_click=False)
+
+    assert _close_entry_announcement(page) is False
+    assert page.clicked == 1
+
+
+def test_close_entry_announcement_targets_only_matching_visible_modal():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            """
+            <style>
+              .modal { display: block; }
+              .hidden { display: none; }
+            </style>
+            <a class="btn_close" id="outside-close">outside</a>
+            <div class="modal hidden"><a class="btn_close">重要公告 hidden</a></div>
+            <div class="modal" id="security-modal">
+              <p>安全提醒</p><a class="btn_close">security</a>
+            </div>
+            <div class="modal" id="announcement-modal">
+              <p>重要公告</p>
+              <a class="btn_close" id="hidden-announcement-close" style="visibility:hidden">hidden</a>
+              <a class="btn_close" id="visible-announcement-close">announcement</a>
+            </div>
+            <input formcontrolname="custIxd" style="display:none">
+            """,
+        )
+        page.evaluate(
+            """() => {
+              document.querySelector('#outside-close').onclick = () => { window.clicked = 'outside'; };
+              document.querySelector('#security-modal .btn_close').onclick = () => { window.clicked = 'security'; };
+              document.querySelector('#announcement-modal #hidden-announcement-close').onclick = () => {
+                window.clicked = 'hidden';
+              };
+              document.querySelector('#announcement-modal #visible-announcement-close').onclick = () => {
+                window.clicked = 'announcement';
+                document.querySelector('input[formcontrolname="custIxd"]').style.display = 'block';
+              };
+            }""",
+        )
+
+        assert _close_entry_announcement(page) is True
+        assert page.evaluate("window.clicked") == "announcement"
+        browser.close()
 
 
 # ============================================================
