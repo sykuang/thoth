@@ -48,6 +48,14 @@ param serverApiKey string
 @secure()
 param pgAdminPassword string
 
+@description('Optional SnapTrade client ID. Leave empty to disable brokerage integration.')
+@secure()
+param snapTradeClientId string = ''
+
+@description('Optional SnapTrade consumer key. Leave empty to disable brokerage integration.')
+@secure()
+param snapTradeConsumerKey string = ''
+
 @description('Object ID of the deploying principal (az ad signed-in-user show --query id -o tsv). Granted Key Vault Secrets Officer to seed secrets during deploy.')
 param deployerObjectId string
 
@@ -364,6 +372,7 @@ resource miSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 // pgAdminPassword 是 @secure() param，內插後仍保 secure flag 直到寫入 KV secret value。
 // **注意**：不能拿 databaseUrl 當 Bicep output (會 fail at deploy time，secure value 不能輸出)。
 var databaseUrl = format('postgresql://{0}:{1}@{2}:5432/{3}?sslmode=require', pgAdminUser, pgAdminPassword, pg.properties.fullyQualifiedDomainName, pgDbName)
+var snapTradeConfigured = !empty(snapTradeClientId) && !empty(snapTradeConsumerKey)
 
 resource kvSecretJwt 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: kv
@@ -412,6 +421,34 @@ resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   name: 'database-url-vnet-v2'
   properties: {
     value: databaseUrl
+    attributes: {
+      enabled: true
+    }
+  }
+  dependsOn: [
+    deployerSecretsOfficer
+  ]
+}
+
+resource kvSecretSnapTradeClientId 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (snapTradeConfigured) {
+  parent: kv
+  name: 'snaptrade-client-id'
+  properties: {
+    value: snapTradeClientId
+    attributes: {
+      enabled: true
+    }
+  }
+  dependsOn: [
+    deployerSecretsOfficer
+  ]
+}
+
+resource kvSecretSnapTradeConsumerKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (snapTradeConfigured) {
+  parent: kv
+  name: 'snaptrade-consumer-key'
+  properties: {
+    value: snapTradeConsumerKey
     attributes: {
       enabled: true
     }
@@ -483,7 +520,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
       ]
       // Key Vault reference 模式：value 改成 keyVaultUrl + identity
       // ACA runtime 用指定的 MI 去 Key Vault 拉，注入成 env 給 container
-      secrets: [
+      secrets: concat([
         {
           name: 'jwt-secret'
           keyVaultUrl: kvSecretJwt.properties.secretUri
@@ -504,7 +541,18 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: kvSecretDatabaseUrl.properties.secretUri
           identity: mi.id
         }
-      ]
+      ], snapTradeConfigured ? [
+        {
+          name: 'snaptrade-client-id'
+          keyVaultUrl: kvSecretSnapTradeClientId!.properties.secretUri
+          identity: mi.id
+        }
+        {
+          name: 'snaptrade-key'
+          keyVaultUrl: kvSecretSnapTradeConsumerKey!.properties.secretUri
+          identity: mi.id
+        }
+      ] : [])
     }
     template: {
       containers: [
@@ -515,7 +563,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('1.0')
             memory: '2.0Gi'
           }
-          env: [
+          env: concat([
             { name: 'JWT_SECRET', secretRef: 'jwt-secret' }
             { name: 'SERVER_FERNET_KEY', secretRef: 'fernet-key-v2' }
             { name: 'SERVER_API_KEY', secretRef: 'api-key' }
@@ -527,7 +575,10 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'DATABASE_URL', secretRef: 'database-url-vnet-v2' }
             { name: 'CORS_ORIGINS', value: effectiveCorsOrigins }
             { name: 'PYTHONUNBUFFERED', value: '1' }
-          ]
+          ], snapTradeConfigured ? [
+            { name: 'SNAPTRADE_CLIENT_ID', secretRef: 'snaptrade-client-id' }
+            { name: 'SNAPTRADE_CONSUMER_KEY', secretRef: 'snaptrade-key' }
+          ] : [])
           probes: [
             {
               type: 'Liveness'

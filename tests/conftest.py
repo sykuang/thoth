@@ -109,6 +109,11 @@ def client(tmp_path, monkeypatch):
     except ModuleNotFoundError:
         pass
     try:
+        import backend.server.routers.snaptrade as r_snaptrade
+        importlib.reload(r_snaptrade)
+    except ModuleNotFoundError:
+        pass
+    try:
         import backend.server.routers.sync as r_sync
         importlib.reload(r_sync)
     except ModuleNotFoundError:

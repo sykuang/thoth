@@ -113,6 +113,9 @@ jobs:
         # 型別檢查不通過直接 block — 型別錯誤就是 bug。
         run: pnpm typecheck
 
+      - name: Decimal formatting regression
+        run: pnpm test:decimal
+
       - name: ESLint (informational — does not block CI)
         # `expo lint` runs ESLint with expo-config. Currently surfaces some React
         # warnings (setState in useEffect, etc.) that are pre-existing and not

@@ -211,6 +211,7 @@ from backend.server.routers.portfolio import router as portfolio_router
 from backend.server.routers.preferences import router as preferences_router
 from backend.server.routers.push import router as push_router
 from backend.server.routers.rules import router as rules_router
+from backend.server.routers.snaptrade import router as snaptrade_router
 from backend.server.routers.sync import router as sync_router
 from backend.server.routers.sync_preference import router as sync_preference_router
 from backend.server.routers.sync_ws import router as sync_ws_router
@@ -223,7 +224,7 @@ for _r in (
     # auto_debit 必須在 cards 之前 — /cards/auto-debit/* 是 specific path，
     # 否則 cards_router 的 /cards/{bank}/{card_no} 會 greedy match 變 404.
     auto_debit_router, cards_router, preferences_router,
-    portfolio_router, push_router,
+    portfolio_router, push_router, snaptrade_router,
 ):
     app.include_router(_r, prefix=_API_PREFIX)
 

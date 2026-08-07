@@ -501,6 +501,72 @@ export type PortfolioSummary = {
   skipped: string[];
 };
 
+export type SnapTradeStatus = {
+  configured: boolean;
+  registered: boolean;
+  connection_count: number | null;
+  last_synced_at: string | null;
+};
+
+export type BrokerageAccount = {
+  id: string;
+  name: string;
+  number: string | null;
+  institution_name: string;
+  brokerage_slug: string | null;
+  balance_total: string | null;
+  balance_currency: string | null;
+  activities_supported: boolean;
+  holdings_unavailable: boolean;
+  synced_at: string;
+};
+
+export type BrokerageBalance = {
+  account_id: string;
+  currency: string;
+  cash: string | null;
+  buying_power: string | null;
+  synced_at: string;
+};
+
+export type BrokeragePosition = {
+  account_id: string;
+  provider_symbol_id: string;
+  symbol: string;
+  description: string | null;
+  asset_type: string | null;
+  quantity: string;
+  price: string | null;
+  market_value: string | null;
+  average_cost: string | null;
+  currency: string | null;
+  synced_at: string;
+};
+
+export type BrokerageActivity = {
+  id: string;
+  account_id: string;
+  type: string;
+  trade_date: string | null;
+  settlement_date: string | null;
+  symbol: string | null;
+  description: string | null;
+  units: string | null;
+  price: string | null;
+  amount: string | null;
+  fee: string | null;
+  currency: string | null;
+  synced_at: string;
+};
+
+export type SnapTradePortfolio = {
+  accounts: BrokerageAccount[];
+  balances: BrokerageBalance[];
+  positions: BrokeragePosition[];
+  activities: BrokerageActivity[];
+  last_synced_at: string | null;
+};
+
 // =====================================================================
 // Phase 5.1 — Categorization Rules
 // =====================================================================

@@ -53,6 +53,8 @@ else
 fi
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
+SNAPTRADE_CLIENT_ID="${SNAPTRADE_CLIENT_ID:-}"
+SNAPTRADE_CONSUMER_KEY="${SNAPTRADE_CONSUMER_KEY:-}"
 
 # -------- 1. RG --------
 echo "==> [1/5] Ensure RG $RG in $LOCATION"
@@ -116,7 +118,7 @@ echo "    Deployer IP allow: $DEPLOYER_IP_CIDR"
 # inputs explicitly (without echoing secret values).
 export NAME_PREFIX LOCATION ACR_LOGIN_SERVER IMAGE_REF \
   JWT_SECRET SERVER_FERNET_KEY SERVER_API_KEY PG_ADMIN_PASSWORD DEPLOYER_OID \
-  DEPLOYER_IP_CIDR
+  SNAPTRADE_CLIENT_ID SNAPTRADE_CONSUMER_KEY DEPLOYER_IP_CIDR
 
 PARAM_FILE=$(mktemp)
 trap 'rm -f "$PARAM_FILE"' EXIT
@@ -136,6 +138,8 @@ params = {
     "serverFernetKey": {"value": os.environ["SERVER_FERNET_KEY"]},
     "serverApiKey": {"value": os.environ["SERVER_API_KEY"]},
     "pgAdminPassword": {"value": os.environ["PG_ADMIN_PASSWORD"]},
+    "snapTradeClientId": {"value": os.environ.get("SNAPTRADE_CLIENT_ID", "")},
+    "snapTradeConsumerKey": {"value": os.environ.get("SNAPTRADE_CONSUMER_KEY", "")},
     "deployerObjectId": {"value": os.environ["DEPLOYER_OID"]},
     "kvPublicAccess": {"value": kv_public},
     "kvDeployerIpCidr": {"value": os.environ.get("DEPLOYER_IP_CIDR", "") if kv_public else ""},

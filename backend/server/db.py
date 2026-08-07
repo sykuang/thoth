@@ -294,6 +294,91 @@ CREATE INDEX IF NOT EXISTS ix_push_tokens_user
 CREATE INDEX IF NOT EXISTS ix_push_tokens_last_used
     ON user_push_tokens(last_used_at);
 
+-- SnapTrade：server-side app credentials + per-user encrypted SnapTrade identity。
+-- 所有 portfolio rows 明確帶 user_id；provider secrets 永不下放 frontend。
+CREATE TABLE IF NOT EXISTS snaptrade_users (
+    user_id               INTEGER PRIMARY KEY,
+    snaptrade_user_id     TEXT NOT NULL UNIQUE,
+    encrypted_user_secret {_BLOB_TYPE} NOT NULL,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snaptrade_locks (
+    user_id      INTEGER NOT NULL,
+    operation    TEXT NOT NULL,
+    owner_token  TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    PRIMARY KEY (user_id, operation)
+);
+
+CREATE TABLE IF NOT EXISTS brokerage_accounts (
+    user_id               INTEGER NOT NULL,
+    provider              TEXT NOT NULL,
+    provider_account_id   TEXT NOT NULL,
+    name                   TEXT NOT NULL,
+    number                 TEXT,
+    institution_name       TEXT NOT NULL,
+    brokerage_slug         TEXT,
+    balance_total          TEXT,
+    balance_currency       TEXT,
+    activities_supported INTEGER NOT NULL DEFAULT 0,
+    holdings_unavailable INTEGER NOT NULL DEFAULT 0,
+    synced_at              TEXT NOT NULL,
+    PRIMARY KEY (user_id, provider, provider_account_id)
+);
+CREATE INDEX IF NOT EXISTS ix_brokerage_accounts_user
+    ON brokerage_accounts(user_id, provider);
+
+CREATE TABLE IF NOT EXISTS brokerage_balances (
+    user_id              INTEGER NOT NULL,
+    provider             TEXT NOT NULL,
+    provider_account_id  TEXT NOT NULL,
+    currency             TEXT NOT NULL,
+    cash                 TEXT,
+    buying_power         TEXT,
+    synced_at            TEXT NOT NULL,
+    PRIMARY KEY (user_id, provider, provider_account_id, currency)
+);
+
+CREATE TABLE IF NOT EXISTS brokerage_positions (
+    user_id              INTEGER NOT NULL,
+    provider             TEXT NOT NULL,
+    provider_account_id  TEXT NOT NULL,
+    provider_symbol_id   TEXT NOT NULL,
+    symbol               TEXT NOT NULL,
+    description          TEXT,
+    asset_type           TEXT,
+    quantity             TEXT NOT NULL,
+    price                TEXT,
+    market_value         TEXT,
+    average_cost         TEXT,
+    currency             TEXT,
+    synced_at            TEXT NOT NULL,
+    PRIMARY KEY (user_id, provider, provider_account_id, provider_symbol_id)
+);
+
+CREATE TABLE IF NOT EXISTS brokerage_activities (
+    user_id              INTEGER NOT NULL,
+    provider             TEXT NOT NULL,
+    provider_activity_id TEXT NOT NULL,
+    provider_account_id  TEXT NOT NULL,
+    activity_type        TEXT NOT NULL,
+    trade_date           TEXT,
+    settlement_date      TEXT,
+    symbol               TEXT,
+    description          TEXT,
+    units                TEXT,
+    price                TEXT,
+    amount               TEXT,
+    fee                  TEXT,
+    currency             TEXT,
+    synced_at            TEXT NOT NULL,
+    PRIMARY KEY (user_id, provider, provider_account_id, provider_activity_id)
+);
+CREATE INDEX IF NOT EXISTS ix_brokerage_activities_user_date
+    ON brokerage_activities(user_id, provider, trade_date);
+
 -- 2026-06-23 (L13 使用者指示): 自動同步排程 — 每個 user 一個 daily schedule.
 --   * user_id PK = 1 user 1 schedule (1:N to bank_accounts at fire-time)
 --   * Fire 時 fan-out 該 user 全部 has_creds=true 的 account
@@ -433,6 +518,13 @@ def _ensure_schema(conn: Any) -> None:
             conn.execute(stmt)
     else:
         conn.executescript(_SCHEMA)
+
+    brokerage_cols = _columns(conn, "brokerage_accounts")
+    if "holdings_unavailable" not in brokerage_cols:
+        conn.execute(
+            "ALTER TABLE brokerage_accounts "
+            "ADD COLUMN holdings_unavailable INTEGER NOT NULL DEFAULT 0",
+        )
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上
     cols = _columns(conn, "sync_jobs")
@@ -825,20 +917,249 @@ def open_bank_conn(bank: str) -> Connection | None:
     return con
 
 
+_SNAPTRADE_PROVIDER = "snaptrade"
+
+
+def snaptrade_acquire_lock(
+    user_id: int,
+    operation: str,
+    owner_token: str,
+    acquired_at: str,
+    expires_at: str,
+) -> bool:
+    with get_conn() as conn:
+        result = conn.execute(
+            "INSERT INTO snaptrade_locks "
+            "(user_id, operation, owner_token, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (user_id, operation) DO UPDATE SET "
+            "owner_token=excluded.owner_token, acquired_at=excluded.acquired_at, "
+            "expires_at=excluded.expires_at WHERE snaptrade_locks.expires_at <= excluded.acquired_at",
+            (user_id, operation, owner_token, acquired_at, expires_at),
+        )
+        return result.rowcount == 1
+
+
+def snaptrade_release_lock(user_id: int, operation: str, owner_token: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM snaptrade_locks "
+            "WHERE user_id = ? AND operation = ? AND owner_token = ?",
+            (user_id, operation, owner_token),
+        )
+
+
+def snaptrade_get_credentials(user_id: int) -> tuple[str, bytes] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT snaptrade_user_id, encrypted_user_secret "
+            "FROM snaptrade_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    encrypted = row[1].tobytes() if isinstance(row[1], memoryview) else bytes(row[1])
+    return str(row[0]), encrypted
+
+
+def _snaptrade_lock_is_current(
+    conn: Connection,
+    user_id: int,
+    operation: str,
+    owner_token: str,
+    now: str,
+) -> bool:
+    if DB_BACKEND == "postgres":
+        sql = (
+            "SELECT owner_token, expires_at FROM snaptrade_locks "
+            "WHERE user_id = ? AND operation = ? FOR UPDATE"
+        )
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+        sql = (
+            "SELECT owner_token, expires_at FROM snaptrade_locks "
+            "WHERE user_id = ? AND operation = ?"
+        )
+    row = conn.execute(sql, (user_id, operation)).fetchone()
+    return row is not None and row[0] == owner_token and row[1] > now
+
+
+def snaptrade_insert_credentials(
+    user_id: int,
+    snaptrade_user_id: str,
+    encrypted_user_secret: bytes,
+    now: str,
+    *,
+    lock_owner: str,
+) -> bool:
+    with get_conn() as conn:
+        if not _snaptrade_lock_is_current(
+            conn, user_id, "registration", lock_owner, now,
+        ):
+            return False
+        conn.execute(
+            "INSERT INTO snaptrade_users "
+            "(user_id, snaptrade_user_id, encrypted_user_secret, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, snaptrade_user_id, encrypted_user_secret, now, now),
+        )
+    return True
+
+
+def snaptrade_replace_snapshot(
+    user_id: int,
+    accounts: list[dict[str, Any]],
+    balances: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    activities: list[dict[str, Any]],
+    *,
+    lock_owner: str,
+    lock_now: str,
+) -> bool:
+    with get_conn() as conn:
+        if not _snaptrade_lock_is_current(
+            conn, user_id, "sync", lock_owner, lock_now,
+        ):
+            return False
+        params = (user_id, _SNAPTRADE_PROVIDER)
+        for table in (
+            "brokerage_activities",
+            "brokerage_balances",
+            "brokerage_positions",
+            "brokerage_accounts",
+        ):
+            conn.execute(
+                f"DELETE FROM {table} WHERE user_id = ? AND provider = ?",
+                params,
+            )
+        for row in accounts:
+            conn.execute(
+                "INSERT INTO brokerage_accounts "
+                "(user_id, provider, provider_account_id, name, number, institution_name, "
+                "brokerage_slug, balance_total, balance_currency, activities_supported, "
+                "holdings_unavailable, synced_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, _SNAPTRADE_PROVIDER, row["id"], row["name"], row["number"],
+                    row["institution_name"], row["brokerage_slug"], row["balance_total"],
+                    row["balance_currency"], int(row["activities_supported"]),
+                    int(row["holdings_unavailable"]), row["synced_at"],
+                ),
+            )
+        for row in balances:
+            conn.execute(
+                "INSERT INTO brokerage_balances VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, _SNAPTRADE_PROVIDER, row["account_id"], row["currency"], row["cash"],
+                    row["buying_power"], row["synced_at"],
+                ),
+            )
+        for row in positions:
+            conn.execute(
+                "INSERT INTO brokerage_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, _SNAPTRADE_PROVIDER, row["account_id"], row["provider_symbol_id"],
+                    row["symbol"], row["description"], row["asset_type"], row["quantity"],
+                    row["price"], row["market_value"], row["average_cost"], row["currency"],
+                    row["synced_at"],
+                ),
+            )
+        for row in activities:
+            conn.execute(
+                "INSERT INTO brokerage_activities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (user_id, provider, provider_account_id, provider_activity_id) DO UPDATE SET "
+                "provider_account_id=excluded.provider_account_id, activity_type=excluded.activity_type, "
+                "trade_date=excluded.trade_date, settlement_date=excluded.settlement_date, "
+                "symbol=excluded.symbol, description=excluded.description, units=excluded.units, "
+                "price=excluded.price, amount=excluded.amount, fee=excluded.fee, "
+                "currency=excluded.currency, synced_at=excluded.synced_at",
+                (
+                    user_id, _SNAPTRADE_PROVIDER, row["id"], row["account_id"], row["type"],
+                    row["trade_date"], row["settlement_date"], row["symbol"], row["description"],
+                    row["units"], row["price"], row["amount"], row["fee"], row["currency"],
+                    row["synced_at"],
+                ),
+            )
+    return True
+
+
+def snaptrade_snapshot(user_id: int) -> dict[str, Any]:
+    with get_conn() as conn:
+        conn.execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ"
+            if DB_BACKEND == "postgres" else "BEGIN",
+        )
+        account_rows = conn.execute(
+            "SELECT provider_account_id, name, number, institution_name, brokerage_slug, "
+            "balance_total, balance_currency, activities_supported, holdings_unavailable, synced_at "
+            "FROM brokerage_accounts WHERE user_id = ? AND provider = ? ORDER BY institution_name, name",
+            (user_id, _SNAPTRADE_PROVIDER),
+        ).fetchall()
+        balance_rows = conn.execute(
+            "SELECT provider_account_id, currency, cash, buying_power, synced_at "
+            "FROM brokerage_balances WHERE user_id = ? AND provider = ? "
+            "ORDER BY provider_account_id, currency",
+            (user_id, _SNAPTRADE_PROVIDER),
+        ).fetchall()
+        position_rows = conn.execute(
+            "SELECT provider_account_id, provider_symbol_id, symbol, description, asset_type, "
+            "quantity, price, market_value, average_cost, currency, synced_at "
+            "FROM brokerage_positions WHERE user_id = ? AND provider = ? "
+            "ORDER BY provider_account_id, symbol",
+            (user_id, _SNAPTRADE_PROVIDER),
+        ).fetchall()
+        activity_rows = conn.execute(
+            "SELECT provider_activity_id, provider_account_id, activity_type, trade_date, "
+            "settlement_date, symbol, description, units, price, amount, fee, currency, synced_at "
+            "FROM brokerage_activities WHERE user_id = ? AND provider = ? "
+            "ORDER BY trade_date DESC, provider_activity_id DESC",
+            (user_id, _SNAPTRADE_PROVIDER),
+        ).fetchall()
+    accounts = [{
+        "id": r[0], "name": r[1], "number": r[2], "institution_name": r[3],
+        "brokerage_slug": r[4], "balance_total": r[5], "balance_currency": r[6],
+        "activities_supported": bool(r[7]), "holdings_unavailable": bool(r[8]),
+        "synced_at": r[9],
+    } for r in account_rows]
+    balances = [{
+        "account_id": r[0], "currency": r[1], "cash": r[2],
+        "buying_power": r[3], "synced_at": r[4],
+    } for r in balance_rows]
+    positions = [{
+        "account_id": r[0], "provider_symbol_id": r[1], "symbol": r[2],
+        "description": r[3], "asset_type": r[4], "quantity": r[5], "price": r[6],
+        "market_value": r[7], "average_cost": r[8], "currency": r[9], "synced_at": r[10],
+    } for r in position_rows]
+    activities = [{
+        "id": r[0], "account_id": r[1], "type": r[2], "trade_date": r[3],
+        "settlement_date": r[4], "symbol": r[5], "description": r[6], "units": r[7],
+        "price": r[8], "amount": r[9], "fee": r[10], "currency": r[11],
+        "synced_at": r[12],
+    } for r in activity_rows]
+    return {
+        "accounts": accounts,
+        "balances": balances,
+        "positions": positions,
+        "activities": activities,
+        "last_synced_at": max((row["synced_at"] for row in accounts), default=None),
+    }
+
+
 __all__ = [
     "DB_BACKEND",
-    # type aliases
     "Connection",
     "Cursor",
-    # exceptions
     "IntegrityError",
     "OperationalError",
     "Row",
-    # connection lifecycles
-    "get_conn",            # server-side state (users, bank_accounts, ...)
+    "get_conn",
     "now_iso",
-    "open_bank_conn",      # per-bank data (transactions, cards, ...)
-    # helpers
+    "open_bank_conn",
     "q",
     "server_db_path",
+    "snaptrade_acquire_lock",
+    "snaptrade_get_credentials",
+    "snaptrade_insert_credentials",
+    "snaptrade_release_lock",
+    "snaptrade_replace_snapshot",
+    "snaptrade_snapshot",
 ]

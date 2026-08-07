@@ -52,6 +52,12 @@ def _force_pg_backend(monkeypatch):
     from backend.server.db import get_conn
     with get_conn() as conn:
         for table in [
+            "snaptrade_locks",
+            "brokerage_activities",
+            "brokerage_positions",
+            "brokerage_balances",
+            "brokerage_accounts",
+            "snaptrade_users",
             "user_preferences",
             "category_rules",
             "sync_jobs",
@@ -81,7 +87,13 @@ def test_schema_creates_all_tables_on_postgres():
         "bank_accounts",
         "bank_credentials",
         "bank_credentials_v2",
+        "brokerage_accounts",
+        "brokerage_balances",
+        "brokerage_positions",
+        "brokerage_activities",
         "category_rules",
+        "snaptrade_locks",
+        "snaptrade_users",
         "sync_jobs",
         "user_preferences",
         "users",
