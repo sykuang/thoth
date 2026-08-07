@@ -19,6 +19,7 @@ import { ChevronRight, Clock3, Tags, Workflow, type LucideIcon } from 'lucide-re
 import { useEffect, useState, type ReactNode } from 'react';
 import { Alert, Platform, Pressable, Switch, Text, View } from 'react-native';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
+import { SnapTradeConnectionSettings } from '@/components/SnapTradeSections';
 
 import { usePreferences } from '@/hooks/usePreferences';
 import { biometricAvailable } from '@/lib/biometric';
@@ -64,6 +65,10 @@ export default function SettingsHomeScreen() {
             testID="settings-auto-sync-link"
             last
           />
+        </SettingsGroup>
+
+        <SettingsGroup title="券商連結">
+          <SnapTradeConnectionSettings />
         </SettingsGroup>
 
         {/* 安全性 — iOS native 才顯示 (web 沒有 Face ID) */}

@@ -30,6 +30,7 @@ import {
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { BankBadge } from '@/components/BankBadge';
 import { AutoDebitSettingModal } from '@/components/AutoDebitSettingModal';
+import { SnapTradeAccountsSection } from '@/components/SnapTradeSections';
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { bankMeta } from '@/lib/banks';
 import { formatRelativeTime } from '@/lib/datetime';
@@ -419,7 +420,7 @@ export default function AccountsTabScreen() {
           )}
         </View>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
-          每家銀行底下的存款帳戶與信用卡。點「☁️」單獨同步該銀行,或上方「全部同步」一次跑完。
+          管理銀行帳戶、信用卡與已連結券商。銀行資料可用「☁️」同步，券商資料列於下方。
         </Text>
 
         {triggerSync.isError && (
@@ -450,7 +451,7 @@ export default function AccountsTabScreen() {
           </View>
         ) : groups.length === 0 ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
-            <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">還沒任何帳戶資料</Text>
+            <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">還沒任何銀行帳戶資料</Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center mb-4">
               新增一個銀行帳號後點「☁️ 全部同步」抓帳
             </Text>
@@ -489,6 +490,7 @@ export default function AccountsTabScreen() {
             </Pressable>
           </>
         )}
+        <SnapTradeAccountsSection />
       </View>
     </KeyboardAwareScrollView>
   );

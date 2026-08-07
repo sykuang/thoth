@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 
 REDIRECT_URI = "thoth:///investments"
@@ -17,6 +20,7 @@ class FakeSnapTradeGateway:
         self.empty_accounts = False
         self.holdings_initial_sync_completed = True
         self.transactions_initial_sync_completed = True
+        self.transactions_status_missing = False
         self.holdings_unavailable = False
         self.activity_calls = 0
         self.activity_id = "activity-1"
@@ -26,6 +30,9 @@ class FakeSnapTradeGateway:
         self.deleted: list[str] = []
         self.option_positions: list[dict[str, Any]] = []
         self.account_total = "1250.00"
+        self.connection_disabled = False
+        self.transactions_last_successful_sync = datetime.now(UTC).date().isoformat()
+        self.transactions_first_transaction_date = "2024-08-08"
 
     def register_user(self, user_id: str) -> dict[str, str]:
         if user_id in self.remote_users:
@@ -47,12 +54,16 @@ class FakeSnapTradeGateway:
         return "https://connect.snaptrade.example/portal"
 
     def list_connections(self, user_id: str, user_secret: str) -> list[dict[str, Any]]:
-        return [{"id": "auth-1", "brokerage": {"slug": self.slug}}]
+        return [{
+            "id": "auth-1",
+            "disabled": self.connection_disabled,
+            "brokerage": {"slug": self.slug},
+        }]
 
     def list_accounts(self, user_id: str, user_secret: str) -> list[dict[str, Any]]:
         if self.empty_accounts:
             return []
-        return [{
+        account = {
             "id": "account-high",
             "name": "Schwab Brokerage",
             "number": "••1234",
@@ -65,10 +76,15 @@ class FakeSnapTradeGateway:
                 },
                 "transactions": {
                     "initial_sync_completed": self.transactions_initial_sync_completed,
+                    "last_successful_sync": self.transactions_last_successful_sync,
+                    "first_transaction_date": self.transactions_first_transaction_date,
                 },
             },
             "balance": {"total": {"amount": self.account_total, "currency": "USD"}},
-        }]
+        }
+        if self.transactions_status_missing:
+            del account["sync_status"]["transactions"]
+        return [account]
 
     def list_balances(
         self, user_id: str, user_secret: str, account_id: str,
@@ -216,6 +232,10 @@ def test_sync_persists_cash_positions_and_real_activities_without_float_rounding
     assert [row["id"] for row in body["accounts"]] == ["account-high"]
     assert body["accounts"][0]["brokerage_slug"] == "SCHWAB"
     assert body["accounts"][0]["activities_supported"] is True
+    assert body["accounts"][0]["transactions_last_successful_sync"] == (
+        fake.transactions_last_successful_sync
+    )
+    assert body["accounts"][0]["transactions_first_transaction_date"] == "2024-08-08"
     assert body["balances"][0]["cash"] == "250.00"
     assert body["positions"][0]["symbol"] == "NVDA"
     assert body["positions"][0]["quantity"] == "2.5"
@@ -232,6 +252,43 @@ def test_failed_refresh_preserves_previous_snapshot(client, monkeypatch):
     before = client.get("/snaptrade/portfolio", headers=headers).json()
 
     fake.fail_positions = True
+    failed = client.post("/snaptrade/sync", headers=headers)
+
+    assert failed.status_code == 502
+    assert client.get("/snaptrade/portfolio", headers=headers).json() == before
+
+
+def test_disabled_connection_preserves_previous_snapshot(client, monkeypatch):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-disabled-connection@example.com")
+    assert _connect(client, headers).status_code == 200
+    assert client.post("/snaptrade/sync", headers=headers).status_code == 200
+    before = client.get("/snaptrade/portfolio", headers=headers).json()
+
+    fake.connection_disabled = True
+    failed = client.post("/snaptrade/sync", headers=headers)
+
+    assert failed.status_code == 502
+    assert client.get("/snaptrade/portfolio", headers=headers).json() == before
+
+
+@pytest.mark.parametrize(
+    "last_successful_sync",
+    [None, "not-a-date", (datetime.now(UTC).date() - timedelta(days=8)).isoformat()],
+)
+def test_invalid_or_stale_transaction_freshness_preserves_previous_snapshot(
+    client, monkeypatch, last_successful_sync,
+):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    email_part = last_successful_sync or "missing"
+    headers = _register(client, f"snaptrade-stale-{email_part}@example.com")
+    assert _connect(client, headers).status_code == 200
+    assert client.post("/snaptrade/sync", headers=headers).status_code == 200
+    before = client.get("/snaptrade/portfolio", headers=headers).json()
+
+    fake.transactions_last_successful_sync = last_successful_sync
     failed = client.post("/snaptrade/sync", headers=headers)
 
     assert failed.status_code == 502
@@ -454,17 +511,51 @@ def test_sdk_v11_option_holdings_are_saved(client, monkeypatch):
     assert position["market_value"] == "2000"
 
 
-def test_unsupported_brokerage_never_synthesizes_activities(client, monkeypatch):
+def test_ibkr_flex_fetches_activities_when_transaction_sync_is_complete(client, monkeypatch):
     fake = FakeSnapTradeGateway()
-    fake.slug = "UNSUPPORTED"
+    fake.slug = "INTERACTIVE-BROKERS-FLEX"
     _install_fake(monkeypatch, fake)
-    headers = _register(client, "snaptrade-unsupported@example.com")
+    headers = _register(client, "snaptrade-ibkr@example.com")
     assert _connect(client, headers).status_code == 200
     assert client.post("/snaptrade/sync", headers=headers).status_code == 200
-    assert fake.activity_calls == 0
+    assert fake.activity_calls == 1
     body = client.get("/snaptrade/portfolio", headers=headers).json()
-    assert body["accounts"][0]["activities_supported"] is False
-    assert body["activities"] == []
+    assert body["accounts"][0]["activities_supported"] is True
+    assert [row["id"] for row in body["activities"]] == ["activity-1"]
+
+
+def test_missing_transaction_sync_status_fails_closed(client, monkeypatch):
+    fake = FakeSnapTradeGateway()
+    fake.slug = "INTERACTIVE-BROKERS-FLEX"
+    fake.transactions_status_missing = True
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-missing-txn-status@example.com")
+    assert _connect(client, headers).status_code == 200
+
+    response = client.post("/snaptrade/sync", headers=headers)
+
+    assert response.status_code == 502
+    assert fake.activity_calls == 0
+
+
+def test_sdk_v11_gateway_uses_canonical_api_root(monkeypatch):
+    import snaptrade_client
+
+    captured: dict[str, str] = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("SNAPTRADE_CLIENT_ID", "client")
+    monkeypatch.setenv("SNAPTRADE_CONSUMER_KEY", "consumer")
+    monkeypatch.setattr(snaptrade_client, "SnapTrade", Client)
+
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    SnapTradeSDKGateway()
+
+    assert captured["host"] == "https://api.snaptrade.com"
 
 
 def test_sdk_v11_connection_contract_accepts_redirect_uri_camel_case():
@@ -520,12 +611,11 @@ def test_sdk_activities_are_paginated_without_truncation(monkeypatch):
     class RawActivityAPI:
         @staticmethod
         def _get_account_activities_mapped_args(
-            *, account_id, user_id, user_secret, start_date, end_date,
-            limit=None, offset=None,
+            *, account_id, user_id, user_secret, limit=None, offset=None,
         ):
             assert (account_id, user_id, user_secret) == ("account-1", "user", "secret")
             return SimpleNamespace(
-                query={"startDate": start_date, "endDate": end_date, "limit": limit, "offset": offset},
+                query={"limit": limit, "offset": offset},
                 path={"accountId": account_id},
             )
 
@@ -535,8 +625,12 @@ def test_sdk_activities_are_paginated_without_truncation(monkeypatch):
             assert path_params == {"accountId": "account-1"}
             offset = query_params["offset"]
             calls.append(offset)
-            rows = [{"id": f"activity-{i}"} for i in range(offset, min(offset + 2, 3))]
-            return SimpleNamespace(status=200, body=json.dumps(rows).encode())
+            rows = [{"id": f"activity-{offset}"}] if offset < 3 else []
+            body = {
+                "data": rows,
+                "pagination": {"offset": offset, "limit": 2, "total": 3},
+            }
+            return SimpleNamespace(status=200, body=json.dumps(body).encode())
 
     monkeypatch.setattr(snaptrade, "_ACTIVITY_PAGE_SIZE", 2)
     gateway: Any = object.__new__(SnapTradeSDKGateway)
@@ -545,7 +639,69 @@ def test_sdk_activities_are_paginated_without_truncation(monkeypatch):
     rows = gateway.list_activities("user", "secret", "account-1")
 
     assert [row["id"] for row in rows] == ["activity-0", "activity-1", "activity-2"]
-    assert calls == [0, 2]
+    assert calls == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"data": []}, "pagination"),
+        (
+            {"items": [], "pagination": {"offset": 0, "limit": 1, "total": 0}},
+            "data",
+        ),
+        (
+            {"data": [], "pagination": {"offset": 0, "limit": 0, "total": 0}},
+            "pagination",
+        ),
+    ],
+)
+def test_sdk_activities_reject_malformed_envelope(body, message):
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    class RawActivityAPI:
+        @staticmethod
+        def _get_account_activities_mapped_args(**kwargs):
+            return SimpleNamespace(query={}, path={"accountId": kwargs["account_id"]})
+
+        @staticmethod
+        def _get_account_activities_oapg(**kwargs):
+            return SimpleNamespace(status=200, body=json.dumps(body).encode())
+
+    gateway: Any = object.__new__(SnapTradeSDKGateway)
+    gateway.client = SimpleNamespace(account_information=RawActivityAPI())
+
+    with pytest.raises(RuntimeError, match=message):
+        gateway.list_activities("user", "secret", "account-1")
+
+
+def test_sdk_activities_reject_duplicate_ids_across_pages(monkeypatch):
+    from backend.server import snaptrade
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    class RawActivityAPI:
+        @staticmethod
+        def _get_account_activities_mapped_args(**kwargs):
+            return SimpleNamespace(
+                query={"offset": kwargs["offset"], "limit": kwargs["limit"]},
+                path={"accountId": kwargs["account_id"]},
+            )
+
+        @staticmethod
+        def _get_account_activities_oapg(*, query_params, **kwargs):
+            offset = query_params["offset"]
+            body = {
+                "data": [{"id": "duplicate", "type": "BUY"}],
+                "pagination": {"offset": offset, "limit": 1, "total": 2},
+            }
+            return SimpleNamespace(status=200, body=json.dumps(body).encode())
+
+    monkeypatch.setattr(snaptrade, "_ACTIVITY_PAGE_SIZE", 1)
+    gateway: Any = object.__new__(SnapTradeSDKGateway)
+    gateway.client = SimpleNamespace(account_information=RawActivityAPI())
+
+    with pytest.raises(RuntimeError, match="重複"):
+        gateway.list_activities("user", "secret", "account-1")
 
 
 def test_registration_storage_failure_deletes_remote_user_and_retry_succeeds(

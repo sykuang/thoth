@@ -23,17 +23,7 @@ from backend.server.db import now_iso
 _PROVIDER = "snaptrade"
 _ACTIVITY_PAGE_SIZE = 1000
 _MAX_ACTIVITY_PAGES = 100
-
-
-# SnapTrade brokerages with a real Transactions capability. Unknown/unsupported
-# providers still sync balances and positions, but we never synthesize activities.
-_ACTIVITY_SLUGS = {
-    "AJ-BELL", "ALPACA", "ALPACA-PAPER", "BINANCE", "CHASE", "COINBASE",
-    "DEGIRO", "ETRADE", "FIDELITY", "KRAKEN", "MOOMOO", "PUBLIC",
-    "QUESTRADE", "QUESTRADE-UNOFFICIAL", "ROBINHOOD", "SCHWAB", "STAKEAUS",
-    "TASTYTRADE", "TD-DIRECT-INVESTING", "TRADIER", "TRADING212",
-    "VANGUARD-US", "WEALTHSIMPLE",
-}
+_MAX_TRANSACTION_SYNC_LAG = timedelta(days=7)
 
 
 class SnapTradeNotConfigured(RuntimeError):
@@ -102,7 +92,7 @@ def _response(value: Any) -> Any:
     return _plain(value)
 
 
-def _raw_rows(api: Any, operation: str, **kwargs: Any) -> list[dict[str, Any]]:
+def _raw_payload(api: Any, operation: str, **kwargs: Any) -> Any:
     """Use the pinned v11 transport without its lossy float deserializer."""
     mapped = getattr(api, f"_{operation}_mapped_args")(**kwargs)
     call_args = {
@@ -120,7 +110,11 @@ def _raw_rows(api: Any, operation: str, **kwargs: Any) -> list[dict[str, Any]]:
         body = body.decode()
     if isinstance(body, str):
         body = json.loads(body, parse_float=Decimal)
-    return _rows(body)
+    return body
+
+
+def _raw_rows(api: Any, operation: str, **kwargs: Any) -> list[dict[str, Any]]:
+    return _rows(_raw_payload(api, operation, **kwargs))
 
 
 def _rows(value: Any) -> list[dict[str, Any]]:
@@ -238,6 +232,7 @@ class SnapTradeSDKGateway:
         from snaptrade_client import SnapTrade
 
         self.client = SnapTrade(
+            host="https://api.snaptrade.com",
             consumer_key=os.environ["SNAPTRADE_CONSUMER_KEY"],
             client_id=os.environ["SNAPTRADE_CLIENT_ID"],
         )
@@ -330,24 +325,58 @@ class SnapTradeSDKGateway:
         )
 
     def list_activities(self, user_id: str, user_secret: str, account_id: str) -> list[dict[str, Any]]:
-        end_date = date.today()
         rows: list[dict[str, Any]] = []
+        seen_activity_ids: set[str] = set()
         offset = 0
+        expected_total: int | None = None
         for _ in range(_MAX_ACTIVITY_PAGES):
-            page = _raw_rows(
+            payload = _raw_payload(
                 self.client.account_information,
                 "get_account_activities",
                 user_id=user_id,
                 user_secret=user_secret,
                 account_id=account_id,
-                start_date=end_date - timedelta(days=365),
-                end_date=end_date,
                 offset=offset,
                 limit=_ACTIVITY_PAGE_SIZE,
             )
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("SnapTrade activities response 缺少 pagination")
+            data = payload.get("data")
+            if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+                raise RuntimeError("SnapTrade activities response data 格式錯誤")
+            page = data
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, Mapping):
+                raise RuntimeError("SnapTrade activities response 缺少 pagination")
+            page_offset = pagination.get("offset")
+            page_limit = pagination.get("limit")
+            total = pagination.get("total")
+            if (
+                type(page_offset) is not int
+                or type(page_limit) is not int
+                or type(total) is not int
+                or page_offset != offset
+                or page_limit < 1
+                or page_limit < len(page)
+                or total < offset + len(page)
+            ):
+                raise RuntimeError("SnapTrade activities pagination 格式錯誤")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise RuntimeError("SnapTrade activities pagination total 不一致")
+            for row in page:
+                activity_id = _text(row.get("id"))
+                if not activity_id:
+                    raise RuntimeError("SnapTrade activity 缺少 id")
+                if activity_id in seen_activity_ids:
+                    raise RuntimeError("SnapTrade activities 含重複 id")
+                seen_activity_ids.add(activity_id)
             rows.extend(page)
-            if len(page) < _ACTIVITY_PAGE_SIZE:
+            if len(rows) == expected_total:
                 return rows
+            if not page:
+                raise RuntimeError("SnapTrade activities pagination 提前結束")
             offset += len(page)
         raise RuntimeError("SnapTrade activities 超過安全分頁上限；保留前次 snapshot")
 
@@ -443,6 +472,12 @@ class SnapTradeService:
             raise SnapTradeNotRegistered("請先開啟 SnapTrade Connection Portal")
         gateway = self._gateway()
         connections = gateway.list_connections(*credentials)
+        for connection in connections:
+            disabled = connection.get("disabled")
+            if type(disabled) is not bool:
+                raise RuntimeError("SnapTrade connection 缺少 disabled 狀態")
+            if disabled:
+                raise RuntimeError("SnapTrade connection 已停用；保留前次 snapshot")
         authorization_slugs = {
             authorization_id: slug
             for connection in connections
@@ -465,7 +500,12 @@ class SnapTradeService:
             if not account_id or not institution:
                 raise RuntimeError("SnapTrade account 缺少 id/institution_name")
             slug = _slug(raw, authorization_slugs)
-            activities_supported = slug in _ACTIVITY_SLUGS
+            transactions_status = _nested(raw, "sync_status", "transactions")
+            if not isinstance(transactions_status, Mapping):
+                raise RuntimeError(
+                    f"SnapTrade account {account_id} 缺少 transactions sync status",
+                )
+            activities_supported = True
             holdings_unavailable = _nested(
                 raw, "sync_status", "holdings", "holdings_unavailable",
             ) is True
@@ -478,10 +518,26 @@ class SnapTradeService:
                 )
             if (
                 activities_supported
-                and _nested(raw, "sync_status", "transactions", "initial_sync_completed") is not True
+                and transactions_status.get("initial_sync_completed") is not True
             ):
                 raise RuntimeError(
                     f"SnapTrade account {account_id} transactions 尚未完成初次同步",
+                )
+            last_successful_sync = _text(transactions_status.get("last_successful_sync"))
+            try:
+                last_successful_date = date.fromisoformat(last_successful_sync or "")
+            except ValueError as error:
+                raise RuntimeError(
+                    f"SnapTrade account {account_id} transactions freshness 格式錯誤",
+                ) from error
+            today = datetime.now(UTC).date()
+            if (
+                last_successful_date.isoformat() != last_successful_sync
+                or last_successful_date > today
+                or today - last_successful_date > _MAX_TRANSACTION_SYNC_LAG
+            ):
+                raise RuntimeError(
+                    f"SnapTrade account {account_id} transactions freshness 已過期",
                 )
             if holdings_unavailable:
                 raw_balances = []
@@ -556,6 +612,12 @@ class SnapTradeService:
             "holdings_unavailable": _nested(
                 raw, "sync_status", "holdings", "holdings_unavailable",
             ) is True,
+            "transactions_last_successful_sync": _text(
+                _nested(raw, "sync_status", "transactions", "last_successful_sync"),
+            ),
+            "transactions_first_transaction_date": _text(
+                _nested(raw, "sync_status", "transactions", "first_transaction_date"),
+            ),
             "synced_at": synced_at,
         }
 

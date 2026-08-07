@@ -4,7 +4,7 @@
  * L5-RWD: header/tab colors 用 brand-* token, dark mode 由 useColorScheme 自動切。
  */
 import { Redirect, Tabs } from 'expo-router';
-import { ChartCandlestick, LayoutDashboard, ReceiptText, Settings, WalletCards } from 'lucide-react-native';
+import { LayoutDashboard, ReceiptText, Settings, WalletCards } from 'lucide-react-native';
 import { useColorScheme } from 'nativewind';
 
 import { useAuthStore } from '@/stores/auth';
@@ -63,10 +63,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="investments"
         options={{
-          title: '投資',
-          tabBarIcon: ({ color, size, focused }) => (
-            <ChartCandlestick size={size} color={color} strokeWidth={focused ? 2.8 : 2.2} />
-          ),
+          href: null,
         }}
       />
       <Tabs.Screen

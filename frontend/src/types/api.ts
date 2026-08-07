@@ -518,6 +518,8 @@ export type BrokerageAccount = {
   balance_currency: string | null;
   activities_supported: boolean;
   holdings_unavailable: boolean;
+  transactions_last_successful_sync: string | null;
+  transactions_first_transaction_date: string | null;
   synced_at: string;
 };
 

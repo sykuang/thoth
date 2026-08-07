@@ -324,6 +324,8 @@ CREATE TABLE IF NOT EXISTS brokerage_accounts (
     balance_currency       TEXT,
     activities_supported INTEGER NOT NULL DEFAULT 0,
     holdings_unavailable INTEGER NOT NULL DEFAULT 0,
+    transactions_last_successful_sync TEXT,
+    transactions_first_transaction_date TEXT,
     synced_at              TEXT NOT NULL,
     PRIMARY KEY (user_id, provider, provider_account_id)
 );
@@ -524,6 +526,16 @@ def _ensure_schema(conn: Any) -> None:
         conn.execute(
             "ALTER TABLE brokerage_accounts "
             "ADD COLUMN holdings_unavailable INTEGER NOT NULL DEFAULT 0",
+        )
+    if "transactions_last_successful_sync" not in brokerage_cols:
+        conn.execute(
+            "ALTER TABLE brokerage_accounts "
+            "ADD COLUMN transactions_last_successful_sync TEXT",
+        )
+    if "transactions_first_transaction_date" not in brokerage_cols:
+        conn.execute(
+            "ALTER TABLE brokerage_accounts "
+            "ADD COLUMN transactions_first_transaction_date TEXT",
         )
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上
@@ -1036,13 +1048,16 @@ def snaptrade_replace_snapshot(
                 "INSERT INTO brokerage_accounts "
                 "(user_id, provider, provider_account_id, name, number, institution_name, "
                 "brokerage_slug, balance_total, balance_currency, activities_supported, "
-                "holdings_unavailable, synced_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "holdings_unavailable, transactions_last_successful_sync, "
+                "transactions_first_transaction_date, synced_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id, _SNAPTRADE_PROVIDER, row["id"], row["name"], row["number"],
                     row["institution_name"], row["brokerage_slug"], row["balance_total"],
                     row["balance_currency"], int(row["activities_supported"]),
-                    int(row["holdings_unavailable"]), row["synced_at"],
+                    int(row["holdings_unavailable"]),
+                    row["transactions_last_successful_sync"],
+                    row["transactions_first_transaction_date"], row["synced_at"],
                 ),
             )
         for row in balances:
@@ -1090,7 +1105,8 @@ def snaptrade_snapshot(user_id: int) -> dict[str, Any]:
         )
         account_rows = conn.execute(
             "SELECT provider_account_id, name, number, institution_name, brokerage_slug, "
-            "balance_total, balance_currency, activities_supported, holdings_unavailable, synced_at "
+            "balance_total, balance_currency, activities_supported, holdings_unavailable, "
+            "transactions_last_successful_sync, transactions_first_transaction_date, synced_at "
             "FROM brokerage_accounts WHERE user_id = ? AND provider = ? ORDER BY institution_name, name",
             (user_id, _SNAPTRADE_PROVIDER),
         ).fetchall()
@@ -1118,7 +1134,8 @@ def snaptrade_snapshot(user_id: int) -> dict[str, Any]:
         "id": r[0], "name": r[1], "number": r[2], "institution_name": r[3],
         "brokerage_slug": r[4], "balance_total": r[5], "balance_currency": r[6],
         "activities_supported": bool(r[7]), "holdings_unavailable": bool(r[8]),
-        "synced_at": r[9],
+        "transactions_last_successful_sync": r[9],
+        "transactions_first_transaction_date": r[10], "synced_at": r[11],
     } for r in account_rows]
     balances = [{
         "account_id": r[0], "currency": r[1], "cash": r[2],
