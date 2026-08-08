@@ -33,6 +33,7 @@ export default function CardsLayout() {
       />
       <Stack.Screen name="[bank]/[card_no]" options={{ title: '帳單明細' }} />
       <Stack.Screen name="brokerage/[account_id]" options={{ title: '持股明細' }} />
+      <Stack.Screen name="manual/[account_id]" options={{ title: '手動帳戶' }} />
     </Stack>
   );
 }

@@ -392,7 +392,8 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
       total_assets       = 銀行台幣存款 balance_history.twd_balance sum (TWD only, 真實值)
       fx_assets_twd      = 所有銀行外幣帳戶用 fx_service 換 TWD 的估值 sum
       brokerage_assets_twd = SnapTrade 每個券商帳戶 balance_total 換 TWD 的估值 sum
-      total_assets_with_fx = total_assets + fx_assets_twd + brokerage_assets_twd
+      manual_assets_twd = 手動存款與投資帳戶換 TWD 的估值 sum
+      total_assets_with_fx = total_assets + fx_assets_twd + brokerage_assets_twd + manual_assets_twd
       total_liabilities  = **上期帳單未繳** sum (只算已出帳還沒繳的)
       current_month_spending = 本月 consume_date 在 pending + billed 表 sum
       net_worth          = total_assets - total_liabilities (TWD only, 保守)
@@ -431,6 +432,8 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
     total_assets = 0
     fx_assets_twd = 0           # 外幣帳戶 TWD 估值 sum (給 frontend 大字用)
     brokerage_assets_twd = 0    # SnapTrade account total；不重加 cash / positions
+    manual_assets_twd = 0       # 手動存款 + 投資 current valuation（breakdown only）
+    manual_liabilities_twd = 0  # 手動貸款 current valuation（breakdown only）
     total_liabilities = 0       # 信用卡未繳 + 貸款餘額
     total_card_unpaid = 0       # 純信用卡未繳（給 frontend 拆分用）
     total_loan = 0              # 純貸款餘額
@@ -582,7 +585,41 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         # 券商快照 / FX 失敗不應遮蔽既有銀行 summary。
         pass
 
-    total_assets_with_fx = total_assets + fx_assets_twd + brokerage_assets_twd
+    # 手動帳戶共用既有 product taxonomy 與 summary buckets。交易明細只作
+    # journal；不以歷史成交價冒充 current valuation。First-party manual store
+    # 若整體讀取失敗必須 fail closed，不能把已知資產偽裝成 0。
+    from backend.server.financial_accounts import list_manual_accounts
+
+    for account in list_manual_accounts(user_id):
+        if not account.included_in_net_worth or account.balance is None:
+            continue
+        try:
+            estimate = fx_service.convert_to_twd(account.balance, account.currency)
+        except Exception:
+            skipped.append(account.id)
+            continue
+        if estimate is None:
+            skipped.append(account.id)
+            continue
+        product_type = account.product_type
+        if account_classify.is_liability_type(product_type):
+            magnitude = abs(estimate)
+            total_liabilities += magnitude
+            total_loan += magnitude
+            manual_liabilities_twd += magnitude
+        elif (
+            product_type == account_classify.ProductType.INVESTMENT
+            or account_classify.is_asset_type(product_type)
+        ):
+            value = max(estimate, 0)
+            manual_assets_twd += value
+        manual_as_of = _normalize_iso_date(account.as_of)
+        if manual_as_of and (overall_latest is None or manual_as_of > overall_latest):
+            overall_latest = manual_as_of
+
+    total_assets_with_fx = (
+        total_assets + fx_assets_twd + brokerage_assets_twd + manual_assets_twd
+    )
     total_ms = (time.perf_counter() - total_started) * 1000
     perf_log.info(
         "event=portfolio.summary section=total user_id=%s duration_ms=%.1f banks=%s skipped=%s",
@@ -592,7 +629,9 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         "total_assets": total_assets,                       # TWD only (真實)
         "fx_assets_twd": fx_assets_twd,                     # 銀行外幣帳戶 TWD 估值
         "brokerage_assets_twd": brokerage_assets_twd,       # 券商帳戶 TWD 估值
-        "total_assets_with_fx": total_assets_with_fx,       # 含銀行外幣與券商估值
+        "manual_assets_twd": manual_assets_twd,             # 手動資產獨立 bucket
+        "manual_liabilities_twd": manual_liabilities_twd,   # 手動負債 breakdown（已含 total_liabilities）
+        "total_assets_with_fx": total_assets_with_fx,       # 含銀行外幣、券商與手動資產估值
         "total_liabilities": total_liabilities,
         "total_card_unpaid": total_card_unpaid,             # frontend 拆分用
         "total_loan": total_loan,                           # frontend 拆分用

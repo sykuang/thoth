@@ -381,6 +381,45 @@ CREATE TABLE IF NOT EXISTS brokerage_activities (
 CREATE INDEX IF NOT EXISTS ix_brokerage_activities_user_date
     ON brokerage_activities(user_id, provider, trade_date);
 
+-- User-maintained financial accounts. Provider snapshots stay in their own
+-- authoritative stores; the canonical read model adapts both sources.
+CREATE TABLE IF NOT EXISTS manual_financial_accounts (
+    id                    {_PK_TYPE},
+    user_id               INTEGER NOT NULL,
+    product_type          TEXT NOT NULL,
+    institution_name      TEXT NOT NULL,
+    name                  TEXT NOT NULL,
+    account_ref           TEXT,
+    currency              TEXT NOT NULL,
+    balance               TEXT NOT NULL,
+    as_of                 TEXT NOT NULL,
+    included_in_net_worth INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_manual_financial_accounts_user
+    ON manual_financial_accounts(user_id, updated_at DESC);
+
+-- Manual investment journal only. Current account valuation remains the
+-- authoritative net-worth input; historical trade cost is not market value.
+CREATE TABLE IF NOT EXISTS manual_investment_transactions (
+    id           {_PK_TYPE},
+    user_id      INTEGER NOT NULL,
+    account_id   INTEGER NOT NULL REFERENCES manual_financial_accounts(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    occurred_on  TEXT NOT NULL,
+    symbol       TEXT,
+    quantity     TEXT,
+    unit_price   TEXT,
+    amount       TEXT NOT NULL,
+    currency     TEXT NOT NULL,
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_manual_investment_txns_account_date
+    ON manual_investment_transactions(user_id, account_id, occurred_on DESC, id DESC);
+
 -- 2026-06-23 (L13 使用者指示): 自動同步排程 — 每個 user 一個 daily schedule.
 --   * user_id PK = 1 user 1 schedule (1:N to bank_accounts at fire-time)
 --   * Fire 時 fan-out 該 user 全部 has_creds=true 的 account

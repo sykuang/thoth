@@ -34,11 +34,13 @@ import { SnapTradeAccountsSection } from '@/components/SnapTradeSections';
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { bankMeta } from '@/lib/banks';
 import { formatRelativeTime } from '@/lib/datetime';
+import { formatDecimalFixed } from '@/lib/decimal';
 import { maskCardNo } from '@/lib/mask';
 import {
   type BankAccount,
   type BankAccountBalance,
   type Card,
+  type FinancialAccount,
   type SupportedBank,
   type SyncJob,
   type TriggerSyncResponse,
@@ -286,6 +288,11 @@ export default function AccountsTabScreen() {
     retry: false,
   });
 
+  const manualAccountsQ = useQuery<FinancialAccount[], ApiError>({
+    queryKey: ['financial-accounts', 'manual'],
+    queryFn: () => api<FinancialAccount[]>('/financial-accounts?source=manual'),
+  });
+
   const balances = balancesQ.data ?? [];
   const cards = cardsQ.data ?? [];
   const bankAccounts = bankAccountsQ.data ?? [];
@@ -444,6 +451,9 @@ export default function AccountsTabScreen() {
         {cardsQ.isError && (
           <ErrorBanner title="讀取信用卡失敗" error={cardsQ.error} />
         )}
+        {manualAccountsQ.isError && (
+          <ErrorBanner title="讀取手動帳戶失敗" error={manualAccountsQ.error} />
+        )}
 
         {isLoading ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-6 shadow-card">
@@ -490,9 +500,94 @@ export default function AccountsTabScreen() {
             </Pressable>
           </>
         )}
+        <ManualAccountsSection
+          accounts={manualAccountsQ.data ?? []}
+          isLoading={manualAccountsQ.isLoading}
+        />
         <SnapTradeAccountsSection />
       </View>
     </ScrollView>
+  );
+}
+
+function ManualAccountsSection({
+  accounts,
+  isLoading,
+}: {
+  accounts: FinancialAccount[];
+  isLoading: boolean;
+}) {
+  const router = useRouter();
+  const typeLabel: Record<string, string> = {
+    deposit: '存款',
+    time_deposit: '定存',
+    fx_deposit: '外幣存款',
+    checking: '支票存款',
+    loan: '貸款',
+    mortgage: '房貸',
+    credit_line: '信用額度',
+    investment: '投資',
+  };
+  return (
+    <View className="mt-5">
+      <View className="flex-row items-center justify-between mb-3">
+        <View>
+          <Text className="text-ink-900 dark:text-ink-50 text-h2">手動帳戶</Text>
+          <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
+            存款、貸款與投資持股／交易
+          </Text>
+        </View>
+        <Pressable
+          onPress={() => router.push('/(tabs)/cards/manual/new')}
+          accessibilityRole="button"
+          accessibilityLabel="新增手動帳戶"
+          className="bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
+          testID="add-manual-account"
+        >
+          <Text className="text-white text-small font-semibold">＋ 新增</Text>
+        </Pressable>
+      </View>
+      {isLoading ? (
+        <View className="bg-white dark:bg-ink-900 rounded-2xl p-5">
+          <ActivityIndicator />
+        </View>
+      ) : accounts.length === 0 ? (
+        <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 border border-dashed border-ink-300 dark:border-ink-700">
+          <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
+            尚未建立手動帳戶
+          </Text>
+        </View>
+      ) : accounts.map((account) => (
+        <Pressable
+          key={account.id}
+          accessibilityRole="button"
+          accessibilityLabel={`開啟手動帳戶 ${account.name}`}
+          onPress={() => router.push({
+            pathname: '/(tabs)/cards/manual/[account_id]',
+            params: { account_id: account.id },
+          })}
+          className={`bg-white dark:bg-ink-900 rounded-2xl px-4 py-3 shadow-card mb-3 active:opacity-80 ${
+            account.included_in_net_worth ? '' : 'opacity-50'
+          }`}
+          testID={`manual-account-${account.id}`}
+        >
+          <View className="flex-row items-baseline justify-between gap-3">
+            <View className="flex-1 min-w-0">
+              <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold" numberOfLines={1}>
+                {account.name}
+              </Text>
+              <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5" numberOfLines={1}>
+                {account.institution_name} · {typeLabel[account.product_type] ?? account.product_type}
+              </Text>
+            </View>
+            <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold">
+              {account.currency}{' '}
+              {account.balance == null ? '—' : (formatDecimalFixed(account.balance, 2) ?? '—')}
+            </Text>
+          </View>
+        </Pressable>
+      ))}
+    </View>
   );
 }
 

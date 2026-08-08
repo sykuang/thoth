@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import csv
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import io
 import math
 import threading
@@ -234,7 +235,7 @@ def get_rate(currency: str) -> float | None:
         return None
 
 
-def convert_to_twd(amount: float | int | None, currency: str | None) -> int | None:
+def convert_to_twd(amount: float | int | str | None, currency: str | None) -> int | None:
     """原幣金額 → TWD 估值 (int 四捨五入).
 
     None 條件:
@@ -251,6 +252,9 @@ def convert_to_twd(amount: float | int | None, currency: str | None) -> int | No
     if rate is None:
         return None
     try:
-        return round(float(amount) * rate)
-    except (ValueError, TypeError):
+        value = Decimal(str(amount)) * Decimal(str(rate))
+        if not value.is_finite():
+            return None
+        return int(value.to_integral_value(rounding=ROUND_HALF_EVEN))
+    except (InvalidOperation, ValueError, TypeError):
         return None

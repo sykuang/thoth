@@ -38,6 +38,7 @@ ALLOWED_PATHS = {
     "backend/server/sync_jobs_repo.py",
     "backend/server/sync_batches_repo.py",  # 2026-06-23 (Plan A): batch summary push
     "backend/server/preferences_repo.py",
+    "backend/server/financial_accounts_repo.py",
     "backend/server/refresh_tokens.py",
     "backend/server/auto_debit_settings_repo.py",
     "backend/server/payment_reminder_notifications.py",

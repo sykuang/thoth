@@ -484,7 +484,11 @@ export type PortfolioSummary = {
   fx_assets_twd: number;
   /** SnapTrade 券商帳戶總值的 TWD 估值；每帳戶只採 balance_total 一次. */
   brokerage_assets_twd: number;
-  /** = total_assets + fx_assets_twd + brokerage_assets_twd. */
+  /** 手動存款與投資的獨立 TWD asset bucket；只在 total_assets_with_fx 加一次. */
+  manual_assets_twd: number;
+  /** 手動貸款的 TWD breakdown；已包含在 total_liabilities，不可重加. */
+  manual_liabilities_twd: number;
+  /** = total_assets + fx_assets_twd + brokerage_assets_twd + manual_assets_twd. */
   total_assets_with_fx: number;
   /** = total_card_unpaid + total_loan. */
   total_liabilities: number;
@@ -569,6 +573,55 @@ export type SnapTradePortfolio = {
   positions: BrokeragePosition[];
   activities: BrokerageActivity[];
   last_synced_at: string | null;
+};
+
+export type FinancialAccountSource = 'manual' | 'bank_sync' | 'brokerage_sync';
+export type FinancialAccountProductType =
+  | 'deposit'
+  | 'time_deposit'
+  | 'fx_deposit'
+  | 'checking'
+  | 'loan'
+  | 'mortgage'
+  | 'credit_line'
+  | 'investment'
+  | 'unknown';
+
+export type FinancialAccount = {
+  id: string;
+  source: FinancialAccountSource;
+  source_ref: string;
+  institution_name: string;
+  name: string;
+  account_ref: string | null;
+  product_type: FinancialAccountProductType;
+  currency: string;
+  balance: string | null;
+  as_of: string | null;
+  included_in_net_worth: boolean;
+  editable: boolean;
+  deletable: boolean;
+};
+
+export type ManualInvestmentTransaction = {
+  id: number;
+  account_id: string;
+  kind: 'opening' | 'buy' | 'sell' | 'fee';
+  occurred_on: string;
+  symbol: string | null;
+  quantity: string | null;
+  unit_price: string | null;
+  amount: string;
+  currency: string;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ManualInvestmentHolding = {
+  symbol: string;
+  quantity: string;
+  currency: string;
 };
 
 // =====================================================================
