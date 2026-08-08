@@ -67,6 +67,7 @@ from backend.core import bank_data
 from backend.server.deps import current_user
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
+    clear_dashboard_cache,
     get_or_set_dashboard_cache,
 )
 from backend.server.creds_store import AccountsRepo
@@ -1514,6 +1515,10 @@ def update_transaction(
             f"此銀行 ({e.bank}) 的 {e.table} 缺 {e.column} 欄, 請先升級",
         ) from e
 
+    # category / auto_excluded / splits 都會改變 Dashboard aggregate。
+    # Frontend invalidate 只能觸發重抓；若不清 server TTL cache，重抓仍會拿到
+    # 最多 30 秒前的本月消費與收支統計。
+    clear_dashboard_cache(user["id"])
     return transform(bank, result)
 
 

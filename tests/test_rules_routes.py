@@ -176,6 +176,14 @@ def test_recategorize_runs_and_returns_counts(client, tmp_path, monkeypatch):
     不另開 tmp_path/banks 子目錄 (避免 server route _data_root() 跟 test BankStore 路徑不一致).
     """
     import backend.core.store as store_mod
+    from backend.server.routers import rules as rules_router
+
+    cleared: list[int] = []
+    monkeypatch.setattr(
+        rules_router,
+        "clear_dashboard_cache",
+        lambda user_id: cleared.append(user_id),
+    )
 
     token = _register_and_token(client)
     h = {"Authorization": f"Bearer {token}"}
@@ -198,6 +206,7 @@ def test_recategorize_runs_and_returns_counts(client, tmp_path, monkeypatch):
     body = r.json()
     assert "updated" in body
     assert body["updated"] >= 1
+    assert len(cleared) == 1
 
     # 驗證 category 真的寫進去了
     bs = store_mod.BankStore("sinopac")

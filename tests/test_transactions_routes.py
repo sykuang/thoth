@@ -673,6 +673,34 @@ def test_patch_transaction_category(client, data_root):
     assert r.json()["category"] == "餐飲"
 
 
+def test_patch_transaction_clears_dashboard_cache(client, data_root, monkeypatch):
+    """交易統計欄位改動後，Dashboard不得繼續拿舊portfolio/stats cache。"""
+    from backend.server.routers import transactions as transactions_router
+
+    cleared: list[int] = []
+    monkeypatch.setattr(
+        transactions_router,
+        "clear_dashboard_cache",
+        lambda user_id: cleared.append(user_id),
+    )
+    token = _register(client, email="patch-cache-clear@p.com")
+    client.post("/accounts", json={"bank": "hsbc", "label": "t"}, headers=_auth(token))
+    _seed_bank_db(data_root, "hsbc", pending=[
+        {"card_no": "X", "date": "2026-06-12", "desc": "x", "amount": 1000},
+    ])
+    listed = client.get("/transactions?bank=hsbc&kind=pending", headers=_auth(token))
+    raw_id = listed.json()["items"][0]["raw"]["id"]
+
+    response = client.patch(
+        f"/transactions/hsbc/pending/{raw_id}",
+        json={"auto_excluded": True},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(cleared) == 1
+
+
 def test_patch_transaction_clear_category(client, data_root):
     token = _register(client, email="patchclear@p.com")
     client.post("/accounts", json={"bank": "hsbc", "label": "t"}, headers=_auth(token))

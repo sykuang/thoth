@@ -35,6 +35,7 @@ Endpoint:
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timedelta, UTC
@@ -324,6 +325,42 @@ def _current_month_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m")
 
 
+def _included_card_spending_amount(row: Any) -> int:
+    """Return the card amount remaining after per-split exclusions.
+
+    Parent ``auto_excluded`` rows are removed by the facade query. Invalid
+    legacy JSON or splits that do not reconcile to the parent conservatively
+    fall back to the parent amount instead of silently under-counting.
+    """
+    parent_amount = abs(_to_int(getattr(row, "amount", None)) or 0)
+    raw = getattr(row, "splits_overwrite", None)
+    if not raw:
+        return parent_amount
+    try:
+        splits = json.loads(raw)
+    except (TypeError, ValueError):
+        return parent_amount
+    if not isinstance(splits, list) or not splits or len(splits) > 20:
+        return parent_amount
+
+    total = 0
+    included = 0
+    for split in splits:
+        if not isinstance(split, dict):
+            return parent_amount
+        value = split.get("amount")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return parent_amount
+        excluded = split.get("auto_excluded", False)
+        if not isinstance(excluded, bool):
+            return parent_amount
+        amount = value
+        total += amount
+        if not excluded:
+            included += amount
+    return included if total == parent_amount else parent_amount
+
+
 def _bank_current_month_spending(bank: str, user_id: int) -> int:
     """本月消費 (TWD only) = card_pending_txns(全部) + card_billed_txns 本月 consume_date.
 
@@ -355,8 +392,7 @@ def _bank_current_month_spending(bank: str, user_id: int) -> int:
             continue
         if r.card_no in excluded_cards:
             continue
-        amt = _to_int(r.amount) or 0
-        total += abs(amt)
+        total += _included_card_spending_amount(r)
     # billed 表 — 看 consume_date 過濾本月
     for r in db_api.list_card_billed_amounts_for_month(
         bank=bank, user_id=user_id, month_pattern=pattern,
@@ -366,8 +402,7 @@ def _bank_current_month_spending(bank: str, user_id: int) -> int:
             continue
         if r.card_no in excluded_cards:
             continue
-        amt = _to_int(r.amount) or 0
-        total += abs(amt)
+        total += _included_card_spending_amount(r)
     return total
 
 

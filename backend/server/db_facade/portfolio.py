@@ -101,6 +101,7 @@ class CardMonthAmountRow(BaseModel):
     amount: float | int | None
     currency: str | None
     card_no: str | None
+    splits_overwrite: str | None = None
 
 
 # ============================================================
@@ -308,9 +309,14 @@ class PortfolioReadMixin(_BaseHelpers):
             excl_filter = (
                 " AND COALESCE(auto_excluded, 0) = 0" if "auto_excluded" in cols else ""
             )
+            splits_expr = (
+                "splits_overwrite" if "splits_overwrite" in cols
+                else "NULL AS splits_overwrite"
+            )
             try:
                 rows = con.execute(
-                    f"""SELECT amount, currency, card_no FROM card_pending_txns
+                    f"""SELECT amount, currency, card_no, {splits_expr}
+                        FROM card_pending_txns
                         WHERE user_id = ?{excl_filter}""",
                     (user_id,),
                 ).fetchall()
@@ -321,6 +327,7 @@ class PortfolioReadMixin(_BaseHelpers):
                     amount=r["amount"],
                     currency=r["currency"],
                     card_no=r["card_no"],
+                    splits_overwrite=r["splits_overwrite"],
                 )
                 for r in rows
             ]
@@ -352,9 +359,14 @@ class PortfolioReadMixin(_BaseHelpers):
             excl_filter = (
                 " AND COALESCE(auto_excluded, 0) = 0" if "auto_excluded" in cols else ""
             )
+            splits_expr = (
+                "splits_overwrite" if "splits_overwrite" in cols
+                else "NULL AS splits_overwrite"
+            )
             try:
                 rows = con.execute(
-                    f"""SELECT amount, currency, card_no FROM card_billed_txns
+                    f"""SELECT amount, currency, card_no, {splits_expr}
+                        FROM card_billed_txns
                         WHERE user_id = ? AND consume_date LIKE ?{excl_filter}""",
                     (user_id, month_pattern),
                 ).fetchall()
@@ -365,6 +377,7 @@ class PortfolioReadMixin(_BaseHelpers):
                     amount=r["amount"],
                     currency=r["currency"],
                     card_no=r["card_no"],
+                    splits_overwrite=r["splits_overwrite"],
                 )
                 for r in rows
             ]

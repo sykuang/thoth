@@ -85,6 +85,8 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
             description TEXT,
             amount INTEGER,
             currency TEXT,
+            auto_excluded INTEGER NOT NULL DEFAULT 0,
+            splits_overwrite TEXT,
             refreshed_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS card_billed_txns (
@@ -101,7 +103,9 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
             consume_amount REAL,
             first_seen TEXT,
             dedup_key TEXT,
-            category TEXT
+            category TEXT,
+            auto_excluded INTEGER NOT NULL DEFAULT 0,
+            splits_overwrite TEXT
         );
         CREATE TABLE IF NOT EXISTS twd_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,20 +147,25 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
     for r in (pending_rows or []):
         con.execute(
             """INSERT INTO card_pending_txns
-               (scope, card_no, consume_date, amount, currency, refreshed_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (scope, card_no, consume_date, amount, currency, auto_excluded,
+                splits_overwrite, refreshed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (r.get("scope", "unbilled"), r.get("card_no"), r.get("consume_date"),
-             r["amount"], r.get("currency", "TWD"), now),
+             r["amount"], r.get("currency", "TWD"),
+             1 if r.get("auto_excluded") else 0,
+             json.dumps(r["splits"]) if r.get("splits") else None, now),
         )
     for r in (billed_rows or []):
         con.execute(
             """INSERT INTO card_billed_txns
                (card_no, bill_date, currency, consume_date, post_date, description,
-                amount, first_seen, dedup_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                amount, first_seen, dedup_key, auto_excluded, splits_overwrite)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (r.get("card_no"), r.get("bill_date"), r.get("currency", "TWD"),
              r.get("consume_date"), r.get("post_date"), r.get("description"),
-             r["amount"], now, f"test-{id(r)}"),
+             r["amount"], now, f"test-{id(r)}",
+             1 if r.get("auto_excluded") else 0,
+             json.dumps(r["splits"]) if r.get("splits") else None),
         )
     # fx_accounts: 模擬 sinopac JPY 帳戶 — accounts 表 + twd_transactions 都要插
     # 2026-06-14 (excluded): fx_accounts dict 支援 excluded: bool (預設 False)
@@ -280,6 +289,82 @@ def test_summary_current_month_spending_from_pending_and_billed(temp_data_root, 
     # 41036 + 29 (pending 全部) + 5000 (billed 本月) = 46065
     assert ubot["current_month_spending"] == 46065
     assert body["current_month_spending"] == 46065
+
+
+def test_summary_current_month_spending_respects_transaction_exclusions(
+    temp_data_root, client, auth_headers,
+):
+    """整筆與拆帳子項的「不納入統計」都必須從Dashboard本月消費扣除。"""
+    month = _current_month_str()
+    _seed_bank_db(
+        temp_data_root,
+        "ubot",
+        pending_rows=[
+            {"amount": 1000, "currency": "TWD", "card_no": "keep"},
+            {
+                "amount": 2000,
+                "currency": "TWD",
+                "card_no": "ignored-parent",
+                "auto_excluded": True,
+            },
+            {
+                "amount": 1200,
+                "currency": "TWD",
+                "card_no": "split",
+                "splits": [
+                    {"amount": 300, "category": "飲食", "auto_excluded": False},
+                    {"amount": 900, "category": "代墊", "auto_excluded": True},
+                ],
+            },
+        ],
+        billed_rows=[
+            {
+                "amount": 500,
+                "currency": "TWD",
+                "card_no": "ignored-billed",
+                "consume_date": f"{month}-10",
+                "auto_excluded": True,
+            },
+        ],
+    )
+
+    response = client.get("/portfolio/summary", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["current_month_spending"] == 1300
+
+
+def test_summary_malformed_split_exclusions_fall_back_to_parent_amount(
+    temp_data_root, client, auth_headers,
+):
+    """不可信split型別不可經int/bool coercion後靜默少算本月消費。"""
+    _seed_bank_db(
+        temp_data_root,
+        "ubot",
+        pending_rows=[
+            {
+                "amount": 3,
+                "currency": "TWD",
+                "splits": [
+                    {"amount": 1.9, "auto_excluded": False},
+                    {"amount": 2.1, "auto_excluded": True},
+                ],
+            },
+            {
+                "amount": 4,
+                "currency": "TWD",
+                "splits": [
+                    {"amount": 1, "auto_excluded": "false"},
+                    {"amount": 3, "auto_excluded": False},
+                ],
+            },
+        ],
+    )
+
+    response = client.get("/portfolio/summary", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["current_month_spending"] == 7
 
 
 def test_summary_pending_is_NOT_added_to_liabilities(temp_data_root, client, auth_headers):

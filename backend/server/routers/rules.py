@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from backend.server import rules_repo
 from backend.server.deps import current_user
 from backend.server.categorizer import categorize_with_excluded, safe_match
+from backend.server.dashboard_cache import clear_dashboard_cache
 from backend.server.db_facade import BankNotAvailable, db_api
 from backend.server.seed_rules import reset_to_defaults
 
@@ -584,6 +585,8 @@ def recategorize(
             "total": bank_total, "updated": bank_upd, "protected": bank_protected,
         }
 
+    if updated:
+        clear_dashboard_cache(user["id"])
     return {
         "total_rows": total,
         "updated": updated,
