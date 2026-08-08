@@ -50,7 +50,10 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert 'testID="symbol-search-results"' in source
     assert "testID={`symbol-option-${match.symbol}`}" in source
     assert 'testID="symbol-confirmation"' in source
-    assert "已確認 {selectedSymbol.symbol} · Yahoo Finance" in source
+    assert "已確認 {selectedSymbol.symbol} · Yahoo Finance" not in source
+    assert "Yahoo 現價 {quoteQ.data.currency}" not in source
+    assert "{selectedSymbol.symbol}" in source
+    assert "{quoteQ.data.currency} {formatDecimalFixed(quoteQ.data.regular_market_price, 2)}" in source
     assert "queryKey: ['financial-accounts']" in source
     assert "queryKey: ['portfolio', 'summary']" in source
     assert "account.manual_balance ?? account.balance" in source

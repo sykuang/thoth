@@ -489,22 +489,19 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
             )}
             {selectedSymbol != null && (
               <View
-                className="-mt-3 mb-4 bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 rounded-xl p-3"
+                className="-mt-3 mb-4 bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 rounded-xl px-3 py-2.5 flex-row items-center justify-between gap-3"
                 testID="symbol-confirmation"
               >
                 <Text className="text-emerald-800 dark:text-emerald-200 text-small font-semibold">
-                  已確認 {selectedSymbol.symbol} · Yahoo Finance
-                </Text>
-                <Text className="text-emerald-700 dark:text-emerald-300 text-micro mt-1">
-                  {selectedSymbol.name} · {selectedSymbol.exchange_name ?? selectedSymbol.exchange ?? selectedSymbol.quote_type}
+                  {selectedSymbol.symbol}
                 </Text>
                 {quoteQ.isFetching ? (
-                  <ActivityIndicator className="mt-2" />
+                  <ActivityIndicator size="small" />
                 ) : quoteQ.isError ? (
-                  <Text className="text-amber-700 dark:text-amber-300 text-micro mt-2">現價暫時無法取得；代號仍已確認。</Text>
+                  <Text className="text-amber-700 dark:text-amber-300 text-micro">現價暫缺</Text>
                 ) : quoteQ.data ? (
-                  <Text className="text-emerald-800 dark:text-emerald-200 text-small mt-2">
-                    Yahoo 現價 {quoteQ.data.currency} {formatDecimalFixed(quoteQ.data.regular_market_price, 2)}
+                  <Text className="text-emerald-800 dark:text-emerald-200 text-small">
+                    {quoteQ.data.currency} {formatDecimalFixed(quoteQ.data.regular_market_price, 2)}
                   </Text>
                 ) : null}
               </View>
