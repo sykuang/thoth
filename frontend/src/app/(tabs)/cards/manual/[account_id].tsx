@@ -88,12 +88,9 @@ export default function ManualAccountScreen() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [productType, setProductType] = useState<EditableProductType>('deposit');
-  const [institutionName, setInstitutionName] = useState('');
   const [name, setName] = useState('');
-  const [accountRef, setAccountRef] = useState('');
   const [currency, setCurrency] = useState('TWD');
   const [balance, setBalance] = useState('0');
-  const [asOf, setAsOf] = useState(today());
   const [included, setIncluded] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -112,12 +109,9 @@ export default function ManualAccountScreen() {
     // Async query hydrates user-editable state once; derived values would overwrite edits.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (account.product_type !== 'unknown') setProductType(account.product_type);
-    setInstitutionName(account.institution_name);
     setName(account.name);
-    setAccountRef(account.account_ref ?? '');
     setCurrency(account.currency);
     setBalance((account.balance ?? '0').replace(/^-/, ''));
-    setAsOf(account.as_of ?? today());
     setIncluded(account.included_in_net_worth);
   }, [account]);
 
@@ -128,12 +122,9 @@ export default function ManualAccountScreen() {
         method: isNew ? 'POST' : 'PATCH',
         body: {
           product_type: productType,
-          institution_name: institutionName.trim(),
           name: name.trim(),
-          account_ref: accountRef.trim() || null,
           currency: currency.trim().toUpperCase(),
           balance: balance.trim(),
-          as_of: asOf.trim(),
           included_in_net_worth: included,
         },
       },
@@ -226,14 +217,12 @@ export default function ManualAccountScreen() {
               </Pressable>
             ))}
           </View>
-          <Field label="機構" value={institutionName} onChangeText={setInstitutionName} placeholder="銀行或券商名稱" testID="manual-institution" />
-          <Field label="帳戶名稱" value={name} onChangeText={setName} placeholder="例如：緊急預備金" testID="manual-name" />
-          <Field label="帳號末碼（選填）" value={accountRef} onChangeText={setAccountRef} placeholder="例如：1234" />
+          <Field label="名稱" value={name} onChangeText={setName} placeholder="例如：永豐證券、緊急預備金" testID="manual-name" />
           <View className="flex-row gap-3">
             <View className="w-28"><Field label="幣別" value={currency} onChangeText={setCurrency} placeholder="TWD" /></View>
             <View className="flex-1"><Field label={productType === 'investment' ? '目前總值' : '目前餘額'} value={balance} onChangeText={setBalance} keyboardType="decimal-pad" testID="manual-balance" /></View>
           </View>
-          <Field label="估值日期（YYYY-MM-DD）" value={asOf} onChangeText={setAsOf} placeholder="2026-08-08" />
+
           <View className="flex-row items-center justify-between py-2 mb-3">
             <View className="flex-1 pr-3">
               <Text className="text-ink-900 dark:text-ink-50 text-body">納入淨資產</Text>
@@ -248,7 +237,7 @@ export default function ManualAccountScreen() {
             onPress={() => saveAccount.mutate()}
             accessibilityRole="button"
             accessibilityLabel={isNew ? '新增手動帳戶' : '儲存手動帳戶'}
-            disabled={saveAccount.isPending || !institutionName.trim() || !name.trim() || !balance.trim()}
+            disabled={saveAccount.isPending || !name.trim() || !balance.trim()}
             className={`bg-brand-600 active:bg-brand-700 rounded-xl py-3 items-center ${saveAccount.isPending ? 'opacity-50' : ''}`}
             testID="save-manual-account"
           >

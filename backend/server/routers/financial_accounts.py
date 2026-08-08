@@ -58,12 +58,9 @@ def _decimal_text(value: str, *, allow_zero: bool = True) -> str:
 
 class ManualAccountPayload(BaseModel):
     product_type: ProductType
-    institution_name: str = Field(min_length=1, max_length=120)
     name: str = Field(min_length=1, max_length=120)
-    account_ref: str | None = Field(default=None, max_length=64)
     currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
     balance: str
-    as_of: date
     included_in_net_worth: bool = True
 
     @field_validator("balance")
@@ -72,9 +69,7 @@ class ManualAccountPayload(BaseModel):
         return _decimal_text(value)
 
     def domain_values(self) -> dict:
-        values = self.model_dump()
-        values["as_of"] = self.as_of.isoformat()
-        return values
+        return self.model_dump()
 
 
 class InvestmentTransactionPayload(BaseModel):
@@ -128,7 +123,11 @@ def list_accounts(
     return accounts if source is None else [row for row in accounts if row.source == source]
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=FinancialAccount)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=FinancialAccount,
+)
 def create_account(
     body: ManualAccountPayload,
     user: dict = Depends(current_user),
@@ -141,7 +140,10 @@ def create_account(
     return account
 
 
-@router.patch("/{account_id}", response_model=FinancialAccount)
+@router.patch(
+    "/{account_id}",
+    response_model=FinancialAccount,
+)
 def update_account(
     account_id: str,
     body: ManualAccountPayload,

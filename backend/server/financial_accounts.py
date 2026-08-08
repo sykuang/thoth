@@ -30,7 +30,7 @@ class FinancialAccount(BaseModel):
     id: str
     source: AccountSource
     source_ref: str
-    institution_name: str
+    institution_name: str | None
     name: str
     account_ref: str | None
     product_type: str
@@ -124,12 +124,9 @@ def parse_manual_id(account_id: str) -> int:
 def _normalize_account_values(
     *,
     product_type: str,
-    institution_name: str,
     name: str,
-    account_ref: str | None,
     currency: str,
     balance: object,
-    as_of: str,
     included_in_net_worth: bool,
 ) -> dict[str, object]:
     product_type = product_type.strip().lower()
@@ -140,21 +137,17 @@ def _normalize_account_values(
         raise InvalidManualAccount("enter balance as a non-negative magnitude")
     if account_classify.is_liability_type(product_type):
         amount = -amount
-    institution_name = institution_name.strip()
     name = name.strip()
     currency = currency.strip().upper()
-    if not institution_name or not name:
-        raise InvalidManualAccount("institution and name are required")
+    if not name:
+        raise InvalidManualAccount("name is required")
     if len(currency) != 3 or not currency.isalpha():
         raise InvalidManualAccount("currency must be a three-letter code")
     return {
         "product_type": product_type,
-        "institution_name": institution_name,
         "name": name,
-        "account_ref": account_ref.strip() if account_ref and account_ref.strip() else None,
         "currency": currency,
         "balance": format(amount, "f"),
-        "as_of": as_of,
         "included_in_net_worth": bool(included_in_net_worth),
     }
 
@@ -164,14 +157,14 @@ def _row_to_manual_account(row) -> FinancialAccount:
         id=_manual_id(int(_row_value(row, 0, "id"))),
         source="manual",
         source_ref=str(_row_value(row, 0, "id")),
-        institution_name=_row_value(row, 2, "institution_name"),
-        name=_row_value(row, 3, "name"),
-        account_ref=_row_value(row, 4, "account_ref"),
+        institution_name=None,
+        name=_row_value(row, 2, "name"),
+        account_ref=None,
         product_type=_row_value(row, 1, "product_type"),
-        currency=_row_value(row, 5, "currency"),
-        balance=_row_value(row, 6, "balance"),
-        as_of=_row_value(row, 7, "as_of"),
-        included_in_net_worth=bool(_row_value(row, 8, "included_in_net_worth")),
+        currency=_row_value(row, 3, "currency"),
+        balance=_row_value(row, 4, "balance"),
+        as_of=None,
+        included_in_net_worth=bool(_row_value(row, 5, "included_in_net_worth")),
         editable=True,
         deletable=True,
     )

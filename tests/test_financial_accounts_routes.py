@@ -22,16 +22,57 @@ def _auth(token: str) -> dict[str, str]:
 def _payload(**overrides):
     payload = {
         "product_type": "deposit",
-        "institution_name": "Palace Bank",
         "name": "Emergency Fund",
-        "account_ref": "1234",
         "currency": "TWD",
         "balance": "1000.50",
-        "as_of": "2026-08-08",
         "included_in_net_worth": True,
     }
     payload.update(overrides)
     return payload
+
+
+def test_manual_account_schema_drops_obsolete_columns(tmp_path, monkeypatch):
+    import importlib
+    import sqlite3
+
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DB_BACKEND", "sqlite")
+    from backend.server import db
+    importlib.reload(db)
+
+    with sqlite3.connect(db.server_db_path()) as conn:
+        conn.execute(
+            """CREATE TABLE manual_financial_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_type TEXT NOT NULL,
+                institution_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                account_ref TEXT,
+                currency TEXT NOT NULL,
+                balance TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                included_in_net_worth INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+        conn.execute(
+            """INSERT INTO manual_financial_accounts
+               (user_id, product_type, institution_name, name, account_ref, currency,
+                balance, as_of, included_in_net_worth, created_at, updated_at)
+               VALUES (1, 'deposit', 'Legacy Bank', 'Emergency Fund', '1234', 'TWD',
+                       '1000', '2026-08-08', 1, 'now', 'now')""",
+        )
+
+    with db.get_conn() as conn:
+        columns = db._columns(conn, "manual_financial_accounts")
+        row = conn.execute(
+            "SELECT name, balance FROM manual_financial_accounts WHERE id=1",
+        ).fetchone()
+
+    assert {"institution_name", "account_ref", "as_of"}.isdisjoint(columns)
+    assert tuple(row) == ("Emergency Fund", "1000")
 
 
 def test_manual_financial_account_crud_and_liability_normalization(client):
@@ -45,6 +86,9 @@ def test_manual_financial_account_crud_and_liability_normalization(client):
     assert account["source"] == "manual"
     assert account["product_type"] == "deposit"
     assert account["balance"] == "1000.50"
+    assert account["institution_name"] is None
+    assert account["account_ref"] is None
+    assert account["as_of"] is None
     assert account["editable"] is True
     assert account["deletable"] is True
 

@@ -31,6 +31,13 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert 'accessibilityRole="radio"' in source
     assert "accessibilityLabel={label}" in source
     assert 'accessibilityLabel="納入淨資產"' in source
+    assert 'label="名稱"' in source
+    assert "institution_name:" not in source
+    assert "account_ref:" not in source
+    assert "as_of:" not in source
+    assert "manual-institution" not in source
+    assert "帳號末碼" not in source
+    assert "估值日期" not in source
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:

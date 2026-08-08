@@ -591,7 +591,7 @@ export type FinancialAccount = {
   id: string;
   source: FinancialAccountSource;
   source_ref: string;
-  institution_name: string;
+  institution_name: string | null;
   name: string;
   account_ref: string | null;
   product_type: FinancialAccountProductType;

@@ -577,7 +577,7 @@ function ManualAccountsSection({
                 {account.name}
               </Text>
               <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5" numberOfLines={1}>
-                {account.institution_name} · {typeLabel[account.product_type] ?? account.product_type}
+                {typeLabel[account.product_type] ?? account.product_type}
               </Text>
             </View>
             <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold">

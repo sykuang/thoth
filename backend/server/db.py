@@ -387,12 +387,9 @@ CREATE TABLE IF NOT EXISTS manual_financial_accounts (
     id                    {_PK_TYPE},
     user_id               INTEGER NOT NULL,
     product_type          TEXT NOT NULL,
-    institution_name      TEXT NOT NULL,
     name                  TEXT NOT NULL,
-    account_ref           TEXT,
     currency              TEXT NOT NULL,
     balance               TEXT NOT NULL,
-    as_of                 TEXT NOT NULL,
     included_in_net_worth INTEGER NOT NULL DEFAULT 1,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL
@@ -576,6 +573,13 @@ def _ensure_schema(conn: Any) -> None:
             "ALTER TABLE brokerage_accounts "
             "ADD COLUMN transactions_first_transaction_date TEXT",
         )
+
+    manual_account_cols = _columns(conn, "manual_financial_accounts")
+    for obsolete_column in ("institution_name", "account_ref", "as_of"):
+        if obsolete_column in manual_account_cols:
+            conn.execute(
+                f"ALTER TABLE manual_financial_accounts DROP COLUMN {obsolete_column}",
+            )
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上
     cols = _columns(conn, "sync_jobs")

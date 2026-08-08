@@ -6,10 +6,7 @@ from typing import Callable
 from backend.server import db
 
 
-_ACCOUNT_COLUMNS = (
-    "id, product_type, institution_name, name, account_ref, currency, "
-    "balance, as_of, included_in_net_worth"
-)
+_ACCOUNT_COLUMNS = "id, product_type, name, currency, balance, included_in_net_worth"
 _TRANSACTION_COLUMNS = (
     "id, account_id, kind, occurred_on, symbol, quantity, unit_price, "
     "amount, currency, note, created_at, updated_at"
@@ -36,12 +33,11 @@ def insert_account(user_id: int, values: dict[str, object], now: str) -> int:
     with db.get_conn() as conn:
         row = conn.execute(
             """INSERT INTO manual_financial_accounts
-               (user_id, product_type, institution_name, name, account_ref, currency,
-                balance, as_of, included_in_net_worth, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+               (user_id, product_type, name, currency, balance,
+                included_in_net_worth, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (
-                user_id, values["product_type"], values["institution_name"], values["name"],
-                values["account_ref"], values["currency"], values["balance"], values["as_of"],
+                user_id, values["product_type"], values["name"], values["currency"], values["balance"],
                 1 if values["included_in_net_worth"] else 0, now, now,
             ),
         ).fetchone()
@@ -81,12 +77,10 @@ def update_account(user_id: int, account_id: int, values: dict[str, object], now
                 return "has_transactions"
         cursor = conn.execute(
             """UPDATE manual_financial_accounts SET
-                   product_type=?, institution_name=?, name=?, account_ref=?, currency=?,
-                   balance=?, as_of=?, included_in_net_worth=?, updated_at=?
+                   product_type=?, name=?, currency=?, balance=?, included_in_net_worth=?, updated_at=?
                WHERE id=? AND user_id=?""",
             (
-                values["product_type"], values["institution_name"], values["name"],
-                values["account_ref"], values["currency"], values["balance"], values["as_of"],
+                values["product_type"], values["name"], values["currency"], values["balance"],
                 1 if values["included_in_net_worth"] else 0, now, account_id, user_id,
             ),
         )

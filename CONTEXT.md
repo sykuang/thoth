@@ -6,7 +6,7 @@
 A user's configured login relationship with a supported bank. It may contain credentials and can synchronize zero or more financial accounts and cards. A bank connection is not itself a financial account.
 
 ### Financial Account
-A user-owned store of financial value or obligation with a stable identity, product type, institution, currency, current valuation, and valuation date. A financial account may be synchronized from a provider or maintained manually.
+A user-owned store of financial value or obligation with a stable identity, name, product type, currency, and current valuation. Synchronized accounts may additionally supply an institution, masked account reference, and provider valuation timestamp; manual accounts intentionally do not store those source-specific fields.
 
 ### Synchronized Account
 A financial account whose authoritative current valuation is supplied by a bank crawler or brokerage provider. Provider data is read-only in Thoth except for user-owned display metadata and inclusion preferences.
