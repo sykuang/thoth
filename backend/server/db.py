@@ -407,7 +407,6 @@ CREATE TABLE IF NOT EXISTS manual_investment_transactions (
     occurred_on  TEXT NOT NULL,
     symbol       TEXT,
     quantity     TEXT,
-    unit_price   TEXT,
     amount       TEXT NOT NULL,
     currency     TEXT NOT NULL,
     note         TEXT,

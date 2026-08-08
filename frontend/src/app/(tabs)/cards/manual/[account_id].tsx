@@ -15,7 +15,12 @@ import {
 import { Dropdown, type DropdownOption } from '@/components/Dropdown';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { api, ApiError, formatApiError } from '@/lib/api';
-import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
+import {
+  divideDecimal,
+  formatDecimal,
+  formatDecimalFixed,
+  multiplyDecimal,
+} from '@/lib/decimal';
 import type {
   FinancialAccount,
   FinancialAccountProductType,
@@ -27,6 +32,7 @@ import type {
 
 type EditableProductType = Exclude<FinancialAccountProductType, 'unknown'>;
 type TradeKind = ManualInvestmentTransaction['kind'];
+type CostInputMode = 'unit' | 'total';
 
 const PRODUCT_TYPES: { value: EditableProductType; label: string }[] = [
   { value: 'deposit', label: '存款' },
@@ -63,6 +69,10 @@ const today = () => {
   const day = String(date.getDate()).padStart(2, '0');
   return `${date.getFullYear()}-${month}-${day}`;
 };
+
+function derivedUnitCost(row: ManualInvestmentTransaction): string | null {
+  return row.quantity ? divideDecimal(row.amount, row.quantity, 2) : null;
+}
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -284,7 +294,10 @@ export default function ManualAccountScreen() {
         </View>
 
         {!isNew && account?.product_type === 'investment' && accountId && (
-          <InvestmentJournal accountId={accountId} defaultCurrency={account.currency} />
+          <InvestmentJournal
+            accountId={accountId}
+            defaultCurrency={account.currency}
+          />
         )}
 
         {!isNew && (
@@ -304,7 +317,13 @@ export default function ManualAccountScreen() {
   );
 }
 
-function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; defaultCurrency: string }) {
+export function InvestmentJournal({
+  accountId,
+  defaultCurrency,
+}: {
+  accountId: string;
+  defaultCurrency: string;
+}) {
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<number | null>(null);
   const [kind, setKind] = useState<TradeKind>('opening');
@@ -312,6 +331,8 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
   const [symbol, setSymbol] = useState('');
   const [quantity, setQuantity] = useState('');
   const [unitPrice, setUnitPrice] = useState('');
+  const [totalCost, setTotalCost] = useState('');
+  const [costInputMode, setCostInputMode] = useState<CostInputMode>('unit');
   const [amount, setAmount] = useState('');
   const [currency, setCurrency] = useState(defaultCurrency);
   const [note, setNote] = useState('');
@@ -352,6 +373,8 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
     setSymbol('');
     setQuantity('');
     setUnitPrice('');
+    setTotalCost('');
+    setCostInputMode('unit');
     setAmount('');
     setCurrency(defaultCurrency);
     setNote('');
@@ -370,8 +393,11 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
           occurred_on: occurredOn,
           symbol: kind === 'fee' ? null : symbol.trim().toUpperCase(),
           quantity: kind === 'fee' ? null : quantity.trim(),
-          unit_price: kind === 'fee' ? null : unitPrice.trim(),
-          amount: kind === 'fee' ? amount.trim() : null,
+          amount: kind === 'fee'
+            ? amount.trim()
+            : costInputMode === 'total'
+              ? totalCost.trim()
+              : (multiplyDecimal(quantity.trim(), unitPrice.trim(), 12) ?? ''),
           currency: currency.trim().toUpperCase(),
           note: note.trim() || null,
         },
@@ -406,7 +432,9 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
     setOccurredOn(row.occurred_on);
     setSymbol(row.symbol ?? '');
     setQuantity(row.quantity ?? '');
-    setUnitPrice(row.unit_price ?? '');
+    setUnitPrice(derivedUnitCost(row) ?? '');
+    setTotalCost(row.kind === 'fee' ? '' : row.amount);
+    setCostInputMode('total');
     setAmount(row.kind === 'fee' ? row.amount : '');
     setCurrency(row.currency);
     setNote(row.note ?? '');
@@ -538,7 +566,54 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
           </>
         )}
         {kind !== 'fee' && <Field label="數量" value={quantity} onChangeText={setQuantity} keyboardType="decimal-pad" />}
-        {kind !== 'fee' && <Field label={kind === 'opening' ? '期初單位成本' : '成交單價'} value={unitPrice} onChangeText={setUnitPrice} keyboardType="decimal-pad" />}
+        {kind !== 'fee' && (
+          <>
+            <Text className="text-ink-700 dark:text-ink-300 text-small font-medium mb-2">
+              成本輸入方式
+            </Text>
+            <View className="flex-row rounded-xl bg-ink-100 dark:bg-ink-800 p-1 mb-4">
+              {([
+                ['unit', '單位成本'],
+                ['total', '總成本'],
+              ] as const).map(([value, label]) => (
+                <Pressable
+                  key={value}
+                  onPress={() => setCostInputMode(value)}
+                  accessibilityRole="radio"
+                  accessibilityState={{ selected: costInputMode === value }}
+                  accessibilityLabel={`成本輸入方式：${label}`}
+                  className={`flex-1 rounded-lg py-2.5 items-center ${
+                    costInputMode === value ? 'bg-brand-600' : ''
+                  }`}
+                  testID={`cost-mode-${value}`}
+                >
+                  <Text className={costInputMode === value
+                    ? 'text-white text-small font-semibold'
+                    : 'text-ink-600 dark:text-ink-300 text-small font-semibold'}>
+                    {label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {costInputMode === 'unit' ? (
+              <Field
+                label={kind === 'opening' ? '期初單位成本' : '成交單價'}
+                value={unitPrice}
+                onChangeText={setUnitPrice}
+                keyboardType="decimal-pad"
+                testID="manual-unit-cost"
+              />
+            ) : (
+              <Field
+                label="總成本"
+                value={totalCost}
+                onChangeText={setTotalCost}
+                keyboardType="decimal-pad"
+                testID="manual-total-cost"
+              />
+            )}
+          </>
+        )}
         {kind === 'fee' && <Field label="費用金額" value={amount} onChangeText={setAmount} keyboardType="decimal-pad" />}
         <Field label="幣別" value={currency} onChangeText={setCurrency} placeholder="USD" />
         <Field label="備註（選填）" value={note} onChangeText={setNote} />
@@ -579,7 +654,9 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
                 </Text>
                 <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
                   {row.occurred_on}{row.quantity ? ` · ${formatDecimal(row.quantity) ?? row.quantity} 股` : ''}
-                  {row.unit_price ? ` · ${row.currency} ${formatDecimalFixed(row.unit_price, 2)}` : ''}
+                  {row.quantity
+                    ? ` · 單位成本 ${row.currency} ${derivedUnitCost(row) ?? '—'}`
+                    : ''}
                 </Text>
               </View>
               <Text className="text-ink-700 dark:text-ink-300 text-small">

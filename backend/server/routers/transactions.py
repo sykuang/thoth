@@ -338,21 +338,21 @@ def _normalize_splits_input(raw: Any, parent_amount: int) -> list[dict[str, Any]
         if unknown:
             raise ValueError(f"split 不支援的欄位: {sorted(unknown)}")
         raw_amount = item.get("amount")
-        if raw_amount is None or isinstance(raw_amount, bool):
+        if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
             raise ValueError("split amount 必須是整數")
-        try:
-            amount = int(raw_amount)
-        except (TypeError, ValueError):
-            raise ValueError("split amount 必須是整數") from None
+        amount = raw_amount
         if amount <= 0:
             raise ValueError("split amount 必須大於 0 (方向沿用母筆, 不用負號)")
+        auto_excluded = item.get("auto_excluded", False)
+        if not isinstance(auto_excluded, bool):
+            raise ValueError("split auto_excluded 必須是布林值")
 
         out.append({
             "amount": amount,
             "category": _split_opt_str(item, "category"),
             "subcategory": _split_opt_str(item, "subcategory"),
             "note": _split_opt_str(item, "note", 200),
-            "auto_excluded": bool(item.get("auto_excluded")),
+            "auto_excluded": auto_excluded,
         })
 
     total = sum(s["amount"] for s in out)

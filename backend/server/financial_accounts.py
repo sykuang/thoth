@@ -55,7 +55,6 @@ class InvestmentTransaction(BaseModel):
     occurred_on: str
     symbol: str | None
     quantity: str | None
-    unit_price: str | None
     amount: str
     currency: str
     note: str | None
@@ -351,7 +350,6 @@ def _normalize_transaction_values(
     currency: str,
     symbol: str | None = None,
     quantity: object | None = None,
-    unit_price: object | None = None,
     amount: object | None = None,
     note: str | None = None,
 ) -> dict[str, str | None]:
@@ -369,29 +367,24 @@ def _normalize_transaction_values(
         if parsed_quantity <= 0:
             raise InvalidManualAccount("quantity must be positive")
         quantity_text = format(parsed_quantity, "f")
-        if unit_price is None:
-            raise InvalidManualAccount("unit price is required for position transactions")
-        parsed_price = _decimal(unit_price)
-        if parsed_price < 0:
-            raise InvalidManualAccount("unit price must be non-negative")
-        if kind == "opening" and parsed_price == 0:
+        parsed_amount = _decimal(amount)
+        if parsed_amount < 0:
+            raise InvalidManualAccount("total cost must be non-negative")
+        if kind == "opening" and parsed_amount == 0:
             raise InvalidManualAccount("opening cost must be positive")
-        price_text = format(parsed_price, "f")
-        amount_text = format(parsed_quantity * parsed_price, "f")
+        amount_text = format(parsed_amount, "f")
     else:
         parsed_amount = _decimal(amount)
         if parsed_amount <= 0:
             raise InvalidManualAccount("fee amount must be positive")
         symbol = None
         quantity_text = None
-        price_text = None
         amount_text = format(parsed_amount, "f")
     return {
         "kind": kind,
         "occurred_on": occurred_on,
         "symbol": symbol,
         "quantity": quantity_text,
-        "unit_price": price_text,
         "amount": amount_text,
         "currency": currency,
         "note": note.strip() if note and note.strip() else None,
@@ -406,12 +399,11 @@ def _row_to_transaction(row) -> InvestmentTransaction:
         occurred_on=_row_value(row, 3, "occurred_on"),
         symbol=_row_value(row, 4, "symbol"),
         quantity=_row_value(row, 5, "quantity"),
-        unit_price=_row_value(row, 6, "unit_price"),
-        amount=_row_value(row, 7, "amount"),
-        currency=_row_value(row, 8, "currency"),
-        note=_row_value(row, 9, "note"),
-        created_at=_row_value(row, 10, "created_at"),
-        updated_at=_row_value(row, 11, "updated_at"),
+        amount=_row_value(row, 6, "amount"),
+        currency=_row_value(row, 7, "currency"),
+        note=_row_value(row, 8, "note"),
+        created_at=_row_value(row, 9, "created_at"),
+        updated_at=_row_value(row, 10, "updated_at"),
     )
 
 

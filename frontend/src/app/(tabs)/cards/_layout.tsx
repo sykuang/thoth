@@ -26,7 +26,8 @@ export default function CardsLayout() {
       }}
     >
       <Stack.Screen name="index" options={{ headerShown: false }} />
-      <Stack.Screen name="new" options={{ title: '新增銀行帳號' }} />
+      <Stack.Screen name="add" options={{ title: '新增帳戶' }} />
+      <Stack.Screen name="new" options={{ title: '連結銀行帳號' }} />
       <Stack.Screen
         name="credentials/[bank]"
         options={{ title: '管理登入' }}

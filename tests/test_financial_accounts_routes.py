@@ -64,15 +64,57 @@ def test_manual_account_schema_drops_obsolete_columns(tmp_path, monkeypatch):
                VALUES (1, 'deposit', 'Legacy Bank', 'Emergency Fund', '1234', 'TWD',
                        '1000', '2026-08-08', 1, 'now', 'now')""",
         )
+        conn.execute(
+            """CREATE TABLE manual_investment_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                occurred_on TEXT NOT NULL,
+                symbol TEXT,
+                quantity TEXT,
+                unit_price TEXT,
+                amount TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+        conn.execute(
+            """INSERT INTO manual_investment_transactions
+               (user_id, account_id, kind, occurred_on, symbol, quantity, unit_price,
+                amount, currency, note, created_at, updated_at)
+               VALUES (1, 1, 'opening', '2026-08-08', 'AAA', '5', '80',
+                       '400', 'USD', NULL, 'now', 'now')""",
+        )
 
     with db.get_conn() as conn:
         columns = db._columns(conn, "manual_financial_accounts")
+        transaction_columns = db._columns(conn, "manual_investment_transactions")
         row = conn.execute(
             "SELECT name, balance FROM manual_financial_accounts WHERE id=1",
+        ).fetchone()
+        transaction_row = conn.execute(
+            "SELECT quantity, amount FROM manual_investment_transactions WHERE id=1",
         ).fetchone()
 
     assert {"institution_name", "account_ref", "as_of"}.isdisjoint(columns)
     assert tuple(row) == ("Emergency Fund", "1000")
+    # Compatibility release: 0.3.90 stops reading/writing the legacy column,
+    # but leaves it in an existing DB until all 0.3.89 revisions are drained.
+    assert "unit_price" in transaction_columns
+    assert tuple(transaction_row) == ("5", "400")
+
+
+def test_fresh_manual_investment_schema_has_only_total_cost(client):
+    from backend.server import db
+
+    with db.get_conn() as conn:
+        columns = db._columns(conn, "manual_investment_transactions")
+
+    assert "amount" in columns
+    assert "unit_price" not in columns
 
 
 def test_manual_financial_account_crud_and_liability_normalization(client):
@@ -282,6 +324,21 @@ def test_manual_investment_transaction_crud_without_dividends(client):
         },
     )
     assert missing_opening_cost.status_code == 422, missing_opening_cost.text
+    legacy_unit_cost = client.post(
+        f"/financial-accounts/{account['id']}/transactions",
+        headers=headers,
+        json={
+            "kind": "opening",
+            "occurred_on": "2026-07-31",
+            "symbol": "AAA",
+            "quantity": "5",
+            "unit_price": "80",
+            "currency": "USD",
+        },
+    )
+    assert legacy_unit_cost.status_code == 422, legacy_unit_cost.text
+    assert "unit_price" in legacy_unit_cost.text
+    assert "extra_forbidden" in legacy_unit_cost.text
     zero_opening_cost = client.post(
         f"/financial-accounts/{account['id']}/transactions",
         headers=headers,
@@ -290,11 +347,32 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-07-31",
             "symbol": "AAA",
             "quantity": "5",
-            "unit_price": "0",
+            "amount": "0",
             "currency": "USD",
         },
     )
     assert zero_opening_cost.status_code == 422, zero_opening_cost.text
+
+    opening_from_total_cost = client.post(
+        f"/financial-accounts/{account['id']}/transactions",
+        headers=headers,
+        json={
+            "kind": "opening",
+            "occurred_on": "2026-07-30",
+            "symbol": "TOTAL",
+            "quantity": "3",
+            "amount": "100",
+            "currency": "USD",
+        },
+    )
+    assert opening_from_total_cost.status_code == 201, opening_from_total_cost.text
+    assert opening_from_total_cost.json()["amount"] == "100"
+    cleanup_total_cost = client.delete(
+        f"/financial-accounts/{account['id']}/transactions/"
+        f"{opening_from_total_cost.json()['id']}",
+        headers=headers,
+    )
+    assert cleanup_total_cost.status_code == 204, cleanup_total_cost.text
 
     opening = client.post(
         f"/financial-accounts/{account['id']}/transactions",
@@ -304,13 +382,12 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-07-31",
             "symbol": "AAA",
             "quantity": "5",
-            "unit_price": "80.00",
+            "amount": "400.00",
             "currency": "USD",
             "note": "opening position",
         },
     )
     assert opening.status_code == 201, opening.text
-    assert opening.json()["unit_price"] == "80.00"
     assert opening.json()["amount"] == "400.00"
 
     backdated_sell = client.post(
@@ -321,7 +398,7 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-07-30",
             "symbol": "AAA",
             "quantity": "1",
-            "unit_price": "99",
+            "amount": "99",
             "currency": "USD",
         },
     )
@@ -335,7 +412,7 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-08-01",
             "symbol": "AAA",
             "quantity": "2.5",
-            "unit_price": "100.00",
+            "amount": "250.00",
             "currency": "USD",
             "note": "opening trade",
         },
@@ -345,8 +422,7 @@ def test_manual_investment_transaction_crud_without_dividends(client):
     assert trade["account_id"] == account["id"]
     assert trade["kind"] == "buy"
     assert trade["quantity"] == "2.5"
-    assert trade["unit_price"] == "100.00"
-    assert trade["amount"] == "250.000"
+    assert trade["amount"] == "250.00"
     assert client.get(
         f"/financial-accounts/{account['id']}/holdings",
         headers=headers,
@@ -367,14 +443,14 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-08-02",
             "symbol": "AAA",
             "quantity": "1.25",
-            "unit_price": "120.00",
+            "amount": "150.00",
             "currency": "USD",
             "note": None,
         },
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["kind"] == "sell"
-    assert updated.json()["amount"] == "150.0000"
+    assert updated.json()["amount"] == "150.00"
     assert client.get(
         f"/financial-accounts/{account['id']}/holdings",
         headers=headers,
@@ -388,7 +464,7 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "occurred_on": "2026-08-03",
             "symbol": "AAA",
             "quantity": "99",
-            "unit_price": "120",
+            "amount": "11880",
             "currency": "USD",
         },
     )
@@ -476,7 +552,7 @@ def test_manual_investment_concurrent_sells_cannot_create_negative_holdings(clie
             "occurred_on": "2026-08-01",
             "symbol": "AAA",
             "quantity": "1",
-            "unit_price": "10",
+            "amount": "10",
             "currency": "USD",
         },
     ).status_code == 201
@@ -495,8 +571,7 @@ def test_manual_investment_concurrent_sells_cannot_create_negative_holdings(clie
                 occurred_on="2026-08-02",
                 symbol="AAA",
                 quantity="1",
-                unit_price="10",
-                amount=None,
+                amount="10",
                 currency="USD",
                 note=None,
             )
@@ -537,9 +612,9 @@ def test_manual_account_decimal_input_is_bounded(client, monkeypatch):
         "currency": "USD",
     }
     for payload in (
-        {**base_trade, "kind": "opening", "quantity": "1e2", "unit_price": "1"},
-        {**base_trade, "kind": "opening", "quantity": "1", "unit_price": "1e2"},
-        {**base_trade, "kind": "buy", "quantity": "1", "unit_price": "1e2"},
+        {**base_trade, "kind": "opening", "quantity": "1e2", "amount": "1"},
+        {**base_trade, "kind": "opening", "quantity": "1", "amount": "1e2"},
+        {**base_trade, "kind": "buy", "quantity": "1", "amount": "1e2"},
         {"kind": "fee", "occurred_on": "2026-08-01", "amount": "1e2", "currency": "USD"},
     ):
         assert client.post(

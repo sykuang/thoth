@@ -630,7 +630,6 @@ export type ManualInvestmentTransaction = {
   occurred_on: string;
   symbol: string | null;
   quantity: string | null;
-  unit_price: string | null;
   amount: string;
   currency: string;
   note: string | null;

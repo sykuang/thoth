@@ -177,7 +177,7 @@ def test_investment_account_balance_uses_yahoo_market_value_and_clears_summary_c
             "occurred_on": "2026-08-09",
             "symbol": "0050.TW",
             "quantity": "5",
-            "unit_price": "80",
+            "amount": "400",
             "currency": "TWD",
         },
     )

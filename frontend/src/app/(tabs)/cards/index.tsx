@@ -396,35 +396,46 @@ export default function AccountsTabScreen() {
   return (
     <ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-4 py-6 max-w-[800px] w-full mx-auto">
-        {/* Header — title + ☁️ 全部同步 (Phase 8.6 — sync 主入口從 dashboard 搬過來) */}
+        {/* Header — 帳戶新增與同步的單一全域入口 */}
         <View className="flex-row items-start mb-1">
           <View className="flex-1">
             <Text className="text-ink-900 dark:text-ink-50 text-h1 mb-1">帳戶</Text>
           </View>
-          {groups.length > 0 && (
+          <View className="flex-row gap-2">
             <Pressable
-              onPress={() => triggerSyncAll.mutate()}
-              disabled={allSyncBusy}
-              className={`bg-accent-600 dark:bg-accent-500 active:bg-accent-700 dark:active:bg-accent-600 rounded-xl px-4 py-2 shadow-brand ${
-                allSyncBusy ? 'opacity-40' : ''
-              }`}
-              testID="sync-all-btn"
+              onPress={() => router.push('/(tabs)/cards/add')}
+              accessibilityRole="button"
+              accessibilityLabel="新增帳戶"
+              className="bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2 shadow-brand"
+              testID="add-account-btn"
             >
-              {triggerSyncAll.isPending ? (
-                <View className="flex-row items-center gap-2">
-                  <ActivityIndicator color="#fff" size="small" />
-                  <Text className="text-white text-small font-semibold">啟動中...</Text>
-                </View>
-              ) : hasRunningJob ? (
-                <View className="flex-row items-center gap-2">
-                  <ActivityIndicator color="#fff" size="small" />
-                  <Text className="text-white text-small font-semibold">同步中...</Text>
-                </View>
-              ) : (
-                <Text className="text-white text-small font-semibold">☁️ 全部同步</Text>
-              )}
+              <Text className="text-white text-small font-semibold">＋ 新增</Text>
             </Pressable>
-          )}
+            {groups.length > 0 && (
+              <Pressable
+                onPress={() => triggerSyncAll.mutate()}
+                disabled={allSyncBusy}
+                className={`bg-accent-600 dark:bg-accent-500 active:bg-accent-700 dark:active:bg-accent-600 rounded-xl px-4 py-2 shadow-brand ${
+                  allSyncBusy ? 'opacity-40' : ''
+                }`}
+                testID="sync-all-btn"
+              >
+                {triggerSyncAll.isPending ? (
+                  <View className="flex-row items-center gap-2">
+                    <ActivityIndicator color="#fff" size="small" />
+                    <Text className="text-white text-small font-semibold">啟動中...</Text>
+                  </View>
+                ) : hasRunningJob ? (
+                  <View className="flex-row items-center gap-2">
+                    <ActivityIndicator color="#fff" size="small" />
+                    <Text className="text-white text-small font-semibold">同步中...</Text>
+                  </View>
+                ) : (
+                  <Text className="text-white text-small font-semibold">☁️ 全部同步</Text>
+                )}
+              </Pressable>
+            )}
+          </View>
         </View>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
           管理銀行帳戶、信用卡與已連結券商。銀行資料可用「☁️」同步，券商資料列於下方。
@@ -462,43 +473,20 @@ export default function AccountsTabScreen() {
         ) : groups.length === 0 ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
             <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">還沒任何銀行帳戶資料</Text>
-            <Text className="text-ink-500 dark:text-ink-400 text-small text-center mb-4">
-              新增一個銀行帳號後點「☁️ 全部同步」抓帳
+            <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
+              點上方「新增」連結銀行或建立手動帳戶
             </Text>
-            {/* Phase 8.2: 空狀態時的 primary CTA */}
-            <Pressable
-              onPress={() => router.push('/(tabs)/cards/new')}
-              className="bg-brand-600 active:bg-brand-700 rounded-xl px-5 py-3 items-center shadow-brand"
-              testID="empty-add-account-btn"
-            >
-              <Text className="text-white text-h3">+ 新增銀行帳號</Text>
-            </Pressable>
           </View>
         ) : (
-          <>
-            {groups.map((g) => (
-              <BankGroupCard
-                key={g.bank}
-                group={g}
-                lastJob={lastJobByBank[g.bank]}
-                onSync={() => triggerBankSync(g.bank)}
-                syncBusy={syncingBanks.has(g.bank)}
-              />
-            ))}
-            {/* Phase 8.2: 頁底 CTA — 補加新銀行 / 同銀行多帳號 */}
-            <Pressable
-              onPress={() => router.push('/(tabs)/cards/new')}
-              className="bg-white dark:bg-ink-900 rounded-2xl p-5 mt-2 mb-2 items-center border border-dashed border-ink-300 dark:border-ink-700 active:bg-ink-100 dark:active:bg-ink-800"
-              testID="add-account-cta"
-            >
-              <Text className="text-brand-600 dark:text-brand-400 text-h3 font-semibold">
-                + 新增銀行帳號
-              </Text>
-              <Text className="text-ink-500 dark:text-ink-400 text-micro mt-1">
-                同一家銀行可建多帳號 (主帳 / 老婆 / 公司)
-              </Text>
-            </Pressable>
-          </>
+          groups.map((g) => (
+            <BankGroupCard
+              key={g.bank}
+              group={g}
+              lastJob={lastJobByBank[g.bank]}
+              onSync={() => triggerBankSync(g.bank)}
+              syncBusy={syncingBanks.has(g.bank)}
+            />
+          ))
         )}
         <ManualAccountsSection
           accounts={manualAccountsQ.data ?? []}
@@ -530,22 +518,11 @@ function ManualAccountsSection({
   };
   return (
     <View className="mt-5">
-      <View className="flex-row items-center justify-between mb-3">
-        <View>
-          <Text className="text-ink-900 dark:text-ink-50 text-h2">手動帳戶</Text>
-          <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-            存款、貸款與投資持股／交易
-          </Text>
-        </View>
-        <Pressable
-          onPress={() => router.push('/(tabs)/cards/manual/new')}
-          accessibilityRole="button"
-          accessibilityLabel="新增手動帳戶"
-          className="bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
-          testID="add-manual-account"
-        >
-          <Text className="text-white text-small font-semibold">＋ 新增</Text>
-        </Pressable>
+      <View className="mb-3">
+        <Text className="text-ink-900 dark:text-ink-50 text-h2">手動帳戶</Text>
+        <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
+          存款、貸款與投資持股／交易
+        </Text>
       </View>
       {isLoading ? (
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5">

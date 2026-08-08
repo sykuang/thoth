@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.server import yahoo_finance
 from backend.server.deps import current_user
@@ -83,11 +83,12 @@ class ManualAccountPayload(BaseModel):
 
 
 class InvestmentTransactionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     kind: Literal["opening", "buy", "sell", "fee"]
     occurred_on: date
     symbol: str | None = Field(default=None, max_length=32)
     quantity: str | None = None
-    unit_price: str | None = None
     amount: str | None = None
     currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
     note: str | None = Field(default=None, max_length=500)
@@ -98,9 +99,12 @@ class InvestmentTransactionPayload(BaseModel):
             if not self.symbol or self.quantity is None:
                 raise ValueError("position transactions require symbol and quantity")
             self.quantity = _decimal_text(self.quantity, allow_zero=False)
-            if self.unit_price is None:
-                raise ValueError("position transactions require unit_price")
-            self.unit_price = _decimal_text(self.unit_price, allow_zero=self.kind != "opening")
+            if self.amount is None:
+                raise ValueError("position transactions require total amount")
+            self.amount = _decimal_text(
+                self.amount,
+                allow_zero=self.kind != "opening",
+            )
         else:
             if self.amount is None:
                 raise ValueError("fee requires amount")

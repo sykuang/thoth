@@ -156,6 +156,40 @@ def test_split_rejects_non_positive_amount(client, data_root):
     assert r.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("parent_amount", "splits"),
+    [
+        (
+            3,
+            [
+                {"amount": 1.9, "category": "餐飲"},
+                {"amount": 2.1, "category": "日用品"},
+            ],
+        ),
+        (
+            4,
+            [
+                {"amount": 1, "category": "餐飲", "auto_excluded": "false"},
+                {"amount": 3, "category": "日用品"},
+            ],
+        ),
+    ],
+)
+def test_split_rejects_coercible_amount_and_boolean_types(
+    client, data_root, parent_amount, splits,
+):
+    token = _register(client, email=f"split-types-{parent_amount}@p.com")
+    raw_id = _seed_one_billed(client, data_root, token, amount=parent_amount)
+
+    response = client.patch(
+        f"/transactions/hsbc/billed/{raw_id}",
+        json={"splits": splits},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400, response.text
+
+
 def test_split_rejects_unknown_subfield(client, data_root):
     token = _register(client, email="split-badfield@p.com")
     raw_id = _seed_one_billed(client, data_root, token, amount=1200)

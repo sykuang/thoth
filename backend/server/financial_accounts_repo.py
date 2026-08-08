@@ -8,7 +8,7 @@ from backend.server import db
 
 _ACCOUNT_COLUMNS = "id, product_type, name, currency, balance, included_in_net_worth"
 _TRANSACTION_COLUMNS = (
-    "id, account_id, kind, occurred_on, symbol, quantity, unit_price, "
+    "id, account_id, kind, occurred_on, symbol, quantity, "
     "amount, currency, note, created_at, updated_at"
 )
 
@@ -129,12 +129,12 @@ def mutate_transaction(
             assert values is not None
             row = conn.execute(
                 """INSERT INTO manual_investment_transactions
-                   (user_id, account_id, kind, occurred_on, symbol, quantity, unit_price,
+                   (user_id, account_id, kind, occurred_on, symbol, quantity,
                     amount, currency, note, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 (
                     user_id, account_id, values["kind"], values["occurred_on"], values["symbol"],
-                    values["quantity"], values["unit_price"], values["amount"], values["currency"],
+                    values["quantity"], values["amount"], values["currency"],
                     values["note"], now, now,
                 ),
             ).fetchone()
@@ -144,12 +144,12 @@ def mutate_transaction(
             assert values is not None
             cursor = conn.execute(
                 """UPDATE manual_investment_transactions SET
-                       kind=?, occurred_on=?, symbol=?, quantity=?, unit_price=?, amount=?,
+                       kind=?, occurred_on=?, symbol=?, quantity=?, amount=?,
                        currency=?, note=?, updated_at=?
                    WHERE id=? AND account_id=? AND user_id=?""",
                 (
                     values["kind"], values["occurred_on"], values["symbol"], values["quantity"],
-                    values["unit_price"], values["amount"], values["currency"], values["note"], now,
+                    values["amount"], values["currency"], values["note"], now,
                     transaction_id, account_id, user_id,
                 ),
             )
@@ -170,12 +170,12 @@ def insert_transaction(
     with db.get_conn() as conn:
         row = conn.execute(
             """INSERT INTO manual_investment_transactions
-               (user_id, account_id, kind, occurred_on, symbol, quantity, unit_price,
+               (user_id, account_id, kind, occurred_on, symbol, quantity,
                 amount, currency, note, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (
                 user_id, account_id, values["kind"], values["occurred_on"], values["symbol"],
-                values["quantity"], values["unit_price"], values["amount"], values["currency"],
+                values["quantity"], values["amount"], values["currency"],
                 values["note"], now, now,
             ),
         ).fetchone()
@@ -212,12 +212,12 @@ def update_transaction(
     with db.get_conn() as conn:
         cursor = conn.execute(
             """UPDATE manual_investment_transactions SET
-                   kind=?, occurred_on=?, symbol=?, quantity=?, unit_price=?, amount=?,
+                   kind=?, occurred_on=?, symbol=?, quantity=?, amount=?,
                    currency=?, note=?, updated_at=?
                WHERE id=? AND account_id=? AND user_id=?""",
             (
                 values["kind"], values["occurred_on"], values["symbol"], values["quantity"],
-                values["unit_price"], values["amount"], values["currency"], values["note"], now,
+                values["amount"], values["currency"], values["note"], now,
                 transaction_id, account_id, user_id,
             ),
         )
