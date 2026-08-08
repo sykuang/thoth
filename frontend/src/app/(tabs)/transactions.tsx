@@ -11,7 +11,7 @@
  *   - 主表: 日期/銀行/帳號or卡號/說明/金額/分類
  *   - 分頁: 每頁 100 筆, 上下一頁 + 跳轉
  */
-import { useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -31,6 +31,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { TxnRow } from '@/components/transactions/TxnRow';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
+import { SnapTradeActivitiesSection } from '@/components/SnapTradeSections';
 import {
   type Granularity,
   currentPeriodKey,
@@ -90,10 +91,14 @@ const TWD_TXN_UNSUPPORTED_BANKS: ReadonlySet<string> = new Set();
 // 原本 transactions.tsx 1531 行 → 拆完約 750 行, 主檔只剩 TransactionsScreen.
 
 export default function TransactionsScreen() {
-  const params = useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; drilldown?: string }>();
+  const router = useRouter();
+  const params = useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; brokerage_account_id?: string; drilldown?: string }>();
   const initialBank = typeof params.bank === 'string' ? params.bank : '';
   const accountNo = typeof params.account_no === 'string' ? params.account_no : '';
   const cardNo = typeof params.card_no === 'string' ? params.card_no : '';
+  const brokerageAccountId = typeof params.brokerage_account_id === 'string'
+    ? params.brokerage_account_id
+    : '';
   const bp = useBreakpoint();
   const { data: prefs } = usePreferences();
   const fxMode = prefs.fx_display_mode;
@@ -138,13 +143,13 @@ export default function TransactionsScreen() {
   // This effect is the intentional bridge from router state into clearable UI filter state.
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    const routeSignature = [initialBank, accountNo, cardNo, params.drilldown ?? ''].join('|');
+    const routeSignature = [initialBank, accountNo, cardNo, brokerageAccountId, params.drilldown ?? ''].join('|');
     if (appliedRouteSignatureRef.current === routeSignature) return;
     appliedRouteSignatureRef.current = routeSignature;
     setSelectedBanks(initialBank ? [initialBank] : []);
     setActiveAccountNo(accountNo);
     setActiveCardNo(cardNo);
-    if (accountNo || cardNo || typeof params.drilldown === 'string') {
+    if (accountNo || cardNo || brokerageAccountId || typeof params.drilldown === 'string') {
       setCategory('');
       setSubcategory('');
       setSearch('');
@@ -159,7 +164,7 @@ export default function TransactionsScreen() {
       setSelectedKeys(new Set());
       setBulkSheetOpen(false);
     }
-  }, [initialBank, accountNo, cardNo, params.drilldown]);
+  }, [initialBank, accountNo, cardNo, brokerageAccountId, params.drilldown]);
   /* eslint-enable react-hooks/set-state-in-effect */
   // 統一 row identity：txnKey 與 row key 共用 t.id (Transaction type 已標 required)
   const txnKey = (t: Transaction) => `${t.bank}|${t.kind}|${t.id}`;
@@ -329,6 +334,27 @@ export default function TransactionsScreen() {
 
   // Period label 給 section header / CategorySummary 用
   const periodLabel = periodDisplayLabel(granularity, selectedPeriod);
+
+  if (brokerageAccountId) {
+    return (
+      <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
+        <View className="px-4 py-4 max-w-[800px] w-full mx-auto">
+          <View className="flex-row items-center justify-between gap-3 mb-4">
+            <Text className="text-ink-900 dark:text-ink-50 text-h1">券商明細</Text>
+            <Pressable
+              onPress={() => router.replace('/(tabs)/transactions')}
+              accessibilityRole="button"
+              accessibilityLabel="顯示全部交易明細"
+              className="px-3 py-1.5 rounded-lg active:bg-ink-100 dark:active:bg-ink-800"
+            >
+              <Text className="text-brand-600 dark:text-brand-400 text-small">全部明細</Text>
+            </Pressable>
+          </View>
+          <SnapTradeActivitiesSection accountId={brokerageAccountId} />
+        </View>
+      </KeyboardAwareScrollView>
+    );
+  }
 
   return (
     <>
@@ -724,7 +750,7 @@ export default function TransactionsScreen() {
                 ? '還沒有任何銀行帳號'
                 : isUnsupportedAccountDrilldown
                   ? '此銀行尚未支援存款交易明細同步'
-                  : '此篩選沒有任何交易'}
+                  : '此篩選沒有任何銀行交易'}
             </Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
               {availableBanks.length === 0
@@ -864,6 +890,7 @@ export default function TransactionsScreen() {
             {/* Phase 9 C-2 (2026-06-19): pagination 區塊整段砍 — 一個 period 50-200 筆 scroll 順 */}
           </>
         )}
+        <SnapTradeActivitiesSection />
       </View>
     </KeyboardAwareScrollView>
     {/* Phase 9.2: 底部 selection bar (selectionMode 才出現, 浮在 list 上) */}

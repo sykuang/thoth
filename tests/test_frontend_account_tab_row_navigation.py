@@ -48,7 +48,7 @@ def test_transactions_tab_accepts_exact_account_and_card_query_filter():
     txns = TRANSACTIONS_TSX.read_text()
 
     assert "[bank]/accounts/[account_no]" not in layout
-    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; drilldown?: string }>" in txns
+    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; brokerage_account_id?: string; drilldown?: string }>" in txns
     assert "params.account_no" in txns
     assert "params.card_no" in txns
     assert "t.account_no === effectiveAccountNo" in txns

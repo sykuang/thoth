@@ -88,7 +88,7 @@ export function SnapTradeConnectionSettings() {
               : !status.configured
                 ? '伺服器尚未設定 SnapTrade'
                 : status.connection_count
-                  ? `已連結 ${status.connection_count} 個券商；資料顯示於「帳戶」`
+                  ? `已連結 ${status.connection_count} 個券商；帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」`
                   : status.registered
                     ? '已建立 SnapTrade 使用者，尚未連結券商'
                     : '尚未開始連結'}
@@ -124,6 +124,7 @@ export function SnapTradeConnectionSettings() {
 }
 
 export function SnapTradeAccountsSection() {
+  const router = useRouter();
   const queryClient = useQueryClient();
   const statusQuery = useQuery({
     queryKey: ['snaptrade', 'status'],
@@ -176,6 +177,13 @@ export function SnapTradeAccountsSection() {
           account={account}
           balances={portfolio.balances.filter((row) => row.account_id === account.id)}
           positions={portfolio.positions.filter((row) => row.account_id === account.id)}
+          onPress={() => router.push({
+            pathname: '/(tabs)/transactions',
+            params: {
+              brokerage_account_id: account.id,
+              drilldown: String(Date.now()),
+            },
+          })}
         />
       ))}
       {portfolioQuery.isSuccess && hasConnection && portfolio.accounts.length === 0 && (
@@ -185,7 +193,6 @@ export function SnapTradeAccountsSection() {
           </Text>
         </View>
       )}
-      {portfolio.activities.length > 0 && <Activities rows={portfolio.activities} />}
     </View>
   );
 }
@@ -234,13 +241,21 @@ function AccountCard({
   account,
   balances,
   positions,
+  onPress,
 }: {
   account: BrokerageAccount;
   balances: BrokerageBalance[];
   positions: BrokeragePosition[];
+  onPress: () => void;
 }) {
   return (
-    <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
+    <Pressable
+      onPress={onPress}
+      className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4 active:opacity-80"
+      testID={`brokerage-account-detail-${account.id}`}
+      accessibilityRole="button"
+      accessibilityLabel={`查看 ${accountLabel(account)} 交易明細`}
+    >
       <View className="flex-row justify-between gap-3">
         <View className="flex-1">
           <Text className="text-ink-900 dark:text-ink-50 text-h3">{account.institution_name}</Text>
@@ -301,15 +316,65 @@ function AccountCard({
           <Text className="text-ink-400 text-small">此帳戶目前沒有證券持倉</Text>
         ) : null}
       </View>
-    </View>
+    </Pressable>
   );
 }
 
-function Activities({ rows }: { rows: BrokerageActivity[] }) {
+export function SnapTradeActivitiesSection({
+  accountId,
+}: {
+  accountId?: string;
+}) {
+  const portfolioQuery = useQuery({
+    queryKey: ['snaptrade', 'portfolio'],
+    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
+  });
+  if (portfolioQuery.isLoading) {
+    return <Text className="text-ink-400 text-small py-4">讀取券商交易明細…</Text>;
+  }
+  if (portfolioQuery.isError) {
+    return (
+      <Text className="text-red-600 text-small py-4">{formatApiError(portfolioQuery.error)}</Text>
+    );
+  }
+  const portfolio = portfolioQuery.data ?? EMPTY_PORTFOLIO;
+  const account = accountId
+    ? portfolio.accounts.find((row) => row.id === accountId)
+    : undefined;
+  if (accountId && account?.activities_supported === false) {
+    return <Text className="text-ink-500 dark:text-ink-400 text-small py-4">此帳戶目前未提供交易明細</Text>;
+  }
+  const rows = accountId
+    ? portfolio.activities.filter((row) => row.account_id === accountId)
+    : portfolio.activities;
+  if (rows.length === 0 && !accountId) return null;
   return (
-    <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
-      <Text className="text-ink-900 dark:text-ink-50 text-h3">近期交易活動</Text>
-      <Text className="text-ink-400 text-micro mt-1 mb-3">顯示最近 50 筆</Text>
+    <Activities
+      rows={rows}
+      accounts={portfolio.accounts}
+      title={account ? `${account.institution_name} 交易明細` : '券商交易明細'}
+    />
+  );
+}
+
+function Activities({
+  rows,
+  accounts,
+  title,
+}: {
+  rows: BrokerageActivity[];
+  accounts: BrokerageAccount[];
+  title: string;
+}) {
+  return (
+    <View
+      className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5"
+      testID="snaptrade-activities-section"
+    >
+      <Text className="text-ink-900 dark:text-ink-50 text-h3">{title}</Text>
+      <Text className="text-ink-400 text-micro mt-1 mb-3">
+        {rows.length > 0 ? `顯示最近 ${Math.min(rows.length, 50)} 筆` : '此帳戶目前沒有交易明細'}
+      </Text>
       {rows.slice(0, 50).map((row) => (
         <View
           key={`${row.account_id}:${row.id}`}
@@ -320,6 +385,7 @@ function Activities({ rows }: { rows: BrokerageActivity[] }) {
               {row.type} · {row.symbol ?? row.description ?? '—'}
             </Text>
             <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
+              {accounts.find((account) => account.id === row.account_id)?.institution_name ?? '券商'} ·{' '}
               {row.trade_date?.slice(0, 10) ?? '日期未知'}
               {row.units != null ? ` · ${formatDecimal(row.units) ?? '—'} 單位` : ''}
             </Text>
