@@ -297,6 +297,15 @@ export default function ManualAccountScreen() {
           <InvestmentJournal
             accountId={accountId}
             defaultCurrency={account.currency}
+            mode="overview"
+            onCreatePress={() => router.push({
+              pathname: '/(tabs)/cards/manual/transaction',
+              params: { account_id: accountId },
+            })}
+            onEditPress={(transactionId) => router.push({
+              pathname: '/(tabs)/cards/manual/transaction',
+              params: { account_id: accountId, transaction_id: String(transactionId) },
+            })}
           />
         )}
 
@@ -320,22 +329,42 @@ export default function ManualAccountScreen() {
 export function InvestmentJournal({
   accountId,
   defaultCurrency,
+  mode,
+  initialTransaction,
+  onCreatePress,
+  onEditPress,
+  onSaved,
+  onCancel,
 }: {
   accountId: string;
   defaultCurrency: string;
+  mode: 'overview' | 'create';
+  initialTransaction?: ManualInvestmentTransaction;
+  onCreatePress?: () => void;
+  onEditPress?: (transactionId: number) => void;
+  onSaved?: () => void;
+  onCancel?: () => void;
 }) {
   const queryClient = useQueryClient();
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [kind, setKind] = useState<TradeKind>('opening');
-  const [occurredOn, setOccurredOn] = useState(today());
-  const [symbol, setSymbol] = useState('');
-  const [quantity, setQuantity] = useState('');
-  const [unitPrice, setUnitPrice] = useState('');
-  const [totalCost, setTotalCost] = useState('');
-  const [costInputMode, setCostInputMode] = useState<CostInputMode>('unit');
-  const [amount, setAmount] = useState('');
-  const [currency, setCurrency] = useState(defaultCurrency);
-  const [note, setNote] = useState('');
+  const [editingId, setEditingId] = useState<number | null>(initialTransaction?.id ?? null);
+  const [kind, setKind] = useState<TradeKind>(initialTransaction?.kind ?? 'opening');
+  const [occurredOn, setOccurredOn] = useState(initialTransaction?.occurred_on ?? today());
+  const [symbol, setSymbol] = useState(initialTransaction?.symbol ?? '');
+  const [quantity, setQuantity] = useState(initialTransaction?.quantity ?? '');
+  const [unitPrice, setUnitPrice] = useState(
+    initialTransaction ? (derivedUnitCost(initialTransaction) ?? '') : '',
+  );
+  const [totalCost, setTotalCost] = useState(
+    initialTransaction?.kind === 'fee' ? '' : (initialTransaction?.amount ?? ''),
+  );
+  const [costInputMode, setCostInputMode] = useState<CostInputMode>(
+    initialTransaction ? 'total' : 'unit',
+  );
+  const [amount, setAmount] = useState(
+    initialTransaction?.kind === 'fee' ? initialTransaction.amount : '',
+  );
+  const [currency, setCurrency] = useState(initialTransaction?.currency ?? defaultCurrency);
+  const [note, setNote] = useState(initialTransaction?.note ?? '');
   const [selectedSymbol, setSelectedSymbol] = useState<YahooSymbolMatch | null>(null);
   const normalizedSymbol = symbol.trim().toUpperCase();
   const debouncedSymbol = useDebouncedValue(normalizedSymbol, 350);
@@ -343,10 +372,12 @@ export function InvestmentJournal({
   const transactionsQ = useQuery<ManualInvestmentTransaction[], ApiError>({
     queryKey: ['financial-accounts', accountId, 'transactions'],
     queryFn: () => api(`/financial-accounts/${accountId}/transactions`),
+    enabled: mode === 'overview',
   });
   const holdingsQ = useQuery<ManualInvestmentHolding[], ApiError>({
     queryKey: ['financial-accounts', accountId, 'holdings'],
     queryFn: () => api(`/financial-accounts/${accountId}/holdings`),
+    enabled: mode === 'overview',
   });
   const symbolSearchQ = useQuery<YahooSymbolMatch[], ApiError>({
     queryKey: ['yahoo-symbol-search', debouncedSymbol, currency.trim().toUpperCase()],
@@ -411,6 +442,7 @@ export function InvestmentJournal({
         queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
       ]);
       resetTradeForm();
+      onSaved?.();
     },
   });
   const deleteTrade = useMutation<void, ApiError, number>({
@@ -426,21 +458,6 @@ export function InvestmentJournal({
     },
   });
 
-  function editTrade(row: ManualInvestmentTransaction) {
-    setEditingId(row.id);
-    setKind(row.kind);
-    setOccurredOn(row.occurred_on);
-    setSymbol(row.symbol ?? '');
-    setQuantity(row.quantity ?? '');
-    setUnitPrice(derivedUnitCost(row) ?? '');
-    setTotalCost(row.kind === 'fee' ? '' : row.amount);
-    setCostInputMode('total');
-    setAmount(row.kind === 'fee' ? row.amount : '');
-    setCurrency(row.currency);
-    setNote(row.note ?? '');
-    setSelectedSymbol(null);
-  }
-
   function confirmDeleteTrade(id: number) {
     const message = '刪除後會重新計算持股，且無法復原。';
     if (Platform.OS === 'web') {
@@ -455,24 +472,39 @@ export function InvestmentJournal({
 
   return (
     <>
-      <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
-        <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">目前持股</Text>
-        {holdingsQ.isLoading ? <ActivityIndicator /> : holdingsQ.isError ? (
-          <Pressable accessibilityRole="button" accessibilityLabel="重試載入持股" onPress={() => holdingsQ.refetch()}>
-            <Text className="text-red-600 text-small">載入失敗，點此重試</Text>
-          </Pressable>
-        ) : (holdingsQ.data ?? []).length === 0 ? (
-          <Text className="text-ink-500 dark:text-ink-400 text-small">尚無持股，先新增期初持股或買入交易。</Text>
-        ) : (holdingsQ.data ?? []).map((holding) => (
-          <View key={`${holding.symbol}:${holding.currency}`} className="flex-row justify-between py-2 border-b border-ink-100 dark:border-ink-800">
-            <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">{holding.symbol}</Text>
-            <Text className="text-ink-700 dark:text-ink-300 text-small">
-              {formatDecimal(holding.quantity) ?? holding.quantity} 股 · {holding.currency}
-            </Text>
+      {mode === 'overview' && (
+        <>
+          <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
+            <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">目前持股</Text>
+            {holdingsQ.isLoading ? <ActivityIndicator /> : holdingsQ.isError ? (
+              <Pressable accessibilityRole="button" accessibilityLabel="重試載入持股" onPress={() => holdingsQ.refetch()}>
+                <Text className="text-red-600 text-small">載入失敗，點此重試</Text>
+              </Pressable>
+            ) : (holdingsQ.data ?? []).length === 0 ? (
+              <Text className="text-ink-500 dark:text-ink-400 text-small">尚無持股，先新增期初持股或買入交易。</Text>
+            ) : (holdingsQ.data ?? []).map((holding) => (
+              <View key={`${holding.symbol}:${holding.currency}`} className="flex-row justify-between py-2 border-b border-ink-100 dark:border-ink-800">
+                <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">{holding.symbol}</Text>
+                <Text className="text-ink-700 dark:text-ink-300 text-small">
+                  {formatDecimal(holding.quantity) ?? holding.quantity} 股 · {holding.currency}
+                </Text>
+              </View>
+            ))}
           </View>
-        ))}
-      </View>
 
+          <Pressable
+            onPress={onCreatePress}
+            accessibilityRole="button"
+            accessibilityLabel="新增持股或交易"
+            className="bg-brand-600 active:bg-brand-700 rounded-xl py-3 items-center mb-5"
+            testID="add-manual-investment-transaction"
+          >
+            <Text className="text-white text-h3">＋ 新增持股／交易</Text>
+          </Pressable>
+        </>
+      )}
+
+      {mode === 'create' && (
       <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
         <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">
           {editingId == null ? '新增交易' : '編輯交易'}
@@ -619,8 +651,8 @@ export function InvestmentJournal({
         <Field label="備註（選填）" value={note} onChangeText={setNote} />
         {saveTrade.isError && <Text className="text-red-600 text-small mb-3">{formatApiError(saveTrade.error)}</Text>}
         <View className="flex-row gap-3">
-          {editingId != null && (
-            <Pressable accessibilityRole="button" accessibilityLabel="取消編輯交易" onPress={resetTradeForm} className="flex-1 border border-ink-300 dark:border-ink-700 rounded-xl py-3 items-center">
+          {(editingId != null || onCancel != null) && (
+            <Pressable accessibilityRole="button" accessibilityLabel="取消交易編輯" onPress={onCancel ?? resetTradeForm} className="flex-1 border border-ink-300 dark:border-ink-700 rounded-xl py-3 items-center">
               <Text className="text-ink-700 dark:text-ink-300 text-h3">取消</Text>
             </Pressable>
           )}
@@ -636,7 +668,9 @@ export function InvestmentJournal({
           </Pressable>
         </View>
       </View>
+      )}
 
+      {mode === 'overview' && (
       <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
         <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">交易明細</Text>
         {transactionsQ.isLoading ? <ActivityIndicator /> : transactionsQ.isError ? (
@@ -664,13 +698,14 @@ export function InvestmentJournal({
               </Text>
             </View>
             <View className="flex-row justify-end gap-3 mt-2">
-              <Pressable accessibilityRole="button" accessibilityLabel={`編輯 ${row.symbol ?? ''} 交易`} onPress={() => editTrade(row)}><Text className="text-brand-600 text-small">編輯</Text></Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel={`編輯 ${row.symbol ?? ''} 交易`} onPress={() => onEditPress?.(row.id)}><Text className="text-brand-600 text-small">編輯</Text></Pressable>
               <Pressable accessibilityRole="button" accessibilityLabel={`刪除 ${row.symbol ?? ''} 交易`} onPress={() => confirmDeleteTrade(row.id)} disabled={deleteTrade.isPending}><Text className="text-red-600 text-small">刪除</Text></Pressable>
             </View>
           </View>
         ))}
         {deleteTrade.isError && <Text className="text-red-600 text-small mt-3">{formatApiError(deleteTrade.error)}</Text>}
       </View>
+      )}
     </>
   );
 }

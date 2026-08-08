@@ -3,7 +3,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "frontend/src/app/(tabs)/cards/index.tsx"
 ACCOUNT_ADD = ROOT / "frontend/src/app/(tabs)/cards/add.tsx"
+CARDS_LAYOUT = ROOT / "frontend/src/app/(tabs)/cards/_layout.tsx"
 DETAIL = ROOT / "frontend/src/app/(tabs)/cards/manual/[account_id].tsx"
+TRANSACTION = ROOT / "frontend/src/app/(tabs)/cards/manual/transaction.tsx"
 TYPES = ROOT / "frontend/src/types/api.ts"
 
 
@@ -27,6 +29,7 @@ def test_accounts_tab_exposes_manual_financial_accounts() -> None:
 
 def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> None:
     source = DETAIL.read_text()
+    transaction_source = TRANSACTION.read_text()
     assert "/holdings" in source
     assert "/transactions" in source
     assert "期初持股" in source
@@ -79,6 +82,23 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert 'testID="manual-currency"' in source
     assert '<View className="w-28"><Field label="幣別"' not in source
     assert "!ACCOUNT_CURRENCIES.some((option) => option.value === normalizedCurrency)" in source
+    assert 'mode="overview"' in source
+    assert "manual/transaction" in source
+    assert "onCreatePress" in source
+    assert "onEditPress" in source
+    assert "mode === 'overview'" in source
+    assert "mode === 'create'" in source
+    assert "InvestmentJournal" in transaction_source
+    assert 'mode="create"' in transaction_source
+    assert "initialTransaction" in transaction_source
+    assert "router.dismissTo" in transaction_source
+    assert "refetchOnMount: 'always'" in transaction_source
+    assert "accountsQ.isFetchedAfterMount" in transaction_source
+    assert "transactionsQ.isFetchedAfterMount" in transaction_source
+    assert "accountsQ.isError && accountsQ.data == null" in transaction_source
+    assert "transactionId != null && transactionsQ.isError && transactionsQ.data == null" in transaction_source
+    assert "editingId != null || onCancel != null" in source
+    assert 'name="manual/transaction"' in CARDS_LAYOUT.read_text()
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:
