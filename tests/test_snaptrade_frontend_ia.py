@@ -104,6 +104,15 @@ def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
     assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions
 
 
+def test_brokerage_usd_amounts_use_fixed_two_decimal_formatter():
+    sections = SECTIONS.read_text()
+    transaction_row = BROKERAGE_TXN_ROW.read_text()
+
+    expected = "currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value)"
+    assert expected in sections
+    assert expected in transaction_row
+
+
 def test_brokerage_desktop_transaction_date_stays_in_fixed_width_column():
     row = BROKERAGE_TXN_ROW.read_text()
 
@@ -119,3 +128,10 @@ def test_account_snapshot_does_not_report_unrelated_live_status_error():
     ]
 
     assert "sync.error ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null)" in accounts_section
+
+
+def test_accounts_tab_uses_plain_scroll_view_without_keyboard_insets():
+    accounts = ACCOUNTS.read_text()
+
+    assert '<ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' in accounts
+    assert '<KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' not in accounts

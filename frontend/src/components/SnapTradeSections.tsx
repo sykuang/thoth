@@ -5,7 +5,7 @@ import { useRouter } from 'expo-router';
 import { Platform, Pressable, Text, View } from 'react-native';
 
 import { api, formatApiError } from '@/lib/api';
-import { formatDecimal } from '@/lib/decimal';
+import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
 import type {
   BrokerageAccount,
   SnapTradePortfolio,
@@ -23,7 +23,7 @@ const PORTAL_URL_MAX_AGE_MS = 4 * 60 * 1000;
 
 function money(value: string | null, currency: string | null): string {
   if (value == null) return '—';
-  const formatted = formatDecimal(value);
+  const formatted = currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value);
   return formatted == null ? '—' : `${currency ?? ''} ${formatted}`.trim();
 }
 

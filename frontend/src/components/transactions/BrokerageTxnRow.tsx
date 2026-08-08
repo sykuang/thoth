@@ -1,13 +1,13 @@
 import { Text, View } from 'react-native';
 
 import { BankBadge } from '@/components/BankBadge';
-import { formatDecimal } from '@/lib/decimal';
+import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
 import { parseDateForMobileLayout } from '@/lib/txnDisplay';
 import type { BrokerageAccount, BrokerageActivity } from '@/types/api';
 
 function money(value: string | null, currency: string | null): string {
   if (value == null) return '—';
-  const formatted = formatDecimal(value);
+  const formatted = currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value);
   return formatted == null ? '—' : `${currency ?? ''} ${formatted}`.trim();
 }
 

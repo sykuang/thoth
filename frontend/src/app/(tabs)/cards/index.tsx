@@ -27,7 +27,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
+
 import { BankBadge } from '@/components/BankBadge';
 import { AutoDebitSettingModal } from '@/components/AutoDebitSettingModal';
 import { SnapTradeAccountsSection } from '@/components/SnapTradeSections';
@@ -387,7 +387,7 @@ export default function AccountsTabScreen() {
   };
 
   return (
-    <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
+    <ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-4 py-6 max-w-[800px] w-full mx-auto">
         {/* Header — title + ☁️ 全部同步 (Phase 8.6 — sync 主入口從 dashboard 搬過來) */}
         <View className="flex-row items-start mb-1">
@@ -492,7 +492,7 @@ export default function AccountsTabScreen() {
         )}
         <SnapTradeAccountsSection />
       </View>
-    </KeyboardAwareScrollView>
+    </ScrollView>
   );
 }
 

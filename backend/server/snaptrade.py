@@ -232,6 +232,7 @@ class SnapTradeSDKGateway:
         from snaptrade_client import SnapTrade
 
         self.client = SnapTrade(
+            host="https://api.snaptrade.com",
             consumer_key=os.environ["SNAPTRADE_CONSUMER_KEY"],
             client_id=os.environ["SNAPTRADE_CLIENT_ID"],
         )
