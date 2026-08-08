@@ -31,7 +31,10 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { TxnRow } from '@/components/transactions/TxnRow';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
-import { SnapTradeActivitiesSection } from '@/components/SnapTradeSections';
+import {
+  SnapTradeActivitiesSection,
+  SnapTradeHoldingsSection,
+} from '@/components/SnapTradeSections';
 import {
   type Granularity,
   currentPeriodKey,
@@ -350,6 +353,7 @@ export default function TransactionsScreen() {
               <Text className="text-brand-600 dark:text-brand-400 text-small">全部明細</Text>
             </Pressable>
           </View>
+          <SnapTradeHoldingsSection accountId={brokerageAccountId} />
           <SnapTradeActivitiesSection accountId={brokerageAccountId} />
         </View>
       </KeyboardAwareScrollView>

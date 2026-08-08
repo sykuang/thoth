@@ -9,8 +9,6 @@ import { formatDecimal } from '@/lib/decimal';
 import type {
   BrokerageAccount,
   BrokerageActivity,
-  BrokerageBalance,
-  BrokeragePosition,
   SnapTradePortfolio,
   SnapTradeStatus,
 } from '@/types/api';
@@ -155,7 +153,7 @@ export function SnapTradeAccountsSection() {
     && !hasSnapshot
   ) return null;
 
-  const error = sync.error ?? statusQuery.error ?? portfolioQuery.error;
+  const error = sync.error ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null);
   return (
     <View className="mt-6" testID="snaptrade-accounts-section">
       <View className="flex-row items-center justify-between gap-3 mb-3">
@@ -175,8 +173,6 @@ export function SnapTradeAccountsSection() {
         <AccountCard
           key={account.id}
           account={account}
-          balances={portfolio.balances.filter((row) => row.account_id === account.id)}
-          positions={portfolio.positions.filter((row) => row.account_id === account.id)}
           onPress={() => router.push({
             pathname: '/(tabs)/transactions',
             params: {
@@ -239,26 +235,63 @@ function ActionButton({
 
 function AccountCard({
   account,
-  balances,
-  positions,
   onPress,
 }: {
   account: BrokerageAccount;
-  balances: BrokerageBalance[];
-  positions: BrokeragePosition[];
   onPress: () => void;
 }) {
   return (
     <Pressable
       onPress={onPress}
-      className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4 active:opacity-80"
+      className="bg-white dark:bg-ink-900 rounded-2xl px-4 py-3 shadow-card mb-3 active:opacity-80"
       testID={`brokerage-account-detail-${account.id}`}
       accessibilityRole="button"
-      accessibilityLabel={`查看 ${accountLabel(account)} 交易明細`}
+      accessibilityLabel={`查看 ${accountLabel(account)} 持股與交易明細`}
+    >
+      <View className="flex-row items-baseline justify-between gap-3">
+        <View className="flex-1 min-w-0">
+          <Text className="text-ink-900 dark:text-ink-50 text-body" numberOfLines={1}>
+            {account.institution_name}
+          </Text>
+          <Text className="text-ink-400 dark:text-ink-500 text-micro mt-1" numberOfLines={1}>
+            {accountLabel(account)}
+          </Text>
+        </View>
+        <Text className="text-emerald-600 dark:text-emerald-400 text-h3 font-semibold font-mono" numberOfLines={1}>
+          {money(account.balance_total, account.balance_currency)}
+        </Text>
+      </View>
+    </Pressable>
+  );
+}
+
+export function SnapTradeHoldingsSection({ accountId }: { accountId: string }) {
+  const portfolioQuery = useQuery({
+    queryKey: ['snaptrade', 'portfolio'],
+    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
+  });
+  if (portfolioQuery.isLoading) {
+    return <Text className="text-ink-400 text-small py-4">讀取券商持股明細…</Text>;
+  }
+  if (portfolioQuery.isError) {
+    return <Text className="text-red-600 text-small py-4">{formatApiError(portfolioQuery.error)}</Text>;
+  }
+  const portfolio = portfolioQuery.data ?? EMPTY_PORTFOLIO;
+  const account = portfolio.accounts.find((row) => row.id === accountId);
+  if (!account) {
+    return <Text className="text-ink-400 text-small py-4">找不到券商帳戶</Text>;
+  }
+  const balances = portfolio.balances.filter((row) => row.account_id === accountId);
+  const positions = portfolio.positions.filter((row) => row.account_id === accountId);
+
+  return (
+    <View
+      className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5"
+      testID="snaptrade-holdings-section"
     >
       <View className="flex-row justify-between gap-3">
         <View className="flex-1">
-          <Text className="text-ink-900 dark:text-ink-50 text-h3">{account.institution_name}</Text>
+          <Text className="text-ink-900 dark:text-ink-50 text-h3">{account.institution_name} 持股明細</Text>
           <Text className="text-ink-500 dark:text-ink-400 text-small mt-0.5">
             {accountLabel(account)}
           </Text>
@@ -316,7 +349,7 @@ function AccountCard({
           <Text className="text-ink-400 text-small">此帳戶目前沒有證券持倉</Text>
         ) : null}
       </View>
-    </Pressable>
+    </View>
   );
 }
 

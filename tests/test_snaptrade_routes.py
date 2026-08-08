@@ -538,8 +538,9 @@ def test_missing_transaction_sync_status_fails_closed(client, monkeypatch):
     assert fake.activity_calls == 0
 
 
-def test_sdk_v11_gateway_uses_canonical_api_root(monkeypatch):
+def test_sdk_v11_gateway_keeps_compatible_default_host(monkeypatch):
     import snaptrade_client
+    from snaptrade_client.configuration import Configuration
 
     captured: dict[str, str] = {}
 
@@ -555,7 +556,8 @@ def test_sdk_v11_gateway_uses_canonical_api_root(monkeypatch):
 
     SnapTradeSDKGateway()
 
-    assert captured["host"] == "https://api.snaptrade.com"
+    assert Configuration().host == "https://api.snaptrade.com/api/v1"
+    assert "host" not in captured
 
 
 def test_sdk_v11_connection_contract_accepts_redirect_uri_camel_case():

@@ -47,12 +47,20 @@ def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
 def test_brokerage_account_row_deeplinks_to_existing_transactions_tab():
     sections = SECTIONS.read_text()
     transactions = TRANSACTIONS.read_text()
-    account_card = sections[sections.index("function AccountCard"):sections.index("function Activities")]
+    account_card = sections[
+        sections.index("function AccountCard"):
+        sections.index("export function SnapTradeHoldingsSection")
+    ]
 
     assert "pathname: '/(tabs)/transactions'" in sections
     assert "brokerage_account_id: account.id" in sections
     assert "drilldown: String(Date.now())" in sections
     assert "testID={`brokerage-account-detail-${account.id}`}" in account_card
+    assert "account.balance_total" in account_card
+    assert "positions.map" not in account_card
+    assert "balances.map" not in account_card
+    assert "查看 ${accountLabel(account)} 持股與交易明細" in account_card
+    assert "<SnapTradeHoldingsSection accountId={brokerageAccountId} />" in transactions
     assert "onPress={() => router.replace('/(tabs)/transactions')}" in transactions
     assert 'accessibilityLabel="顯示全部交易明細"' in transactions
 
@@ -63,3 +71,13 @@ def test_brokerage_detail_reports_query_errors_and_unsupported_snapshots():
     assert "if (!accountId) return null" not in sections
     assert "if (accountId && account?.activities_supported === false)" in sections
     assert "此帳戶目前未提供交易明細" in sections
+
+
+def test_account_snapshot_does_not_report_unrelated_live_status_error():
+    sections = SECTIONS.read_text()
+    accounts_section = sections[
+        sections.index("export function SnapTradeAccountsSection"):
+        sections.index("function ActionButton")
+    ]
+
+    assert "sync.error ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null)" in accounts_section
