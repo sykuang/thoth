@@ -5,7 +5,7 @@
     "as_of": "2026-06-14T12:34:56+00:00",
     "source": "bank_of_taiwan" | "open_er_api",
     "base": "TWD",
-    "rates": {"USD": 31.695, "JPY": 0.2, "CNY": 4.707, ...}
+    "rates": {"USD": 31.62, "JPY": 0.19945, "CNY": 4.6825, ...}
   }
 
   - rates[X] = 1 X 等於多少 TWD (給 frontend 算「外幣 → TWD 估值」用)

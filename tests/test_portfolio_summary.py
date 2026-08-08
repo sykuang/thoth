@@ -706,6 +706,43 @@ def test_fx_assets_twd_zero_when_no_fx_accounts(
     assert body["net_worth_with_fx"] == body["net_worth"] == 500_000
 
 
+def test_brokerage_account_totals_are_included_once_in_net_worth(
+    temp_data_root, client, auth_headers, monkeypatch
+):
+    """SnapTrade account total 進淨資產；cash/positions 不得重複加總。"""
+    from backend.server import db, fx_service
+
+    _seed_bank_db(temp_data_root, "cathay", balance=100_000)
+    def convert(amount, ccy):
+        if amount == "bad":
+            raise OverflowError("synthetic invalid brokerage amount")
+        return round(float(amount) * {"USD": 31.62, "TWD": 1}[ccy.upper()])
+
+    monkeypatch.setattr(fx_service, "convert_to_twd", convert)
+    monkeypatch.setattr(db, "snaptrade_snapshot", lambda _user_id: {
+        "accounts": [
+            {"id": "bad", "balance_total": "bad", "balance_currency": "USD", "synced_at": "2026-08-08T09:00:00+00:00"},
+            {"id": "missing-currency", "balance_total": "500", "balance_currency": None, "synced_at": "2026-08-08T09:00:00+00:00"},
+            {"id": "ibkr", "balance_total": "1000", "balance_currency": "USD", "synced_at": "2026-08-08T10:00:00+00:00"},
+            {"id": "schwab", "balance_total": "5000", "balance_currency": "TWD", "synced_at": "2026-08-08T11:00:00+00:00"},
+            {"id": "missing", "balance_total": None, "balance_currency": "USD", "synced_at": "2026-08-08T11:00:00+00:00"},
+        ],
+        "balances": [{"account_id": "ibkr", "cash": "999999", "currency": "USD"}],
+        "positions": [{"account_id": "ibkr", "market_value": "999999", "currency": "USD"}],
+        "activities": [],
+        "last_synced_at": "2026-08-08T11:00:00+00:00",
+    })
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+
+    assert body["total_assets"] == 100_000
+    assert body["fx_assets_twd"] == 0
+    assert body["brokerage_assets_twd"] == 36_620
+    assert body["total_assets_with_fx"] == 136_620
+    assert body["net_worth_with_fx"] == 136_620
+    assert body["as_of"] == "2026-08-08"
+
+
 def test_fx_assets_twd_aggregates_fx_balance_with_rate(
     temp_data_root, client, auth_headers, monkeypatch
 ):

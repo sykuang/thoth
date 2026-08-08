@@ -213,6 +213,35 @@ def test_connect_registers_user_encrypts_secret_and_returns_read_only_portal(cli
     assert "secret" not in json.dumps(status.json()).lower()
 
 
+def test_sync_clears_portfolio_summary_cache(client, monkeypatch):
+    from backend.server.routers import snaptrade as router_module
+
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    cleared: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        router_module,
+        "clear_dashboard_cache",
+        lambda **kwargs: cleared.append(kwargs),
+        raising=False,
+    )
+    headers = _register(client, "snaptrade-cache-clear@example.com")
+    assert _connect(client, headers).status_code == 200
+
+    response = client.post("/snaptrade/sync", headers=headers)
+
+    assert response.status_code == 200
+    assert len(cleared) == 1
+    assert cleared[0]["namespace"] == "portfolio.summary"
+    assert isinstance(cleared[0]["user_id"], int)
+
+    cleared.clear()
+    fake.fail_positions = True
+    failed = client.post("/snaptrade/sync", headers=headers)
+    assert failed.status_code == 502
+    assert cleared == []
+
+
 def test_sync_persists_cash_positions_and_real_activities_without_float_rounding(client, monkeypatch):
     fake = FakeSnapTradeGateway()
     _install_fake(monkeypatch, fake)

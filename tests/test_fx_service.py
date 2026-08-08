@@ -2,7 +2,7 @@
 
 驗:
   - 台銀 CSV 解析正確 (USD/JPY/CNY/...)
-  - 取「即期賣出」(col 13), 不是「即期買入」或「現金」
+  - 取「即期買入」(col 3) 與「即期賣出」(col 13) 的中間價
   - 主來源失敗 → fallback open.er-api
   - Cache TTL 6 小時 — 連打 N 次只觸發 1 次網路
   - convert_to_twd 正確 round int
@@ -72,13 +72,10 @@ def _mk_response(*, status_code=200, content=None, json_data=None):
 # ============================================================
 
 def test_fx_service_parses_bot_csv_correctly():
-    """台銀 CSV → rates dict, 取「即期賣出」(col 13).
+    """台銀 CSV → rates dict, 取即期買入與即期賣出的中間價.
 
-    USD 即期賣出 = 31.69500
-    JPY 即期賣出 = 0.20120
-    CNY 即期賣出 = 4.70700
-    EUR 即期賣出 = 36.62500
-    HKD 即期賣出 = 4.07100
+    USD = (31.54500 + 31.69500) / 2 = 31.62
+    JPY = (0.19770 + 0.20120) / 2 = 0.19945
     """
     fake_resp = _mk_response(content=SAMPLE_BOT_CSV)
     with patch("backend.server.fx_service.httpx.get", return_value=fake_resp):
@@ -87,11 +84,11 @@ def test_fx_service_parses_bot_csv_correctly():
     assert bundle is not None
     assert bundle["source"] == "bank_of_taiwan"
     rates = bundle["rates"]
-    assert rates["USD"] == 31.695
-    assert rates["JPY"] == 0.2012
-    assert rates["CNY"] == 4.707
-    assert rates["EUR"] == 36.625
-    assert rates["HKD"] == 4.071
+    assert rates["USD"] == 31.62
+    assert rates["JPY"] == 0.19945
+    assert rates["CNY"] == 4.6825
+    assert rates["EUR"] == 36.365
+    assert rates["HKD"] == 4.036
     # 最少 5 個幣別
     assert len(rates) >= 5
 
@@ -102,6 +99,7 @@ def test_fx_service_skips_malformed_bot_rows():
     驗:
       - 欄位不足的 row 跳過
       - 非數字的 rate 跳過
+      - NaN 等非有限值跳過
       - 還是有正確 row 進結果
     """
     bad_csv = (
@@ -109,6 +107,7 @@ def test_fx_service_skips_malformed_bot_rows():
         "USD,本行買入,31.22000,31.54500,31.56700,31.52500,31.46600,31.41000,31.35400,31.29600,31.24000,本行賣出,31.89000,31.69500,31.67100,31.63400,31.58300,31.53400,31.48400,31.43700,31.38400,\n"
         "BAD,short,row\n"  # 欄位不夠
         "ZZZ,本行買入,1,1,1,1,1,1,1,1,1,本行賣出,1,not_a_number,1,1,1,1,1,1,1,\n"  # rate not numeric
+        "NAN,本行買入,1,nan,1,1,1,1,1,1,1,本行賣出,1,1,1,1,1,1,1,1,1,\n"  # non-finite
         "XX,本行買入,1,1,1,1,1,1,1,1,1,本行賣出,1,1,1,1,1,1,1,1,1,\n"  # 幣別 < 3 字 → skip
     )
     fake_resp = _mk_response(content=bad_csv)
@@ -116,7 +115,7 @@ def test_fx_service_skips_malformed_bot_rows():
         bundle = fx_service.get_rates()
     assert bundle is not None
     rates = bundle["rates"]
-    assert rates == {"USD": 31.695}  # 只有合法 row 進來
+    assert rates == {"USD": 31.62}  # 只有買賣兩側都合法的 row 進來
 
 
 # ============================================================
@@ -195,9 +194,9 @@ def test_fx_service_caches_rates():
         b = fx_service.get_rates()
 
     assert mock_get.call_count == 1
-    assert r1 == 31.695
-    assert r2 == 0.2012
-    assert r3 == 4.707
+    assert r1 == 31.62
+    assert r2 == 0.19945
+    assert r3 == 4.6825
     assert b["source"] == "bank_of_taiwan"
 
 
@@ -237,7 +236,7 @@ def test_fx_service_uses_stale_cache_when_refresh_fails():
         # 仍應回得到舊 cache
         bundle = fx_service.get_rates()
         assert bundle is not None
-        assert bundle["rates"]["USD"] == 31.695
+        assert bundle["rates"]["USD"] == 31.62
 
 
 # ============================================================
@@ -251,18 +250,17 @@ def test_convert_to_twd_returns_int():
         twd = fx_service.convert_to_twd(1201387, "JPY")
     assert twd is not None
     assert isinstance(twd, int)
-    # 1201387 * 0.2012 = 241719.0444 → round → 241719
-    assert twd == 241719
+    # 1201387 * 0.19945 = 239617.13... → round → 239617
+    assert twd == 239617
 
 
-def test_convert_to_twd_rounds_correctly():
-    """0.5 邊界 → bank round (Python 預設, 看 round() impl)."""
+def test_convert_to_twd_uses_midpoint_rate():
+    """TWD 換算使用即期買賣中間價。"""
     fake_resp = _mk_response(content=SAMPLE_BOT_CSV)
     with patch("backend.server.fx_service.httpx.get", return_value=fake_resp):
-        # 100 * 31.695 = 3169.5 → bank round → 3170 (Python 3 banker's rounding)
-        # 但這裡用 int(round(x)) 仍 ok, 容忍 ±1
+        # 100 * 31.62 = 3162
         twd_usd = fx_service.convert_to_twd(100, "USD")
-    assert twd_usd in (3169, 3170)
+    assert twd_usd == 3162
 
 
 def test_convert_to_twd_returns_none_for_unknown_currency():
@@ -314,4 +312,4 @@ def test_get_rate_handles_lowercase_currency():
     fake_resp = _mk_response(content=SAMPLE_BOT_CSV)
     with patch("backend.server.fx_service.httpx.get", return_value=fake_resp):
         rate = fx_service.get_rate("jpy")
-    assert rate == 0.2012
+    assert rate == 0.19945

@@ -5,8 +5,8 @@
       URL: https://rate.bot.com.tw/xrt/flcsv/0/day
       每列: <CCY>,本行買入,現金買入,即期買入,...,本行賣出,現金賣出,即期賣出,...
             col[0]=currency, col[3]=即期買入, col[13]=即期賣出
-  - **取「即期賣出」當匯率** (col[13])
-      使用者 TWD 記帳：外幣 → TWD 估值對齊銀行賣價 (用 sell 因為 user 「賣外幣換 TWD」)
+  - **取「即期買入 / 即期賣出」中間價** (col[3], col[13])
+      作為外幣資產的中性 TWD 估值，不偏向任一交易方向。
       JPY/SEK/THB/ZAR/IDR 等小面額幣別 BoT 用「100 單位」報價 (rate.bot 把 100 JPY 一起報)
       他們 raw CSV 仍是 per-1-unit (JPY 0.20 對 TWD), 不需另外處理。
   - **Fallback**: open.er-api.com/v6/latest/TWD
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import threading
 import time
 from datetime import datetime, UTC
@@ -46,11 +47,12 @@ HTTP_TIMEOUT = 5.0  # 秒 — 失敗快, 不拖慢 endpoint
 #   col[0]  = 幣別 (USD/JPY/CNY/...)
 #   col[1]  = '本行買入' literal
 #   col[2]  = 現金買入
-#   col[3]  = 即期買入  ← spot buying
+#   col[3]  = 即期買入  ← spot buying ★
 #   col[4..10] = 遠期 buying (10/30/60/90/120/150/180 天)
 #   col[11] = '本行賣出' literal
 #   col[12] = 現金賣出
-#   col[13] = 即期賣出  ← spot selling ★ 取這個當匯率
+#   col[13] = 即期賣出  ← spot selling ★
+_BOT_SPOT_BUY_COL = 3
 _BOT_SPOT_SELL_COL = 13
 
 
@@ -63,7 +65,7 @@ _BOT_SPOT_SELL_COL = 13
 #     "fetched_at": <epoch_seconds>,
 #     "source": "bank_of_taiwan" | "open_er_api",
 #     "as_of": "<ISO datetime>",
-#     "rates": {"USD": 31.695, "JPY": 0.2, ...},
+#     "rates": {"USD": 31.62, "JPY": 0.19945, ...},
 #   }
 # 用 RLock 保護 race (FastAPI thread pool 可能多 thread 同時打)
 
@@ -94,7 +96,7 @@ def _fetch_bot_csv() -> dict[str, Any] | None:
     返回:
         {"source": "bank_of_taiwan",
          "as_of": "<ISO datetime>",
-         "rates": {"USD": 31.695, "JPY": 0.2, ...}}
+         "rates": {"USD": 31.62, "JPY": 0.19945, ...}}
     """
     try:
         r = httpx.get(BOT_CSV_URL, timeout=HTTP_TIMEOUT)
@@ -115,12 +117,13 @@ def _fetch_bot_csv() -> dict[str, Any] | None:
         if not ccy or len(ccy) != 3:
             continue
         try:
-            rate = float(row[_BOT_SPOT_SELL_COL])
+            buy = float(row[_BOT_SPOT_BUY_COL])
+            sell = float(row[_BOT_SPOT_SELL_COL])
         except (ValueError, TypeError):
             continue
-        if rate <= 0:
+        if not math.isfinite(buy) or not math.isfinite(sell) or buy <= 0 or sell <= 0:
             continue
-        rates[ccy] = rate
+        rates[ccy] = round((buy + sell) / 2, 6)
 
     if not rates:
         return None

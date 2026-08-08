@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.server.deps import current_user
+from backend.server.dashboard_cache import clear_dashboard_cache
 from backend.server.snaptrade import (
     SnapTradeBusy,
     SnapTradeInvalidCallback,
@@ -60,7 +61,9 @@ def connect(
 @router.post("/sync")
 def sync(user: dict = Depends(current_user)) -> dict[str, Any]:
     try:
-        return get_service().sync(user["id"])
+        result = get_service().sync(user["id"])
+        clear_dashboard_cache(user_id=user["id"], namespace="portfolio.summary")
+        return result
     except Exception as error:
         _raise_http(error)
 

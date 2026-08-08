@@ -10,6 +10,8 @@ TRANSACTIONS = ROOT / "frontend/src/app/(tabs)/transactions.tsx"
 SECTIONS = ROOT / "frontend/src/components/SnapTradeSections.tsx"
 BROKERAGE_DETAIL = ROOT / "frontend/src/app/(tabs)/cards/brokerage/[account_id].tsx"
 BROKERAGE_TXN_ROW = ROOT / "frontend/src/components/transactions/BrokerageTxnRow.tsx"
+DASHBOARD = ROOT / "frontend/src/app/(tabs)/dashboard.tsx"
+API_TYPES = ROOT / "frontend/src/types/api.ts"
 
 
 def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
@@ -135,3 +137,11 @@ def test_accounts_tab_uses_plain_scroll_view_without_keyboard_insets():
 
     assert '<ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' in accounts
     assert '<KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' not in accounts
+
+
+def test_brokerage_assets_prevent_dashboard_empty_state():
+    dashboard = DASHBOARD.read_text()
+    api_types = API_TYPES.read_text()
+
+    assert "brokerage_assets_twd: number;" in api_types
+    assert "portfolio.brokerage_assets_twd === 0" in dashboard

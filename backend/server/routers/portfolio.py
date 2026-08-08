@@ -45,7 +45,7 @@ from pydantic import BaseModel
 
 from backend.core import account_classify, bank_data
 from backend.server.deps import current_user
-from backend.server import fx_service
+from backend.server import db, fx_service
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
     clear_dashboard_cache,  # noqa: F401 — intentional router-level cache control API
@@ -390,8 +390,9 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
 
     **語意定義** (使用者規則 2026-06-14):
       total_assets       = 銀行台幣存款 balance_history.twd_balance sum (TWD only, 真實值)
-      fx_assets_twd      = 所有外幣帳戶用 fx_service 換 TWD 的估值 sum (估值)
-      total_assets_with_fx = total_assets + fx_assets_twd (給 frontend 大字「總資產」用)
+      fx_assets_twd      = 所有銀行外幣帳戶用 fx_service 換 TWD 的估值 sum
+      brokerage_assets_twd = SnapTrade 每個券商帳戶 balance_total 換 TWD 的估值 sum
+      total_assets_with_fx = total_assets + fx_assets_twd + brokerage_assets_twd
       total_liabilities  = **上期帳單未繳** sum (只算已出帳還沒繳的)
       current_month_spending = 本月 consume_date 在 pending + billed 表 sum
       net_worth          = total_assets - total_liabilities (TWD only, 保守)
@@ -404,7 +405,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
 
     fx_assets_twd 設計鐵則 (使用者 2026-06-14):
       - 只算 accounts 表 currency != 'TWD' 且 twd_transactions 撈得到 balance 的帳戶
-      - 用 fx_service.convert_to_twd (台銀即期賣出價, 6h cache)
+      - 用 fx_service.convert_to_twd (台銀即期買賣中間價, 6h cache)
       - fx_service 抓不到該幣別 → 該帳戶不算進 fx_assets_twd (保守略過)
       - 不從 balance_history.fx_balance 撈 (爬蟲對 fx 折算口徑不統一, 不可信)
 
@@ -412,7 +413,8 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         {
             "total_assets": int,              # TWD only (真實)
             "fx_assets_twd": int,             # 外幣帳戶 TWD 估值 sum
-            "total_assets_with_fx": int,      # = total_assets + fx_assets_twd
+            "brokerage_assets_twd": int,     # 券商帳戶總值 TWD 估值
+            "total_assets_with_fx": int,      # = total_assets + fx + brokerage
             "total_liabilities": int,         # 上期帳單未繳 sum
             "current_month_spending": int,
             "net_worth": int,                 # = total_assets - total_liabilities (TWD only)
@@ -428,6 +430,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
     skipped: list[str] = []
     total_assets = 0
     fx_assets_twd = 0           # 外幣帳戶 TWD 估值 sum (給 frontend 大字用)
+    brokerage_assets_twd = 0    # SnapTrade account total；不重加 cash / positions
     total_liabilities = 0       # 信用卡未繳 + 貸款餘額
     total_card_unpaid = 0       # 純信用卡未繳（給 frontend 拆分用）
     total_loan = 0              # 純貸款餘額
@@ -559,7 +562,27 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
             "as_of": bank_as_of,
         })
 
-    total_assets_with_fx = total_assets + fx_assets_twd
+    try:
+        brokerage_snapshot = db.snaptrade_snapshot(user_id)
+        for account in brokerage_snapshot["accounts"]:
+            amount = account.get("balance_total")
+            currency = account.get("balance_currency")
+            if amount is None or not currency:
+                continue
+            try:
+                estimate = convert_to_twd(amount, currency)
+            except Exception:
+                continue
+            if estimate is not None:
+                brokerage_assets_twd += estimate
+        brokerage_as_of = _normalize_iso_date(brokerage_snapshot.get("last_synced_at"))
+        if brokerage_as_of and (overall_latest is None or brokerage_as_of > overall_latest):
+            overall_latest = brokerage_as_of
+    except Exception:
+        # 券商快照 / FX 失敗不應遮蔽既有銀行 summary。
+        pass
+
+    total_assets_with_fx = total_assets + fx_assets_twd + brokerage_assets_twd
     total_ms = (time.perf_counter() - total_started) * 1000
     perf_log.info(
         "event=portfolio.summary section=total user_id=%s duration_ms=%.1f banks=%s skipped=%s",
@@ -567,14 +590,15 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
     )
     return {
         "total_assets": total_assets,                       # TWD only (真實)
-        "fx_assets_twd": fx_assets_twd,                     # 外幣帳戶 TWD 估值
-        "total_assets_with_fx": total_assets_with_fx,       # 含 fx 估值
+        "fx_assets_twd": fx_assets_twd,                     # 銀行外幣帳戶 TWD 估值
+        "brokerage_assets_twd": brokerage_assets_twd,       # 券商帳戶 TWD 估值
+        "total_assets_with_fx": total_assets_with_fx,       # 含銀行外幣與券商估值
         "total_liabilities": total_liabilities,
         "total_card_unpaid": total_card_unpaid,             # frontend 拆分用
         "total_loan": total_loan,                           # frontend 拆分用
         "current_month_spending": total_current_month,
         "net_worth": total_assets - total_liabilities,                   # TWD only
-        "net_worth_with_fx": total_assets_with_fx - total_liabilities,   # 含外幣估值
+        "net_worth_with_fx": total_assets_with_fx - total_liabilities,   # 含外幣與券商估值
         "as_of": overall_latest,
         "by_bank": sorted(by_bank, key=lambda b: -((b["assets"] or 0) + (b.get("fx_assets_twd") or 0))),
         "skipped": skipped,

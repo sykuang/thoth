@@ -555,6 +555,7 @@ function PortfolioHeader({
   if (
     portfolio.total_assets === 0 &&
     portfolio.fx_assets_twd === 0 &&
+    portfolio.brokerage_assets_twd === 0 &&
     portfolio.total_liabilities === 0 &&
     portfolio.current_month_spending === 0
   ) {

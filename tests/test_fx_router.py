@@ -81,8 +81,8 @@ def test_fx_rates_returns_dict(client, auth_headers):
     assert "CNY" in rates
     assert "EUR" in rates
     assert "HKD" in rates
-    assert rates["USD"] == 31.695
-    assert rates["JPY"] == 0.2012
+    assert rates["USD"] == 31.62
+    assert rates["JPY"] == 0.19945
 
 
 def test_fx_rates_falls_back_to_er_api_when_bot_fails(client, auth_headers):

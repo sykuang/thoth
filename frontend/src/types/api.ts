@@ -480,9 +480,11 @@ export type PortfolioBankSummary = {
 
 export type PortfolioSummary = {
   total_assets: number;
-  /** 外幣帳戶 TWD 估值 sum (台銀即期賣出價, 6h cache). */
+  /** 外幣帳戶 TWD 估值 sum (台銀即期買賣中間價, 6h cache). */
   fx_assets_twd: number;
-  /** = total_assets + fx_assets_twd (給 dashboard 大字「總資產」用). */
+  /** SnapTrade 券商帳戶總值的 TWD 估值；每帳戶只採 balance_total 一次. */
+  brokerage_assets_twd: number;
+  /** = total_assets + fx_assets_twd + brokerage_assets_twd. */
   total_assets_with_fx: number;
   /** = total_card_unpaid + total_loan. */
   total_liabilities: number;
@@ -494,7 +496,7 @@ export type PortfolioSummary = {
   current_month_spending: number;
   /** = total_assets - total_liabilities (TWD only, 保守). */
   net_worth: number;
-  /** = total_assets_with_fx - total_liabilities (含外幣估值). */
+  /** = total_assets_with_fx - total_liabilities (含外幣與券商估值). */
   net_worth_with_fx: number;
   as_of: string | null;
   by_bank: PortfolioBankSummary[];
