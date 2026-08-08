@@ -122,7 +122,7 @@ export default function ManualAccountScreen() {
     if (account.product_type !== 'unknown') setProductType(account.product_type);
     setName(account.name);
     setCurrency(account.currency);
-    setBalance((account.balance ?? '0').replace(/^-/, ''));
+    setBalance((account.manual_balance ?? account.balance ?? '0').replace(/^-/, ''));
     setIncluded(account.included_in_net_worth);
   }, [account]);
 
@@ -136,6 +136,7 @@ export default function ManualAccountScreen() {
           name: name.trim(),
           currency: currency.trim().toUpperCase(),
           balance: balance.trim(),
+          manual_balance: balance.trim(),
           included_in_net_worth: included,
         },
       },

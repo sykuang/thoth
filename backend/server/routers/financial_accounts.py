@@ -19,6 +19,7 @@ from backend.server.financial_accounts import (
     create_manual_account,
     delete_investment_transaction,
     delete_manual_account,
+    get_manual_account,
     list_financial_accounts,
     list_investment_holdings,
     list_investment_transactions,
@@ -64,6 +65,7 @@ class ManualAccountPayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
     balance: str
+    manual_balance: str | None = None
     included_in_net_worth: bool = True
 
     @field_validator("balance")
@@ -71,8 +73,13 @@ class ManualAccountPayload(BaseModel):
     def validate_balance(cls, value: str) -> str:
         return _decimal_text(value)
 
+    @field_validator("manual_balance")
+    @classmethod
+    def validate_manual_balance(cls, value: str | None) -> str | None:
+        return _decimal_text(value) if value is not None else None
+
     def domain_values(self) -> dict:
-        return self.model_dump()
+        return self.model_dump(exclude={"manual_balance"})
 
 
 class InvestmentTransactionPayload(BaseModel):
@@ -201,7 +208,11 @@ def update_account(
     user: dict = Depends(current_user),
 ) -> FinancialAccount:
     try:
-        account = update_manual_account(user["id"], account_id, **body.domain_values())
+        values = body.domain_values()
+        existing = get_manual_account(user["id"], account_id)
+        if existing.product_type == "investment":
+            values["balance"] = body.manual_balance or (existing.balance or "0").lstrip("-")
+        account = update_manual_account(user["id"], account_id, **values)
     except ManualAccountNotFound as exc:
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:

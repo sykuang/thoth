@@ -38,6 +38,7 @@ class FinancialAccount(BaseModel):
     product_type: str
     currency: str
     balance: str | None
+    manual_balance: str | None = None
     as_of: str | None
     valuation_source: ValuationSource | None = None
     included_in_net_worth: bool
@@ -166,6 +167,7 @@ def _row_to_manual_account(row) -> FinancialAccount:
         product_type=_row_value(row, 1, "product_type"),
         currency=_row_value(row, 3, "currency"),
         balance=str(_row_value(row, 4, "balance")),
+        manual_balance=str(_row_value(row, 4, "balance")),
         as_of=None,
         valuation_source="manual",
         included_in_net_worth=bool(_row_value(row, 5, "included_in_net_worth")),

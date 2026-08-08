@@ -186,8 +186,23 @@ def test_investment_account_balance_uses_yahoo_market_value_and_clears_summary_c
     accounts_response = client.get("/financial-accounts?source=manual", headers=headers)
     assert accounts_response.status_code == 200, accounts_response.text
     assert accounts_response.json()[0]["balance"] == "514.25"
+    assert accounts_response.json()[0]["manual_balance"] == "0"
     assert accounts_response.json()[0]["valuation_source"] == "yahoo_finance"
     assert accounts_response.json()[0]["as_of"] == "2026-08-07T05:30:01+00:00"
+
+    rename_response = client.patch(
+        f"/financial-accounts/{account_id}",
+        headers=headers,
+        json={
+            "product_type": "investment",
+            "name": "Renamed without overwriting fallback",
+            "currency": "TWD",
+            "balance": accounts_response.json()[0]["manual_balance"],
+            "included_in_net_worth": True,
+        },
+    )
+    assert rename_response.status_code == 200, rename_response.text
+    assert rename_response.json()["balance"] == "0"
 
     refreshed_summary = client.get("/portfolio/summary", headers=headers)
     assert refreshed_summary.status_code == 200, refreshed_summary.text
@@ -199,6 +214,8 @@ def test_investment_account_balance_uses_yahoo_market_value_and_clears_summary_c
     monkeypatch.setattr(yahoo_finance, "get_quote", fail_quote)
     fallback_response = client.get("/financial-accounts?source=manual", headers=headers)
     assert fallback_response.status_code == 200, fallback_response.text
+    assert fallback_response.json()[0]["name"] == "Renamed without overwriting fallback"
     assert fallback_response.json()[0]["balance"] == "0"
+    assert fallback_response.json()[0]["manual_balance"] == "0"
     assert fallback_response.json()[0]["valuation_source"] == "manual_fallback"
     assert fallback_response.json()[0]["as_of"] is None

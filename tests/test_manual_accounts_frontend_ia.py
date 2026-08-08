@@ -53,6 +53,8 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "已確認 {selectedSymbol.symbol} · Yahoo Finance" in source
     assert "queryKey: ['financial-accounts']" in source
     assert "queryKey: ['portfolio', 'summary']" in source
+    assert "account.manual_balance ?? account.balance" in source
+    assert "manual_balance: balance.trim()" in source
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:

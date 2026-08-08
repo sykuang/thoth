@@ -597,6 +597,7 @@ export type FinancialAccount = {
   product_type: FinancialAccountProductType;
   currency: string;
   balance: string | null;
+  manual_balance?: string | null;
   as_of: string | null;
   valuation_source: 'manual' | 'yahoo_finance' | 'manual_fallback' | null;
   included_in_net_worth: boolean;

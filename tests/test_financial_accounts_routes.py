@@ -110,6 +110,46 @@ def test_manual_financial_account_crud_and_liability_normalization(client):
     assert client.get("/financial-accounts", headers=headers).json() == []
 
 
+def test_investment_patch_preserves_fallback_for_legacy_clients(client):
+    token = _register(client, "manual-investment-legacy@palace.example")
+    headers = _auth(token)
+    created = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="investment", balance="40"),
+    ).json()
+
+    legacy_patch = client.patch(
+        f"/financial-accounts/{created['id']}",
+        headers=headers,
+        json=_payload(product_type="investment", name="Renamed", balance="514.25"),
+    )
+    assert legacy_patch.status_code == 200, legacy_patch.text
+    assert legacy_patch.json()["name"] == "Renamed"
+    assert legacy_patch.json()["manual_balance"] == "40"
+
+    explicit_patch = client.patch(
+        f"/financial-accounts/{created['id']}",
+        headers=headers,
+        json={
+            **_payload(product_type="investment", name="Explicit fallback", balance="999"),
+            "manual_balance": "55",
+        },
+    )
+    assert explicit_patch.status_code == 200, explicit_patch.text
+    assert explicit_patch.json()["manual_balance"] == "55"
+
+    invalid_patch = client.patch(
+        f"/financial-accounts/{created['id']}",
+        headers=headers,
+        json={
+            **_payload(product_type="investment", balance="999"),
+            "manual_balance": "1e2",
+        },
+    )
+    assert invalid_patch.status_code == 422, invalid_patch.text
+
+
 def test_manual_financial_accounts_are_tenant_isolated(client):
     owner = _register(client, "manual-owner@palace.example")
     other = _register(client, "manual-other@palace.example")
