@@ -12,6 +12,7 @@ import {
   View,
 } from 'react-native';
 
+import { Dropdown, type DropdownOption } from '@/components/Dropdown';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
@@ -36,6 +37,19 @@ const PRODUCT_TYPES: { value: EditableProductType; label: string }[] = [
   { value: 'mortgage', label: '房貸' },
   { value: 'credit_line', label: '信用額度' },
   { value: 'investment', label: '投資' },
+];
+const ACCOUNT_CURRENCIES: DropdownOption[] = [
+  { value: 'TWD', label: 'TWD — 新台幣' },
+  { value: 'USD', label: 'USD — 美元' },
+  { value: 'JPY', label: 'JPY — 日圓' },
+  { value: 'EUR', label: 'EUR — 歐元' },
+  { value: 'GBP', label: 'GBP — 英鎊' },
+  { value: 'HKD', label: 'HKD — 港幣' },
+  { value: 'CNY', label: 'CNY — 人民幣' },
+  { value: 'AUD', label: 'AUD — 澳幣' },
+  { value: 'CAD', label: 'CAD — 加幣' },
+  { value: 'SGD', label: 'SGD — 新加坡幣' },
+  { value: 'CHF', label: 'CHF — 瑞士法郎' },
 ];
 const TRADE_KINDS: { value: TradeKind; label: string }[] = [
   { value: 'opening', label: '期初持股' },
@@ -104,6 +118,13 @@ export default function ManualAccountScreen() {
   const [balance, setBalance] = useState('0');
   const [included, setIncluded] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const normalizedCurrency = currency.trim().toUpperCase();
+  const accountCurrencyOptions = useMemo(
+    () => normalizedCurrency && !ACCOUNT_CURRENCIES.some((option) => option.value === normalizedCurrency)
+      ? [...ACCOUNT_CURRENCIES, { value: normalizedCurrency, label: normalizedCurrency }]
+      : ACCOUNT_CURRENCIES,
+    [normalizedCurrency],
+  );
 
   const accountsQ = useQuery<FinancialAccount[], ApiError>({
     queryKey: ['financial-accounts', 'manual'],
@@ -228,7 +249,15 @@ export default function ManualAccountScreen() {
           </View>
           <Field label="名稱" value={name} onChangeText={setName} placeholder="例如：永豐證券、緊急預備金" testID="manual-name" />
           <View className="flex-row gap-3">
-            <View className="w-28"><Field label="幣別" value={currency} onChangeText={setCurrency} placeholder="TWD" /></View>
+            <View className="w-44 mb-4">
+              <Dropdown
+                label="幣別"
+                value={normalizedCurrency}
+                onChange={setCurrency}
+                options={accountCurrencyOptions}
+                testID="manual-currency"
+              />
+            </View>
             <View className="flex-1"><Field label={productType === 'investment' ? '目前總值' : '目前餘額'} value={balance} onChangeText={setBalance} keyboardType="decimal-pad" testID="manual-balance" /></View>
           </View>
 

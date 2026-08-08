@@ -58,6 +58,11 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "queryKey: ['portfolio', 'summary']" in source
     assert "account.manual_balance ?? account.balance" in source
     assert "manual_balance: balance.trim()" in source
+    assert "const ACCOUNT_CURRENCIES" in source
+    assert 'label="幣別"' in source
+    assert 'testID="manual-currency"' in source
+    assert '<View className="w-28"><Field label="幣別"' not in source
+    assert "!ACCOUNT_CURRENCIES.some((option) => option.value === normalizedCurrency)" in source
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:
