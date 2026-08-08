@@ -230,7 +230,7 @@ def test_manual_investment_transaction_crud_without_dividends(client):
         json=_payload(product_type="investment", name="Manual Portfolio", balance="5000"),
     ).json()
 
-    opening = client.post(
+    missing_opening_cost = client.post(
         f"/financial-accounts/{account['id']}/transactions",
         headers=headers,
         json={
@@ -239,10 +239,39 @@ def test_manual_investment_transaction_crud_without_dividends(client):
             "symbol": "AAA",
             "quantity": "5",
             "currency": "USD",
+        },
+    )
+    assert missing_opening_cost.status_code == 422, missing_opening_cost.text
+    zero_opening_cost = client.post(
+        f"/financial-accounts/{account['id']}/transactions",
+        headers=headers,
+        json={
+            "kind": "opening",
+            "occurred_on": "2026-07-31",
+            "symbol": "AAA",
+            "quantity": "5",
+            "unit_price": "0",
+            "currency": "USD",
+        },
+    )
+    assert zero_opening_cost.status_code == 422, zero_opening_cost.text
+
+    opening = client.post(
+        f"/financial-accounts/{account['id']}/transactions",
+        headers=headers,
+        json={
+            "kind": "opening",
+            "occurred_on": "2026-07-31",
+            "symbol": "AAA",
+            "quantity": "5",
+            "unit_price": "80.00",
+            "currency": "USD",
             "note": "opening position",
         },
     )
     assert opening.status_code == 201, opening.text
+    assert opening.json()["unit_price"] == "80.00"
+    assert opening.json()["amount"] == "400.00"
 
     backdated_sell = client.post(
         f"/financial-accounts/{account['id']}/transactions",
@@ -407,6 +436,7 @@ def test_manual_investment_concurrent_sells_cannot_create_negative_holdings(clie
             "occurred_on": "2026-08-01",
             "symbol": "AAA",
             "quantity": "1",
+            "unit_price": "10",
             "currency": "USD",
         },
     ).status_code == 201
@@ -467,7 +497,8 @@ def test_manual_account_decimal_input_is_bounded(client, monkeypatch):
         "currency": "USD",
     }
     for payload in (
-        {**base_trade, "kind": "opening", "quantity": "1e2"},
+        {**base_trade, "kind": "opening", "quantity": "1e2", "unit_price": "1"},
+        {**base_trade, "kind": "opening", "quantity": "1", "unit_price": "1e2"},
         {**base_trade, "kind": "buy", "quantity": "1", "unit_price": "1e2"},
         {"kind": "fee", "occurred_on": "2026-08-01", "amount": "1e2", "currency": "USD"},
     ):

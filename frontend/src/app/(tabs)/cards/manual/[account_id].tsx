@@ -129,17 +129,14 @@ export default function ManualAccountScreen() {
         },
       },
     ),
-    onSuccess: async (saved) => {
+    onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['financial-accounts'] }),
         queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
       ]);
       setError(null);
       if (isNew) {
-        router.replace({
-          pathname: '/(tabs)/cards/manual/[account_id]',
-          params: { account_id: saved.id },
-        });
+        router.dismissTo('/(tabs)/cards');
       }
     },
     onError: (err) => setError(formatApiError(err)),
@@ -311,7 +308,7 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
           occurred_on: occurredOn,
           symbol: kind === 'fee' ? null : symbol.trim().toUpperCase(),
           quantity: kind === 'fee' ? null : quantity.trim(),
-          unit_price: kind === 'buy' || kind === 'sell' ? unitPrice.trim() : null,
+          unit_price: kind === 'fee' ? null : unitPrice.trim(),
           amount: kind === 'fee' ? amount.trim() : null,
           currency: currency.trim().toUpperCase(),
           note: note.trim() || null,
@@ -404,7 +401,7 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
         <Field label="日期（YYYY-MM-DD）" value={occurredOn} onChangeText={setOccurredOn} />
         {kind !== 'fee' && <Field label="代號" value={symbol} onChangeText={setSymbol} placeholder="例如：AAPL" />}
         {kind !== 'fee' && <Field label="數量" value={quantity} onChangeText={setQuantity} keyboardType="decimal-pad" />}
-        {(kind === 'buy' || kind === 'sell') && <Field label="成交單價" value={unitPrice} onChangeText={setUnitPrice} keyboardType="decimal-pad" />}
+        {kind !== 'fee' && <Field label={kind === 'opening' ? '期初單位成本' : '成交單價'} value={unitPrice} onChangeText={setUnitPrice} keyboardType="decimal-pad" />}
         {kind === 'fee' && <Field label="費用金額" value={amount} onChangeText={setAmount} keyboardType="decimal-pad" />}
         <Field label="幣別" value={currency} onChangeText={setCurrency} placeholder="USD" />
         <Field label="備註（選填）" value={note} onChangeText={setNote} />

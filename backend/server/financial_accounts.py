@@ -301,15 +301,15 @@ def _normalize_transaction_values(
         if parsed_quantity <= 0:
             raise InvalidManualAccount("quantity must be positive")
         quantity_text = format(parsed_quantity, "f")
-        if kind == "opening" and unit_price is None:
-            price_text = None
-            amount_text = "0"
-        else:
-            parsed_price = _decimal(unit_price)
-            if parsed_price < 0:
-                raise InvalidManualAccount("unit price must be non-negative")
-            price_text = format(parsed_price, "f")
-            amount_text = format(parsed_quantity * parsed_price, "f")
+        if unit_price is None:
+            raise InvalidManualAccount("unit price is required for position transactions")
+        parsed_price = _decimal(unit_price)
+        if parsed_price < 0:
+            raise InvalidManualAccount("unit price must be non-negative")
+        if kind == "opening" and parsed_price == 0:
+            raise InvalidManualAccount("opening cost must be positive")
+        price_text = format(parsed_price, "f")
+        amount_text = format(parsed_quantity * parsed_price, "f")
     else:
         parsed_amount = _decimal(amount)
         if parsed_amount <= 0:

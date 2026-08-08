@@ -51,8 +51,10 @@ def _decimal_text(value: str, *, allow_zero: bool = True) -> str:
         parsed = Decimal(raw)
     except (InvalidOperation, ValueError) as exc:
         raise ValueError("must be a decimal string") from exc
-    if not parsed.is_finite() or parsed < 0 or (not allow_zero and parsed == 0):
+    if not parsed.is_finite() or parsed < 0:
         raise ValueError("must be a finite non-negative decimal")
+    if not allow_zero and parsed == 0:
+        raise ValueError("must be a positive decimal")
     return raw
 
 
@@ -88,10 +90,9 @@ class InvestmentTransactionPayload(BaseModel):
             if not self.symbol or self.quantity is None:
                 raise ValueError("position transactions require symbol and quantity")
             self.quantity = _decimal_text(self.quantity, allow_zero=False)
-            if self.kind != "opening" and self.unit_price is None:
-                raise ValueError("buy/sell require unit_price")
-            if self.unit_price is not None:
-                self.unit_price = _decimal_text(self.unit_price)
+            if self.unit_price is None:
+                raise ValueError("position transactions require unit_price")
+            self.unit_price = _decimal_text(self.unit_price, allow_zero=self.kind != "opening")
         else:
             if self.amount is None:
                 raise ValueError("fee requires amount")

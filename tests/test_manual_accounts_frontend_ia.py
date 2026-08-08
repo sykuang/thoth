@@ -18,6 +18,8 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "/holdings" in source
     assert "/transactions" in source
     assert "期初持股" in source
+    assert 'label={kind === \'opening\' ? \'期初單位成本\' : \'成交單價\'}' in source
+    assert "kind === 'fee' ? null : unitPrice.trim()" in source
     assert "買入" in source
     assert "賣出" in source
     assert "費用" in source
@@ -38,6 +40,8 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "manual-institution" not in source
     assert "帳號末碼" not in source
     assert "估值日期" not in source
+    assert "router.dismissTo('/(tabs)/cards')" in source
+    assert "router.replace({" not in source
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:
