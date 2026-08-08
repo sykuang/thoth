@@ -48,7 +48,8 @@ def test_account_tab_routes_canonical_refs_not_last_four():
 def test_transactions_tab_filters_by_exact_canonical_ref():
     src = TRANSACTIONS_TSX.read_text()
 
-    assert "account_no?: string; card_no?: string; brokerage_account_id?: string; drilldown?: string" in src
+    assert "account_no?: string; card_no?: string; drilldown?: string" in src
+    assert "brokerage_account_id" not in src
     assert "const [activeAccountNo, setActiveAccountNo] = useState(accountNo);" in src
     assert "const [activeCardNo, setActiveCardNo] = useState(cardNo);" in src
     assert "t.account_no === effectiveAccountNo" in src

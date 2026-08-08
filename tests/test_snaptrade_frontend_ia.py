@@ -8,6 +8,8 @@ ACCOUNTS = ROOT / "frontend/src/app/(tabs)/cards/index.tsx"
 CALLBACK = ROOT / "frontend/src/app/(tabs)/investments.tsx"
 TRANSACTIONS = ROOT / "frontend/src/app/(tabs)/transactions.tsx"
 SECTIONS = ROOT / "frontend/src/components/SnapTradeSections.tsx"
+BROKERAGE_DETAIL = ROOT / "frontend/src/app/(tabs)/cards/brokerage/[account_id].tsx"
+BROKERAGE_TXN_ROW = ROOT / "frontend/src/components/transactions/BrokerageTxnRow.tsx"
 
 
 def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
@@ -27,50 +29,86 @@ def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
     assert "maybeCompleteAuthSession" in callback
     assert "export function SnapTradeConnectionSettings" in sections
     assert "export function SnapTradeAccountsSection" in sections
-    assert "export function SnapTradeActivitiesSection" in sections
+    assert "export function SnapTradeActivitiesSection" not in sections
     accounts_section = sections[
         sections.index("export function SnapTradeAccountsSection"):
         sections.index("function ActionButton")
     ]
     assert "portfolio.activities" not in accounts_section
-    assert "<SnapTradeActivitiesSection" in transactions
-    assert "brokerage_account_id" in transactions
+    assert "SnapTradeActivitiesSection" not in transactions
+    assert "mergeTransactionTimeline" in transactions
+    assert "BrokerageTxnRow" in transactions
+    assert "(activity.trade_date ?? activity.settlement_date ?? '').slice(0, 10)" in transactions
     assert "enabled: (statusQuery.data?.connection_count ?? 0) > 0" not in sections
     assert "if (!status?.connection_count) return null" not in sections
-    assert "交易資料更新至" in sections
+    assert "持股資料更新至" in sections
+    assert "交易資料更新至" not in sections
     assert "帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」" in sections
     assert "交易明細顯示於「明細」" not in sections
     assert "資料顯示於「帳戶」" not in sections
     assert "上次同步：" not in sections
 
 
-def test_brokerage_account_row_deeplinks_to_existing_transactions_tab():
+def test_brokerage_account_row_opens_holdings_detail_not_transactions():
     sections = SECTIONS.read_text()
     transactions = TRANSACTIONS.read_text()
+    assert BROKERAGE_DETAIL.exists()
+    brokerage_detail = BROKERAGE_DETAIL.read_text()
+    accounts_section = sections[
+        sections.index("export function SnapTradeAccountsSection"):
+        sections.index("function ActionButton")
+    ]
     account_card = sections[
         sections.index("function AccountCard"):
         sections.index("export function SnapTradeHoldingsSection")
     ]
 
-    assert "pathname: '/(tabs)/transactions'" in sections
-    assert "brokerage_account_id: account.id" in sections
-    assert "drilldown: String(Date.now())" in sections
+    assert "pathname: '/(tabs)/cards/brokerage/[account_id]'" in accounts_section
+    assert "account_id: account.id" in accounts_section
+    assert "pathname: '/(tabs)/transactions'" not in accounts_section
     assert "testID={`brokerage-account-detail-${account.id}`}" in account_card
     assert "account.balance_total" in account_card
     assert "positions.map" not in account_card
     assert "balances.map" not in account_card
-    assert "查看 ${accountLabel(account)} 持股與交易明細" in account_card
-    assert "<SnapTradeHoldingsSection accountId={brokerageAccountId} />" in transactions
-    assert "onPress={() => router.replace('/(tabs)/transactions')}" in transactions
-    assert 'accessibilityLabel="顯示全部交易明細"' in transactions
+    assert "查看 ${accountLabel(account)} 持股明細" in account_card
+    assert "<SnapTradeHoldingsSection accountId={accountId} />" in brokerage_detail
+    assert "<SnapTradeHoldingsSection" not in transactions
+    assert "SnapTradeActivitiesSection" not in transactions
+    assert "brokerage_account_id" not in transactions
+
+    holdings_section = sections[sections.index("export function SnapTradeHoldingsSection"):]
+    assert "持股資料更新至：{account.synced_at}" in holdings_section
+    assert "transactions_last_successful_sync" not in holdings_section
+    assert "transactions_first_transaction_date" not in holdings_section
 
 
 def test_brokerage_detail_reports_query_errors_and_unsupported_snapshots():
     sections = SECTIONS.read_text()
+    transactions = TRANSACTIONS.read_text()
 
     assert "if (!accountId) return null" not in sections
-    assert "if (accountId && account?.activities_supported === false)" in sections
-    assert "此帳戶目前未提供交易明細" in sections
+    assert "account.activities_supported" in transactions
+    assert "部分券商帳戶目前未提供交易明細" in transactions
+    assert "券商交易讀取失敗" in transactions
+
+
+def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
+    transactions = TRANSACTIONS.read_text()
+
+    assert "const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;" in transactions
+    assert "brokerageScopeActive && brokerageQ.isError" in transactions
+    assert "brokerageScopeActive && brokerageQ.isLoading" in transactions
+    assert "activeBrokeragePortfolio?.accounts.some" in transactions
+    assert "enabled: brokerageScopeActive" in transactions
+    assert "const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;" in transactions
+    assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions
+
+
+def test_brokerage_desktop_transaction_date_stays_in_fixed_width_column():
+    row = BROKERAGE_TXN_ROW.read_text()
+
+    assert "const displayDate = date?.slice(0, 10) ?? '—';" in row
+    assert "{displayDate}" in row
 
 
 def test_account_snapshot_does_not_report_unrelated_live_status_error():

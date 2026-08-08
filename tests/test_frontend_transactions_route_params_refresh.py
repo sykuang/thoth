@@ -21,21 +21,21 @@ def test_transactions_route_params_sync_into_mounted_filter_state():
     assert "import { useMemo, useState } from 'react';" not in src
     assert "import { useEffect, useMemo, useRef, useState } from 'react';" in src
     assert "const appliedRouteSignatureRef = useRef<string | null>(null);" in src
-    assert "const routeSignature = [initialBank, accountNo, cardNo, brokerageAccountId, params.drilldown ?? ''].join('|');" in src
+    assert "const routeSignature = [initialBank, accountNo, cardNo, params.drilldown ?? ''].join('|');" in src
     assert "if (appliedRouteSignatureRef.current === routeSignature) return;" in src
     assert "appliedRouteSignatureRef.current = routeSignature;" in src
-    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; brokerage_account_id?: string; drilldown?: string }>" in src
+    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; drilldown?: string }>" in src
     assert "useEffect(() => {" in src
     assert "setSelectedBanks(initialBank ? [initialBank] : [])" in src
     assert "setKind(initialKind)" not in src
-    assert "}, [initialBank, accountNo, cardNo, brokerageAccountId, params.drilldown]);" in src
+    assert "}, [initialBank, accountNo, cardNo, params.drilldown]);" in src
 
 
 def test_account_drilldown_resets_stale_client_side_filters_and_modes():
     src = TRANSACTIONS_TSX.read_text()
 
     effect = src[src.index("useEffect(() => {"):src.index("// 統一 row identity")]
-    assert "if (accountNo || cardNo || brokerageAccountId || typeof params.drilldown === 'string')" in effect
+    assert "if (accountNo || cardNo || typeof params.drilldown === 'string')" in effect
     assert "setCategory('')" in effect
     assert "setSubcategory('')" in effect
     assert "setSearch('')" in effect
@@ -54,12 +54,14 @@ def test_transactions_tab_has_pull_to_refresh_that_forces_snapshot_refetch():
     src = TRANSACTIONS_TSX.read_text()
 
     assert "RefreshControl," in src
-    assert "const transactionRefreshing = (datasetQ.isRefetching && !datasetQ.isLoading) || datasetQ.isRefreshingChanges;" in src
+    assert "|| (brokerageScopeActive && brokerageQ.isRefetching)" in src
     assert "refreshControl={" in src
     assert "<RefreshControl" in src
     assert "refreshing={transactionRefreshing}" in src
     assert "onRefresh={() => {" in src
     assert "void datasetQ.refreshSnapshot();" in src
+    assert "if (brokerageScopeActive) void brokerageQ.refetch();" in src
+    assert "void Promise.all([datasetQ.refreshSnapshot(), brokerageQ.refetch()]);" not in src
 
 
 def test_frontend_dataset_cache_fetches_whole_snapshot_not_incremental_changes():

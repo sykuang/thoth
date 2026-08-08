@@ -55,7 +55,7 @@
     "desktop:build:debug": "tauri build --debug",
     "desktop:icon": "tauri icon",
     "lint": "expo lint",
-    "test:decimal": "tsx src/lib/decimal.test.ts",
+    "test:decimal": "tsx src/lib/decimal.test.ts && tsx src/lib/transactionTimeline.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "private": true,

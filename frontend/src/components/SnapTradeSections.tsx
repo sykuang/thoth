@@ -8,7 +8,6 @@ import { api, formatApiError } from '@/lib/api';
 import { formatDecimal } from '@/lib/decimal';
 import type {
   BrokerageAccount,
-  BrokerageActivity,
   SnapTradePortfolio,
   SnapTradeStatus,
 } from '@/types/api';
@@ -174,10 +173,9 @@ export function SnapTradeAccountsSection() {
           key={account.id}
           account={account}
           onPress={() => router.push({
-            pathname: '/(tabs)/transactions',
+            pathname: '/(tabs)/cards/brokerage/[account_id]',
             params: {
-              brokerage_account_id: account.id,
-              drilldown: String(Date.now()),
+              account_id: account.id,
             },
           })}
         />
@@ -246,7 +244,7 @@ function AccountCard({
       className="bg-white dark:bg-ink-900 rounded-2xl px-4 py-3 shadow-card mb-3 active:opacity-80"
       testID={`brokerage-account-detail-${account.id}`}
       accessibilityRole="button"
-      accessibilityLabel={`查看 ${accountLabel(account)} 持股與交易明細`}
+      accessibilityLabel={`查看 ${accountLabel(account)} 持股明細`}
     >
       <View className="flex-row items-baseline justify-between gap-3">
         <View className="flex-1 min-w-0">
@@ -296,13 +294,8 @@ export function SnapTradeHoldingsSection({ accountId }: { accountId: string }) {
             {accountLabel(account)}
           </Text>
           <Text className="text-ink-400 text-micro mt-1">
-            交易資料更新至：{account.transactions_last_successful_sync ?? '未知'}
+            持股資料更新至：{account.synced_at}
           </Text>
-          {account.transactions_first_transaction_date && (
-            <Text className="text-ink-400 text-micro mt-0.5">
-              最早可見交易：{account.transactions_first_transaction_date}
-            </Text>
-          )}
         </View>
         <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">
           {money(account.balance_total, account.balance_currency)}
@@ -349,85 +342,6 @@ export function SnapTradeHoldingsSection({ accountId }: { accountId: string }) {
           <Text className="text-ink-400 text-small">此帳戶目前沒有證券持倉</Text>
         ) : null}
       </View>
-    </View>
-  );
-}
-
-export function SnapTradeActivitiesSection({
-  accountId,
-}: {
-  accountId?: string;
-}) {
-  const portfolioQuery = useQuery({
-    queryKey: ['snaptrade', 'portfolio'],
-    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
-  });
-  if (portfolioQuery.isLoading) {
-    return <Text className="text-ink-400 text-small py-4">讀取券商交易明細…</Text>;
-  }
-  if (portfolioQuery.isError) {
-    return (
-      <Text className="text-red-600 text-small py-4">{formatApiError(portfolioQuery.error)}</Text>
-    );
-  }
-  const portfolio = portfolioQuery.data ?? EMPTY_PORTFOLIO;
-  const account = accountId
-    ? portfolio.accounts.find((row) => row.id === accountId)
-    : undefined;
-  if (accountId && account?.activities_supported === false) {
-    return <Text className="text-ink-500 dark:text-ink-400 text-small py-4">此帳戶目前未提供交易明細</Text>;
-  }
-  const rows = accountId
-    ? portfolio.activities.filter((row) => row.account_id === accountId)
-    : portfolio.activities;
-  if (rows.length === 0 && !accountId) return null;
-  return (
-    <Activities
-      rows={rows}
-      accounts={portfolio.accounts}
-      title={account ? `${account.institution_name} 交易明細` : '券商交易明細'}
-    />
-  );
-}
-
-function Activities({
-  rows,
-  accounts,
-  title,
-}: {
-  rows: BrokerageActivity[];
-  accounts: BrokerageAccount[];
-  title: string;
-}) {
-  return (
-    <View
-      className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5"
-      testID="snaptrade-activities-section"
-    >
-      <Text className="text-ink-900 dark:text-ink-50 text-h3">{title}</Text>
-      <Text className="text-ink-400 text-micro mt-1 mb-3">
-        {rows.length > 0 ? `顯示最近 ${Math.min(rows.length, 50)} 筆` : '此帳戶目前沒有交易明細'}
-      </Text>
-      {rows.slice(0, 50).map((row) => (
-        <View
-          key={`${row.account_id}:${row.id}`}
-          className="flex-row justify-between gap-3 py-3 border-b border-ink-100 dark:border-ink-800 last:border-b-0"
-        >
-          <View className="flex-1">
-            <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">
-              {row.type} · {row.symbol ?? row.description ?? '—'}
-            </Text>
-            <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-              {accounts.find((account) => account.id === row.account_id)?.institution_name ?? '券商'} ·{' '}
-              {row.trade_date?.slice(0, 10) ?? '日期未知'}
-              {row.units != null ? ` · ${formatDecimal(row.units) ?? '—'} 單位` : ''}
-            </Text>
-          </View>
-          <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold">
-            {money(row.amount, row.currency)}
-          </Text>
-        </View>
-      ))}
     </View>
   );
 }
