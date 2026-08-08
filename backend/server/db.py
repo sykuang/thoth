@@ -543,6 +543,20 @@ def _columns(conn: Any, table: str) -> set[str]:
     return {r[1] for r in cur.fetchall()}
 
 
+def _drop_column_if_present(conn: Any, table: str, column: str) -> None:
+    if column not in _columns(conn, table):
+        return
+    if DB_BACKEND == "postgres":
+        conn.execute(f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{column}"')
+        return
+    try:
+        conn.execute(f'ALTER TABLE "{table}" DROP COLUMN "{column}"')
+    except sqlite3.OperationalError:
+        # Another process may have dropped it after the check.
+        if column in _columns(conn, table):
+            raise
+
+
 def _ensure_schema(conn: Any) -> None:
     """執行 schema DDL (IF NOT EXISTS, 重複安全) + L5-1 migration。
 
@@ -573,12 +587,9 @@ def _ensure_schema(conn: Any) -> None:
             "ADD COLUMN transactions_first_transaction_date TEXT",
         )
 
-    manual_account_cols = _columns(conn, "manual_financial_accounts")
     for obsolete_column in ("institution_name", "account_ref", "as_of"):
-        if obsolete_column in manual_account_cols:
-            conn.execute(
-                f"ALTER TABLE manual_financial_accounts DROP COLUMN {obsolete_column}",
-            )
+        _drop_column_if_present(conn, "manual_financial_accounts", obsolete_column)
+    _drop_column_if_present(conn, "manual_investment_transactions", "unit_price")
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上
     cols = _columns(conn, "sync_jobs")

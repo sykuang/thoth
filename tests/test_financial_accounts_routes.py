@@ -101,9 +101,7 @@ def test_manual_account_schema_drops_obsolete_columns(tmp_path, monkeypatch):
 
     assert {"institution_name", "account_ref", "as_of"}.isdisjoint(columns)
     assert tuple(row) == ("Emergency Fund", "1000")
-    # Compatibility release: 0.3.90 stops reading/writing the legacy column,
-    # but leaves it in an existing DB until all 0.3.89 revisions are drained.
-    assert "unit_price" in transaction_columns
+    assert "unit_price" not in transaction_columns
     assert tuple(transaction_row) == ("5", "400")
 
 
@@ -115,6 +113,32 @@ def test_fresh_manual_investment_schema_has_only_total_cost(client):
 
     assert "amount" in columns
     assert "unit_price" not in columns
+
+
+def test_drop_column_tolerates_another_sqlite_process_winning_race(monkeypatch):
+    from backend.server import db
+
+    class RacingConnection:
+        def execute(self, _sql):
+            raise db.sqlite3.OperationalError('no such column: "unit_price"')
+
+    observed_columns = iter([{"unit_price"}, set()])
+    monkeypatch.setattr(db, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db, "_columns", lambda _conn, _table: next(observed_columns))
+
+    db._drop_column_if_present(
+        RacingConnection(),
+        "manual_investment_transactions",
+        "unit_price",
+    )
+
+    monkeypatch.setattr(db, "_columns", lambda _conn, _table: {"unit_price"})
+    with pytest.raises(db.sqlite3.OperationalError):
+        db._drop_column_if_present(
+            RacingConnection(),
+            "manual_investment_transactions",
+            "unit_price",
+        )
 
 
 def test_manual_financial_account_crud_and_liability_normalization(client):
