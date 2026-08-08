@@ -598,9 +598,28 @@ export type FinancialAccount = {
   currency: string;
   balance: string | null;
   as_of: string | null;
+  valuation_source: 'manual' | 'yahoo_finance' | 'manual_fallback' | null;
   included_in_net_worth: boolean;
   editable: boolean;
   deletable: boolean;
+};
+
+export type YahooSymbolMatch = {
+  symbol: string;
+  name: string;
+  exchange: string | null;
+  exchange_name: string | null;
+  quote_type: string;
+};
+
+export type YahooQuote = {
+  symbol: string;
+  name: string;
+  currency: string;
+  exchange_name: string | null;
+  quote_type: string | null;
+  regular_market_price: string;
+  regular_market_time: number | null;
 };
 
 export type ManualInvestmentTransaction = {

@@ -84,13 +84,12 @@ def test_brokerage_account_row_opens_holdings_detail_not_transactions():
     assert "transactions_first_transaction_date" not in holdings_section
 
 
-def test_brokerage_detail_reports_query_errors_and_unsupported_snapshots():
+def test_brokerage_detail_reports_query_errors_without_global_unsupported_banner():
     sections = SECTIONS.read_text()
     transactions = TRANSACTIONS.read_text()
 
     assert "if (!accountId) return null" not in sections
-    assert "account.activities_supported" in transactions
-    assert "部分券商帳戶目前未提供交易明細" in transactions
+    assert "部分券商帳戶目前未提供交易明細" not in transactions
     assert "券商交易讀取失敗" in transactions
 
 
@@ -100,7 +99,6 @@ def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
     assert "const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;" in transactions
     assert "brokerageScopeActive && brokerageQ.isError" in transactions
     assert "brokerageScopeActive && brokerageQ.isLoading" in transactions
-    assert "activeBrokeragePortfolio?.accounts.some" in transactions
     assert "enabled: brokerageScopeActive" in transactions
     assert "const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;" in transactions
     assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions

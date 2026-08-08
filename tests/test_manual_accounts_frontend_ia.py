@@ -11,6 +11,8 @@ def test_accounts_tab_exposes_manual_financial_accounts() -> None:
     assert "/financial-accounts?source=manual" in source
     assert "manual/[account_id]" in source
     assert "add-manual-account" in source
+    assert "Yahoo 市值" in source
+    assert "Yahoo 查價失敗，顯示手動估值" in source
 
 
 def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> None:
@@ -42,6 +44,15 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "估值日期" not in source
     assert "router.dismissTo('/(tabs)/cards')" in source
     assert "router.replace({" not in source
+    assert "useDebouncedValue(normalizedSymbol, 350)" in source
+    assert "/financial-accounts/symbols/search?q=" in source
+    assert "/financial-accounts/symbols/${encodeURIComponent(selectedSymbol!.symbol)}/quote" in source
+    assert 'testID="symbol-search-results"' in source
+    assert "testID={`symbol-option-${match.symbol}`}" in source
+    assert 'testID="symbol-confirmation"' in source
+    assert "已確認 {selectedSymbol.symbol} · Yahoo Finance" in source
+    assert "queryKey: ['financial-accounts']" in source
+    assert "queryKey: ['portfolio', 'summary']" in source
 
 
 def test_manual_investment_contract_has_no_dividend_kind() -> None:

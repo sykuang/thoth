@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from backend.server import yahoo_finance
 from backend.server.deps import current_user
 from backend.server.financial_accounts import (
     FinancialAccount,
@@ -105,6 +106,24 @@ class InvestmentTransactionPayload(BaseModel):
         return values
 
 
+class YahooSymbolMatchResponse(BaseModel):
+    symbol: str
+    name: str
+    exchange: str | None
+    exchange_name: str | None
+    quote_type: str
+
+
+class YahooQuoteResponse(BaseModel):
+    symbol: str
+    name: str
+    currency: str
+    exchange_name: str | None
+    quote_type: str | None
+    regular_market_price: str
+    regular_market_time: int | None
+
+
 def _not_found(exc: ManualAccountNotFound) -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, "找不到此手動帳戶或交易")
 
@@ -122,6 +141,37 @@ def list_accounts(
         return list_manual_accounts(user["id"])
     accounts = list_financial_accounts(user["id"])
     return accounts if source is None else [row for row in accounts if row.source == source]
+
+
+@router.get("/symbols/search", response_model=list[YahooSymbolMatchResponse])
+def search_symbols(
+    q: str = Query(min_length=1, max_length=64),
+    preferred_currency: str | None = Query(default=None, min_length=3, max_length=3),
+    _user: dict = Depends(current_user),
+) -> list[YahooSymbolMatchResponse]:
+    try:
+        rows = yahoo_finance.search_symbols(q, preferred_currency)
+    except yahoo_finance.YahooFinanceUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Yahoo Finance 暫時無法查詢代號",
+        ) from exc
+    return [YahooSymbolMatchResponse(**vars(row)) for row in rows]
+
+
+@router.get("/symbols/{symbol}/quote", response_model=YahooQuoteResponse)
+def get_symbol_quote(
+    symbol: str,
+    _user: dict = Depends(current_user),
+) -> YahooQuoteResponse:
+    try:
+        row = yahoo_finance.get_quote(symbol)
+    except yahoo_finance.YahooFinanceUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Yahoo Finance 暫時無法取得現價",
+        ) from exc
+    return YahooQuoteResponse(**vars(row))
 
 
 @router.post(
@@ -206,11 +256,13 @@ def create_transaction(
     user: dict = Depends(current_user),
 ) -> InvestmentTransaction:
     try:
-        return create_investment_transaction(user["id"], account_id, **body.domain_values())
+        transaction = create_investment_transaction(user["id"], account_id, **body.domain_values())
     except ManualAccountNotFound as exc:
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:
         raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+    return transaction
 
 
 @router.patch(
@@ -224,13 +276,15 @@ def update_transaction(
     user: dict = Depends(current_user),
 ) -> InvestmentTransaction:
     try:
-        return update_investment_transaction(
+        transaction = update_investment_transaction(
             user["id"], account_id, transaction_id, **body.domain_values(),
         )
     except ManualAccountNotFound as exc:
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:
         raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+    return transaction
 
 
 @router.delete(
@@ -248,3 +302,4 @@ def delete_transaction(
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:
         raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])

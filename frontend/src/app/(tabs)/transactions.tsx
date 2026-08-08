@@ -762,11 +762,6 @@ export default function TransactionsScreen() {
             券商交易讀取失敗：{formatApiError(brokerageQ.error)}
           </Text>
         )}
-        {viewMode === 'list' && activeBrokeragePortfolio?.accounts.some((account) => !account.activities_supported) && (
-          <Text className="text-amber-600 dark:text-amber-400 text-small mb-3">
-            部分券商帳戶目前未提供交易明細
-          </Text>
-        )}
         {datasetQ.isLoading || (brokerageScopeActive && brokerageQ.isLoading) ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
             <ActivityIndicator />

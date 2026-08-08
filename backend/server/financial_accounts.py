@@ -4,6 +4,7 @@ Provider stores remain authoritative. Only source='manual' is writable here.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 from typing import Literal
@@ -11,10 +12,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from backend.core import account_classify
-from backend.server import db, financial_accounts_repo as repo
+from backend.server import db, financial_accounts_repo as repo, fx_service, yahoo_finance
 
 AccountSource = Literal["manual", "bank_sync", "brokerage_sync"]
 TransactionKind = Literal["opening", "buy", "sell", "fee"]
+ValuationSource = Literal["manual", "yahoo_finance", "manual_fallback"]
 
 
 _ALLOWED_PRODUCT_TYPES = (
@@ -37,6 +39,7 @@ class FinancialAccount(BaseModel):
     currency: str
     balance: str | None
     as_of: str | None
+    valuation_source: ValuationSource | None = None
     included_in_net_worth: bool
     editable: bool
     deletable: bool
@@ -162,8 +165,9 @@ def _row_to_manual_account(row) -> FinancialAccount:
         account_ref=None,
         product_type=_row_value(row, 1, "product_type"),
         currency=_row_value(row, 3, "currency"),
-        balance=_row_value(row, 4, "balance"),
+        balance=str(_row_value(row, 4, "balance")),
         as_of=None,
+        valuation_source="manual",
         included_in_net_worth=bool(_row_value(row, 5, "included_in_net_worth")),
         editable=True,
         deletable=True,
@@ -185,7 +189,69 @@ def get_manual_account(user_id: int, account_id: str) -> FinancialAccount:
 
 
 def list_manual_accounts(user_id: int) -> list[FinancialAccount]:
-    return [_row_to_manual_account(row) for row in repo.list_accounts(user_id)]
+    accounts: list[FinancialAccount] = []
+    for row in repo.list_accounts(user_id):
+        account = _row_to_manual_account(row)
+        if account.product_type == account_classify.ProductType.INVESTMENT:
+            balance, valuation_source, valuation_as_of = _investment_market_balance(
+                user_id,
+                int(_row_value(row, 0, "id")),
+                account.currency,
+                account.balance,
+            )
+            account = account.model_copy(update={
+                "balance": balance,
+                "valuation_source": valuation_source,
+                "as_of": valuation_as_of,
+            })
+        accounts.append(account)
+    return accounts
+
+
+def _investment_market_balance(
+    user_id: int,
+    account_row_id: int,
+    account_currency: str,
+    fallback_balance: str | None,
+) -> tuple[str | None, ValuationSource, str | None]:
+    """Best-effort quote projection; ledger writes never depend on Yahoo."""
+    try:
+        totals = _holding_totals(user_id, account_row_id)
+        if not totals:
+            return fallback_balance, "manual", None
+        market_value = Decimal(0)
+        quote_times: list[int] = []
+        for (symbol, ledger_currency), quantity in totals.items():
+            if quantity == 0:
+                continue
+            quote = yahoo_finance.get_quote(symbol)
+            if quote.currency != ledger_currency:
+                return fallback_balance, "manual_fallback", None
+            if quote.regular_market_time is not None:
+                quote_times.append(quote.regular_market_time)
+            value = quantity * Decimal(quote.regular_market_price)
+            if quote.currency == account_currency:
+                market_value += value
+            elif account_currency == "TWD":
+                converted = fx_service.convert_to_twd(format(value, "f"), quote.currency)
+                if converted is None:
+                    return fallback_balance, "manual_fallback", None
+                market_value += Decimal(converted)
+            else:
+                return fallback_balance, "manual_fallback", None
+        valuation_as_of = (
+            datetime.fromtimestamp(min(quote_times), UTC).isoformat()
+            if quote_times else None
+        )
+        return format(market_value, "f"), "yahoo_finance", valuation_as_of
+    except (
+        InvalidManualAccount,
+        InvalidOperation,
+        OSError,
+        OverflowError,
+        yahoo_finance.YahooFinanceUnavailable,
+    ):
+        return fallback_balance, "manual_fallback", None
 
 
 def update_manual_account(user_id: int, account_id: str, **values) -> FinancialAccount:

@@ -20,6 +20,8 @@ import type {
   FinancialAccountProductType,
   ManualInvestmentHolding,
   ManualInvestmentTransaction,
+  YahooQuote,
+  YahooSymbolMatch,
 } from '@/types/api';
 
 type EditableProductType = Exclude<FinancialAccountProductType, 'unknown'>;
@@ -47,6 +49,15 @@ const today = () => {
   const day = String(date.getDate()).padStart(2, '0');
   return `${date.getFullYear()}-${month}-${day}`;
 };
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [delayMs, value]);
+  return debounced;
+}
 
 function Field({
   label,
@@ -190,7 +201,7 @@ export default function ManualAccountScreen() {
           {isNew ? '新增手動帳戶' : '編輯手動帳戶'}
         </Text>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-5">
-          current valuation 用於淨資產；投資成交價不會冒充目前市價。
+          投資帳戶優先以 Yahoo 持股市值估算；查價失敗時保留手動目前總值。歷史成交價不會冒充現價。
         </Text>
 
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
@@ -274,6 +285,9 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
   const [amount, setAmount] = useState('');
   const [currency, setCurrency] = useState(defaultCurrency);
   const [note, setNote] = useState('');
+  const [selectedSymbol, setSelectedSymbol] = useState<YahooSymbolMatch | null>(null);
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const debouncedSymbol = useDebouncedValue(normalizedSymbol, 350);
 
   const transactionsQ = useQuery<ManualInvestmentTransaction[], ApiError>({
     queryKey: ['financial-accounts', accountId, 'transactions'],
@@ -282,6 +296,23 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
   const holdingsQ = useQuery<ManualInvestmentHolding[], ApiError>({
     queryKey: ['financial-accounts', accountId, 'holdings'],
     queryFn: () => api(`/financial-accounts/${accountId}/holdings`),
+  });
+  const symbolSearchQ = useQuery<YahooSymbolMatch[], ApiError>({
+    queryKey: ['yahoo-symbol-search', debouncedSymbol, currency.trim().toUpperCase()],
+    queryFn: () => api(
+      `/financial-accounts/symbols/search?q=${encodeURIComponent(debouncedSymbol)}`
+      + `&preferred_currency=${encodeURIComponent(currency.trim().toUpperCase())}`,
+    ),
+    enabled: kind !== 'fee' && selectedSymbol == null && debouncedSymbol.length >= 2,
+    staleTime: 60 * 60 * 1000,
+  });
+  const quoteQ = useQuery<YahooQuote, ApiError>({
+    queryKey: ['yahoo-quote', selectedSymbol?.symbol],
+    queryFn: () => api(
+      `/financial-accounts/symbols/${encodeURIComponent(selectedSymbol!.symbol)}/quote`,
+    ),
+    enabled: kind !== 'fee' && selectedSymbol != null,
+    staleTime: 60 * 1000,
   });
 
   function resetTradeForm() {
@@ -294,6 +325,7 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
     setAmount('');
     setCurrency(defaultCurrency);
     setNote('');
+    setSelectedSymbol(null);
   }
 
   const saveTrade = useMutation<ManualInvestmentTransaction, ApiError>({
@@ -319,6 +351,8 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['financial-accounts', accountId, 'transactions'] }),
         queryClient.invalidateQueries({ queryKey: ['financial-accounts', accountId, 'holdings'] }),
+        queryClient.invalidateQueries({ queryKey: ['financial-accounts'] }),
+        queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
       ]);
       resetTradeForm();
     },
@@ -329,6 +363,8 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['financial-accounts', accountId, 'transactions'] }),
         queryClient.invalidateQueries({ queryKey: ['financial-accounts', accountId, 'holdings'] }),
+        queryClient.invalidateQueries({ queryKey: ['financial-accounts'] }),
+        queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
       ]);
       resetTradeForm();
     },
@@ -344,6 +380,7 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
     setAmount(row.kind === 'fee' ? row.amount : '');
     setCurrency(row.currency);
     setNote(row.note ?? '');
+    setSelectedSymbol(null);
   }
 
   function confirmDeleteTrade(id: number) {
@@ -399,7 +436,80 @@ function InvestmentJournal({ accountId, defaultCurrency }: { accountId: string; 
           ))}
         </View>
         <Field label="日期（YYYY-MM-DD）" value={occurredOn} onChangeText={setOccurredOn} />
-        {kind !== 'fee' && <Field label="代號" value={symbol} onChangeText={setSymbol} placeholder="例如：AAPL" />}
+        {kind !== 'fee' && (
+          <>
+            <Field
+              label="代號"
+              value={symbol}
+              onChangeText={(value) => {
+                setSymbol(value);
+                setSelectedSymbol(null);
+              }}
+              placeholder="例如：0050、AAPL"
+              testID="manual-investment-symbol"
+            />
+            {selectedSymbol == null
+              && normalizedSymbol === debouncedSymbol
+              && debouncedSymbol.length >= 2 && (
+              <View
+                className="-mt-3 mb-4 border border-ink-200 dark:border-ink-700 rounded-xl overflow-hidden"
+                testID="symbol-search-results"
+              >
+                {symbolSearchQ.isFetching ? (
+                  <View className="py-3"><ActivityIndicator /></View>
+                ) : symbolSearchQ.isError ? (
+                  <Text className="text-amber-700 dark:text-amber-300 text-small p-3">
+                    Yahoo 代號查詢暫時失敗；仍可輸入完整代號。
+                  </Text>
+                ) : (symbolSearchQ.data ?? []).length === 0 ? (
+                  <Text className="text-ink-500 dark:text-ink-400 text-small p-3">找不到符合的代號</Text>
+                ) : (symbolSearchQ.data ?? []).map((match) => (
+                  <Pressable
+                    key={match.symbol}
+                    onPress={() => {
+                      setSymbol(match.symbol);
+                      setSelectedSymbol(match);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel={`選擇代號 ${match.symbol} ${match.name}`}
+                    className="px-3 py-3 border-b border-ink-100 dark:border-ink-800 active:bg-ink-100 dark:active:bg-ink-800"
+                    testID={`symbol-option-${match.symbol}`}
+                  >
+                    <View className="flex-row justify-between gap-3">
+                      <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">{match.symbol}</Text>
+                      <Text className="text-ink-500 dark:text-ink-400 text-micro">
+                        {match.exchange_name ?? match.exchange ?? match.quote_type}
+                      </Text>
+                    </View>
+                    <Text className="text-ink-600 dark:text-ink-300 text-small mt-0.5" numberOfLines={1}>{match.name}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            )}
+            {selectedSymbol != null && (
+              <View
+                className="-mt-3 mb-4 bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 rounded-xl p-3"
+                testID="symbol-confirmation"
+              >
+                <Text className="text-emerald-800 dark:text-emerald-200 text-small font-semibold">
+                  已確認 {selectedSymbol.symbol} · Yahoo Finance
+                </Text>
+                <Text className="text-emerald-700 dark:text-emerald-300 text-micro mt-1">
+                  {selectedSymbol.name} · {selectedSymbol.exchange_name ?? selectedSymbol.exchange ?? selectedSymbol.quote_type}
+                </Text>
+                {quoteQ.isFetching ? (
+                  <ActivityIndicator className="mt-2" />
+                ) : quoteQ.isError ? (
+                  <Text className="text-amber-700 dark:text-amber-300 text-micro mt-2">現價暫時無法取得；代號仍已確認。</Text>
+                ) : quoteQ.data ? (
+                  <Text className="text-emerald-800 dark:text-emerald-200 text-small mt-2">
+                    Yahoo 現價 {quoteQ.data.currency} {formatDecimalFixed(quoteQ.data.regular_market_price, 2)}
+                  </Text>
+                ) : null}
+              </View>
+            )}
+          </>
+        )}
         {kind !== 'fee' && <Field label="數量" value={quantity} onChangeText={setQuantity} keyboardType="decimal-pad" />}
         {kind !== 'fee' && <Field label={kind === 'opening' ? '期初單位成本' : '成交單價'} value={unitPrice} onChangeText={setUnitPrice} keyboardType="decimal-pad" />}
         {kind === 'fee' && <Field label="費用金額" value={amount} onChangeText={setAmount} keyboardType="decimal-pad" />}

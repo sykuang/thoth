@@ -578,6 +578,11 @@ function ManualAccountsSection({
               </Text>
               <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5" numberOfLines={1}>
                 {typeLabel[account.product_type] ?? account.product_type}
+                {account.product_type === 'investment' && account.valuation_source === 'yahoo_finance'
+                  ? ' · Yahoo 市值'
+                  : account.product_type === 'investment' && account.valuation_source === 'manual_fallback'
+                    ? ' · Yahoo 查價失敗，顯示手動估值'
+                    : ''}
               </Text>
             </View>
             <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold">
