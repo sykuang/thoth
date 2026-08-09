@@ -20,7 +20,11 @@ from pydantic import BaseModel, Field
 
 from backend.core.creds import ALL_CREDS
 from backend.server.deps import current_user
-from backend.server.creds_store import AccountsRepo, LocalFernetBackend
+from backend.server.creds_store import (
+    AccountsRepo,
+    LocalFernetBackend,
+    list_account_metadata,
+)
 from backend.server.db import IntegrityError
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -74,22 +78,7 @@ class RenameAccountReq(BaseModel):
 @router.get("")
 def list_accounts(user: dict = Depends(current_user)) -> list[dict]:
     """列當前 user 所有 accounts (跨銀行), 附 fields_set + has_creds。"""
-    repo = AccountsRepo()
-    store = LocalFernetBackend()
-    accts = repo.list_for_user(user["id"])
-    out = []
-    for a in accts:
-        fields = store.list_fields_acct(a.id, expected_owner_user_id=user["id"])
-        out.append({
-            "id": a.id,
-            "bank": a.bank,
-            "label": a.label,
-            "created_at": a.created_at,
-            "updated_at": a.updated_at,
-            "has_creds": bool(fields),
-            "fields_set": fields,
-        })
-    return out
+    return list_account_metadata(user["id"])
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

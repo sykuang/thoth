@@ -11,8 +11,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from backend.core import account_classify
+from backend.core import account_classify, bank_data
 from backend.server import db, financial_accounts_repo as repo, fx_service, yahoo_finance
+from backend.server.bank_account_projection import bank_accounts
 
 AccountSource = Literal["manual", "bank_sync", "brokerage_sync"]
 TransactionKind = Literal["opening", "buy", "sell", "fee"]
@@ -213,6 +214,20 @@ def list_manual_accounts(user_id: int) -> list[FinancialAccount]:
     return accounts
 
 
+def manual_replica(user_id: int) -> dict[str, list[dict]]:
+    """Return authoritative manual facts without quote/FX-derived valuation."""
+    accounts: list[dict] = []
+    transactions: list[dict] = []
+    for row in repo.list_accounts(user_id):
+        accounts.append(_row_to_manual_account(row).model_dump())
+        row_id = int(_row_value(row, 0, "id"))
+        transactions.extend(
+            _row_to_transaction(txn_row).model_dump()
+            for txn_row in repo.list_transactions(user_id, row_id)
+        )
+    return {"accounts": accounts, "transactions": transactions}
+
+
 def _investment_market_balance(
     user_id: int,
     account_row_id: int,
@@ -293,13 +308,10 @@ def delete_manual_account(user_id: int, account_id: str) -> None:
 
 
 def _bank_accounts(user_id: int) -> list[FinancialAccount]:
-    # Lazy import avoids coupling portfolio aggregation back into this module at import time.
-    from backend.server.routers.portfolio import KNOWN_BANKS, _bank_accounts as read_bank_accounts
-
     result: list[FinancialAccount] = []
-    for bank in KNOWN_BANKS:
+    for bank in bank_data.KNOWN_BANKS:
         try:
-            accounts = read_bank_accounts(bank, user_id)
+            accounts = bank_accounts(bank, user_id)
         except Exception:
             continue
         for account in accounts:

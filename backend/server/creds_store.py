@@ -360,3 +360,25 @@ class LocalFernetBackend:
                 (user_id, bank),
             ).fetchall()
         return [r[0] for r in rows]
+
+
+def list_account_metadata(user_id: int) -> list[dict]:
+    """Return non-secret bank account slots with credential field presence."""
+    repo = AccountsRepo()
+    store = LocalFernetBackend()
+    out: list[dict] = []
+    for account in repo.list_for_user(user_id):
+        fields = store.list_fields_acct(
+            account.id,
+            expected_owner_user_id=user_id,
+        )
+        out.append({
+            "id": account.id,
+            "bank": account.bank,
+            "label": account.label,
+            "created_at": account.created_at,
+            "updated_at": account.updated_at,
+            "has_creds": bool(fields),
+            "fields_set": fields,
+        })
+    return out

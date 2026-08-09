@@ -47,6 +47,7 @@ from pydantic import BaseModel
 from backend.core import account_classify, bank_data
 from backend.server.deps import current_user
 from backend.server import db, fx_service
+from backend.server.bank_account_projection import bank_accounts as _project_bank_accounts
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
     clear_dashboard_cache,  # noqa: F401 — intentional router-level cache control API
@@ -735,79 +736,10 @@ def _bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
 
     Plan B B4: 全 SQL 走 db_facade. Caller 不再傳 con.
     """
-    # Plan B B2: accounts 表
-    accounts = db_api.list_accounts(bank=bank, user_id=user_id)
-    if not accounts:
-        return []
-
-    # Plan B B4: 每帳戶最新 twd_txn balance
-    txn_balances = db_api.list_latest_account_txn_balances(bank=bank, user_id=user_id)
-
-    # 貸款帳戶 fast-path: balance_history.loan_balance fallback
-    loan_balance_total: int | None = None
-    loan_balance_date: str | None = None
-    lb = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
-    if lb is not None:
-        loan_balance_total = lb.loan_balance
-        loan_balance_date = _normalize_iso_date(lb.snapshot_date)
-
-    out: list[BankAccountBalance] = []
-    for a in accounts:
-        account_no = a.account_no
-        product_type = a.product_type
-        balance: float | None = None
-        snapshot_date: str | None = None
-        raw_bal = a.raw_balance
-        if raw_bal is not None:
-            balance = raw_bal if isinstance(raw_bal, float) and raw_bal != int(raw_bal) else int(raw_bal)
-            snapshot_date = _normalize_iso_date(a.raw_balance_date)
-        elif account_no in txn_balances:
-            tb = txn_balances[account_no]
-            balance = tb.balance
-            snapshot_date = _normalize_iso_date(tb.txn_datetime)
-        elif account_classify.is_liability_type(product_type) and loan_balance_total is not None:
-            balance = loan_balance_total
-            snapshot_date = loan_balance_date
-        else:
-            snapshot_date = _normalize_iso_date(a.updated_at)
-
-        balance = account_classify.normalize_account_balance(product_type, balance)
-
-        currency = (a.currency or "TWD").upper()
-
-        # twd_estimate / fx_rate_used — 外幣帳戶顯示「≈ NT$ X」副字
-        # 鐵則: fx_service 失敗一律 None, 不 raise (frontend 容忍)
-        twd_estimate: int | None = None
-        fx_rate_used: float | None = None
-        if balance is not None:
-            if currency == "TWD":
-                twd_estimate = round(balance)
-                fx_rate_used = 1.0
-            else:
-                try:
-                    rate = fx_service.get_rate(currency)
-                    if rate is not None:
-                        twd_estimate = fx_service.convert_to_twd(balance, currency)
-                        fx_rate_used = rate
-                except Exception:
-                    pass
-
-        out.append(BankAccountBalance(
-            bank=bank,
-            account_no=account_no,
-            currency=currency,
-            nickname=a.nickname,
-            nickname_overwrite=a.nickname_overwrite,
-            product_type=a.product_type,
-            type=a.type,
-            balance=balance,
-            snapshot_date=snapshot_date,
-            is_stale=_is_stale_days(snapshot_date, ACCOUNT_STALE_DAYS),
-            twd_estimate=twd_estimate,
-            fx_rate_used=fx_rate_used,
-            excluded=a.excluded,
-        ))
-    return out
+    return [
+        BankAccountBalance(**row.model_dump())
+        for row in _project_bank_accounts(bank, user_id)
+    ]
 
 
 @router.get("/accounts", response_model=list[BankAccountBalance])

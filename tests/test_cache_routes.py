@@ -1,4 +1,4 @@
-"""Frontend dataset cache endpoints: snapshot + incremental changes."""
+"""Legacy full-snapshot frontend dataset endpoint."""
 from __future__ import annotations
 
 import sqlite3
@@ -92,21 +92,13 @@ def test_cache_snapshot_returns_accounts_cards_transactions_and_cursor(client, t
     assert {t["kind"] for t in body["transactions"]} == {"twd", "billed"}
 
 
-def test_cache_changes_returns_only_rows_newer_than_cursor(client, tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
-    token = _register(client, email="cache-user2@palace.example")
-    _seed_cache_bank(tmp_path, "cathay")
-
-    r = client.get("/cache/changes?since=2026-07-01T10:02:30", headers=_auth(token))
-
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["cursor"] >= "2026-07-01T10:03:00"
-    # accounts are intentionally sent as a small full replacement set on changes,
-    # because portfolio account balances don't expose a durable per-row cursor.
-    assert body["accounts"][0]["account_no"] == "1234567890"
-    assert body["transactions"]
-    assert [t["kind"] for t in body["transactions"]] == ["billed"]
+def test_cache_changes_endpoint_is_retired(client) -> None:
+    token = _register(client, email="cache-retired@palace.example")
+    response = client.get(
+        "/cache/changes?since=2026-07-01T10:02:30",
+        headers=_auth(token),
+    )
+    assert response.status_code == 404
 
 
 def test_cache_snapshot_expands_splits_and_hides_parent(client, tmp_path, monkeypatch) -> None:

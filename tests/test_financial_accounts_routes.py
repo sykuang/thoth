@@ -703,13 +703,12 @@ def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeyp
     headers = _auth(token)
     assert client.post("/financial-accounts", headers=headers, json=_payload()).status_code == 201
 
-    from backend.server import db
-    from backend.server.routers import portfolio
+    from backend.server import db, financial_accounts
 
-    monkeypatch.setattr(portfolio, "KNOWN_BANKS", ["demo"])
+    monkeypatch.setattr(financial_accounts.bank_data, "KNOWN_BANKS", ["demo"])
     monkeypatch.setattr(
-        portfolio,
-        "_bank_accounts",
+        financial_accounts,
+        "bank_accounts",
         lambda bank, user_id: [
             SimpleNamespace(
                 account_no="bank-1",

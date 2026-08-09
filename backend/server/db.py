@@ -64,10 +64,11 @@ _PG_POOL_TIMEOUT = float(os.environ.get("PG_POOL_TIMEOUT", "10"))
 _PG_POOL_MAX_LIFETIME = float(os.environ.get("PG_POOL_MAX_LIFETIME", "1800"))
 _PG_POOL_MAX_IDLE = float(os.environ.get("PG_POOL_MAX_IDLE", "300"))
 _PG_POOL_RECONNECT_TIMEOUT = float(os.environ.get("PG_POOL_RECONNECT_TIMEOUT", "60"))
+psycopg: Any | None = None
 
 if DB_BACKEND == "postgres":
     try:
-        import psycopg
+        import psycopg as _psycopg_module
         from psycopg.errors import UniqueViolation as _IntegrityError
         from psycopg_pool import ConnectionPool
     except ImportError as e:
@@ -76,6 +77,7 @@ if DB_BACKEND == "postgres":
             "uv add 'psycopg[binary,pool]>=3.2'",
         ) from e
 
+    psycopg = _psycopg_module
     IntegrityError = _IntegrityError
     _PARAM = "%s"
     _BLOB_TYPE = "BYTEA"
@@ -458,6 +460,19 @@ CREATE TABLE IF NOT EXISTS payment_reminder_notifications (
 );
 CREATE INDEX IF NOT EXISTS ix_payment_reminder_notifications_user_date
     ON payment_reminder_notifications(user_id, reminder_date);
+
+-- Local-first frontend replica read model.  Each row is a complete replaceable
+-- partition; generation advances only when the canonical JSON changes.
+CREATE TABLE IF NOT EXISTS replica_partitions (
+    user_id        INTEGER NOT NULL,
+    partition_key  TEXT NOT NULL,
+    generation     INTEGER NOT NULL DEFAULT 1,
+    content_hash   TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (user_id, partition_key)
+);
+CREATE INDEX IF NOT EXISTS ix_replica_partitions_user
+    ON replica_partitions(user_id);
 """
 
 # Phase L5-1 migration: 用 `ON CONFLICT DO NOTHING` 兩邊都吃
@@ -709,6 +724,7 @@ def _pg_connection_with_retry() -> Iterator[Any]:
     or connection establishment for a few seconds. Retry only the pool checkout /
     connection acquisition. SQL execution errors still surface normally.
     """
+    assert psycopg is not None
     attempts = max(1, _PG_CONNECT_ATTEMPTS)
     last_exc: BaseException | None = None
     for attempt in range(1, attempts + 1):
@@ -1214,6 +1230,66 @@ def snaptrade_snapshot(user_id: int) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def replica_reconcile_lock(user_id: int) -> Iterator[None]:
+    """Hold a PostgreSQL advisory lock without consuming the app pool."""
+    if DB_BACKEND != "postgres":
+        yield
+        return
+    lock_namespace = 0x54484F54  # "THOT"
+    deadline = time.monotonic() + 30
+    assert psycopg is not None
+    raw = psycopg.connect(_database_url(), autocommit=True, connect_timeout=10)
+    try:
+        while True:
+            acquired = bool(raw.execute(
+                "SELECT pg_try_advisory_lock(%s, %s)",
+                (lock_namespace, user_id),
+            ).fetchone()[0])
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for replica reconcile lock")
+            time.sleep(0.025)
+        try:
+            yield
+        finally:
+            raw.execute(
+                "SELECT pg_advisory_unlock(%s, %s)",
+                (lock_namespace, user_id),
+            )
+    finally:
+        raw.close()
+
+
+def upsert_replica_partition(
+    conn: Any,
+    *,
+    user_id: int,
+    partition_key: str,
+    content_hash: str,
+) -> int:
+    row = conn.execute(
+        """
+        INSERT INTO replica_partitions
+            (user_id, partition_key, generation, content_hash, updated_at)
+        VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT(user_id, partition_key) DO UPDATE SET
+            generation = CASE
+                WHEN content_hash = excluded.content_hash THEN generation
+                ELSE generation + 1
+            END,
+            content_hash = excluded.content_hash,
+            updated_at = excluded.updated_at
+        RETURNING generation
+        """,
+        (user_id, partition_key, content_hash, now_iso()),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"replica partition upsert returned no row: {partition_key}")
+    return int(row[0])
+
+
 __all__ = [
     "DB_BACKEND",
     "Connection",
@@ -1225,6 +1301,7 @@ __all__ = [
     "now_iso",
     "open_bank_conn",
     "q",
+    "replica_reconcile_lock",
     "server_db_path",
     "snaptrade_acquire_lock",
     "snaptrade_get_credentials",
@@ -1232,4 +1309,5 @@ __all__ = [
     "snaptrade_release_lock",
     "snaptrade_replace_snapshot",
     "snaptrade_snapshot",
+    "upsert_replica_partition",
 ]
