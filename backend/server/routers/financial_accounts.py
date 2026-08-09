@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from backend.server import yahoo_finance
 from backend.server.deps import current_user
@@ -26,6 +26,7 @@ from backend.server.financial_accounts import (
     list_manual_accounts,
     update_investment_transaction,
     update_manual_account,
+    update_manual_account_inclusion,
 )
 from backend.server.routers.portfolio import clear_dashboard_cache
 
@@ -80,6 +81,12 @@ class ManualAccountPayload(BaseModel):
 
     def domain_values(self) -> dict:
         return self.model_dump(exclude={"manual_balance"})
+
+
+class ManualAccountInclusionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    included_in_net_worth: StrictBool
 
 
 class InvestmentTransactionPayload(BaseModel):
@@ -221,6 +228,25 @@ def update_account(
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:
         raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+    return account
+
+
+@router.patch(
+    "/{account_id}/included",
+    response_model=FinancialAccount,
+)
+def update_account_inclusion(
+    account_id: str,
+    body: ManualAccountInclusionPayload,
+    user: dict = Depends(current_user),
+) -> FinancialAccount:
+    try:
+        account = update_manual_account_inclusion(
+            user["id"], account_id, body.included_in_net_worth,
+        )
+    except ManualAccountNotFound as exc:
+        raise _not_found(exc) from exc
     clear_dashboard_cache(user["id"])
     return account
 

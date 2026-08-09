@@ -298,6 +298,51 @@ def test_excluded_manual_account_does_not_enter_summary(client):
     assert body["total_assets_with_fx"] == 0
 
 
+def test_manual_account_inclusion_patch_only_changes_inclusion(client):
+    token = _register(client, "manual-inclusion-toggle@palace.example")
+    other = _register(client, "manual-inclusion-other@palace.example")
+    headers = _auth(token)
+    created = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(name="Keep Me", balance="321.50"),
+    ).json()
+
+    toggled = client.patch(
+        f"/financial-accounts/{created['id']}/included",
+        headers=headers,
+        json={"included_in_net_worth": False},
+    )
+    assert toggled.status_code == 200, toggled.text
+    assert toggled.json()["included_in_net_worth"] is False
+    assert toggled.json()["name"] == "Keep Me"
+    assert toggled.json()["balance"] == "321.50"
+    excluded_summary = client.get("/portfolio/summary", headers=headers).json()
+    assert excluded_summary["manual_assets_twd"] == 0
+    assert excluded_summary["total_assets_with_fx"] == 0
+
+    included = client.patch(
+        f"/financial-accounts/{created['id']}/included",
+        headers=headers,
+        json={"included_in_net_worth": True},
+    )
+    assert included.status_code == 200, included.text
+    included_summary = client.get("/portfolio/summary", headers=headers).json()
+    assert included_summary["manual_assets_twd"] == 322
+    assert included_summary["total_assets_with_fx"] == 322
+
+    assert client.patch(
+        f"/financial-accounts/{created['id']}/included",
+        headers=_auth(other),
+        json={"included_in_net_worth": False},
+    ).status_code == 404
+    assert client.patch(
+        f"/financial-accounts/{created['id']}/included",
+        headers=headers,
+        json={"included_in_net_worth": "false"},
+    ).status_code == 422
+
+
 def test_manual_store_failure_does_not_publish_zero_net_worth(client, monkeypatch):
     token = _register(client, "manual-store-failure@palace.example")
     headers = _auth(token)
@@ -658,23 +703,35 @@ def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeyp
     headers = _auth(token)
     assert client.post("/financial-accounts", headers=headers, json=_payload()).status_code == 201
 
-    from backend.server import db, financial_accounts
+    from backend.server import db
     from backend.server.routers import portfolio
 
     monkeypatch.setattr(portfolio, "KNOWN_BANKS", ["demo"])
     monkeypatch.setattr(
         portfolio,
         "_bank_accounts",
-        lambda bank, user_id: [SimpleNamespace(
-            account_no="bank-1",
-            nickname="Savings",
-            nickname_overwrite=None,
-            product_type="deposit",
-            currency="TWD",
-            balance=88,
-            snapshot_date="2026-08-08",
-            excluded=False,
-        )],
+        lambda bank, user_id: [
+            SimpleNamespace(
+                account_no="bank-1",
+                nickname="Loan",
+                nickname_overwrite=None,
+                product_type="loan",
+                currency="TWD",
+                balance=-88,
+                snapshot_date="2026-08-08",
+                excluded=False,
+            ),
+            SimpleNamespace(
+                account_no="bank-2",
+                nickname="Malformed",
+                nickname_overwrite=None,
+                product_type="deposit",
+                currency="TWD",
+                balance=float("nan"),
+                snapshot_date="2026-08-08",
+                excluded=False,
+            ),
+        ],
     )
     monkeypatch.setattr(
         db,
@@ -692,7 +749,12 @@ def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeyp
         },
     )
 
-    user_id = client.get("/auth/me", headers=headers).json()["id"]
-    rows = financial_accounts.list_financial_accounts(user_id)
-    assert {row.source for row in rows} == {"manual", "bank_sync", "brokerage_sync"}
-    assert [row.editable for row in rows if row.source != "manual"] == [False, False]
+    response = client.get("/financial-accounts", headers=headers)
+    assert response.status_code == 200
+    rows = response.json()
+    assert {row["source"] for row in rows} == {"manual", "bank_sync", "brokerage_sync"}
+    assert [row["editable"] for row in rows if row["source"] != "manual"] == [False, False, False]
+    assert next(row for row in rows if row["source"] == "bank_sync")["balance"] == "-88"
+    assert next(
+        row for row in rows if row["source_ref"] == "demo:bank-2"
+    )["balance"] is None

@@ -505,7 +505,6 @@ function ManualAccountsSection({
   accounts: FinancialAccount[];
   isLoading: boolean;
 }) {
-  const router = useRouter();
   const typeLabel: Record<string, string> = {
     deposit: '存款',
     time_deposit: '定存',
@@ -535,40 +534,108 @@ function ManualAccountsSection({
           </Text>
         </View>
       ) : accounts.map((account) => (
-        <Pressable
+        <ManualAccountRow
           key={account.id}
-          accessibilityRole="button"
-          accessibilityLabel={`開啟手動帳戶 ${account.name}`}
-          onPress={() => router.push({
-            pathname: '/(tabs)/cards/manual/[account_id]',
-            params: { account_id: account.id },
-          })}
-          className={`bg-white dark:bg-ink-900 rounded-2xl px-4 py-3 shadow-card mb-3 active:opacity-80 ${
-            account.included_in_net_worth ? '' : 'opacity-50'
-          }`}
-          testID={`manual-account-${account.id}`}
-        >
-          <View className="flex-row items-baseline justify-between gap-3">
-            <View className="flex-1 min-w-0">
-              <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold" numberOfLines={1}>
-                {account.name}
-              </Text>
-              <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5" numberOfLines={1}>
-                {typeLabel[account.product_type] ?? account.product_type}
-                {account.product_type === 'investment' && account.valuation_source === 'yahoo_finance'
-                  ? ' · Yahoo 市值'
-                  : account.product_type === 'investment' && account.valuation_source === 'manual_fallback'
-                    ? ' · Yahoo 查價失敗，顯示手動估值'
-                    : ''}
-              </Text>
-            </View>
-            <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold">
-              {account.currency}{' '}
-              {account.balance == null ? '—' : (formatDecimalFixed(account.balance, 2) ?? '—')}
+          account={account}
+          typeLabel={typeLabel[account.product_type] ?? account.product_type}
+        />
+      ))}
+    </View>
+  );
+}
+
+function ManualAccountRow({
+  account,
+  typeLabel,
+}: {
+  account: FinancialAccount;
+  typeLabel: string;
+}) {
+  const router = useRouter();
+  const qc = useQueryClient();
+  const excluded = !account.included_in_net_worth;
+  const toggleMut = useMutation({
+    mutationFn: (next: boolean) => api(
+      `/financial-accounts/${account.id}/included`,
+      {
+        method: 'PATCH',
+        body: { included_in_net_worth: next },
+      },
+    ),
+    onMutate: async (next: boolean) => {
+      await qc.cancelQueries({ queryKey: ['financial-accounts', 'manual'] });
+      const previous = qc.getQueryData<FinancialAccount[]>(['financial-accounts', 'manual']);
+      if (previous) {
+        qc.setQueryData<FinancialAccount[]>(
+          ['financial-accounts', 'manual'],
+          previous.map((row) => row.id === account.id
+            ? { ...row, included_in_net_worth: next }
+            : row),
+        );
+      }
+      return { previous };
+    },
+    onError: (_error, _next, context) => {
+      if (context?.previous) {
+        qc.setQueryData(['financial-accounts', 'manual'], context.previous);
+      }
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['financial-accounts'] });
+      qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] });
+    },
+  });
+
+  return (
+    <View
+      className={`bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-3 flex-row items-stretch ${
+        excluded ? 'opacity-50' : ''
+      }`}
+      testID={`manual-account-${account.id}`}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`開啟手動帳戶 ${account.name}`}
+        onPress={() => router.push({
+          pathname: '/(tabs)/cards/manual/[account_id]',
+          params: { account_id: account.id },
+        })}
+        className="flex-1 min-w-0 px-4 py-3 active:opacity-80"
+      >
+        <View className="flex-row items-baseline justify-between gap-3">
+          <View className="flex-1 min-w-0">
+            <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold" numberOfLines={1}>
+              {account.name}
+            </Text>
+            <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5" numberOfLines={1}>
+              {typeLabel}
+              {account.product_type === 'investment' && account.valuation_source === 'yahoo_finance'
+                ? ' · Yahoo 市值'
+                : account.product_type === 'investment' && account.valuation_source === 'manual_fallback'
+                  ? ' · Yahoo 查價失敗，顯示手動估值'
+                  : ''}
+              {excluded ? ' · 未列入' : ''}
             </Text>
           </View>
-        </Pressable>
-      ))}
+          <Text className={`text-small font-semibold ${excluded
+            ? 'text-ink-400 dark:text-ink-500 line-through'
+            : 'text-ink-900 dark:text-ink-50'}`}>
+            {account.currency}{' '}
+            {account.balance == null ? '—' : (formatDecimalFixed(account.balance, 2) ?? '—')}
+          </Text>
+        </View>
+      </Pressable>
+      <Pressable
+        onPress={() => toggleMut.mutate(excluded)}
+        disabled={toggleMut.isPending}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: toggleMut.isPending }}
+        className="w-12 items-center justify-center active:bg-ink-100 dark:active:bg-ink-800"
+        testID={`manual-account-toggle-${account.id}`}
+        accessibilityLabel={excluded ? '納入淨資產統計' : '不納入淨資產統計'}
+      >
+        <Text className="text-h3">{excluded ? '🙈' : '👁️'}</Text>
+      </Pressable>
     </View>
   );
 }

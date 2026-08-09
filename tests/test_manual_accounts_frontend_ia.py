@@ -19,12 +19,19 @@ def test_accounts_tab_exposes_manual_financial_accounts() -> None:
     assert "add-account-cta" not in source
     assert "Yahoo 市值" in source
     assert "Yahoo 查價失敗，顯示手動估值" in source
+    assert "/included" in source
+    assert "manual-account-toggle-" in source
+    assert "included_in_net_worth: next" in source
+    assert 'accessibilityRole="button"' in source
+    assert "accessibilityState={{ disabled: toggleMut.isPending }}" in source
 
     add_source = ACCOUNT_ADD.read_text()
     assert "連結銀行帳號" in add_source
     assert "新增手動帳戶" in add_source
     assert "'/(tabs)/cards/new'" in add_source
     assert "'/(tabs)/cards/manual/new'" in add_source
+    assert "router.dismissTo('/(tabs)/cards')" in add_source
+    assert 'accessibilityLabel="返回帳戶"' in add_source
 
 
 def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> None:
@@ -53,7 +60,9 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "confirmDeleteTrade" in source
     assert 'accessibilityRole="radio"' in source
     assert "accessibilityLabel={label}" in source
-    assert 'accessibilityLabel="納入淨資產"' in source
+    assert 'accessibilityLabel="納入淨資產"' not in source
+    assert "<Switch" not in source
+    assert "included_in_net_worth: account?.included_in_net_worth ?? true" in source
     assert 'label="名稱"' in source
     assert "institution_name:" not in source
     assert "account_ref:" not in source
@@ -89,6 +98,8 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "mode === 'overview'" in source
     assert "mode === 'create'" in source
     assert "InvestmentJournal" in transaction_source
+    assert "api('/financial-accounts?source=manual')" in transaction_source
+    assert "queryKey: ['financial-accounts', 'manual']" in transaction_source
     assert 'mode="create"' in transaction_source
     assert "initialTransaction" in transaction_source
     assert "router.dismissTo" in transaction_source

@@ -87,6 +87,22 @@ def update_account(user_id: int, account_id: int, values: dict[str, object], now
         return "updated" if cursor.rowcount > 0 else "not_found"
 
 
+def update_account_inclusion(
+    user_id: int,
+    account_id: int,
+    included_in_net_worth: bool,
+    now: str,
+) -> bool:
+    with db.get_conn() as conn:
+        cursor = conn.execute(
+            """UPDATE manual_financial_accounts
+               SET included_in_net_worth=?, updated_at=?
+               WHERE id=? AND user_id=?""",
+            (1 if included_in_net_worth else 0, now, account_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
 def delete_account(user_id: int, account_id: int) -> bool:
     with db.get_conn() as conn:
         cursor = conn.execute(

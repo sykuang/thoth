@@ -104,8 +104,12 @@ def _decimal(value: object) -> Decimal:
     return parsed
 
 
-def _decimal_text(value: object) -> str:
-    return format(_decimal(value), "f")
+def _decimal_text(value: object) -> str | None:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return format(parsed, "f") if parsed.is_finite() else None
 
 
 def _manual_id(row_id: int) -> str:
@@ -262,6 +266,22 @@ def update_manual_account(user_id: int, account_id: str, **values) -> FinancialA
     if outcome == "has_transactions":
         raise InvalidManualAccount("delete investment transactions before changing account type")
     if outcome == "not_found":
+        raise ManualAccountNotFound(account_id)
+    return get_manual_account(user_id, account_id)
+
+
+def update_manual_account_inclusion(
+    user_id: int,
+    account_id: str,
+    included_in_net_worth: bool,
+) -> FinancialAccount:
+    row_id = parse_manual_id(account_id)
+    if not repo.update_account_inclusion(
+        user_id,
+        row_id,
+        included_in_net_worth,
+        db.now_iso(),
+    ):
         raise ManualAccountNotFound(account_id)
     return get_manual_account(user_id, account_id)
 

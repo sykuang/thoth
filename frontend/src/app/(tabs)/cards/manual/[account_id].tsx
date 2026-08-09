@@ -6,7 +6,6 @@ import {
   Alert,
   Platform,
   Pressable,
-  Switch,
   Text,
   TextInput,
   View,
@@ -126,7 +125,6 @@ export default function ManualAccountScreen() {
   const [name, setName] = useState('');
   const [currency, setCurrency] = useState('TWD');
   const [balance, setBalance] = useState('0');
-  const [included, setIncluded] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const normalizedCurrency = currency.trim().toUpperCase();
   const accountCurrencyOptions = useMemo(
@@ -154,7 +152,6 @@ export default function ManualAccountScreen() {
     setName(account.name);
     setCurrency(account.currency);
     setBalance((account.manual_balance ?? account.balance ?? '0').replace(/^-/, ''));
-    setIncluded(account.included_in_net_worth);
   }, [account]);
 
   const saveAccount = useMutation<FinancialAccount, ApiError>({
@@ -168,7 +165,7 @@ export default function ManualAccountScreen() {
           currency: currency.trim().toUpperCase(),
           balance: balance.trim(),
           manual_balance: balance.trim(),
-          included_in_net_worth: included,
+          included_in_net_worth: account?.included_in_net_worth ?? true,
         },
       },
     ),
@@ -271,13 +268,6 @@ export default function ManualAccountScreen() {
             <View className="flex-1"><Field label={productType === 'investment' ? '目前總值' : '目前餘額'} value={balance} onChangeText={setBalance} keyboardType="decimal-pad" testID="manual-balance" /></View>
           </View>
 
-          <View className="flex-row items-center justify-between py-2 mb-3">
-            <View className="flex-1 pr-3">
-              <Text className="text-ink-900 dark:text-ink-50 text-body">納入淨資產</Text>
-              <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">關閉後保留帳戶與明細，但不參與總額</Text>
-            </View>
-            <Switch accessibilityLabel="納入淨資產" value={included} onValueChange={setIncluded} />
-          </View>
           {(error || saveAccount.isError || deleteAccount.isError) && (
             <Text className="text-red-600 text-small mb-3">{error ?? formatApiError(saveAccount.error ?? deleteAccount.error)}</Text>
           )}

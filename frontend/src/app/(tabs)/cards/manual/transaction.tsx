@@ -22,8 +22,8 @@ export default function ManualInvestmentTransactionScreen() {
     || (Number.isInteger(transactionId) && transactionId > 0);
 
   const accountsQ = useQuery<FinancialAccount[], ApiError>({
-    queryKey: ['financial-accounts'],
-    queryFn: () => api('/financial-accounts'),
+    queryKey: ['financial-accounts', 'manual'],
+    queryFn: () => api('/financial-accounts?source=manual'),
     refetchOnMount: 'always',
     enabled: accountId !== '',
   });
