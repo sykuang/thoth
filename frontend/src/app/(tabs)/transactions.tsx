@@ -25,7 +25,6 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { BulkEditSheet, type BulkTarget } from '@/components/BulkEditSheet';
 
 import { useBreakpoint } from '@/hooks/useBreakpoint';
@@ -49,6 +48,8 @@ import {
   aggregateByCategory,
   aggregateBySubcategory,
   computePeriodStats,
+  filterCategoryViewItems,
+  transactionSectionTitle,
   txnCashflowAmount,
 } from '@/lib/txnFilter';
 import {
@@ -251,17 +252,13 @@ export default function TransactionsScreen() {
     [rawItems, category],
   );
 
-  // 實際 render 的 list (套全部 filter, 包含 search/category/subcategory/direction).
-  // 2026-06-22 (使用者指示): 分類 view 強制不套 client-side filter — 永遠顯示「整個 period 的分類分佈」.
-  //   - filter card 已隨 viewMode 隱藏 (見下方 JSX), 但 state (category/subcategory/direction/search)
-  //     仍可能殘留 (例如先在 list view 點了 chip, 再切 category view).
-  //   - 這裡用 viewMode 短路: 分類 view 直接吃 rawItems, list view 才套 filter.
-  //   - 為何不直接清 state? 因為使用者「列 → 分類 → 列回去」要保留先前篩選, 才符合 muscle memory.
+  // 明細 view 套完整 filter；分類 view 忽略明細專屬的分類/搜尋條件，但收入/支出卡
+  // 是兩個 view 共用的可見 scope selector，因此分類聚合必須跟著 direction 切換。
   const filteredItems = useMemo(
     () => {
       const base = rawItems;
       return viewMode === 'category'
-        ? base
+        ? filterCategoryViewItems(base, direction)
         : applyTxnFilters(base, { category, subcategory, direction, search });
     },
     [viewMode, rawItems, category, subcategory, direction, search],
@@ -367,7 +364,7 @@ export default function TransactionsScreen() {
   }
 
   // Phase 9 C-2 (2026-06-19): total 看 filtered (client-side filter 後), 顯示「N 筆」.
-  const filteredCount = viewMode === 'list' ? timelineItems.length : filteredItems.length;
+  const filteredCount = viewMode === 'list' ? timelineItems.length : groupedByCategory.reduce((sum, group) => sum + group.count, 0);
   const rawCount = rawItems.length + (viewMode === 'list' ? brokeragePeriodActivities.length : 0);
   const activeFilterCount =
     Number(selectedBanks.length > 0)
@@ -391,8 +388,10 @@ export default function TransactionsScreen() {
 
   return (
     <>
-    <KeyboardAwareScrollView
+    <ScrollView
       className="flex-1 bg-ink-50 dark:bg-ink-950"
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={{ paddingBottom: 32 }}
       refreshControl={
         <RefreshControl
           refreshing={transactionRefreshing}
@@ -526,7 +525,7 @@ export default function TransactionsScreen() {
 
         {/* Section header — Phase 6 雙 view 段切回 (2026-06-20 使用者) */}
         <View className="flex-row items-center mb-3 px-1">
-          <Text className="text-ink-900 dark:text-ink-50 text-h3">支出明細</Text>
+          <Text className="text-ink-900 dark:text-ink-50 text-h3">{transactionSectionTitle(direction)}</Text>
           <Text className="text-ink-400 dark:text-ink-500 text-small ml-2 flex-1">
             {periodLabel}
           </Text>
@@ -775,7 +774,7 @@ export default function TransactionsScreen() {
           </>
         )}
       </View>
-    </KeyboardAwareScrollView>
+    </ScrollView>
     <Modal
         visible={filterOpen}
         transparent

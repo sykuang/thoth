@@ -109,6 +109,25 @@ export function applyTxnFilters(items: Transaction[], f: TxnFilters): Transactio
   });
 }
 
+/**
+ * Category mode ignores detail-only category/search filters, but the visible
+ * income/expense cards still define the scope shared by both view modes.
+ * Neutral transfers remain visible only when no direction is selected.
+ */
+export function filterCategoryViewItems(
+  items: Transaction[],
+  direction: TxnFilters['direction'],
+): Transaction[] {
+  if (direction === 'all') return items;
+  return items.filter((item) => txnCashflowDirection(item) === direction);
+}
+
+export function transactionSectionTitle(direction: TxnFilters['direction']): string {
+  if (direction === 'income') return '收入明細';
+  if (direction === 'expense') return '支出明細';
+  return '收支明細';
+}
+
 // ============================================================
 // Chip count aggregator — by_category / by_subcategory
 // ============================================================

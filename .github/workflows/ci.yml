@@ -116,6 +116,9 @@ jobs:
       - name: Decimal formatting regression
         run: pnpm test:decimal
 
+      - name: Transaction view regressions
+        run: pnpm test:transactions
+
       - name: Local replica contract regression
         run: pnpm test:replica
 
