@@ -672,8 +672,7 @@ export const FX_DISPLAY_MODES: { value: FxDisplayMode; label: string; hint: stri
  *   - 'consume': 消費日 (預設, MoneyBook 風 — 看見實際刷卡那天)
  *   - 'post':    入帳日 (對帳族 — 對銀行 statement 比較順, 未爬到入帳日 fallback 消費日)
  *
- * 只影響「明細列」顯示, 排序 / 月份歸屬 / 統計仍以 consume_date 為準
- * (避免 7/3 入帳的 6/28 消費被歸到 7 月扭曲分類圖).
+ * 會一起控制明細日期、排序、月份歸屬與統計，確保選擇 post 時跨月交易歸入帳月。
  */
 export type CardDateBasis = 'consume' | 'post';
 

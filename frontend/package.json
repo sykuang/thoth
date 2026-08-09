@@ -15,6 +15,7 @@
     "expo-router": "~56.2.10",
     "expo-secure-store": "~56.0.4",
     "expo-splash-screen": "~56.0.10",
+    "expo-sqlite": "~56.0.5",
     "expo-web-browser": "~56.0.6",
     "lucide-react-native": "^1.18.0",
     "nativewind": "^4.2.5",
@@ -56,6 +57,7 @@
     "desktop:icon": "tauri icon",
     "lint": "expo lint",
     "test:decimal": "tsx src/lib/decimal.test.ts && tsx src/lib/transactionTimeline.test.ts",
+    "test:replica": "tsx src/lib/replica.test.ts && tsx src/lib/replicaSync.test.ts",
     "test:routes": "tsx src/lib/routeParents.test.ts",
     "typecheck": "tsc --noEmit"
   },

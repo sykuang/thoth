@@ -116,6 +116,9 @@ jobs:
       - name: Decimal formatting regression
         run: pnpm test:decimal
 
+      - name: Local replica contract regression
+        run: pnpm test:replica
+
       - name: Route parent contract
         run: pnpm test:routes
 

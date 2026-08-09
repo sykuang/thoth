@@ -1,5 +1,5 @@
 import type { BrokerageAccount, BrokerageActivity, Transaction } from '@/types/api';
-import { mergeTransactionTimeline } from './transactionTimeline';
+import { mergeTransactionTimeline, transactionDateForBasis } from './transactionTimeline';
 
 const bankRows = [
   { id: 1, bank: 'ctbc', kind: 'twd', date: '2026-08-07', datetime: null },
@@ -47,6 +47,35 @@ const stableFallback = mergeTransactionTimeline(
 );
 if (stableFallback.map((row) => row.key).join(',') !== 'bank:ctbc:twd:6,brokerage:acct:e') {
   throw new Error('date-only rows did not preserve stable input order');
+}
+
+const crossMonthCard = {
+  id: 9,
+  bank: 'cathay',
+  kind: 'billed',
+  date: '2026-07-31',
+  consume_date: '2026-07-31',
+  post_date: '2026-08-02',
+  amount: -100,
+  currency: 'TWD',
+} as Transaction;
+if (transactionDateForBasis(crossMonthCard, 'consume') !== '2026-07-31') {
+  throw new Error('consume-date basis regressed');
+}
+if (transactionDateForBasis(crossMonthCard, 'post') !== '2026-08-02') {
+  throw new Error('post-date basis regressed');
+}
+const postBasisTimeline = mergeTransactionTimeline(
+  [
+    { id: 8, bank: 'cathay', kind: 'twd', date: '2026-08-01', amount: -1, currency: 'TWD' },
+    crossMonthCard,
+  ] as Transaction[],
+  [],
+  [],
+  'post',
+);
+if (postBasisTimeline[0].source !== 'bank' || postBasisTimeline[0].transaction.id !== 9) {
+  throw new Error('post-date timeline ordering regressed');
 }
 
 console.log('transaction timeline checks passed');

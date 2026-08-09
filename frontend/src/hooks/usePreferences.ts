@@ -16,12 +16,27 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { api, type ApiError } from '@/lib/api';
+import {
+  assertReplicaOwnerEpoch,
+  getReplicaOwnerEpoch,
+  makeReplicaOwnerKey,
+  ReplicaSyncCancelledError,
+  updateReplicaPreferences,
+} from '@/lib/replica';
+import { replicaStore } from '@/lib/replicaStore';
+import { useAuthStore } from '@/stores/auth';
 import { type UserPreferences } from '@/types/api';
 
 /** Default 跟 backend preferences_router.DEFAULT_PREFERENCES 對齊。 */
 export const DEFAULT_PREFERENCES: UserPreferences = {
   fx_display_mode: 'auto',
   card_date_basis: 'consume',
+};
+
+type PreferencesMutationVariables = {
+  body: Partial<UserPreferences>;
+  ownerKey: string;
+  ownerEpoch: number;
 };
 
 export function usePreferences() {
@@ -34,21 +49,55 @@ export function usePreferences() {
     // 401 unauth 時 api() 已 logout, 這裡不必額外處理
   });
 
-  const mutation = useMutation<UserPreferences, ApiError, Partial<UserPreferences>>({
-    mutationFn: (body) =>
-      api<UserPreferences>('/users/me/preferences', { method: 'PUT', body }),
-    onSuccess: (merged) => {
-      // backend 已回 merged payload, 直接 setQueryData 省一次 GET
-      qc.setQueryData(['user-preferences'], merged);
+  const mutation = useMutation<
+    UserPreferences,
+    ApiError,
+    PreferencesMutationVariables
+  >({
+    scope: { id: 'user-preferences' },
+    mutationFn: ({ body, ownerKey, ownerEpoch }) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api<UserPreferences>('/users/me/preferences', {
+        method: 'PUT',
+        body,
+        skipAuthRetry: true,
+      });
+    },
+    onSuccess: async (merged, variables) => {
+      try {
+        await updateReplicaPreferences(
+          replicaStore,
+          variables.ownerKey,
+          variables.ownerEpoch,
+          merged,
+        );
+        qc.setQueryData(['user-preferences'], merged);
+        await qc.invalidateQueries({
+          queryKey: ['frontend-dataset', 'replica', variables.ownerKey],
+          refetchType: 'all',
+        });
+      } catch (error) {
+        if (!(error instanceof ReplicaSyncCancelledError)) throw error;
+      }
     },
   });
 
   return {
     /** Loading 期間或第一次 fetch 失敗都會吐 default — UI 永遠拿得到值 */
     data: query.data ?? DEFAULT_PREFERENCES,
+    hasServerData: query.data !== undefined,
     isLoading: query.isLoading,
     error: query.error,
-    mutate: mutation.mutate,
+    mutate: (body: Partial<UserPreferences>) => {
+      const auth = useAuthStore.getState();
+      if (!auth.email) return;
+      const ownerKey = makeReplicaOwnerKey(auth.serverUrl, auth.email);
+      mutation.mutate({
+        body,
+        ownerKey,
+        ownerEpoch: getReplicaOwnerEpoch(ownerKey),
+      });
+    },
     isMutating: mutation.isPending,
     mutationError: mutation.error,
   };

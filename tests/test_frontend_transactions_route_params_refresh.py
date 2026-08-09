@@ -64,13 +64,22 @@ def test_transactions_tab_has_pull_to_refresh_that_forces_snapshot_refetch():
     assert "void Promise.all([datasetQ.refreshSnapshot(), brokerageQ.refetch()]);" not in src
 
 
-def test_frontend_dataset_cache_fetches_whole_snapshot_not_incremental_changes():
-    """交易頁資料來源只抓整包 /cache/snapshot；畫面 filter 不可再造成 backend scoped fetch。"""
+def test_frontend_dataset_cache_uses_owner_scoped_replica_sync():
+    """交易頁先讀owner-bound local replica，再以bootstrap/pull更新；畫面filter仍全在本地。"""
     hook = DATASET_HOOK_TS.read_text()
     screen = TRANSACTIONS_TSX.read_text()
 
-    assert "api<FrontendDatasetCache>('/cache/snapshot')" in hook
-    assert "/cache/changes?since=" not in hook
+    assert "makeReplicaOwnerKey(serverUrl, email)" in hook
+    assert "replicaStore.load(ownerKey)" in hook
+    assert "syncReplica(replicaStore, ownerKey" in hook
+    assert "const hydratedOwners = new Set<string>();" in hook
+    assert "const firstHydration = !hydratedOwners.has(ownerKey);" in hook
+    assert "persisted?.schemaVersion === REPLICA_SCHEMA_VERSION" in hook
+    assert "catch (syncError)" in hook
+    assert "return await refreshReplica();" in hook
+    assert "'/replica/bootstrap'" in hook
+    assert "'/replica/pull'" in hook
+    assert "'/cache/snapshot'" not in hook
     assert "setInterval(" not in hook
     assert "useMutation(" not in hook
     assert "api<TransactionsListResponse>(`/transactions" not in screen
@@ -131,12 +140,36 @@ def test_bank_filter_options_are_union_of_credential_and_dataset_banks():
     assert "api<BankAccount[]>('/accounts')" in block
     assert "const banks = new Set<string>();" in block
     assert "if (a.has_creds) banks.add(String(a.bank));" in block
-    assert "for (const a of datasetQ.data?.accounts ?? []) banks.add(a.bank);" in block
-    assert "for (const c of datasetQ.data?.cards ?? []) banks.add(c.bank);" in block
+    assert "datasetQ.data?.accounts" not in block
+    assert "datasetQ.data?.cards" not in block
     assert "for (const t of datasetQ.data?.transactions ?? []) banks.add(t.bank);" in block
     assert "return Array.from(banks);" in block
     assert "return credentialBanks" not in block
     assert "return Array.from(fallbackBanks)" not in block
+
+
+def test_transactions_use_replica_preferences_until_server_preferences_arrive():
+    src = TRANSACTIONS_TSX.read_text()
+    assert "preferencesQ.hasServerData" in src
+    assert "datasetQ.data?.preferences ?? preferencesQ.data" in src
+
+    preferences_hook = (ROOT / "frontend/src/hooks/usePreferences.ts").read_text()
+    assert "updateReplicaPreferences(" in preferences_hook
+    assert "variables.ownerEpoch," in preferences_hook
+    assert "scope: { id: 'user-preferences' }" in preferences_hook
+    guard = preferences_hook.index("assertReplicaOwnerEpoch(ownerKey, ownerEpoch);")
+    request = preferences_hook.index("api<UserPreferences>('/users/me/preferences'", guard)
+    assert guard < request
+    assert "skipAuthRetry: true" in preferences_hook[request:]
+    assert "ownerEpoch: getReplicaOwnerEpoch(ownerKey)" in preferences_hook
+    assert "queryKey: ['frontend-dataset', 'replica', variables.ownerKey]" in preferences_hook
+    assert "refetchType: 'all'" in preferences_hook
+
+    api_client = (ROOT / "frontend/src/lib/api.ts").read_text()
+    assert "if (res.status === 401 && init.skipAuthRetry)" in api_client
+    fail_closed = api_client.index("if (res.status === 401 && init.skipAuthRetry)")
+    refresh_path = api_client.index("if (res.status === 401 && !init.skipAuth)")
+    assert fail_closed < refresh_path
 
 
 def test_transaction_filters_are_hidden_behind_one_button_and_modal():

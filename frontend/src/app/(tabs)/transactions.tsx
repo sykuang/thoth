@@ -1,9 +1,9 @@
 /**
  * 交易記錄 (Phase 5 — /transactions 跨銀行聚合 + 分頁 + filter).
  *
- * 背景: 每家銀行各自一顆 sqlite (BankStore), 增量寫入。
- * Phase 3 frontend cache 後，交易頁只 fetch /cache/snapshot 整包 dataset；
- * bank/account/card/period/category/search/direction 全部只在 frontend filter。
+ * Backend partitions are persisted as an owner-scoped local replica (SQLite on
+ * native, IndexedDB on Web/Tauri); bank/account/card/period/category/search/
+ * direction filters all run against the local projection.
  *
  * UX:
  *   - 明細 header 的篩選按鈕開啟 bank/category/subcategory/search sheet；月份獨立控制
@@ -43,7 +43,7 @@ import {
 } from '@/lib/period';
 import { api, formatApiError } from '@/lib/api';
 import { categorySortRank, sortCategoryKeys } from '@/lib/category-color';
-import { mergeTransactionTimeline } from '@/lib/transactionTimeline';
+import { mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
 import {
   applyTxnFilters,
   aggregateByCategory,
@@ -101,7 +101,11 @@ export default function TransactionsScreen() {
   const accountNo = typeof params.account_no === 'string' ? params.account_no : '';
   const cardNo = typeof params.card_no === 'string' ? params.card_no : '';
   const bp = useBreakpoint();
-  const { data: prefs } = usePreferences();
+  const datasetQ = useFrontendDatasetCache();
+  const preferencesQ = usePreferences();
+  const prefs = preferencesQ.hasServerData
+    ? preferencesQ.data
+    : (datasetQ.data?.preferences ?? preferencesQ.data);
   const fxMode = prefs.fx_display_mode;
   const cardDateBasis = prefs.card_date_basis ?? 'consume';
   const [selectedBanks, setSelectedBanks] = useState<string[]>(initialBank ? [initialBank] : []);
@@ -185,21 +189,18 @@ export default function TransactionsScreen() {
     setSelectedKeys(new Set());
   }
 
-  const datasetQ = useFrontendDatasetCache();
   const bankAccountsQ = useQuery<BankAccount[]>({
     queryKey: ['accounts'],
     queryFn: () => api<BankAccount[]>('/accounts'),
   });
 
-  // accounts/transactions now come from one frontend dataset cache.  The backend
-  // returns the whole DB-shaped snapshot; every visible filter below is local.
+  // Transactions come from the local replica; account/card read models remain on
+  // their existing API paths until those derived projections are migrated fully.
   const availableBanks = useMemo(() => {
     const banks = new Set<string>();
     for (const a of bankAccountsQ.data ?? []) {
       if (a.has_creds) banks.add(String(a.bank));
     }
-    for (const a of datasetQ.data?.accounts ?? []) banks.add(a.bank);
-    for (const c of datasetQ.data?.cards ?? []) banks.add(c.bank);
     for (const t of datasetQ.data?.transactions ?? []) banks.add(t.bank);
     if (initialBank) banks.add(initialBank);
     return Array.from(banks);
@@ -225,11 +226,11 @@ export default function TransactionsScreen() {
     if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);
     if (effectiveCardNo) items = items.filter((t) => t.card_no === effectiveCardNo);
     items = items.filter((t) => {
-      const d = t.date || '';
+      const d = transactionDateForBasis(t, cardDateBasis);
       return d >= since && d <= until;
     });
     return items;
-  }, [datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod]);
+  }, [datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]);
 
   const transactionRefreshing = (
     (datasetQ.isRefetching && !datasetQ.isLoading)
@@ -297,8 +298,9 @@ export default function TransactionsScreen() {
       filteredItems,
       visibleBrokerageActivities,
       activeBrokeragePortfolio?.accounts ?? [],
+      cardDateBasis,
     ),
-    [filteredItems, visibleBrokerageActivities, activeBrokeragePortfolio],
+    [filteredItems, visibleBrokerageActivities, activeBrokeragePortfolio, cardDateBasis],
   );
 
   // 收支表上方兩張卡 (收入/支出) — 數字應代表「目前 period + 非方向 filter」的總覽。

@@ -1,4 +1,4 @@
-import type { BrokerageAccount, BrokerageActivity, Transaction } from '@/types/api';
+import type { BrokerageAccount, BrokerageActivity, CardDateBasis, Transaction } from '@/types/api';
 
 export type TransactionTimelineItem =
   | {
@@ -30,20 +30,37 @@ function timelineTimestamp(value: string): number | null {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+export function transactionDateForBasis(
+  transaction: Transaction,
+  basis: CardDateBasis,
+): string {
+  if (transaction.kind === 'billed' || transaction.kind === 'pending') {
+    if (basis === 'post') {
+      return transaction.post_date ?? transaction.consume_date ?? transaction.date ?? '';
+    }
+    return transaction.consume_date ?? transaction.date ?? transaction.post_date ?? '';
+  }
+  return transaction.date ?? '';
+}
+
 export function mergeTransactionTimeline(
   bankRows: Transaction[],
   brokerageRows: BrokerageActivity[],
   accounts: BrokerageAccount[],
+  cardDateBasis: CardDateBasis = 'consume',
 ): TransactionTimelineItem[] {
   const accountsById = new Map(accounts.map((account) => [account.id, account]));
   return [
     ...bankRows.map<TransactionTimelineItem>((transaction, sortIndex) => {
-      const sortDate = transaction.datetime ?? transaction.date ?? '';
+      const sortDay = transactionDateForBasis(transaction, cardDateBasis);
+      const useTransactionTime = cardDateBasis === 'consume'
+        || (transaction.kind !== 'billed' && transaction.kind !== 'pending');
+      const sortDate = useTransactionTime ? (transaction.datetime ?? sortDay) : sortDay;
       return {
         source: 'bank',
         key: `bank:${transaction.bank}:${transaction.kind}:${transaction.id}`,
         sortIndex,
-        sortDay: transaction.date ?? sortDate.slice(0, 10),
+        sortDay: sortDay.slice(0, 10),
         sortDate,
         sortTimestamp: timelineTimestamp(sortDate),
         transaction,

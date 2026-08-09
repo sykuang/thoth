@@ -12,6 +12,9 @@ import * as SecureStore from 'expo-secure-store';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
+import { activateReplicaOwner, clearReplicaOwner, makeReplicaOwnerKey } from '@/lib/replica';
+import { replicaStore } from '@/lib/replicaStore';
+
 type AuthState = {
   token: string | null;
   /** L9 (2026-06-21): long-lived refresh token (DB-backed, rotation chain).
@@ -99,14 +102,28 @@ export const useAuthStore = create<AuthState>()(
       apiKey: '',
       biometricEnabled: false,
       hydrated: false,
-      setAuth: (token, email, refreshToken = null) =>
-        set({ token, email, refreshToken }),
+      setAuth: (token, email, refreshToken = null) => set((state) => {
+        if (state.email && state.email !== email) {
+          void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
+        }
+        activateReplicaOwner(makeReplicaOwnerKey(state.serverUrl, email));
+        return { token, email, refreshToken };
+      }),
       setTokens: (accessToken, refreshToken) =>
         set({ token: accessToken, refreshToken }),
-      setServerUrl: (serverUrl) => set({ serverUrl }),
+      setServerUrl: (serverUrl) => set((state) => {
+        if (state.email && state.serverUrl !== serverUrl) {
+          void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
+        }
+        if (state.email) activateReplicaOwner(makeReplicaOwnerKey(serverUrl, state.email));
+        return { serverUrl };
+      }),
       setApiKey: (apiKey) => set({ apiKey }),
       setBiometricEnabled: (biometricEnabled) => set({ biometricEnabled }),
-      logout: () => set({ token: null, refreshToken: null, email: null }),
+      logout: () => set((state) => {
+        void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
+        return { token: null, refreshToken: null, email: null };
+      }),
       _setHydrated: (v) => set({ hydrated: v }),
     }),
     {

@@ -64,7 +64,7 @@ def test_transactions_drilldown_route_params_are_part_of_local_dataset_filter():
     assert "let items = datasetQ.data?.transactions ?? [];" in src
     assert "if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);" in src
     assert "if (effectiveCardNo) items = items.filter((t) => t.card_no === effectiveCardNo);" in src
-    assert "[datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod]" in src
+    assert "[datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]" in src
 
 
 def test_backend_transactions_endpoint_supports_exact_canonical_ref_filters():

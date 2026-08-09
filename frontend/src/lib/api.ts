@@ -158,6 +158,8 @@ export function formatApiError(err: unknown): string {
 export type ApiInit = Omit<RequestInit, 'body'> & {
   body?: unknown;
   skipAuth?: boolean;
+  /** Fail on 401 without refreshing/retrying; use for owner-bound mutations. */
+  skipAuthRetry?: boolean;
   /** If true, returns void on 204 instead of attempting JSON parse. */
   raw?: boolean;
   /** Request timeout in ms (default 30000). Set to 0 to disable. */
@@ -405,6 +407,9 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
   // L13: refresh 失敗 → 試 biometric silent re-login (有存 creds 的話) → retry。
   // 例外：(a) skipAuth=true 的 request (login/register/refresh 自己) 不 retry。
   //       (b) 已經 retry 過一次的 request 直接 logout 防無限迴圈。
+  if (res.status === 401 && init.skipAuthRetry) {
+    throw new ApiError(401, await safeReadJson(res));
+  }
   if (res.status === 401 && !init.skipAuth) {
     // /auth/refresh 自己 401 → 試 biometric re-login (refresh token 已死)
     if (path === '/auth/refresh') {
