@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
-import { ArrowLeft, Building2, WalletCards } from 'lucide-react-native';
+import { Building2, WalletCards } from 'lucide-react-native';
 import { Pressable, Text, View } from 'react-native';
 
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
+
 
 export default function AddAccountScreen() {
   const router = useRouter();
@@ -10,16 +11,7 @@ export default function AddAccountScreen() {
   return (
     <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-4 py-6 max-w-[720px] w-full mx-auto">
-        <Pressable
-          onPress={() => router.dismissTo('/(tabs)/cards')}
-          accessibilityRole="button"
-          accessibilityLabel="返回帳戶"
-          className="self-start flex-row items-center gap-2 mb-5 active:opacity-70"
-          testID="back-to-accounts"
-        >
-          <ArrowLeft size={22} color="#9333ea" />
-          <Text className="text-brand-600 text-h3">返回帳戶</Text>
-        </Pressable>
+
         <Text className="text-ink-900 dark:text-ink-50 text-h1 mb-1">新增帳戶</Text>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-5">
           選擇連結銀行，或建立自行維護的手動帳戶。

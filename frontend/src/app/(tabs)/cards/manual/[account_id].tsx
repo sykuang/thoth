@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -12,8 +12,10 @@ import {
 } from 'react-native';
 
 import { Dropdown, type DropdownOption } from '@/components/Dropdown';
+import { DeterministicBackButton } from '@/components/DeterministicBackButton';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { api, ApiError, formatApiError } from '@/lib/api';
+import { manualAccountParent, ROUTE_PARENTS } from '@/lib/routeParents';
 import {
   divideDecimal,
   formatDecimal,
@@ -119,6 +121,7 @@ export default function ManualAccountScreen() {
   const { account_id: rawAccountId } = useLocalSearchParams<{ account_id: string }>();
   const accountId = Array.isArray(rawAccountId) ? rawAccountId[0] : rawAccountId;
   const isNew = accountId === 'new';
+  const parent = manualAccountParent(accountId);
   const router = useRouter();
   const queryClient = useQueryClient();
   const [productType, setProductType] = useState<EditableProductType>('deposit');
@@ -176,7 +179,7 @@ export default function ManualAccountScreen() {
       ]);
       setError(null);
       if (isNew) {
-        router.dismissTo('/(tabs)/cards');
+        router.dismissTo(ROUTE_PARENTS['(tabs)/cards/manual/[account_id]']);
       }
     },
     onError: (err) => setError(formatApiError(err)),
@@ -189,7 +192,7 @@ export default function ManualAccountScreen() {
         queryClient.invalidateQueries({ queryKey: ['financial-accounts'] }),
         queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
       ]);
-      router.back();
+      router.dismissTo(ROUTE_PARENTS['(tabs)/cards/manual/[account_id]']);
     },
     onError: (err) => setError(formatApiError(err)),
   });
@@ -224,7 +227,18 @@ export default function ManualAccountScreen() {
   }
 
   return (
-    <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
+    <>
+      <Stack.Screen
+        options={{
+          headerLeft: () => (
+            <DeterministicBackButton
+              target={parent}
+              label={isNew ? '新增帳戶' : '帳戶'}
+            />
+          ),
+        }}
+      />
+      <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-4 py-6 max-w-[720px] w-full mx-auto">
         <Text className="text-ink-900 dark:text-ink-50 text-h1 mb-1">
           {isNew ? '新增手動帳戶' : '編輯手動帳戶'}
@@ -312,7 +326,8 @@ export default function ManualAccountScreen() {
           </Pressable>
         )}
       </View>
-    </KeyboardAwareScrollView>
+      </KeyboardAwareScrollView>
+    </>
   );
 }
 

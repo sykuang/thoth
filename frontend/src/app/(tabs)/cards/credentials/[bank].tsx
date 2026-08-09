@@ -18,7 +18,7 @@
  *   DELETE /accounts/{id}/fields/{name}
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
+import { Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -49,7 +49,7 @@ function isSupportedBank(b: string | undefined): b is SupportedBank {
 }
 
 export default function PerBankCredentialsScreen() {
-  const router = useRouter();
+
   const qc = useQueryClient();
   const bp = useBreakpoint();
   const params = useLocalSearchParams<{ bank: string }>();
@@ -476,12 +476,7 @@ export default function PerBankCredentialsScreen() {
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-4">
           請從帳戶 tab 點選銀行的 ⚙️ 按鈕進來
         </Text>
-        <Pressable
-          onPress={() => router.back()}
-          className="bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
-        >
-          <Text className="text-white text-h3">回上一頁</Text>
-        </Pressable>
+
       </View>
     );
   }

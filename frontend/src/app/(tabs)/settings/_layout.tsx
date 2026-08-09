@@ -7,41 +7,35 @@
 import { Stack } from 'expo-router';
 import { useColorScheme } from 'nativewind';
 
+import { DeterministicBackButton } from '@/components/DeterministicBackButton';
+import { ROUTE_PARENTS } from '@/lib/routeParents';
+
 export default function SettingsLayout() {
   const { colorScheme } = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const screen = (route: keyof typeof ROUTE_PARENTS, title: string) => ({
+    title,
+    headerBackVisible: false,
+    headerLeft: () => <DeterministicBackButton target={ROUTE_PARENTS[route]} label="設定" />,
+    headerBackTitle: '設定',
+    headerStyle: { backgroundColor: isDark ? '#0f172a' : '#7e22ce' },
+    headerTintColor: '#fff',
+    headerTitleStyle: { fontWeight: '600' as const },
+  });
   return (
     <Stack>
       <Stack.Screen name="index" options={{ headerShown: false }} />
       <Stack.Screen
         name="categories"
-        options={{
-          title: '自動分類規則',
-          headerBackTitle: '設定',
-          headerStyle: { backgroundColor: isDark ? '#0f172a' : '#7e22ce' },
-          headerTintColor: '#fff',
-          headerTitleStyle: { fontWeight: '600' },
-        }}
+        options={screen('(tabs)/settings/categories', '自動分類規則')}
       />
       <Stack.Screen
         name="labels"
-        options={{
-          title: '分類與標籤',
-          headerBackTitle: '設定',
-          headerStyle: { backgroundColor: isDark ? '#0f172a' : '#7e22ce' },
-          headerTintColor: '#fff',
-          headerTitleStyle: { fontWeight: '600' },
-        }}
+        options={screen('(tabs)/settings/labels', '分類與標籤')}
       />
       <Stack.Screen
         name="auto-sync"
-        options={{
-          title: '自動同步',
-          headerBackTitle: '設定',
-          headerStyle: { backgroundColor: isDark ? '#0f172a' : '#7e22ce' },
-          headerTintColor: '#fff',
-          headerTitleStyle: { fontWeight: '600' },
-        }}
+        options={screen('(tabs)/settings/auto-sync', '自動同步')}
       />
     </Stack>
   );

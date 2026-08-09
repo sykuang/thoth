@@ -30,8 +30,7 @@ def test_accounts_tab_exposes_manual_financial_accounts() -> None:
     assert "新增手動帳戶" in add_source
     assert "'/(tabs)/cards/new'" in add_source
     assert "'/(tabs)/cards/manual/new'" in add_source
-    assert "router.dismissTo('/(tabs)/cards')" in add_source
-    assert 'accessibilityLabel="返回帳戶"' in add_source
+
 
 
 def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> None:
@@ -70,7 +69,7 @@ def test_manual_investment_page_has_derived_holdings_and_transaction_crud() -> N
     assert "manual-institution" not in source
     assert "帳號末碼" not in source
     assert "估值日期" not in source
-    assert "router.dismissTo('/(tabs)/cards')" in source
+
     assert "router.replace({" not in source
     assert "useDebouncedValue(normalizedSymbol, 350)" in source
     assert "/financial-accounts/symbols/search?q=" in source

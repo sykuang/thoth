@@ -1,9 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import { ActivityIndicator, Pressable, Text, View } from 'react-native';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
+import { ActivityIndicator, Text, View } from 'react-native';
 
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { api, ApiError, formatApiError } from '@/lib/api';
+import { DeterministicBackButton } from '@/components/DeterministicBackButton';
+import { manualTransactionReturnParent } from '@/lib/routeParents';
 import type { FinancialAccount, ManualInvestmentTransaction } from '@/types/api';
 
 import { InvestmentJournal } from './[account_id]';
@@ -40,10 +42,19 @@ export default function ManualInvestmentTransactionScreen() {
   const initialTransaction = transactionId == null
     ? undefined
     : transactionsQ.data?.find((item) => item.id === transactionId);
-  const returnToAccount = () => router.dismissTo({
-    pathname: '/(tabs)/cards/manual/[account_id]',
-    params: { account_id: accountId },
-  });
+  const routeIsValidated = accountsQ.isFetchedAfterMount && (
+    transactionId == null
+    || !transactionIdIsValid
+    || transactionsQ.isFetchedAfterMount
+  );
+  const returnTarget = manualTransactionReturnParent(
+    accountId,
+    account?.id,
+    transactionId != null,
+    transactionIdIsValid && initialTransaction != null,
+    routeIsValidated,
+  );
+  const returnToAccount = () => router.dismissTo(returnTarget);
   const loading = accountId !== '' && transactionIdIsValid && (
     !accountsQ.isFetchedAfterMount
     || (transactionId != null && !transactionsQ.isFetchedAfterMount)
@@ -61,19 +72,22 @@ export default function ManualInvestmentTransactionScreen() {
             : null;
 
   return (
-    <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
+    <>
+      <Stack.Screen
+        options={{
+          headerLeft: () => (
+            <DeterministicBackButton
+              target={returnTarget}
+              label={accountId ? '手動帳戶' : '帳戶'}
+            />
+          ),
+        }}
+      />
+      <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-4 py-6 max-w-[720px] w-full mx-auto">
         {loading ? <ActivityIndicator /> : error ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card">
-            <Text className="text-red-600 text-small mb-4">{error}</Text>
-            <Pressable
-              onPress={() => router.dismissTo('/(tabs)/cards')}
-              accessibilityRole="button"
-              accessibilityLabel="返回帳戶"
-              className="border border-ink-300 dark:border-ink-700 rounded-xl py-3 items-center"
-            >
-              <Text className="text-ink-700 dark:text-ink-300 text-h3">返回帳戶</Text>
-            </Pressable>
+            <Text className="text-red-600 text-small">{error}</Text>
           </View>
         ) : account ? (
           <InvestmentJournal
@@ -86,6 +100,7 @@ export default function ManualInvestmentTransactionScreen() {
           />
         ) : null}
       </View>
-    </KeyboardAwareScrollView>
+      </KeyboardAwareScrollView>
+    </>
   );
 }

@@ -116,6 +116,9 @@ jobs:
       - name: Decimal formatting regression
         run: pnpm test:decimal
 
+      - name: Route parent contract
+        run: pnpm test:routes
+
       - name: ESLint (informational — does not block CI)
         # `expo lint` runs ESLint with expo-config. Currently surfaces some React
         # warnings (setState in useEffect, etc.) that are pre-existing and not

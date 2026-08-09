@@ -13,9 +13,17 @@
 import { Stack } from 'expo-router';
 import { useColorScheme } from 'nativewind';
 
+import { DeterministicBackButton } from '@/components/DeterministicBackButton';
+import { ROUTE_PARENTS } from '@/lib/routeParents';
+
 export default function CardsLayout() {
   const { colorScheme } = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const screen = (route: keyof typeof ROUTE_PARENTS, title: string, label: string) => ({
+    title,
+    headerBackVisible: false,
+    headerLeft: () => <DeterministicBackButton target={ROUTE_PARENTS[route]} label={label} />,
+  });
   return (
     <Stack
       screenOptions={{
@@ -26,16 +34,16 @@ export default function CardsLayout() {
       }}
     >
       <Stack.Screen name="index" options={{ headerShown: false }} />
-      <Stack.Screen name="add" options={{ title: '新增帳戶' }} />
-      <Stack.Screen name="new" options={{ title: '連結銀行帳號' }} />
+      <Stack.Screen name="add" options={screen('(tabs)/cards/add', '新增帳戶', '帳戶')} />
+      <Stack.Screen name="new" options={screen('(tabs)/cards/new', '連結銀行帳號', '新增帳戶')} />
       <Stack.Screen
         name="credentials/[bank]"
-        options={{ title: '管理登入' }}
+        options={screen('(tabs)/cards/credentials/[bank]', '管理登入', '帳戶')}
       />
-      <Stack.Screen name="[bank]/[card_no]" options={{ title: '帳單明細' }} />
-      <Stack.Screen name="brokerage/[account_id]" options={{ title: '持股明細' }} />
-      <Stack.Screen name="manual/[account_id]" options={{ title: '手動帳戶' }} />
-      <Stack.Screen name="manual/transaction" options={{ title: '新增／編輯交易' }} />
+      <Stack.Screen name="[bank]/[card_no]" options={screen('(tabs)/cards/[bank]/[card_no]', '帳單明細', '帳戶')} />
+      <Stack.Screen name="brokerage/[account_id]" options={screen('(tabs)/cards/brokerage/[account_id]', '持股明細', '帳戶')} />
+      <Stack.Screen name="manual/[account_id]" options={screen('(tabs)/cards/manual/[account_id]', '手動帳戶', '帳戶')} />
+      <Stack.Screen name="manual/transaction" options={{ title: '新增／編輯交易', headerBackVisible: false }} />
     </Stack>
   );
 }

@@ -26,6 +26,7 @@ import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 
 import { BankBadge } from '@/components/BankBadge';
 import { api, ApiError, formatApiError } from '@/lib/api';
+import { ROUTE_PARENTS } from '@/lib/routeParents';
 import {
   type BankAccount,
   type SupportedBank,
@@ -162,7 +163,7 @@ export default function NewBankAccountScreen() {
         {/* Submit */}
         <View className="flex-row gap-3">
           <Pressable
-            onPress={() => router.back()}
+            onPress={() => router.dismissTo(ROUTE_PARENTS['(tabs)/cards/new'])}
             disabled={createMut.isPending}
             className="flex-1 bg-white dark:bg-ink-900 border border-ink-200 dark:border-ink-700 rounded-xl py-3 items-center"
           >
