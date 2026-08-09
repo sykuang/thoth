@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+from backend.server import db
+
 
 def _register(client, email: str = "replica-user@palace.example") -> str:
     response = client.post(
@@ -19,6 +21,31 @@ def _register(client, email: str = "replica-user@palace.example") -> str:
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_replica_partition_upsert_qualifies_postgres_conflict_columns() -> None:
+    class _Result:
+        @staticmethod
+        def fetchone() -> tuple[int]:
+            return (1,)
+
+    class _Connection:
+        sql = ""
+
+        def execute(self, sql: str, _params: tuple[object, ...]) -> _Result:
+            self.sql = sql
+            return _Result()
+
+    conn = _Connection()
+    assert db.upsert_replica_partition(
+        conn,
+        user_id=7,
+        partition_key="user",
+        content_hash="abc",
+    ) == 1
+    assert "WHEN replica_partitions.content_hash = excluded.content_hash" in conn.sql
+    assert "THEN replica_partitions.generation" in conn.sql
+    assert "ELSE replica_partitions.generation + 1" in conn.sql
 
 
 def _seed_bank(data_root: Path, *, user_id: int = 1, bank: str = "cathay") -> None:

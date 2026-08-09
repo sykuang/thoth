@@ -1276,8 +1276,9 @@ def upsert_replica_partition(
         VALUES (?, ?, 1, ?, ?)
         ON CONFLICT(user_id, partition_key) DO UPDATE SET
             generation = CASE
-                WHEN content_hash = excluded.content_hash THEN generation
-                ELSE generation + 1
+                WHEN replica_partitions.content_hash = excluded.content_hash
+                    THEN replica_partitions.generation
+                ELSE replica_partitions.generation + 1
             END,
             content_hash = excluded.content_hash,
             updated_at = excluded.updated_at
