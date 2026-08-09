@@ -6,7 +6,7 @@
  * bank/account/card/period/category/search/direction 全部只在 frontend filter。
  *
  * UX:
- *   - 上方 filter bar: bank chips (多選) + category/subcategory + search box + 月份 picker
+ *   - 明細 header 的篩選按鈕開啟 bank/category/subcategory/search sheet；月份獨立控制
  *   - 中段 stats banner: total + by_bank breakdown
  *   - 主表: 日期/銀行/帳號or卡號/說明/金額/分類
  *   - 分頁: 每頁 100 筆, 上下一頁 + 跳轉
@@ -16,8 +16,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   ActivityIndicator,
+  Modal,
+  Platform,
   Pressable,
   RefreshControl,
+  ScrollView,
   Text,
   TextInput,
   View,
@@ -136,6 +139,7 @@ export default function TransactionsScreen() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [bulkSheetOpen, setBulkSheetOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
   const appliedRouteSignatureRef = useRef<string | null>(null);
   // Expo Router tabs keep this screen mounted; route params are external state.
   // This effect is the intentional bridge from router state into clearable UI filter state.
@@ -161,6 +165,7 @@ export default function TransactionsScreen() {
       setSelectionMode(false);
       setSelectedKeys(new Set());
       setBulkSheetOpen(false);
+      setFilterOpen(false);
     }
   }, [initialBank, accountNo, cardNo, params.drilldown]);
   /* eslint-enable react-hooks/set-state-in-effect */
@@ -357,15 +362,17 @@ export default function TransactionsScreen() {
     setCategory('');
     setSubcategory('');
     setSearch('');
-    setDirection('all');
-    // 清 filter = 回到本月（不再有「全期」概念, 改用「年」granularity 看全期）
-    setGranularity('month');
-    setSelectedPeriod(currentPeriodKey('month'));
   }
 
   // Phase 9 C-2 (2026-06-19): total 看 filtered (client-side filter 後), 顯示「N 筆」.
   const filteredCount = viewMode === 'list' ? timelineItems.length : filteredItems.length;
   const rawCount = rawItems.length + (viewMode === 'list' ? brokeragePeriodActivities.length : 0);
+  const activeFilterCount =
+    Number(selectedBanks.length > 0)
+    + Number(Boolean(effectiveAccountNo || effectiveCardNo))
+    + Number(category !== '')
+    + Number(subcategory !== '')
+    + Number(search.trim().length > 0);
   const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;
   const isUnsupportedAccountDrilldown = Boolean(
     effectiveAccountNo && selectedBanks.length === 1 && TWD_TXN_UNSUPPORTED_BANKS.has(selectedBanks[0]),
@@ -521,6 +528,27 @@ export default function TransactionsScreen() {
           <Text className="text-ink-400 dark:text-ink-500 text-small ml-2 flex-1">
             {periodLabel}
           </Text>
+          {viewMode === 'list' && (
+            <Pressable
+              onPress={() => setFilterOpen(true)}
+              className={`mr-2 px-3 py-1.5 rounded-lg border ${
+                activeFilterCount > 0
+                  ? 'bg-brand-50 border-brand-300 dark:bg-brand-950 dark:border-brand-700'
+                  : 'bg-white border-ink-200 dark:bg-ink-900 dark:border-ink-700'
+              }`}
+              testID="txn-filter-open"
+              accessibilityRole="button"
+              accessibilityLabel={activeFilterCount > 0 ? `篩選，已套用 ${activeFilterCount} 項` : '篩選交易'}
+            >
+              <Text className={`text-small font-semibold ${
+                activeFilterCount > 0
+                  ? 'text-brand-700 dark:text-brand-300'
+                  : 'text-ink-600 dark:text-ink-300'
+              }`}>
+                篩選{activeFilterCount > 0 ? ` ${activeFilterCount}` : ''}
+              </Text>
+            </Pressable>
+          )}
           {/* 「明細 / 分類」segmented — 對應 viewMode state, 不影響 filter/卡片 */}
           <View className="flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-0.5">
             <Pressable
@@ -567,194 +595,7 @@ export default function TransactionsScreen() {
             裡分別看得到，這裡再 dump 一份只搶 filter section 的視覺權重。 */}
 
         {/* ===== Filters ===== */}
-        {/* 2026-06-22 (使用者指示): 篩選 card 只在「明細」view 顯示 — 分類 view 永遠不篩選.
-            這樣分類視角永遠是「整個 period 的分佈」, 跟 dashboard 分類卡片語意一致. */}
-        {viewMode === 'list' && (
-        <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 mb-4 shadow-card">
-          <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-3">篩選</Text>
-
-          {/* Bank chips */}
-          {availableBanks.length > 0 && (
-            <View className="mb-3">
-              <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
-                銀行 (不選=全部)
-              </Text>
-              <View className="flex-row flex-wrap gap-2">
-                {availableBanks.map((b) => {
-                  const sel = selectedBanks.includes(b);
-                  return (
-                    <Pressable
-                      key={b}
-                      onPress={() => toggleBank(b)}
-                      className={`px-3 py-1.5 rounded-full border ${
-                        sel
-                          ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
-                          : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
-                      }`}
-                    >
-                      <Text
-                        className={`text-small ${
-                          sel ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
-                        }`}
-                      >
-                        {BANK_LABELS[b as SupportedBank] ?? b}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </View>
-          )}
-
-          {/* Phase 8 (2026-06-15 使用者指示): 「交易類型」(KIND) filter 已移除,
-              改成下方的「分類」(category) filter — 對使用者更直觀 */}
-
-          {/* 分類 filter (13 主類 + 5 收入類 + 轉帳/還款 — 從現有 rule.category dynamic 撈) */}
-          <View className="mb-3">
-            <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
-              分類
-            </Text>
-            <View className="flex-row flex-wrap gap-2">
-              {/* 「全部」chip */}
-              <Pressable
-                onPress={() => {
-                  setCategory('');
-                  setSubcategory('');  // Phase 8.1: 清主類也要清子類
-                  // Phase 9 C-2: setPage 已砍 (拔分頁)
-                }}
-                className={`px-3 py-1.5 rounded-full border ${
-                  category === ''
-                    ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
-                    : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
-                }`}
-              >
-                <Text
-                  className={`text-small ${
-                    category === '' ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
-                  }`}
-                >
-                  全部
-                </Text>
-              </Pressable>
-              {/* Phase 9 C-2 (2026-06-19): chip 來源從 statsQ.by_category 改 client useMemo byCategory.
-                  跟 backend by_category 邏輯對齊 (skip excluded/auto_excluded, NULL 用 '__null__').
-                  2026-07-05 A 方案: 顯示順序不再吃 Object.keys insertion order，改固定生活記帳順序。 */}
-              {categoryKeys.map((c) => {
-                const sel = category === c;
-                return (
-                  <Pressable
-                    key={c}
-                    onPress={() => {
-                      // Phase 8.1: 換主類時清子類 (避免 stale "飲食.早餐" 套到 "交通" 上)
-                      if (category !== c) setSubcategory('');
-                      setCategory(c);
-                      // Phase 9 C-2: setPage 已砍 (拔分頁)
-                    }}
-                    className={`px-3 py-1.5 rounded-full border ${
-                      sel
-                        ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
-                        : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
-                    }`}
-                  >
-                    <Text
-                      className={`text-small ${
-                        sel ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
-                      }`}
-                    >
-                      {c === '__null__' ? '未分類' : c}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-          </View>
-
-          {/* Phase 9 C-2 (2026-06-19): 子類 chip 來源改 client useMemo bySubcategory (限縮主類). */}
-          {category.length > 0 && Object.keys(bySubcategory).length > 0 && (
-            <View className="mb-3">
-              <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
-                {category} 子分類
-              </Text>
-              <View className="flex-row flex-wrap gap-2">
-                <Pressable
-                  onPress={() => {
-                    setSubcategory('');
-                    // Phase 9 C-2: setPage 已砍 (拔分頁)
-                  }}
-                  className={`px-3 py-1.5 rounded-full border ${
-                    subcategory === ''
-                      ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
-                      : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
-                  }`}
-                >
-                  <Text
-                    className={`text-small ${
-                      subcategory === ''
-                        ? 'text-white font-semibold'
-                        : 'text-ink-600 dark:text-ink-300'
-                    }`}
-                  >
-                    全部
-                  </Text>
-                </Pressable>
-                {/* Phase 9 C-2 (2026-06-19): 子類 chip 來源改 client bySubcategory (含 category 限縮) */}
-                {Object.keys(bySubcategory).map((s) => {
-                  const sel = subcategory === s;
-                  return (
-                    <Pressable
-                      key={s}
-                      onPress={() => {
-                        setSubcategory(sel ? '' : s);  // 點已選 = toggle off
-                        // Phase 9 C-2: setPage 已砍 (拔分頁)
-                      }}
-                      className={`px-3 py-1.5 rounded-full border ${
-                        sel
-                          ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
-                          : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
-                      }`}
-                    >
-                      <Text
-                        className={`text-small ${
-                          sel ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
-                        }`}
-                      >
-                        {s}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </View>
-          )}
-
-          {/* Search + clear */}
-          <View className="flex-row gap-2 items-center">
-            <TextInput
-              className="flex-1 border border-ink-200 dark:border-ink-700 rounded-xl px-3 py-2 text-body bg-white dark:bg-ink-800 text-ink-900 dark:text-ink-50"
-              value={search}
-              onChangeText={(v) => {
-                setSearch(v);
-                // Phase 9 C-2: setPage 已砍 (拔分頁)
-              }}
-              placeholder="搜尋說明 / 標籤"
-              placeholderTextColor="#94a3b8"
-            />
-            {(selectedBanks.length > 0 ||
-              effectiveAccountNo.length > 0 ||
-              effectiveCardNo.length > 0 ||
-              category !== '' ||
-              subcategory !== '' ||
-              search.length > 0) && (
-              <Pressable
-                onPress={clearFilters}
-                className="px-3 py-2 rounded-xl border border-ink-300 dark:border-ink-700"
-              >
-                <Text className="text-ink-600 dark:text-ink-300 text-small">清除</Text>
-              </Pressable>
-            )}
-          </View>
-        </View>
-        )}
+        {/* Full filter controls live in the button-triggered sheet below; keep the list compact. */}
 
         {/* ===== 主表 / 載入 / 錯誤 ===== */}
         {viewMode === 'list' && brokerageScopeActive && brokerageQ.isError && (
@@ -933,6 +774,198 @@ export default function TransactionsScreen() {
         )}
       </View>
     </KeyboardAwareScrollView>
+    <Modal
+        visible={filterOpen}
+        transparent
+        animationType={Platform.OS === 'ios' ? 'slide' : 'fade'}
+        onRequestClose={() => setFilterOpen(false)}
+      >
+        <Pressable
+          className="flex-1 bg-black/50 justify-end web:items-center web:justify-center web:p-4"
+          onPress={() => setFilterOpen(false)}
+          accessible={false}
+          focusable={false}
+        >
+          <Pressable
+            className="bg-white dark:bg-ink-900 rounded-t-3xl web:rounded-2xl w-full max-w-[640px] max-h-[85%] shadow-pop"
+            onPress={(event) => event.stopPropagation()}
+            accessible={false}
+            focusable={false}
+            testID="txn-filter-sheet"
+          >
+            <View className="flex-row items-center justify-between px-5 pt-5 pb-3 border-b border-ink-100 dark:border-ink-800">
+              <Pressable
+                onPress={clearFilters}
+                disabled={activeFilterCount === 0}
+                className={activeFilterCount === 0 ? 'opacity-30' : ''}
+                testID="txn-filter-clear"
+                accessibilityRole="button"
+                accessibilityLabel="清除交易篩選"
+              >
+                <Text className="text-brand-600 dark:text-brand-400 text-body font-semibold">清除</Text>
+              </Pressable>
+              <Text className="text-ink-900 dark:text-ink-50 text-h3 font-bold">篩選交易</Text>
+              <Pressable
+                onPress={() => setFilterOpen(false)}
+                testID="txn-filter-done"
+                accessibilityRole="button"
+                accessibilityLabel="完成交易篩選"
+              >
+                <Text className="text-brand-600 dark:text-brand-400 text-body font-semibold">完成</Text>
+              </Pressable>
+            </View>
+            <ScrollView
+              className="px-5 pt-4"
+              keyboardShouldPersistTaps="handled"
+              automaticallyAdjustKeyboardInsets
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={{ paddingBottom: 36 }}
+            >
+              {availableBanks.length > 0 && (
+                <View className="mb-5">
+                  <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
+                    銀行 (不選=全部)
+                  </Text>
+                  <View className="flex-row flex-wrap gap-2">
+                    {availableBanks.map((bank) => {
+                      const selected = selectedBanks.includes(bank);
+                      return (
+                        <Pressable
+                          key={bank}
+                          onPress={() => toggleBank(bank)}
+                          className={`px-3 py-2 rounded-full border ${
+                            selected
+                              ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
+                              : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
+                          }`}
+                          accessibilityRole="button"
+                          accessibilityState={{ selected }}
+                        >
+                          <Text className={`text-small ${
+                            selected ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
+                          }`}>
+                            {BANK_LABELS[bank as SupportedBank] ?? bank}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
+              )}
+
+              <View className="mb-5">
+                <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
+                  分類
+                </Text>
+                <View className="flex-row flex-wrap gap-2">
+                  <Pressable
+                    onPress={() => {
+                      setCategory('');
+                      setSubcategory('');
+                    }}
+                    className={`px-3 py-2 rounded-full border ${
+                      category === ''
+                        ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
+                        : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
+                    }`}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: category === '' }}
+                  >
+                    <Text className={`text-small ${
+                      category === '' ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
+                    }`}>
+                      全部
+                    </Text>
+                  </Pressable>
+                  {categoryKeys.map((key) => {
+                    const selected = category === key;
+                    return (
+                      <Pressable
+                        key={key}
+                        onPress={() => {
+                          if (!selected) setSubcategory('');
+                          setCategory(key);
+                        }}
+                        className={`px-3 py-2 rounded-full border ${
+                          selected
+                            ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
+                            : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
+                        }`}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected }}
+                      >
+                        <Text className={`text-small ${
+                          selected ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
+                        }`}>
+                          {key === '__null__' ? '未分類' : key}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+
+              {category.length > 0 && Object.keys(bySubcategory).length > 0 && (
+                <View className="mb-5">
+                  <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-2">
+                    {category} 子分類
+                  </Text>
+                  <View className="flex-row flex-wrap gap-2">
+                    <Pressable
+                      onPress={() => setSubcategory('')}
+                      className={`px-3 py-2 rounded-full border ${
+                        subcategory === ''
+                          ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
+                          : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
+                      }`}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: subcategory === '' }}
+                    >
+                      <Text className={`text-small ${
+                        subcategory === '' ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
+                      }`}>
+                        全部
+                      </Text>
+                    </Pressable>
+                    {Object.keys(bySubcategory).map((key) => {
+                      const selected = subcategory === key;
+                      return (
+                        <Pressable
+                          key={key}
+                          onPress={() => setSubcategory(selected ? '' : key)}
+                          className={`px-3 py-2 rounded-full border ${
+                            selected
+                              ? 'bg-brand-600 border-brand-600 dark:bg-brand-500 dark:border-brand-500'
+                              : 'bg-white border-ink-200 dark:bg-ink-800 dark:border-ink-700'
+                          }`}
+                          accessibilityRole="button"
+                          accessibilityState={{ selected }}
+                        >
+                          <Text className={`text-small ${
+                            selected ? 'text-white font-semibold' : 'text-ink-600 dark:text-ink-300'
+                          }`}>
+                            {key}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
+              )}
+
+              {/* Search + clear */}
+              <TextInput
+                className="border border-ink-200 dark:border-ink-700 rounded-xl px-3 py-3 text-body bg-white dark:bg-ink-800 text-ink-900 dark:text-ink-50"
+                value={search}
+                onChangeText={setSearch}
+                placeholder="搜尋說明 / 標籤"
+                placeholderTextColor="#94a3b8"
+                returnKeyType="search"
+              />
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
     {/* Phase 9.2: 底部 selection bar (selectionMode 才出現, 浮在 list 上) */}
     {selectionMode && (
       <View

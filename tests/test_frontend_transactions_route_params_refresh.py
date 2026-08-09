@@ -99,7 +99,7 @@ def test_route_kind_is_not_a_hidden_filter_without_visible_kind_ui():
     """params.kind 曾殘留成 hidden filter；取消 bank 後仍看不到匯豐，按清除才出現。"""
     src = TRANSACTIONS_TSX.read_text()
     raw_block = src[src.index("const rawItems = useMemo(() => {"):src.index("const transactionRefreshing =")]
-    clear_area = src[src.index("{/* Search + clear */}"):src.index("</View>\n        </View>", src.index("{/* Search + clear */}"))]
+    clear_area = src[src.index("function clearFilters() {"):src.index("const filteredCount =")]
 
     assert "const initialKind" not in src
     assert "const [kind, setKind]" not in src
@@ -112,15 +112,14 @@ def test_hidden_account_card_scope_is_effective_only_while_drilldown_bank_select
     """取消/改選銀行後，即使 hidden active refs 還在，也不可再套 account/card scope。"""
     src = TRANSACTIONS_TSX.read_text()
     scope_block = src[src.index("const drilldownScopeActive = Boolean("):src.index("const rawItems = useMemo")]
-    clear_area = src[src.index("{/* Search + clear */}"):src.index("</View>\n        </View>", src.index("{/* Search + clear */}"))]
+    badge_area = src[src.index("const activeFilterCount ="):src.index("const brokerageAccountCount =")]
 
     assert "initialBank && selectedBanks.length === 1 && selectedBanks[0] === initialBank" in scope_block
     assert "const effectiveAccountNo = drilldownScopeActive ? activeAccountNo : '';" in scope_block
     assert "const effectiveCardNo = drilldownScopeActive ? activeCardNo : '';" in scope_block
-    assert "effectiveAccountNo.length > 0" in clear_area
-    assert "effectiveCardNo.length > 0" in clear_area
-    assert "activeAccountNo.length > 0" not in clear_area
-    assert "activeCardNo.length > 0" not in clear_area
+    assert "Boolean(effectiveAccountNo || effectiveCardNo)" in badge_area
+    assert "activeAccountNo" not in badge_area
+    assert "activeCardNo" not in badge_area
 
 
 def test_bank_filter_options_are_union_of_credential_and_dataset_banks():
@@ -138,3 +137,32 @@ def test_bank_filter_options_are_union_of_credential_and_dataset_banks():
     assert "return Array.from(banks);" in block
     assert "return credentialBanks" not in block
     assert "return Array.from(fallbackBanks)" not in block
+
+
+def test_transaction_filters_are_hidden_behind_one_button_and_modal():
+    """銀行／分類／搜尋不可常駐佔滿交易頁；按篩選後才顯示完整 controls。"""
+    src = TRANSACTIONS_TSX.read_text()
+
+    assert "const [filterOpen, setFilterOpen] = useState(false);" in src
+    header = src[src.index("{/* Section header"):src.index("{/* Phase 8.2", src.index("{/* Section header"))]
+    assert 'testID="txn-filter-open"' in header
+    assert "{viewMode === 'list' && (" in header
+    assert "篩選{activeFilterCount > 0 ? ` ${activeFilterCount}` : ''}" in src
+    assert '<Modal\n        visible={filterOpen}' in src
+    assert 'testID="txn-filter-sheet"' in src
+    assert 'testID="txn-filter-done"' in src
+    assert 'testID="txn-filter-clear"' in src
+    assert src.count("accessible={false}") >= 2
+    assert src.count("focusable={false}") >= 2
+    assert "銀行 (不選=全部)" in src
+    assert 'placeholder="搜尋說明 / 標籤"' in src
+
+    main = src[src.index("{/* ===== Filters ===== */}"):src.index("{/* ===== 主表 / 載入 / 錯誤 ===== */}")]
+    assert "銀行 (不選=全部)" not in main
+    assert 'placeholder="搜尋說明 / 標籤"' not in main
+    assert "bg-white dark:bg-ink-900 rounded-2xl p-5 mb-4 shadow-card" not in main
+
+    clear = src[src.index("function clearFilters() {"):src.index("const filteredCount =")]
+    assert "setDirection('all')" not in clear
+    assert "setGranularity('month')" not in clear
+    assert "setSelectedPeriod(" not in clear
