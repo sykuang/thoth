@@ -4,7 +4,7 @@
  * 統一規則:
  *   - 純台幣 (currency='TWD' 且無 consume_currency) → "+NT$ 1,234" / "-NT$ 567"
  *   - 外幣 billed/pending →
- *       * mode='auto'             "EUR 18.60"  + 副字 "≈ NT$ 687"
+ *       * mode='auto'             "EUR 18.60"  + billed 副字 "NT$ 687"／pending estimate「≈ NT$ 687」
  *       * mode='always_twd'       "+NT$ 687"  (+ 副字 "EUR 18.60")
  *       * mode='always_original'  "EUR 18.60" (純原幣, 無副字)
  *   - HSBC pending (currency=EUR, fx_rate=null) → "EUR 18.60" + 副字 "⏳ 出帳後才有匯率"
@@ -59,7 +59,7 @@ export function formatCurrency(amount: number, currency: string): string {
 export type AmountRender = {
   /** 大字, 含正負號 (例 "+NT$ 1,234" / "-EUR 18.60") */
   primary: string;
-  /** 副字 (例 "≈ NT$ 687" 或 "⏳ 出帳後才有匯率"), null 代表不顯示 */
+  /** 副字 (例 "NT$ 687"、"≈ NT$ 687" 或 "⏳ 出帳後才有匯率"), null 代表不顯示 */
   sub: string | null;
   /** 給 UI 配色用 — income/expense/zero, caller 自決顏色 class */
   direction: 'income' | 'expense' | 'zero';
@@ -157,7 +157,7 @@ export function renderAmount(txn: Transaction, mode: FxDisplayMode = 'auto'): Am
       if (twdAbs != null) {
         return {
           primary: originalStr,
-          sub: `≈ ${formatCurrency(twdAbs, 'TWD')}`,
+          sub: `${txn.fx_rate_source === 'bank_billed' ? '' : '≈ '}${formatCurrency(twdAbs, 'TWD')}`,
           direction,
         };
       }

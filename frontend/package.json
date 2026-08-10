@@ -56,7 +56,7 @@
     "desktop:build:debug": "tauri build --debug",
     "desktop:icon": "tauri icon",
     "lint": "expo lint",
-    "test:decimal": "tsx src/lib/decimal.test.ts && tsx src/lib/transactionTimeline.test.ts",
+    "test:decimal": "tsx src/lib/decimal.test.ts && tsx src/lib/transactionTimeline.test.ts && tsx src/lib/currency.test.ts",
     "test:transactions": "tsx src/lib/txnFilter.test.ts",
     "test:replica": "tsx src/lib/replica.test.ts && tsx src/lib/replicaSync.test.ts && tsx src/lib/dashboardCache.test.ts && tsx src/lib/accountTabCache.test.ts",
     "test:routes": "tsx src/lib/routeParents.test.ts",
