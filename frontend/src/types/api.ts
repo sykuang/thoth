@@ -462,6 +462,24 @@ export const BANK_LABELS: Record<SupportedBank, string> = {
 // Phase 6 Plan A — Portfolio Summary (MoneyBook 風 dashboard)
 // =====================================================================
 
+export type DashboardStats = {
+  total: number;
+  total_income: number;
+  total_expense: number;
+  total_net: number;
+  amount_by_month: Record<string, { income: number; expense: number; net: number; count: number }>;
+  amount_by_category: Record<string, number>;
+  by_kind: Record<string, number>;
+  amount_by_flow_type?: Record<string, number>;
+  subscription_total?: number;
+  subscription_by_month?: Record<string, number>;
+  amount_by_income_category?: Record<string, number>;
+  passive_income_total?: number;
+  passive_income_by_month?: Record<string, number>;
+  passive_income_pct?: number;
+  income_unclassified_count?: number;
+};
+
 export type PortfolioBankSummary = {
   bank: string;
   assets: number | null;

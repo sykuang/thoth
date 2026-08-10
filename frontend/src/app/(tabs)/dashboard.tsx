@@ -8,7 +8,7 @@
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -18,11 +18,17 @@ import {
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { PaymentRemindersCard } from '@/components/PaymentRemindersCard';
 import { useBreakpoint } from '@/hooks/useBreakpoint';
+import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import { api } from '@/lib/api';
+import {
+  fetchCompleteDashboardCache,
+  hasNewerDashboardRevision,
+} from '@/lib/dashboardCache';
+import type { ReplicaDashboardCache } from '@/lib/replica';
 import { useAuthStore } from '@/stores/auth';
 import {
   type BankAccount,
-  type Me,
+  type DashboardStats,
   type PaymentReminder,
   type PortfolioSummary,
   type SyncJob,
@@ -34,22 +40,34 @@ import {
 export default function Dashboard() {
   const router = useRouter();
   const bp = useBreakpoint();
+  const email = useAuthStore((s) => s.email);
   const logout = useAuthStore((s) => s.logout);
   const qc = useQueryClient();
-
-  const meQ = useQuery<Me>({
-    queryKey: ['me'],
-    queryFn: () => api<Me>('/auth/me'),
-  });
+  const datasetQ = useFrontendDatasetCache();
+  const localDashboard = datasetQ.data?.dashboardCache;
+  const { ownerKey, persistDashboardCache } = datasetQ;
+  const [remoteDashboard, setRemoteDashboard] = useState<{
+    ownerKey: string;
+    cache: ReplicaDashboardCache;
+  }>();
+  const activeOwnerRef = useRef(ownerKey);
+  const refreshRef = useRef<{ ownerKey: string; promise: Promise<void> } | undefined>(undefined);
+  const completeRevisionsRef = useRef<[number, number, number]>([0, 0, 0]);
+  const [refreshTick, bumpRefreshTick] = useState(0);
+  useEffect(() => {
+    activeOwnerRef.current = ownerKey;
+  }, [ownerKey]);
 
   const accountsQ = useQuery<BankAccount[]>({
-    queryKey: ['accounts'],
+    queryKey: ['accounts', ownerKey],
     queryFn: () => api<BankAccount[]>('/accounts'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
   const jobsQ = useQuery<SyncJob[]>({
-    queryKey: ['sync', 'jobs'],
+    queryKey: ['sync', 'jobs', ownerKey],
     queryFn: () => api<SyncJob[]>('/sync/jobs'),
+    enabled: Boolean(ownerKey),
     refetchInterval: (q) => {
       const data = q.state.data;
       if (!data) return false;
@@ -60,44 +78,113 @@ export default function Dashboard() {
   // W (2026-06-17): 砍 triggerSync (per-account) + triggerSyncAll —
   // PortfolioHeader 重寫後完全沒同步按鈕了, 同步交給 /sync 頁面處理.
 
-  // Phase 6 Plan A — portfolio summary (淨資產主數字 + 資產 / 負債 / 本月消費)
-  // Phase X (2026-06-18): 拿掉 staleTime: 30_000 走 queryClient default (5min)
-  // — sync / toggle excluded / bulk edit 都會 invalidate, 5min cache 安全且省 traffic.
+  // Primary dashboard cards render the last owner-scoped SQLite snapshot first;
+  // these requests then refresh canonical server truth in the background.
   const portfolioQ = useQuery<PortfolioSummary>({
-    queryKey: ['portfolio', 'summary'],
+    queryKey: ['portfolio', 'summary', ownerKey],
     queryFn: () => api<PortfolioSummary>('/portfolio/summary'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
-  // L8.5 — KPI: total income / expense / net + 本月支出 / 餐飲 / 卡費未出帳
-  type StatsResp = {
-    total: number;
-    total_income: number;
-    total_expense: number;
-    total_net: number;
-    amount_by_month: Record<string, { income: number; expense: number; net: number; count: number }>;
-    amount_by_category: Record<string, number>;
-    by_kind: Record<string, number>;
-    // Phase 6 (category taxonomy 2026-06-15)
-    amount_by_flow_type?: Record<string, number>;
-    subscription_total?: number;
-    subscription_by_month?: Record<string, number>;
-    // Phase 7 (Income 5 類 2026-06-15)
-    amount_by_income_category?: Record<string, number>;
-    passive_income_total?: number;
-    passive_income_by_month?: Record<string, number>;
-    passive_income_pct?: number;
-    income_unclassified_count?: number;
-  };
-  const statsQ = useQuery<StatsResp>({
-    queryKey: ['transactions', 'stats'],
-    queryFn: () => api<StatsResp>('/transactions/stats'),
-    // Phase X (2026-06-18): default 5min — sync/categories CRUD invalidate.
+  const statsQ = useQuery<DashboardStats>({
+    queryKey: ['transactions', 'stats', ownerKey],
+    queryFn: () => api<DashboardStats>('/transactions/stats'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
+  const refetchAccounts = accountsQ.refetch;
+  const refetchPortfolio = portfolioQ.refetch;
+  const refetchStats = statsQ.refetch;
+
+  const refreshDashboard = useCallback((): Promise<void> => {
+    if (!ownerKey || !datasetQ.isFetched) return Promise.resolve();
+    const inFlight = refreshRef.current;
+    if (inFlight?.ownerKey === ownerKey) return inFlight.promise;
+
+    const revisions: [number, number, number] = [0, 0, 0];
+    let completed = false;
+    const promise = fetchCompleteDashboardCache({
+      accounts: async () => {
+        const result = await refetchAccounts({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Accounts refresh returned no data');
+        revisions[0] = qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+      portfolio: async () => {
+        const result = await refetchPortfolio({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Portfolio refresh returned no data');
+        revisions[1] = qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+      stats: async () => {
+        const result = await refetchStats({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Statistics refresh returned no data');
+        revisions[2] = qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+    }).then((cache) => {
+      completed = true;
+      completeRevisionsRef.current = revisions;
+      if (activeOwnerRef.current !== ownerKey) return;
+      setRemoteDashboard({ ownerKey, cache });
+      void persistDashboardCache(cache).catch(() => {
+        // Server truth stays visible even if the local snapshot write fails.
+      });
+    }).catch(() => {
+      // Keep the previous complete snapshot when any authoritative read fails.
+    }).finally(() => {
+      if (refreshRef.current?.ownerKey !== ownerKey) return;
+      refreshRef.current = undefined;
+      if (!completed) return;
+      const current: [number, number, number] = [
+        qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0,
+      ];
+      if (activeOwnerRef.current === ownerKey
+        && hasNewerDashboardRevision(current, revisions)) {
+        bumpRefreshTick((value) => value + 1);
+      }
+    });
+    refreshRef.current = { ownerKey, promise };
+    return promise;
+  }, [
+    datasetQ.isFetched,
+    ownerKey,
+    persistDashboardCache,
+    qc,
+    refetchAccounts,
+    refetchPortfolio,
+    refetchStats,
+  ]);
+
+  useEffect(() => {
+    void refreshDashboard();
+  }, [refreshDashboard, refreshTick]);
+
+  useEffect(() => {
+    if (!ownerKey || refreshRef.current?.ownerKey === ownerKey) return;
+    const revisions: [number, number, number] = [
+      qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0,
+    ];
+    if (hasNewerDashboardRevision(revisions, completeRevisionsRef.current)) {
+      void refreshDashboard();
+    }
+  }, [
+    accountsQ.data,
+    ownerKey,
+    portfolioQ.data,
+    qc,
+    refreshDashboard,
+    statsQ.data,
+  ]);
 
   // Phase L10 (2026-06-20): 繳費提醒 (信用卡 auto-debit + 餘額不足/未設定)
   const remindersQ = useQuery<PaymentReminder[]>({
-    queryKey: ['auto-debit', 'reminders'],
+    queryKey: ['auto-debit', 'reminders', ownerKey],
     queryFn: () => api<PaymentReminder[]>('/cards/auto-debit/reminders'),
+    enabled: Boolean(ownerKey),
     // days_until_due 是日期衍生值；app 跨日後回前景時不能沿用昨天的 cache。
     refetchOnWindowFocus: 'always',
   });
@@ -126,7 +213,22 @@ export default function Dashboard() {
     router.replace('/login');
   }
 
-  const ready = (accountsQ.data ?? []).filter((a) => a.has_creds);
+  const dashboard = remoteDashboard?.ownerKey === ownerKey
+    ? remoteDashboard.cache
+    : localDashboard;
+  const accounts = dashboard?.accounts ?? [];
+  const portfolio = dashboard?.portfolio;
+  const stats = dashboard?.stats;
+  const dashboardLoading = !dashboard && (
+    (!datasetQ.isFetched && !datasetQ.isError)
+    || accountsQ.isPending
+    || portfolioQ.isPending
+    || statsQ.isPending
+  );
+  const dashboardError = !dashboard && !dashboardLoading && (
+    datasetQ.isError || accountsQ.isError || portfolioQ.isError || statsQ.isError
+  );
+  const ready = accounts.filter((a) => a.has_creds);
 
   // 是否有任何 job 正在跑 (queued / running) — 給「全部同步」按鈕看
   // (避免重複觸發整批; 個別卡仍可按 — 進 queue 等 backend 序列化執行)
@@ -164,12 +266,10 @@ export default function Dashboard() {
         <View className="flex-row items-start mb-6" testID="dashboard-header">
           <View className="flex-1">
             <Text className="text-ink-900 dark:text-ink-50 text-h1">儀表板</Text>
-            {meQ.data ? (
+            {email ? (
               <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
-                目前登入: <Text className="text-ink-900 dark:text-ink-50 font-semibold">{meQ.data.email}</Text>
+                目前登入: <Text className="text-ink-900 dark:text-ink-50 font-semibold">{email}</Text>
               </Text>
-            ) : meQ.isLoading ? (
-              <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">載入中…</Text>
             ) : null}
           </View>
           <Pressable
@@ -181,20 +281,34 @@ export default function Dashboard() {
         </View>
 
         {/* Phase 6 Plan A — Portfolio header (淨資產主數字 + 資產/負債/本月消費) */}
-        <PortfolioHeader portfolio={portfolioQ.data} isLoading={portfolioQ.isLoading} bp={bp} />
+        <PortfolioHeader portfolio={portfolio} isLoading={dashboardLoading} bp={bp} />
 
         {/* L8.5 — KPI 卡 (本月收支詳細 — 補 portfolio 沒有的 income / expense 拆分) */}
-        <KpiBar stats={statsQ.data} isLoading={statsQ.isLoading} bp={bp} />
+        <KpiBar stats={stats} isLoading={dashboardLoading} bp={bp} />
+
+        {dashboardError && (
+          <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
+            <Text className="text-ink-700 dark:text-ink-200 text-small mb-3">
+              暫時無法載入財務摘要，請稍後再試。
+            </Text>
+            <Pressable
+              className="self-start bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
+              onPress={() => { void refreshDashboard(); }}
+            >
+              <Text className="text-white text-small font-semibold">重新載入</Text>
+            </Pressable>
+          </View>
+        )}
 
         {/* Phase L10 (2026-06-20) — 繳費提醒 (auto-debit 沒設 / 餘額不足 + 3 天內到期)
             H2 位置: KPI 後, Subscription 前. 空 list 自動 hide. */}
         <PaymentRemindersCard reminders={remindersQ.data ?? []} />
 
         {/* Phase 6 (category taxonomy 2026-06-15) — 訂閱合計卡 (0 自動隱藏) */}
-        <SubscriptionCard stats={statsQ.data} bp={bp} />
+        <SubscriptionCard stats={stats} bp={bp} />
 
         {/* Phase 7 (Income 5 類 FIRE 2026-06-15) — 被動收入卡 (0 自動隱藏) */}
-        <PassiveIncomeCard stats={statsQ.data} bp={bp} />
+        <PassiveIncomeCard stats={stats} bp={bp} />
 
         {/* Phase 8.6 — sync UI 已搬到「帳戶」tab。
             (a) 帳戶 tab header 有「☁️ 全部同步」按鈕
@@ -220,7 +334,7 @@ export default function Dashboard() {
         )}
 
         {/* Empty state — 還沒任何已 cred 的 account → 引導去帳戶 tab 新增 */}
-        {ready.length === 0 && !accountsQ.isLoading && (
+        {Boolean(dashboard) && ready.length === 0 && (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-7 shadow-card items-center mb-4">
             <Text className="text-ink-700 dark:text-ink-200 text-h3 mb-1.5">還沒有任何設定好的帳號</Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center mb-4 leading-5">
@@ -254,24 +368,7 @@ export default function Dashboard() {
 // 本月 = sorted desc 的 amount_by_month 第一筆 key（避免硬寫 YYYY-MM
 // 害 timezone / 假月份顯示 0）
 
-type StatsForKpi = {
-  total: number;
-  total_income: number;
-  total_expense: number;
-  total_net: number;
-  amount_by_month: Record<string, { income: number; expense: number; net: number; count: number }>;
-  amount_by_category: Record<string, number>;
-  // Phase 6 (category taxonomy 2026-06-15)
-  amount_by_flow_type?: Record<string, number>;  // expense/income/transfer/investment
-  subscription_total?: number;
-  subscription_by_month?: Record<string, number>;
-  // Phase 7 (Income 5 類 2026-06-15) — FIRE 被動收入指標
-  amount_by_income_category?: Record<string, number>;  // salary/bonus/interest_dividend/investment_gain/other
-  passive_income_total?: number;  // interest_dividend + investment_gain
-  passive_income_by_month?: Record<string, number>;
-  passive_income_pct?: number;  // passive / total_income * 100 (1 位小數)
-  income_unclassified_count?: number;
-};
+type StatsForKpi = DashboardStats;
 
 function fmtTWD(n: number): string {
   // 數字 → "$1,234,567" / 負值 → "-$1,234,567"

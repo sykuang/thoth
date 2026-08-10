@@ -6,6 +6,7 @@ import {
   makeReplicaOwnerKey,
   ReplicaSyncCancelledError,
   syncReplica,
+  updateReplicaDashboardCache,
   updateReplicaPreferences,
   type ReplicaEnvelope,
   type ReplicaRequest,
@@ -172,6 +173,25 @@ async function main() {
       .preferences.card_date_basis),
     'post',
   );
+  const dashboardCache = {
+    cachedAt: '2026-08-10T00:00:00Z',
+    accounts: [],
+    portfolio: { current_month_spending: 9479 },
+    stats: { total: 1 },
+  } as never;
+  await updateReplicaDashboardCache(
+    serializedStore,
+    ownerKey,
+    getReplicaOwnerEpoch(ownerKey),
+    dashboardCache,
+  );
+  equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
+  await syncReplica(serializedStore, ownerKey, async () => ({
+    ...full,
+    generations: { user: 2 },
+    partitions: [{ name: 'user', generation: 2, data: { marker: 'server-refresh' } }],
+  }));
+  equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
   const stalePreferenceEpoch = getReplicaOwnerEpoch(ownerKey);
   await clearReplicaOwner(serializedStore, 'https://money.example/', 'A@Example.COM');
   activateReplicaOwner(ownerKey);

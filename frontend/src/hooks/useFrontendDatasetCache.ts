@@ -4,11 +4,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { queryClient } from '@/lib/queryClient';
 import {
+  getReplicaOwnerEpoch,
   makeReplicaOwnerKey,
   projectReplicaDataset,
   REPLICA_SCHEMA_VERSION,
   ReplicaSyncCancelledError,
   syncReplica,
+  updateReplicaDashboardCache,
+  type ReplicaDashboardCache,
   type ReplicaResponse,
   type ReplicaTransactionDataset,
 } from '@/lib/replica';
@@ -61,6 +64,21 @@ export function useFrontendDatasetCache() {
     }
   }, [ownerKey, queryKey, requestReplica]);
 
+  const persistDashboardCache = useCallback(async (
+    dashboardCache: ReplicaDashboardCache,
+  ): Promise<void> => {
+    if (!ownerKey) return;
+    await updateReplicaDashboardCache(
+      replicaStore,
+      ownerKey,
+      getReplicaOwnerEpoch(ownerKey),
+      dashboardCache,
+    );
+    queryClient.setQueryData<ReplicaTransactionDataset>(queryKey, (current) => (
+      current ? { ...current, dashboardCache } : current
+    ));
+  }, [ownerKey, queryKey]);
+
   const replicaQ = useQuery<ReplicaTransactionDataset>({
     queryKey,
     enabled: Boolean(ownerKey),
@@ -101,9 +119,11 @@ export function useFrontendDatasetCache() {
 
   return {
     ...replicaQ,
+    ownerKey,
     isRefetching: replicaQ.isRefetching || isSyncing,
     refreshSnapshot: refreshReplica,
     refreshChanges: refreshReplica,
     isRefreshingChanges: isSyncing,
+    persistDashboardCache,
   };
 }

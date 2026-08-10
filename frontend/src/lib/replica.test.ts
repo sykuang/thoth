@@ -2,6 +2,7 @@ import {
   applyReplicaResponse,
   makeReplicaOwnerKey,
   projectReplicaDataset,
+  type ReplicaDashboardCache,
   type ReplicaEnvelope,
   type ReplicaResponse,
 } from './replica';
@@ -209,5 +210,59 @@ equal(parityTransactions[1].account_or_card, '*******-789');
 equal(parityTransactions[2].fx_rate, null);
 equal(parityTransactions[2].fx_rate_source, null);
 equal(parityTransactions[2].display_description, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ1234');
+
+const validDashboardCache = {
+  cachedAt: '2026-08-10T00:00:00Z',
+  accounts: [{ has_creds: true }],
+  portfolio: {
+    total_assets: 1,
+    fx_assets_twd: 0,
+    brokerage_assets_twd: 0,
+    total_liabilities: 0,
+    total_card_unpaid: 0,
+    total_loan: 0,
+    current_month_spending: 9479,
+    net_worth_with_fx: 1,
+    by_bank: [],
+  },
+  stats: {
+    total: 1,
+    total_income: 0,
+    total_expense: 9479,
+    total_net: -9479,
+    amount_by_month: {
+      '2026-08': { income: 0, expense: 9479, net: -9479, count: 1 },
+    },
+  },
+} as unknown as ReplicaDashboardCache;
+const validDashboardEnvelope = { ...envelope, dashboardCache: validDashboardCache };
+equal(projectReplicaDataset(validDashboardEnvelope).dashboardCache, validDashboardCache);
+
+const corruptAccountEnvelope = {
+  ...validDashboardEnvelope,
+  dashboardCache: { ...validDashboardCache, accounts: [{}] },
+} as unknown as ReplicaEnvelope;
+equal(projectReplicaDataset(corruptAccountEnvelope).dashboardCache, undefined);
+
+const corruptMonthEnvelope = {
+  ...validDashboardEnvelope,
+  dashboardCache: {
+    ...validDashboardCache,
+    stats: {
+      ...validDashboardCache.stats,
+      amount_by_month: { '2026-08': null },
+    },
+  },
+} as unknown as ReplicaEnvelope;
+equal(projectReplicaDataset(corruptMonthEnvelope).dashboardCache, undefined);
+
+const corruptAsOfEnvelope = {
+  ...validDashboardEnvelope,
+  dashboardCache: {
+    ...validDashboardCache,
+    portfolio: { ...validDashboardCache.portfolio, as_of: {} },
+  },
+} as unknown as ReplicaEnvelope;
+equal(projectReplicaDataset(corruptAsOfEnvelope).dashboardCache, undefined);
 
 console.log('replica contract tests passed');

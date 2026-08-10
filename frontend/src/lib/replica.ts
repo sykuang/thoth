@@ -1,4 +1,7 @@
 import type {
+  BankAccount,
+  DashboardStats,
+  PortfolioSummary,
   Transaction,
   TransactionSplit,
   UserPreferences,
@@ -20,6 +23,13 @@ export type ReplicaResponse = {
   partitions: ReplicaPartition[];
 };
 
+export type ReplicaDashboardCache = {
+  cachedAt: string;
+  accounts: BankAccount[];
+  portfolio: PortfolioSummary;
+  stats: DashboardStats;
+};
+
 export type ReplicaEnvelope = {
   ownerKey: string;
   ownerId: number;
@@ -27,12 +37,14 @@ export type ReplicaEnvelope = {
   generations: Record<string, number>;
   partitions: Record<string, unknown>;
   syncedAt: string;
+  dashboardCache?: ReplicaDashboardCache;
 };
 
 export type ReplicaTransactionDataset = {
   cursor: string;
   transactions: Transaction[];
   preferences: UserPreferences;
+  dashboardCache?: ReplicaDashboardCache;
 };
 
 export type ReplicaStore = {
@@ -109,6 +121,22 @@ export async function updateReplicaPreferences(
         user: { ...user, preferences },
       },
     });
+    assertOwnerActive(ownerKey, epoch);
+  });
+}
+
+export async function updateReplicaDashboardCache(
+  store: ReplicaStore,
+  ownerKey: string,
+  epoch: number,
+  dashboardCache: ReplicaDashboardCache,
+): Promise<void> {
+  await enqueueOwnerTask(ownerKey, async () => {
+    assertOwnerActive(ownerKey, epoch);
+    const current = await store.load(ownerKey);
+    assertOwnerActive(ownerKey, epoch);
+    if (!current || current.schemaVersion !== REPLICA_SCHEMA_VERSION) return;
+    await store.save({ ...current, dashboardCache });
     assertOwnerActive(ownerKey, epoch);
   });
 }
@@ -221,7 +249,67 @@ export function applyReplicaResponse(
     generations,
     partitions,
     syncedAt: new Date().toISOString(),
+    dashboardCache: current?.dashboardCache,
   };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function validDashboardCache(value: unknown): value is ReplicaDashboardCache {
+  const cache = asRecord(value);
+  const portfolio = asRecord(cache?.portfolio);
+  const stats = asRecord(cache?.stats);
+  if (!cache || typeof cache.cachedAt !== 'string' || !Array.isArray(cache.accounts)) return false;
+  if (!cache.accounts.every((row) => asRecord(row)?.has_creds === true
+    || asRecord(row)?.has_creds === false)) return false;
+  if (!portfolio || !Array.isArray(portfolio.by_bank)) return false;
+  if (portfolio.as_of !== undefined && portfolio.as_of !== null
+    && typeof portfolio.as_of !== 'string') return false;
+  for (const key of [
+    'total_assets',
+    'fx_assets_twd',
+    'brokerage_assets_twd',
+    'total_liabilities',
+    'total_card_unpaid',
+    'total_loan',
+    'current_month_spending',
+    'net_worth_with_fx',
+  ]) {
+    if (typeof portfolio[key] !== 'number' || !Number.isFinite(portfolio[key])) return false;
+  }
+  const amountByMonth = asRecord(stats?.amount_by_month);
+  if (!stats || !amountByMonth) return false;
+  for (const key of ['total', 'total_income', 'total_expense', 'total_net']) {
+    if (typeof stats[key] !== 'number' || !Number.isFinite(stats[key])) return false;
+  }
+  for (const key of [
+    'subscription_total',
+    'passive_income_total',
+    'passive_income_pct',
+    'income_unclassified_count',
+  ]) {
+    if (stats[key] !== undefined
+      && (typeof stats[key] !== 'number' || !Number.isFinite(stats[key]))) return false;
+  }
+  for (const value of Object.values(amountByMonth)) {
+    const bucket = asRecord(value);
+    if (!bucket) return false;
+    for (const key of ['income', 'expense', 'net', 'count']) {
+      if (typeof bucket[key] !== 'number' || !Number.isFinite(bucket[key])) return false;
+    }
+  }
+  for (const key of ['subscription_by_month', 'passive_income_by_month']) {
+    if (stats[key] === undefined) continue;
+    const amounts = asRecord(stats[key]);
+    if (!amounts || Object.values(amounts).some(
+      (amount) => typeof amount !== 'number' || !Number.isFinite(amount),
+    )) return false;
+  }
+  return true;
 }
 
 function asRows(value: unknown): Record<string, unknown>[] {
@@ -456,5 +544,8 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
         : 'auto',
       card_date_basis: preferences.card_date_basis === 'post' ? 'post' : 'consume',
     },
+    dashboardCache: validDashboardCache(envelope.dashboardCache)
+      ? envelope.dashboardCache
+      : undefined,
   };
 }
