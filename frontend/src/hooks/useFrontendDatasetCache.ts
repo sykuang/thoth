@@ -1,37 +1,35 @@
 import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api } from '@/lib/api';
 import { queryClient } from '@/lib/queryClient';
 import {
-  getReplicaOwnerEpoch,
-  makeReplicaOwnerKey,
+  assertReplicaOwnerEpoch,
+  guardReplicaOwnerRequest,
+  patchReplicaAccountTabCache,
   projectReplicaDataset,
   REPLICA_SCHEMA_VERSION,
   ReplicaSyncCancelledError,
   syncReplica,
+  updateReplicaAccountTabCache,
   updateReplicaDashboardCache,
+  waitForReplicaOwner,
+  type ReplicaAccountTabCache,
   type ReplicaDashboardCache,
   type ReplicaResponse,
   type ReplicaTransactionDataset,
 } from '@/lib/replica';
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { replicaStore } from '@/lib/replicaStore';
-import { useAuthStore } from '@/stores/auth';
 
 
 const hydratedOwners = new Set<string>();
 
 export function useFrontendDatasetCache() {
-  const token = useAuthStore((state) => state.token);
-  const email = useAuthStore((state) => state.email) ?? '';
-  const serverUrl = useAuthStore((state) => state.serverUrl);
-  const ownerKey = useMemo(
-    () => token && email && serverUrl ? makeReplicaOwnerKey(serverUrl, email) : '',
-    [token, email, serverUrl],
-  );
+  const { ownerKey, ownerEpoch, request } = useOwnerBoundApi();
+  const ownerSessionKey = `${ownerKey}#${ownerEpoch}`;
   const queryKey = useMemo(
-    () => ['frontend-dataset', 'replica', ownerKey] as const,
-    [ownerKey],
+    () => ['frontend-dataset', 'replica', ownerKey, ownerEpoch] as const,
+    [ownerEpoch, ownerKey],
   );
   const [isSyncing, setIsSyncing] = useState(false);
   const synchronizedOwnerRef = useRef<string | null>(null);
@@ -40,10 +38,10 @@ export function useFrontendDatasetCache() {
   const requestReplica = useCallback(async (
     path: '/replica/bootstrap' | '/replica/pull',
     body?: { schema_version: number; generations: Record<string, number> },
-  ): Promise<ReplicaResponse> => api<ReplicaResponse>(path, {
+  ): Promise<ReplicaResponse> => request<ReplicaResponse>(path, {
     method: path === '/replica/pull' ? 'POST' : 'GET',
     body,
-  }), []);
+  }), [request]);
 
   const refreshReplica = useCallback(async (): Promise<ReplicaTransactionDataset> => {
     if (!ownerKey) throw new Error('Replica owner is unavailable');
@@ -56,26 +54,59 @@ export function useFrontendDatasetCache() {
         `[replica-v1] synced owner_id=${envelope.ownerId} partitions=${Object.keys(envelope.partitions).length} transactions=${dataset.transactions.length}`,
       );
       queryClient.setQueryData(queryKey, dataset);
-      synchronizedOwnerRef.current = ownerKey;
+      synchronizedOwnerRef.current = ownerSessionKey;
       return dataset;
     } finally {
       syncCountRef.current -= 1;
       if (syncCountRef.current === 0) setIsSyncing(false);
     }
-  }, [ownerKey, queryKey, requestReplica]);
+  }, [ownerKey, ownerSessionKey, queryKey, requestReplica]);
 
   const persistDashboardCache = useCallback(async (
     dashboardCache: ReplicaDashboardCache,
+    expectedEpoch: number,
   ): Promise<void> => {
     if (!ownerKey) return;
     await updateReplicaDashboardCache(
       replicaStore,
       ownerKey,
-      getReplicaOwnerEpoch(ownerKey),
+      expectedEpoch,
       dashboardCache,
     );
+    assertReplicaOwnerEpoch(ownerKey, expectedEpoch);
     queryClient.setQueryData<ReplicaTransactionDataset>(queryKey, (current) => (
       current ? { ...current, dashboardCache } : current
+    ));
+  }, [ownerKey, queryKey]);
+
+  const persistAccountTabCache = useCallback(async (
+    accountTabCache: ReplicaAccountTabCache,
+    expectedEpoch: number,
+  ): Promise<void> => {
+    if (!ownerKey) return;
+    await updateReplicaAccountTabCache(
+      replicaStore,
+      ownerKey,
+      expectedEpoch,
+      accountTabCache,
+    );
+    assertReplicaOwnerEpoch(ownerKey, expectedEpoch);
+    queryClient.setQueryData<ReplicaTransactionDataset>(queryKey, (current) => (
+      current ? { ...current, accountTabCache } : current
+    ));
+  }, [ownerKey, queryKey]);
+
+  const persistAccountTabCacheUpdate = useCallback(async (
+    updater: (cache: ReplicaAccountTabCache) => ReplicaAccountTabCache,
+    expectedEpoch: number,
+  ): Promise<void> => {
+    if (!ownerKey) return;
+    await patchReplicaAccountTabCache(replicaStore, ownerKey, expectedEpoch, updater);
+    assertReplicaOwnerEpoch(ownerKey, expectedEpoch);
+    queryClient.setQueryData<ReplicaTransactionDataset>(queryKey, (current) => (
+      current?.accountTabCache
+        ? { ...current, accountTabCache: updater(current.accountTabCache) }
+        : current
     ));
   }, [ownerKey, queryKey]);
 
@@ -83,10 +114,15 @@ export function useFrontendDatasetCache() {
     queryKey,
     enabled: Boolean(ownerKey),
     queryFn: async () => {
-      const firstHydration = !hydratedOwners.has(ownerKey);
-      hydratedOwners.add(ownerKey);
+      await waitForReplicaOwner(ownerKey, ownerEpoch);
+      const firstHydration = !hydratedOwners.has(ownerSessionKey);
+      hydratedOwners.add(ownerSessionKey);
       if (firstHydration) {
-        const persisted = await replicaStore.load(ownerKey);
+        const persisted = await guardReplicaOwnerRequest(
+          ownerKey,
+          ownerEpoch,
+          () => replicaStore.load(ownerKey),
+        );
         if (persisted?.schemaVersion === REPLICA_SCHEMA_VERSION) {
           const dataset = projectReplicaDataset(persisted);
           console.info(
@@ -99,7 +135,11 @@ export function useFrontendDatasetCache() {
         return await refreshReplica();
       } catch (syncError) {
         if (syncError instanceof ReplicaSyncCancelledError) throw syncError;
-        const persisted = await replicaStore.load(ownerKey);
+        const persisted = await guardReplicaOwnerRequest(
+          ownerKey,
+          ownerEpoch,
+          () => replicaStore.load(ownerKey),
+        );
         if (persisted?.schemaVersion === REPLICA_SCHEMA_VERSION) {
           return projectReplicaDataset(persisted);
         }
@@ -111,19 +151,23 @@ export function useFrontendDatasetCache() {
   });
 
   useEffect(() => {
-    if (!ownerKey || !replicaQ.data || synchronizedOwnerRef.current === ownerKey) return;
+    if (!ownerKey || !replicaQ.data || synchronizedOwnerRef.current === ownerSessionKey) return;
     void refreshReplica().catch(() => {
       // Offline/read failure keeps the last owner-scoped local replica visible.
     });
-  }, [ownerKey, replicaQ.data, refreshReplica]);
+  }, [ownerKey, ownerSessionKey, replicaQ.data, refreshReplica]);
 
   return {
     ...replicaQ,
     ownerKey,
+    ownerEpoch,
+    ownerApi: request,
     isRefetching: replicaQ.isRefetching || isSyncing,
     refreshSnapshot: refreshReplica,
     refreshChanges: refreshReplica,
     isRefreshingChanges: isSyncing,
     persistDashboardCache,
+    persistAccountTabCache,
+    persistAccountTabCacheUpdate,
   };
 }

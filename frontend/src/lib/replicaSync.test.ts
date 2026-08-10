@@ -3,11 +3,15 @@ import {
   assertReplicaOwnerEpoch,
   clearReplicaOwner,
   getReplicaOwnerEpoch,
+  guardReplicaOwnerRequest,
   makeReplicaOwnerKey,
+  patchReplicaAccountTabCache,
   ReplicaSyncCancelledError,
   syncReplica,
+  updateReplicaAccountTabCache,
   updateReplicaDashboardCache,
   updateReplicaPreferences,
+  waitForReplicaOwner,
   type ReplicaEnvelope,
   type ReplicaRequest,
   type ReplicaResponse,
@@ -27,6 +31,7 @@ function deepEqual(actual: unknown, expected: unknown): void {
 class MemoryStore implements ReplicaStore {
   value: ReplicaEnvelope | undefined;
   clears = 0;
+  clearGate: Promise<void> | undefined;
 
   async load(ownerKey: string) {
     return this.value?.ownerKey === ownerKey ? this.value : undefined;
@@ -37,6 +42,7 @@ class MemoryStore implements ReplicaStore {
   }
 
   async clear(ownerKey: string) {
+    if (this.clearGate) await this.clearGate;
     if (this.value?.ownerKey === ownerKey) this.value = undefined;
     this.clears += 1;
   }
@@ -186,12 +192,68 @@ async function main() {
     dashboardCache,
   );
   equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
+  const accountTabCache = {
+    cachedAt: '2026-08-10T03:00:00Z',
+    balances: [
+      { bank: 'cathay', account_no: '1234', excluded: false },
+      { bank: 'esun', account_no: '5678', excluded: false },
+    ],
+    accounts: [],
+    cards: [],
+    manualAccounts: [],
+  } as never;
+  await updateReplicaAccountTabCache(
+    serializedStore,
+    ownerKey,
+    getReplicaOwnerEpoch(ownerKey),
+    accountTabCache,
+  );
+  equal(serializedStore.value?.accountTabCache?.balances[0]?.account_no, '1234');
+  await patchReplicaAccountTabCache(
+    serializedStore,
+    ownerKey,
+    getReplicaOwnerEpoch(ownerKey),
+    (cache) => ({
+      ...cache,
+      balances: cache.balances.map((row) => row.account_no === '1234'
+        ? { ...row, excluded: true }
+        : row),
+    }),
+  );
+  equal(serializedStore.value?.accountTabCache?.balances[0]?.excluded, true);
+  equal(serializedStore.value?.accountTabCache?.balances[1]?.excluded, false);
   await syncReplica(serializedStore, ownerKey, async () => ({
     ...full,
     generations: { user: 2 },
     partitions: [{ name: 'user', generation: 2, data: { marker: 'server-refresh' } }],
   }));
   equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
+  equal(serializedStore.value?.accountTabCache?.balances[0]?.account_no, '1234');
+
+  let releaseClear!: () => void;
+  serializedStore.clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
+  const pendingClear = clearReplicaOwner(
+    serializedStore,
+    'https://money.example/',
+    'A@Example.COM',
+  );
+  const reactivatedEpoch = getReplicaOwnerEpoch(ownerKey);
+  activateReplicaOwner(ownerKey);
+  let ownerReady = false;
+  const waitingForClear = waitForReplicaOwner(ownerKey, reactivatedEpoch).then(() => {
+    ownerReady = true;
+  });
+  await Promise.resolve();
+  equal(ownerReady, false);
+  equal(serializedStore.value?.accountTabCache?.balances[0]?.account_no, '1234');
+  releaseClear();
+  await pendingClear;
+  await waitingForClear;
+  equal(ownerReady, true);
+  equal(serializedStore.value, undefined);
+  serializedStore.clearGate = undefined;
+  await syncReplica(serializedStore, ownerKey, async () => full);
+
   const stalePreferenceEpoch = getReplicaOwnerEpoch(ownerKey);
   await clearReplicaOwner(serializedStore, 'https://money.example/', 'A@Example.COM');
   activateReplicaOwner(ownerKey);
@@ -216,6 +278,35 @@ async function main() {
     (serializedStore.value?.partitions.user as { preferences?: unknown }).preferences,
     undefined,
   );
+  let staleAccountTabCancelled = false;
+  await updateReplicaAccountTabCache(
+    serializedStore,
+    ownerKey,
+    stalePreferenceEpoch,
+    accountTabCache,
+  ).catch((error: unknown) => {
+    staleAccountTabCancelled = error instanceof ReplicaSyncCancelledError;
+  });
+  equal(staleAccountTabCancelled, true);
+  equal(serializedStore.value?.accountTabCache, undefined);
+
+  const guardedEpoch = getReplicaOwnerEpoch(ownerKey);
+  let releaseGuardedRequest!: (value: string) => void;
+  const guardedRequest = guardReplicaOwnerRequest(
+    ownerKey,
+    guardedEpoch,
+    () => new Promise<string>((resolve) => { releaseGuardedRequest = resolve; }),
+  );
+  await clearReplicaOwner(serializedStore, 'https://money.example/', 'A@Example.COM');
+  activateReplicaOwner(ownerKey);
+  await syncReplica(serializedStore, ownerKey, async () => full);
+  releaseGuardedRequest('stale-success');
+  let staleSuccessCancelled = false;
+  await guardedRequest.catch((error: unknown) => {
+    staleSuccessCancelled = error instanceof ReplicaSyncCancelledError;
+  });
+  equal(staleSuccessCancelled, true);
+  equal(serializedStore.value?.ownerId, full.owner_id);
 
   let rejectRequest!: (error: Error) => void;
   let rejectingRequestStarted = false;

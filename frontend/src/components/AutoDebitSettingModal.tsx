@@ -15,7 +15,8 @@ import { useState } from 'react';
 import { ActivityIndicator, Modal, Pressable, Text, View } from 'react-native';
 
 import { Dropdown, type DropdownOption } from '@/components/Dropdown';
-import { api, formatApiError } from '@/lib/api';
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
+import { formatApiError } from '@/lib/api';
 import {
   type AutoDebitSetting,
   type EligibleAccount,
@@ -42,20 +43,21 @@ function fmtBalance(b: number | null): string {
 
 export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }: Props) {
   const qc = useQueryClient();
+  const { ownerKey, ownerEpoch, request: ownerApi } = useOwnerBoundApi();
   const [err, setErr] = useState<string | null>(null);
 
   // 取 user 所有 TWD 活儲帳戶
   const accountsQ = useQuery<EligibleAccount[]>({
-    queryKey: ['auto-debit', 'eligible-accounts'],
-    queryFn: () => api<EligibleAccount[]>('/cards/auto-debit/eligible-accounts'),
-    enabled: visible,
+    queryKey: ['auto-debit', 'eligible-accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<EligibleAccount[]>('/cards/auto-debit/eligible-accounts'),
+    enabled: visible && Boolean(ownerKey),
   });
 
   // 取目前設定 (確認 currently selected)
   const settingsQ = useQuery<AutoDebitSetting[]>({
-    queryKey: ['auto-debit', 'settings'],
-    queryFn: () => api<AutoDebitSetting[]>('/cards/auto-debit/settings'),
-    enabled: visible,
+    queryKey: ['auto-debit', 'settings', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<AutoDebitSetting[]>('/cards/auto-debit/settings'),
+    enabled: visible && Boolean(ownerKey),
   });
 
   const currentSetting = settingsQ.data?.find((s) => s.card_bank === cardBank);
@@ -70,7 +72,7 @@ export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }:
 
   const saveMut = useMutation({
     mutationFn: async (vars: { account_bank: string; account_no: string }) => {
-      return api<AutoDebitSetting>(`/cards/auto-debit/settings/${cardBank}`, {
+      return ownerApi<AutoDebitSetting>(`/cards/auto-debit/settings/${cardBank}`, {
         method: 'PUT',
         body: vars,
       });
@@ -85,7 +87,7 @@ export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }:
 
   const clearMut = useMutation({
     mutationFn: async () => {
-      return api<void>(`/cards/auto-debit/settings/${cardBank}`, {
+      return ownerApi<void>(`/cards/auto-debit/settings/${cardBank}`, {
         method: 'DELETE',
       });
     },

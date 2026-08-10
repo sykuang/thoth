@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = ROOT / "frontend/src/app/(tabs)/dashboard.tsx"
+OWNER_HOOK = ROOT / "frontend/src/hooks/useOwnerBoundApi.ts"
 
 
 def test_dashboard_hydrates_primary_cards_from_one_complete_snapshot() -> None:
@@ -25,13 +26,16 @@ def test_dashboard_remote_queries_and_persistence_are_owner_bound() -> None:
     source = DASHBOARD.read_text(encoding="utf-8")
 
     for query_key in (
-        "['accounts', ownerKey]",
-        "['portfolio', 'summary', ownerKey]",
-        "['transactions', 'stats', ownerKey]",
-        "['sync', 'jobs', ownerKey]",
-        "['auto-debit', 'reminders', ownerKey]",
+        "['accounts', ownerKey, ownerEpoch]",
+        "['portfolio', 'summary', ownerKey, ownerEpoch]",
+        "['transactions', 'stats', ownerKey, ownerEpoch]",
+        "['sync', 'jobs', ownerKey, ownerEpoch]",
+        "['auto-debit', 'reminders', ownerKey, ownerEpoch]",
     ):
         assert query_key in source
+    owner_hook = OWNER_HOOK.read_text(encoding="utf-8")
+    assert "guardReplicaOwnerRequest" in owner_hook
+    assert "skipAuthRetry: true" in owner_hook
 
     assert "fetchCompleteDashboardCache" in source
     assert "activeOwnerRef.current !== ownerKey" in source
@@ -49,7 +53,9 @@ def test_query_invalidation_refreshes_and_persists_a_complete_snapshot() -> None
     ):
         assert revision_signal in source
     assert "void refreshDashboard();" in source
-    assert "persistDashboardCache(cache)" in source
+    assert "persistDashboardCache(cache, ownerEpoch)" in source
+    assert "assertReplicaOwnerEpoch(ownerKey, ownerEpoch)" in source
+    assert "remoteDashboard.epoch === ownerEpoch" in source
     assert "throwOnError: true" in source
     assert "if (!completed) return;" in source
     assert "staleTime: 1000" not in source

@@ -4,7 +4,8 @@ import * as WebBrowser from 'expo-web-browser';
 import { useRouter } from 'expo-router';
 import { Platform, Pressable, Text, View } from 'react-native';
 
-import { api, formatApiError } from '@/lib/api';
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
+import { formatApiError } from '@/lib/api';
 import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
 import type {
   BrokerageAccount,
@@ -34,12 +35,14 @@ function accountLabel(account: BrokerageAccount): string {
 export function SnapTradeConnectionSettings() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { ownerKey, ownerEpoch, request: ownerApi } = useOwnerBoundApi();
   const statusQuery = useQuery({
-    queryKey: ['snaptrade', 'status'],
-    queryFn: () => api<SnapTradeStatus>('/snaptrade/status'),
+    queryKey: ['snaptrade', 'status', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradeStatus>('/snaptrade/status'),
+    enabled: Boolean(ownerKey),
   });
   const sync = useMutation({
-    mutationFn: () => api('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
+    mutationFn: () => ownerApi('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
@@ -61,7 +64,7 @@ export function SnapTradeConnectionSettings() {
   const connect = useMutation({
     mutationFn: async () => {
       const callbackUri = ExpoLinking.createURL('/investments', { isTripleSlashed: true });
-      const response = await api<{ redirect_uri: string }>('/snaptrade/connect', {
+      const response = await ownerApi<{ redirect_uri: string }>('/snaptrade/connect', {
         method: 'POST',
         body: JSON.stringify({ redirect_uri: callbackUri }),
       });
@@ -123,16 +126,19 @@ export function SnapTradeConnectionSettings() {
 export function SnapTradeAccountsSection() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { ownerKey, ownerEpoch, request: ownerApi } = useOwnerBoundApi();
   const statusQuery = useQuery({
-    queryKey: ['snaptrade', 'status'],
-    queryFn: () => api<SnapTradeStatus>('/snaptrade/status'),
+    queryKey: ['snaptrade', 'status', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradeStatus>('/snaptrade/status'),
+    enabled: Boolean(ownerKey),
   });
   const portfolioQuery = useQuery({
-    queryKey: ['snaptrade', 'portfolio'],
-    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
+    queryKey: ['snaptrade', 'portfolio', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradePortfolio>('/snaptrade/portfolio'),
+    enabled: Boolean(ownerKey),
   });
   const sync = useMutation({
-    mutationFn: () => api('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
+    mutationFn: () => ownerApi('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
@@ -264,9 +270,11 @@ function AccountCard({
 }
 
 export function SnapTradeHoldingsSection({ accountId }: { accountId: string }) {
+  const { ownerKey, ownerEpoch, request: ownerApi } = useOwnerBoundApi();
   const portfolioQuery = useQuery({
-    queryKey: ['snaptrade', 'portfolio'],
-    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
+    queryKey: ['snaptrade', 'portfolio', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradePortfolio>('/snaptrade/portfolio'),
+    enabled: Boolean(ownerKey),
   });
   if (portfolioQuery.isLoading) {
     return <Text className="text-ink-400 text-small py-4">讀取券商持股明細…</Text>;

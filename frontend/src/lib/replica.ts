@@ -1,6 +1,9 @@
 import type {
   BankAccount,
+  BankAccountBalance,
+  Card,
   DashboardStats,
+  FinancialAccount,
   PortfolioSummary,
   Transaction,
   TransactionSplit,
@@ -30,6 +33,14 @@ export type ReplicaDashboardCache = {
   stats: DashboardStats;
 };
 
+export type ReplicaAccountTabCache = {
+  cachedAt: string;
+  balances: BankAccountBalance[];
+  accounts: BankAccount[];
+  cards: Card[];
+  manualAccounts: FinancialAccount[];
+};
+
 export type ReplicaEnvelope = {
   ownerKey: string;
   ownerId: number;
@@ -38,6 +49,7 @@ export type ReplicaEnvelope = {
   partitions: Record<string, unknown>;
   syncedAt: string;
   dashboardCache?: ReplicaDashboardCache;
+  accountTabCache?: ReplicaAccountTabCache;
 };
 
 export type ReplicaTransactionDataset = {
@@ -45,6 +57,7 @@ export type ReplicaTransactionDataset = {
   transactions: Transaction[];
   preferences: UserPreferences;
   dashboardCache?: ReplicaDashboardCache;
+  accountTabCache?: ReplicaAccountTabCache;
 };
 
 export type ReplicaStore = {
@@ -61,6 +74,8 @@ export type ReplicaRequest = (
 const ownerQueues = new Map<string, Promise<unknown>>();
 const ownerEpochs = new Map<string, number>();
 const blockedOwners = new Set<string>();
+const pendingOwnerClears = new Map<string, Promise<void>>();
+const activateAfterClear = new Set<string>();
 
 export class ReplicaSyncCancelledError extends Error {
   constructor() {
@@ -86,8 +101,18 @@ function assertOwnerActive(ownerKey: string, epoch: number): void {
 }
 
 export function activateReplicaOwner(ownerKey: string): void {
-  blockedOwners.delete(ownerKey);
   if (!ownerEpochs.has(ownerKey)) ownerEpochs.set(ownerKey, 0);
+  if (pendingOwnerClears.has(ownerKey)) {
+    activateAfterClear.add(ownerKey);
+    return;
+  }
+  blockedOwners.delete(ownerKey);
+}
+
+export async function waitForReplicaOwner(ownerKey: string, epoch: number): Promise<void> {
+  const pendingClear = pendingOwnerClears.get(ownerKey);
+  if (pendingClear) await pendingClear;
+  assertOwnerActive(ownerKey, epoch);
 }
 
 export function getReplicaOwnerEpoch(ownerKey: string): number {
@@ -97,6 +122,17 @@ export function getReplicaOwnerEpoch(ownerKey: string): number {
 
 export function assertReplicaOwnerEpoch(ownerKey: string, epoch: number): void {
   assertOwnerActive(ownerKey, epoch);
+}
+
+export async function guardReplicaOwnerRequest<T>(
+  ownerKey: string,
+  epoch: number,
+  request: () => Promise<T>,
+): Promise<T> {
+  assertOwnerActive(ownerKey, epoch);
+  const result = await request();
+  assertOwnerActive(ownerKey, epoch);
+  return result;
 }
 
 export async function updateReplicaPreferences(
@@ -137,6 +173,39 @@ export async function updateReplicaDashboardCache(
     assertOwnerActive(ownerKey, epoch);
     if (!current || current.schemaVersion !== REPLICA_SCHEMA_VERSION) return;
     await store.save({ ...current, dashboardCache });
+    assertOwnerActive(ownerKey, epoch);
+  });
+}
+
+export async function updateReplicaAccountTabCache(
+  store: ReplicaStore,
+  ownerKey: string,
+  epoch: number,
+  accountTabCache: ReplicaAccountTabCache,
+): Promise<void> {
+  await enqueueOwnerTask(ownerKey, async () => {
+    assertOwnerActive(ownerKey, epoch);
+    const current = await store.load(ownerKey);
+    assertOwnerActive(ownerKey, epoch);
+    if (!current || current.schemaVersion !== REPLICA_SCHEMA_VERSION) return;
+    await store.save({ ...current, accountTabCache });
+    assertOwnerActive(ownerKey, epoch);
+  });
+}
+
+export async function patchReplicaAccountTabCache(
+  store: ReplicaStore,
+  ownerKey: string,
+  epoch: number,
+  updater: (cache: ReplicaAccountTabCache) => ReplicaAccountTabCache,
+): Promise<void> {
+  await enqueueOwnerTask(ownerKey, async () => {
+    assertOwnerActive(ownerKey, epoch);
+    const current = await store.load(ownerKey);
+    assertOwnerActive(ownerKey, epoch);
+    if (!current || current.schemaVersion !== REPLICA_SCHEMA_VERSION
+      || !current.accountTabCache) return;
+    await store.save({ ...current, accountTabCache: updater(current.accountTabCache) });
     assertOwnerActive(ownerKey, epoch);
   });
 }
@@ -208,12 +277,19 @@ export async function clearReplicaOwner(
   if (!serverUrl || !email) return;
   const ownerKey = makeReplicaOwnerKey(serverUrl, email);
   blockedOwners.add(ownerKey);
+  activateAfterClear.delete(ownerKey);
   ownerEpochs.set(ownerKey, (ownerEpochs.get(ownerKey) ?? 0) + 1);
-  await enqueueOwnerTask(ownerKey, async () => {
+  const clearTask = enqueueOwnerTask(ownerKey, async () => {
     await store.clear(ownerKey);
     const legacyKey = `${serverUrl.trim().replace(/\/+$/, '').toLowerCase()}|${email.trim().toLowerCase()}|v1`;
     if (legacyKey !== ownerKey) await store.clear(legacyKey);
   });
+  pendingOwnerClears.set(ownerKey, clearTask);
+  await clearTask;
+  if (pendingOwnerClears.get(ownerKey) === clearTask) {
+    pendingOwnerClears.delete(ownerKey);
+    if (activateAfterClear.delete(ownerKey)) blockedOwners.delete(ownerKey);
+  }
 }
 
 export function applyReplicaResponse(
@@ -250,6 +326,7 @@ export function applyReplicaResponse(
     partitions,
     syncedAt: new Date().toISOString(),
     dashboardCache: current?.dashboardCache,
+    accountTabCache: current?.accountTabCache,
   };
 }
 
@@ -310,6 +387,112 @@ function validDashboardCache(value: unknown): value is ReplicaDashboardCache {
     )) return false;
   }
   return true;
+}
+
+function isNullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+function isNullableNumber(value: unknown): boolean {
+  return value === null || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function validBankAccount(value: unknown): boolean {
+  const row = asRecord(value);
+  return Boolean(row)
+    && typeof row?.id === 'number'
+    && Number.isInteger(row.id)
+    && typeof row.bank === 'string'
+    && typeof row.label === 'string'
+    && typeof row.created_at === 'string'
+    && typeof row.updated_at === 'string'
+    && typeof row.has_creds === 'boolean'
+    && Array.isArray(row.fields_set)
+    && row.fields_set.every((field) => typeof field === 'string');
+}
+
+function validBankBalance(value: unknown): boolean {
+  const row = asRecord(value);
+  if (!row
+    || typeof row.bank !== 'string'
+    || typeof row.account_no !== 'string'
+    || typeof row.currency !== 'string'
+    || !isNullableString(row.nickname)
+    || !isNullableString(row.product_type)
+    || !isNullableString(row.type)
+    || !isNullableNumber(row.balance)
+    || !isNullableString(row.snapshot_date)
+    || typeof row.is_stale !== 'boolean'
+    || !isNullableNumber(row.twd_estimate)
+    || !isNullableNumber(row.fx_rate_used)
+    || typeof row.excluded !== 'boolean') return false;
+  return row.nickname_overwrite === undefined || isNullableString(row.nickname_overwrite);
+}
+
+function validCard(value: unknown): boolean {
+  const row = asRecord(value);
+  if (!row
+    || typeof row.card_no !== 'string'
+    || typeof row.bank !== 'string'
+    || !isNullableString(row.name)
+    || !isNullableString(row.type)) return false;
+  for (const key of [
+    'nickname_overwrite',
+    'association',
+    'updated_at',
+    'statement_close_date',
+    'payment_due_date',
+    'last_payment_date',
+  ]) {
+    if (row[key] !== undefined && !isNullableString(row[key])) return false;
+  }
+  for (const key of [
+    'credit_limit',
+    'used_credit',
+    'available_credit',
+    'bill_due_amount',
+    'unbilled_amount',
+    'last_payment_amount',
+  ]) {
+    if (row[key] !== undefined && !isNullableNumber(row[key])) return false;
+  }
+  if (row.excluded !== undefined && typeof row.excluded !== 'boolean') return false;
+  if (row.is_cube !== undefined && row.is_cube !== null && typeof row.is_cube !== 'boolean') return false;
+  return row.bill_status === undefined || [
+    'due', 'paid', 'no_payment_required', 'overdue', 'unknown',
+  ].includes(String(row.bill_status));
+}
+
+function validFinancialAccount(value: unknown): boolean {
+  const row = asRecord(value);
+  if (!row) return false;
+  for (const key of ['id', 'source', 'source_ref', 'name', 'product_type', 'currency']) {
+    if (typeof row[key] !== 'string') return false;
+  }
+  for (const key of ['institution_name', 'account_ref', 'balance', 'as_of']) {
+    if (!isNullableString(row[key])) return false;
+  }
+  if (row.manual_balance !== undefined && !isNullableString(row.manual_balance)) return false;
+  if (row.valuation_source !== null && ![
+    'manual', 'yahoo_finance', 'manual_fallback',
+  ].includes(String(row.valuation_source))) return false;
+  return typeof row.included_in_net_worth === 'boolean'
+    && typeof row.editable === 'boolean'
+    && typeof row.deletable === 'boolean';
+}
+
+function validAccountTabCache(value: unknown): value is ReplicaAccountTabCache {
+  const cache = asRecord(value);
+  return Boolean(cache)
+    && typeof cache?.cachedAt === 'string'
+    && Array.isArray(cache.balances)
+    && cache.balances.every(validBankBalance)
+    && Array.isArray(cache.accounts)
+    && cache.accounts.every(validBankAccount)
+    && Array.isArray(cache.cards)
+    && cache.cards.every(validCard)
+    && Array.isArray(cache.manualAccounts)
+    && cache.manualAccounts.every(validFinancialAccount);
 }
 
 function asRows(value: unknown): Record<string, unknown>[] {
@@ -546,6 +729,9 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
     },
     dashboardCache: validDashboardCache(envelope.dashboardCache)
       ? envelope.dashboardCache
+      : undefined,
+    accountTabCache: validAccountTabCache(envelope.accountTabCache)
+      ? envelope.accountTabCache
       : undefined,
   };
 }

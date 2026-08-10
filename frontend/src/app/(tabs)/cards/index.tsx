@@ -16,7 +16,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useRouter } from 'expo-router';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -31,11 +31,26 @@ import {
 import { BankBadge } from '@/components/BankBadge';
 import { AutoDebitSettingModal } from '@/components/AutoDebitSettingModal';
 import { SnapTradeAccountsSection } from '@/components/SnapTradeSections';
+import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
+import {
+  consumeTerminalSyncJobIds,
+  deriveAccountTabLoadStatus,
+  fetchCompleteAccountTabCache,
+  hasNewerAccountTabRevision,
+  updateCachedBankBalance,
+  updateCachedCard,
+  updateCachedManualAccount,
+  type AccountTabRevisionTuple,
+} from '@/lib/accountTabCache';
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { bankMeta } from '@/lib/banks';
 import { formatRelativeTime } from '@/lib/datetime';
 import { formatDecimalFixed } from '@/lib/decimal';
 import { maskCardNo } from '@/lib/mask';
+import {
+  assertReplicaOwnerEpoch,
+  type ReplicaAccountTabCache,
+} from '@/lib/replica';
 import {
   type BankAccount,
   type BankAccountBalance,
@@ -189,6 +204,14 @@ function RenameModal({
 }
 
 // ============================================================
+type AccountTabCacheUpdater = (cache: ReplicaAccountTabCache) => ReplicaAccountTabCache;
+type AccountTabCacheUpdatePhase = 'optimistic' | 'rollback' | 'confirmed' | 'durable';
+type ApplyAccountTabCacheUpdate = (
+  updater: AccountTabCacheUpdater,
+  phase: AccountTabCacheUpdatePhase,
+  expectedEpoch: number,
+) => void;
+
 type BankGroup = {
   bank: string;
   accounts: BankAccountBalance[];
@@ -204,14 +227,59 @@ type BankGroup = {
 export default function AccountsTabScreen() {
   const router = useRouter();
   const qc = useQueryClient();
+  const datasetQ = useFrontendDatasetCache();
+  const localAccountTab = datasetQ.data?.accountTabCache;
+  const {
+    ownerKey,
+    ownerEpoch,
+    ownerApi,
+    persistAccountTabCache,
+    persistAccountTabCacheUpdate,
+  } = datasetQ;
+  const [remoteAccountTab, setRemoteAccountTab] = useState<{
+    ownerKey: string;
+    epoch: number;
+    cache: ReplicaAccountTabCache;
+  }>();
+  const activeOwnerRef = useRef(ownerKey);
+  const refreshRef = useRef<{
+    ownerKey: string;
+    epoch: number;
+    promise: Promise<void>;
+  } | undefined>(undefined);
+  const completeRevisionsRef = useRef<{
+    ownerKey: string;
+    epoch: number;
+    revisions: AccountTabRevisionTuple;
+  }>({ ownerKey: '', epoch: -1, revisions: [0, 0, 0, 0] });
+  const displayedAccountTabRef = useRef<ReplicaAccountTabCache | undefined>(undefined);
+  const serverPatchRevisionRef = useRef(0);
+  const optimisticMutationCountRef = useRef(0);
+  const triggeredJobIdsRef = useRef<Set<number>>(new Set());
+  const [refreshTick, bumpRefreshTick] = useState(0);
+  useEffect(() => {
+    activeOwnerRef.current = ownerKey;
+    serverPatchRevisionRef.current = 0;
+    optimisticMutationCountRef.current = 0;
+    triggeredJobIdsRef.current.clear();
+  }, [ownerEpoch, ownerKey]);
+  const invalidateAccountReads = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ['transactions'] });
+    qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
+    qc.invalidateQueries({ queryKey: ['portfolio'] });
+    qc.invalidateQueries({ queryKey: ['cards'] });
+    qc.invalidateQueries({ queryKey: ['accounts'] });
+    qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
+  }, [qc]);
 
   // Sync infrastructure (Phase 8.6 — 從 dashboard 搬過來 + 改 moneybook 風)
   // - jobsQ: 監聽 /sync/jobs 輪詢 (有 running 時 2s,否則停)
   // - triggerSync: 單一 account_id sync (per-bank ☁️ icon 觸發)
   // - triggerSyncAll: 全部同步 (header ☁️ icon 觸發)
   const jobsQ = useQuery<SyncJob[]>({
-    queryKey: ['sync', 'jobs'],
-    queryFn: () => api<SyncJob[]>('/sync/jobs'),
+    queryKey: ['sync', 'jobs', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SyncJob[]>('/sync/jobs'),
+    enabled: Boolean(ownerKey),
     refetchInterval: (q) => {
       const data = q.state.data;
       if (!data) return false;
@@ -228,7 +296,6 @@ export default function AccountsTabScreen() {
   );
   useEffect(() => {
     if (prevHasRunningRef.current && !hasRunning) {
-      // running → done: 全部 invalidate
       qc.invalidateQueries({ queryKey: ['transactions'] });
       qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
       qc.invalidateQueries({ queryKey: ['portfolio'] });
@@ -238,14 +305,23 @@ export default function AccountsTabScreen() {
     }
     prevHasRunningRef.current = hasRunning;
   }, [hasRunning, qc]);
+  useEffect(() => {
+    if (triggeredJobIdsRef.current.size === 0 || !jobsQ.data) return;
+    const result = consumeTerminalSyncJobIds(triggeredJobIdsRef.current, jobsQ.data);
+    triggeredJobIdsRef.current = result.remaining;
+    if (result.reachedTerminalState) invalidateAccountReads();
+  }, [invalidateAccountReads, jobsQ.data]);
 
   const triggerSync = useMutation<TriggerSyncResponse, ApiError, number>({
-    mutationFn: (accountId) =>
-      api<TriggerSyncResponse>(`/sync/account/${accountId}`, {
+    mutationFn: (accountId) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return ownerApi<TriggerSyncResponse>(`/sync/account/${accountId}`, {
         method: 'POST',
         body: { headless: true },
-      }),
-    onSuccess: () => {
+      });
+    },
+    onSuccess: (result) => {
+      triggeredJobIdsRef.current.add(result.job_id);
       qc.invalidateQueries({ queryKey: ['sync', 'jobs'] });
     },
   });
@@ -254,48 +330,237 @@ export default function AccountsTabScreen() {
     {
       queued: number;
       skipped: number;
+      jobs: TriggerSyncResponse[];
     },
     ApiError,
     void
   >({
-    mutationFn: () => api('/sync/all', { method: 'POST', body: { headless: true } }),
-    onSuccess: () => {
+    mutationFn: () => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return ownerApi('/sync/all', {
+        method: 'POST',
+        body: { headless: true },
+      });
+    },
+    onSuccess: (result) => {
+      for (const job of result.jobs) triggeredJobIdsRef.current.add(job.job_id);
       qc.invalidateQueries({ queryKey: ['sync', 'jobs'] });
-      qc.invalidateQueries({ queryKey: ['portfolio', 'accounts'] });
-      qc.invalidateQueries({ queryKey: ['portfolio', 'cards'] });
-      qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] });
-      qc.invalidateQueries({ queryKey: ['transactions', 'stats'] });
     },
   });
 
   // /portfolio/accounts — 真實帳戶餘額 (每帳戶 1 row, sync 後才有)
   const balancesQ = useQuery<BankAccountBalance[], ApiError>({
-    queryKey: ['portfolio', 'accounts'],
-    queryFn: () => api<BankAccountBalance[]>('/portfolio/accounts'),
+    queryKey: ['portfolio', 'accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<BankAccountBalance[]>('/portfolio/accounts'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
   // /accounts — 已建立的 cred 槽位 (即使還沒 sync 也有 row)
   // 為了解決「使用者剛新增帳號後到帳戶 tab 看到空白」的反直覺，需要把
   // 「已建但未同步」的銀行也顯示出來。差集邏輯在下方 groupMap 組裝時做。
   const bankAccountsQ = useQuery<BankAccount[], ApiError>({
-    queryKey: ['accounts'],
-    queryFn: () => api<BankAccount[]>('/accounts'),
+    queryKey: ['accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<BankAccount[]>('/accounts'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
   const cardsQ = useQuery<Card[], ApiError>({
-    queryKey: ['cards'],
-    queryFn: () => api<Card[]>('/cards'),
+    queryKey: ['cards', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<Card[]>('/cards'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
     retry: false,
   });
 
   const manualAccountsQ = useQuery<FinancialAccount[], ApiError>({
-    queryKey: ['financial-accounts', 'manual'],
-    queryFn: () => api<FinancialAccount[]>('/financial-accounts?source=manual'),
+    queryKey: ['financial-accounts', 'manual', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<FinancialAccount[]>('/financial-accounts?source=manual'),
+    enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
-  const balances = balancesQ.data ?? [];
-  const cards = cardsQ.data ?? [];
-  const bankAccounts = bankAccountsQ.data ?? [];
+  const refetchBalances = balancesQ.refetch;
+  const refetchBankAccounts = bankAccountsQ.refetch;
+  const refetchCards = cardsQ.refetch;
+  const refetchManualAccounts = manualAccountsQ.refetch;
+
+  const refreshAccountTab = useCallback((): Promise<void> => {
+    if (!ownerKey || !datasetQ.isFetched || optimisticMutationCountRef.current > 0) {
+      return Promise.resolve();
+    }
+    try {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+    } catch {
+      return Promise.resolve();
+    }
+    const inFlight = refreshRef.current;
+    if (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch) {
+      return inFlight.promise;
+    }
+
+    const revisions: AccountTabRevisionTuple = [0, 0, 0, 0];
+    const serverPatchRevision = serverPatchRevisionRef.current;
+    let completed = false;
+    const promise = fetchCompleteAccountTabCache({
+      balances: async () => {
+        const result = await refetchBalances({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Account balances refresh returned no data');
+        revisions[0] = qc.getQueryState(
+          ['portfolio', 'accounts', ownerKey, ownerEpoch],
+        )?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+      accounts: async () => {
+        const result = await refetchBankAccounts({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Bank accounts refresh returned no data');
+        revisions[1] = qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+      cards: async () => {
+        const result = await refetchCards({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Cards refresh returned no data');
+        revisions[2] = qc.getQueryState(['cards', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+      manualAccounts: async () => {
+        const result = await refetchManualAccounts({ cancelRefetch: false, throwOnError: true });
+        if (!result.data) throw new Error('Manual accounts refresh returned no data');
+        revisions[3] = qc.getQueryState(
+          ['financial-accounts', 'manual', ownerKey, ownerEpoch],
+        )?.dataUpdateCount ?? 0;
+        return result.data;
+      },
+    }).then((cache) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      if (activeOwnerRef.current !== ownerKey) return;
+      if (optimisticMutationCountRef.current > 0) return;
+      if (serverPatchRevisionRef.current !== serverPatchRevision) {
+        bumpRefreshTick((value) => value + 1);
+        return;
+      }
+      completed = true;
+      completeRevisionsRef.current = { ownerKey, epoch: ownerEpoch, revisions };
+      setRemoteAccountTab({ ownerKey, epoch: ownerEpoch, cache });
+      void persistAccountTabCache(cache, ownerEpoch).catch(() => {
+        // Server truth stays visible even if the local snapshot write fails.
+      });
+    }).catch(() => {
+      // Keep the previous complete snapshot when any authoritative read fails.
+    }).finally(() => {
+      const activeRefresh = refreshRef.current;
+      if (activeRefresh?.ownerKey !== ownerKey || activeRefresh.epoch !== ownerEpoch) return;
+      refreshRef.current = undefined;
+      if (!completed) return;
+      try {
+        assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      } catch {
+        return;
+      }
+      const current: AccountTabRevisionTuple = [
+        qc.getQueryState(['portfolio', 'accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['cards', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+        qc.getQueryState(
+          ['financial-accounts', 'manual', ownerKey, ownerEpoch],
+        )?.dataUpdateCount ?? 0,
+      ];
+      if (activeOwnerRef.current === ownerKey
+        && hasNewerAccountTabRevision(current, revisions)) {
+        bumpRefreshTick((value) => value + 1);
+      }
+    });
+    refreshRef.current = { ownerKey, epoch: ownerEpoch, promise };
+    return promise;
+  }, [
+    datasetQ.isFetched,
+    ownerEpoch,
+    ownerKey,
+    persistAccountTabCache,
+    qc,
+    refetchBalances,
+    refetchBankAccounts,
+    refetchCards,
+    refetchManualAccounts,
+  ]);
+
+  useEffect(() => {
+    void refreshAccountTab();
+  }, [refreshAccountTab, refreshTick]);
+
+  useEffect(() => {
+    const inFlight = refreshRef.current;
+    if (!ownerKey || (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch)) return;
+    const revisions: AccountTabRevisionTuple = [
+      qc.getQueryState(['portfolio', 'accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['cards', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['financial-accounts', 'manual', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+    ];
+    const complete = completeRevisionsRef.current;
+    if (complete.ownerKey !== ownerKey
+      || complete.epoch !== ownerEpoch
+      || hasNewerAccountTabRevision(revisions, complete.revisions)) {
+      void refreshAccountTab();
+    }
+  }, [
+    balancesQ.data,
+    bankAccountsQ.data,
+    cardsQ.data,
+    manualAccountsQ.data,
+    ownerEpoch,
+    ownerKey,
+    qc,
+    refreshAccountTab,
+  ]);
+
+  const accountTab = remoteAccountTab?.ownerKey === ownerKey
+    && remoteAccountTab.epoch === ownerEpoch
+    ? remoteAccountTab.cache
+    : localAccountTab;
+  useEffect(() => {
+    displayedAccountTabRef.current = accountTab;
+  }, [accountTab, ownerEpoch, ownerKey]);
+  const applyAccountTabCacheUpdate = useCallback<ApplyAccountTabCacheUpdate>((
+    updater,
+    phase,
+    expectedEpoch,
+  ) => {
+    if (!ownerKey || activeOwnerRef.current !== ownerKey) return;
+    try {
+      assertReplicaOwnerEpoch(ownerKey, expectedEpoch);
+    } catch {
+      return;
+    }
+    if (phase === 'optimistic') {
+      optimisticMutationCountRef.current += 1;
+    } else {
+      if (phase === 'rollback' || phase === 'confirmed') {
+        optimisticMutationCountRef.current = Math.max(0, optimisticMutationCountRef.current - 1);
+      }
+      bumpRefreshTick((value) => value + 1);
+    }
+    const current = displayedAccountTabRef.current;
+    if (!current) return;
+    const next = updater(current);
+    const persist = phase === 'confirmed' || phase === 'durable';
+    if (persist) serverPatchRevisionRef.current += 1;
+    displayedAccountTabRef.current = next;
+    setRemoteAccountTab({ ownerKey, epoch: expectedEpoch, cache: next });
+    if (persist) {
+      void persistAccountTabCacheUpdate(updater, expectedEpoch).catch(() => {
+        // The server-confirmed UI patch remains visible if disk persistence fails.
+      });
+    }
+  }, [ownerKey, persistAccountTabCacheUpdate]);
+  const balances = accountTab?.balances ?? [];
+  const cards = accountTab?.cards ?? [];
+  const bankAccounts = accountTab?.accounts ?? [];
+  const manualAccounts = accountTab?.manualAccounts ?? [];
+  const accountTabStatus = deriveAccountTabLoadStatus(
+    accountTab,
+    { isFetched: datasetQ.isFetched, isError: datasetQ.isError },
+    [balancesQ, bankAccountsQ, cardsQ, manualAccountsQ],
+  );
+  const accountTabLoading = accountTabStatus === 'loading';
+  const accountTabError = accountTabStatus === 'error';
 
   // 依銀行分組 — 整本 tab 的核心
   const groupMap = new Map<string, BankGroup>();
@@ -331,8 +596,6 @@ export default function AccountsTabScreen() {
     return a.bank.localeCompare(b.bank);
   });
 
-  const isLoading = balancesQ.isLoading || cardsQ.isLoading || bankAccountsQ.isLoading;
-
   // === Sync helpers (Phase 8.6) ===
   // 1. lastJobByBank: 該銀行最近一筆 sync job (任一 account)
   //    bank 粒度而非 account_id 粒度,因為 BankGroupCard ☁️ 是 per-bank icon
@@ -349,14 +612,11 @@ export default function AccountsTabScreen() {
   }, [jobsQ.data]);
 
   // bankToAccountIds: 同銀行的所有 account_id (per-bank ☁️ 觸發時要逐個 trigger)
-  const bankToAccountIds = useMemo(() => {
-    const m: Record<string, number[]> = {};
-    for (const a of bankAccountsQ.data ?? []) {
-      if (!m[a.bank]) m[a.bank] = [];
-      m[a.bank].push(a.id);
-    }
-    return m;
-  }, [bankAccountsQ.data]);
+  const bankToAccountIds: Record<string, number[]> = {};
+  for (const account of bankAccounts) {
+    if (!bankToAccountIds[account.bank]) bankToAccountIds[account.bank] = [];
+    bankToAccountIds[account.bank].push(account.id);
+  }
 
   // 2. hasRunningJob: 任何 job queued/running → 全部同步按鈕變 disabled + 標示
   const hasRunningJob = useMemo(() => {
@@ -456,21 +716,25 @@ export default function AccountsTabScreen() {
           </View>
         )}
 
-        {balancesQ.isError && (
-          <ErrorBanner title="讀取帳戶餘額失敗" error={balancesQ.error} />
-        )}
-        {cardsQ.isError && (
-          <ErrorBanner title="讀取信用卡失敗" error={cardsQ.error} />
-        )}
-        {manualAccountsQ.isError && (
-          <ErrorBanner title="讀取手動帳戶失敗" error={manualAccountsQ.error} />
+        {accountTabError && (
+          <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
+            <Text className="text-ink-700 dark:text-ink-200 text-small mb-3">
+              暫時無法載入帳戶資料，請稍後再試。
+            </Text>
+            <Pressable
+              className="self-start bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
+              onPress={() => { void refreshAccountTab(); }}
+            >
+              <Text className="text-white text-small font-semibold">重新載入</Text>
+            </Pressable>
+          </View>
         )}
 
-        {isLoading ? (
+        {accountTabLoading ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-6 shadow-card">
             <ActivityIndicator />
           </View>
-        ) : groups.length === 0 ? (
+        ) : Boolean(accountTab) && groups.length === 0 ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
             <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">還沒任何銀行帳戶資料</Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
@@ -485,13 +749,21 @@ export default function AccountsTabScreen() {
               lastJob={lastJobByBank[g.bank]}
               onSync={() => triggerBankSync(g.bank)}
               syncBusy={syncingBanks.has(g.bank)}
+              ownerKey={ownerKey}
+              ownerEpoch={ownerEpoch}
+              applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
             />
           ))
         )}
-        <ManualAccountsSection
-          accounts={manualAccountsQ.data ?? []}
-          isLoading={manualAccountsQ.isLoading}
-        />
+        {!accountTabError && (
+          <ManualAccountsSection
+            accounts={manualAccounts}
+            isLoading={accountTabLoading}
+            ownerKey={ownerKey}
+            ownerEpoch={ownerEpoch}
+            applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
+          />
+        )}
         <SnapTradeAccountsSection />
       </View>
     </ScrollView>
@@ -501,9 +773,15 @@ export default function AccountsTabScreen() {
 function ManualAccountsSection({
   accounts,
   isLoading,
+  ownerKey,
+  ownerEpoch,
+  applyAccountTabCacheUpdate,
 }: {
   accounts: FinancialAccount[];
   isLoading: boolean;
+  ownerKey: string;
+  ownerEpoch: number;
+  applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
 }) {
   const typeLabel: Record<string, string> = {
     deposit: '存款',
@@ -538,6 +816,9 @@ function ManualAccountsSection({
           key={account.id}
           account={account}
           typeLabel={typeLabel[account.product_type] ?? account.product_type}
+          ownerKey={ownerKey}
+          ownerEpoch={ownerEpoch}
+          applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
         />
       ))}
     </View>
@@ -547,38 +828,60 @@ function ManualAccountsSection({
 function ManualAccountRow({
   account,
   typeLabel,
+  ownerKey,
+  ownerEpoch,
+  applyAccountTabCacheUpdate,
 }: {
   account: FinancialAccount;
   typeLabel: string;
+  ownerKey: string;
+  ownerEpoch: number;
+  applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
 }) {
   const router = useRouter();
   const qc = useQueryClient();
   const excluded = !account.included_in_net_worth;
   const toggleMut = useMutation({
-    mutationFn: (next: boolean) => api(
-      `/financial-accounts/${account.id}/included`,
-      {
-        method: 'PATCH',
-        body: { included_in_net_worth: next },
-      },
-    ),
-    onMutate: async (next: boolean) => {
-      await qc.cancelQueries({ queryKey: ['financial-accounts', 'manual'] });
-      const previous = qc.getQueryData<FinancialAccount[]>(['financial-accounts', 'manual']);
-      if (previous) {
-        qc.setQueryData<FinancialAccount[]>(
-          ['financial-accounts', 'manual'],
-          previous.map((row) => row.id === account.id
-            ? { ...row, included_in_net_worth: next }
-            : row),
-        );
-      }
-      return { previous };
+    mutationFn: (next: boolean) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api(
+        `/financial-accounts/${account.id}/included`,
+        {
+          method: 'PATCH',
+          body: { included_in_net_worth: next },
+          skipAuthRetry: true,
+        },
+      );
+    },
+    onMutate: (next: boolean) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedManualAccount(cache, account.id, {
+          included_in_net_worth: next,
+        }),
+        'optimistic',
+        ownerEpoch,
+      );
+      return { previous: account.included_in_net_worth };
     },
     onError: (_error, _next, context) => {
-      if (context?.previous) {
-        qc.setQueryData(['financial-accounts', 'manual'], context.previous);
+      if (context) {
+        applyAccountTabCacheUpdate(
+          (cache) => updateCachedManualAccount(cache, account.id, {
+            included_in_net_worth: context.previous,
+          }),
+          'rollback',
+          ownerEpoch,
+        );
       }
+    },
+    onSuccess: (_result, next) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedManualAccount(cache, account.id, {
+          included_in_net_worth: next,
+        }),
+        'confirmed',
+        ownerEpoch,
+      );
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['financial-accounts'] });
@@ -640,17 +943,6 @@ function ManualAccountRow({
   );
 }
 
-function ErrorBanner({ title, error }: { title: string; error: unknown }) {
-  return (
-    <View className="bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 rounded-2xl p-5 mb-4">
-      <Text className="text-red-700 dark:text-red-300 text-h3 mb-2">{title}</Text>
-      <Text className="text-red-700 dark:text-red-400 text-small">
-        {formatApiError(error)}
-      </Text>
-    </View>
-  );
-}
-
 // ============================================================
 // 單一銀行 card (MoneyBook 風 — 整張白底卡, 內含 header + 子帳戶 list)
 // ============================================================
@@ -659,11 +951,17 @@ function BankGroupCard({
   lastJob,
   onSync,
   syncBusy,
+  ownerKey,
+  ownerEpoch,
+  applyAccountTabCacheUpdate,
 }: {
   group: BankGroup;
   lastJob: SyncJob | undefined;
   onSync: () => void;
   syncBusy: boolean;
+  ownerKey: string;
+  ownerEpoch: number;
+  applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
 }) {
   const bankLabel = BANK_LABELS[group.bank as SupportedBank] ?? group.bank;
   const meta = bankMeta(group.bank);
@@ -752,6 +1050,9 @@ function BankGroupCard({
         <AccountRow
           key={`a-${a.account_no}-${a.currency}`}
           account={a}
+          ownerKey={ownerKey}
+          ownerEpoch={ownerEpoch}
+          applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
           isLast={
             idx === group.accounts.length - 1 &&
             group.cards.length === 0 &&
@@ -765,6 +1066,9 @@ function BankGroupCard({
         <CardRow
           key={`c-${c.card_no}`}
           card={c}
+          ownerKey={ownerKey}
+          ownerEpoch={ownerEpoch}
+          applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
           isLast={idx === group.cards.length - 1 && group.pendingBankAccounts.length === 0}
         />
       ))}
@@ -900,9 +1204,15 @@ function PendingBankAccountRow({
 function AccountRow({
   account,
   isLast,
+  ownerKey,
+  ownerEpoch,
+  applyAccountTabCacheUpdate,
 }: {
   account: BankAccountBalance;
   isLast: boolean;
+  ownerKey: string;
+  ownerEpoch: number;
+  applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
 }) {
   const qc = useQueryClient();
   const router = useRouter();
@@ -936,71 +1246,57 @@ function AccountRow({
         : 'bg-amber-500';
 
   // PATCH /portfolio/accounts/{bank}/{account_no}/excluded
-  // Write-through cache (2026-06-18): UI 先樂觀更新 → 背景寫 server.
-  //   - accounts list: 找 row 翻 excluded
-  //   - transactions list (所有 filter 變體): 該帳戶 row 全翻 excluded
-  //   - aggregate (summary / stats): 算的, optimistic 太複雜 → settle 後 invalidate
-  // 失敗時 onError 用 snapshot rollback. user 在弱網下也是「先看到反灰, 失敗才復原」.
+  // 帳戶 snapshot 先樂觀反灰；server 成功後同一 delta 寫回 owner-scoped replica。
+  // Aggregate 與交易資料在 settle 後走 authoritative invalidation。
   const toggleMut = useMutation({
-    mutationFn: (next: boolean) =>
-      api(`/portfolio/accounts/${account.bank}/${account.account_no}/excluded`, {
+    mutationFn: (next: boolean) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api(`/portfolio/accounts/${account.bank}/${account.account_no}/excluded`, {
         method: 'PATCH',
         body: { excluded: next },
-      }),
-    onMutate: async (next: boolean) => {
-      // 取消任何 in-flight refetch, 避免覆蓋 optimistic write
-      await qc.cancelQueries({ queryKey: ['portfolio', 'accounts'] });
-      await qc.cancelQueries({ queryKey: ['transactions'] });
-
-      // Snapshot (for rollback)
-      const prevAccounts = qc.getQueryData<BankAccountBalance[]>(['portfolio', 'accounts']);
-      const prevTxns = qc.getQueriesData<{ items: { bank: string; account_or_card: string | null; excluded?: boolean }[] }>({
-        queryKey: ['transactions'],
+        skipAuthRetry: true,
       });
-
-      // Write-through: accounts
-      if (prevAccounts) {
-        qc.setQueryData<BankAccountBalance[]>(
-          ['portfolio', 'accounts'],
-          prevAccounts.map((a) =>
-            a.bank === account.bank && a.account_no === account.account_no
-              ? { ...a, excluded: next }
-              : a,
+    },
+    onMutate: (next: boolean) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedBankBalance(
+          cache,
+          account.bank,
+          account.account_no,
+          { excluded: next },
+        ),
+        'optimistic',
+        ownerEpoch,
+      );
+      return { previous: account.excluded };
+    },
+    onError: (_error, _next, context) => {
+      if (context) {
+        applyAccountTabCacheUpdate(
+          (cache) => updateCachedBankBalance(
+            cache,
+            account.bank,
+            account.account_no,
+            { excluded: context.previous },
           ),
+          'rollback',
+          ownerEpoch,
         );
       }
-
-      // Write-through: 所有 transactions list 變體 (各 filter 各一份 cache)
-      // account_or_card 為「末四碼」, 比對 account_no 結尾.
-      const tail = account.account_no.slice(-4);
-      for (const [key, data] of prevTxns) {
-        if (!data || !Array.isArray(data.items)) continue;
-        qc.setQueryData(key, {
-          ...data,
-          items: data.items.map((t) =>
-            t.bank === account.bank && t.account_or_card === tail
-              ? { ...t, excluded: next }
-              : t,
-          ),
-        });
-      }
-
-      return { prevAccounts, prevTxns };
     },
-    onError: (_err, _next, ctx) => {
-      // Rollback
-      if (ctx?.prevAccounts) {
-        qc.setQueryData(['portfolio', 'accounts'], ctx.prevAccounts);
-      }
-      if (ctx?.prevTxns) {
-        for (const [key, data] of ctx.prevTxns) {
-          qc.setQueryData(key, data);
-        }
-      }
+    onSuccess: (_result, next) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedBankBalance(
+          cache,
+          account.bank,
+          account.account_no,
+          { excluded: next },
+        ),
+        'confirmed',
+        ownerEpoch,
+      );
     },
     onSettled: () => {
-      // 不管成功失敗, 背景刷 aggregate (summary / stats 是算的不能 optimistic)
-      // accounts / transactions 也順手 invalidate 對齊真值 (server 才是 source of truth)
       qc.invalidateQueries({ queryKey: ['portfolio', 'accounts'] });
       qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] });
       qc.invalidateQueries({ queryKey: ['transactions'] });
@@ -1010,12 +1306,25 @@ function AccountRow({
 
   // Phase 8.2 C: PATCH /portfolio/accounts/{bank}/{account_no}/nickname
   const renameMut = useMutation({
-    mutationFn: (newName: string | null) =>
-      api(`/portfolio/accounts/${account.bank}/${account.account_no}/nickname`, {
+    mutationFn: (newName: string | null) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api(`/portfolio/accounts/${account.bank}/${account.account_no}/nickname`, {
         method: 'PATCH',
         body: { nickname_overwrite: newName },
-      }),
-    onSuccess: () => {
+        skipAuthRetry: true,
+      });
+    },
+    onSuccess: (_result, newName) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedBankBalance(
+          cache,
+          account.bank,
+          account.account_no,
+          { nickname_overwrite: newName },
+        ),
+        'durable',
+        ownerEpoch,
+      );
       qc.invalidateQueries({ queryKey: ['portfolio', 'accounts'] });
       setEditing(false);
     },
@@ -1134,7 +1443,19 @@ function AccountRow({
 // Phase 6 (2026-06-14 PM): excluded → 整列反灰 + 卡名劃線 + 右側 toggle
 // Phase 8.2 C (2026-06-14): ✏️ 加暱稱編輯 — PATCH /cards/{bank}/{card_no}/nickname
 // ============================================================
-function CardRow({ card, isLast }: { card: Card; isLast: boolean }) {
+function CardRow({
+  card,
+  isLast,
+  ownerKey,
+  ownerEpoch,
+  applyAccountTabCacheUpdate,
+}: {
+  card: Card;
+  isLast: boolean;
+  ownerKey: string;
+  ownerEpoch: number;
+  applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
+}) {
   const qc = useQueryClient();
   const router = useRouter();
   const [editing, setEditing] = useState(false);
@@ -1167,61 +1488,45 @@ function CardRow({ card, isLast }: { card: Card; isLast: boolean }) {
   const displayName = overwriteName.length > 0 ? overwriteName : rawName;
 
   // PATCH /cards/{bank}/{card_no}/excluded
-  // Write-through cache (2026-06-18): UI 先樂觀更新 → 背景寫 server.
-  //   - cards list: 找 card 翻 excluded
-  //   - transactions list (所有 filter 變體): 該卡 row 全翻 excluded
-  //   - aggregate (summary): 算的, settle 後 invalidate
+  // 卡片 snapshot 先樂觀反灰；server 成功後寫回 owner-scoped replica，
+  // aggregate 與交易資料在 settle 後 authoritative refresh。
   const toggleMut = useMutation({
-    mutationFn: (next: boolean) =>
-      api(`/cards/${card.bank}/${card.card_no}/excluded`, {
+    mutationFn: (next: boolean) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api(`/cards/${card.bank}/${card.card_no}/excluded`, {
         method: 'PATCH',
         body: { excluded: next },
-      }),
-    onMutate: async (next: boolean) => {
-      await qc.cancelQueries({ queryKey: ['cards'] });
-      await qc.cancelQueries({ queryKey: ['transactions'] });
-
-      const prevCards = qc.getQueryData<Card[]>(['cards']);
-      const prevTxns = qc.getQueriesData<{ items: { bank: string; account_or_card: string | null; excluded?: boolean }[] }>({
-        queryKey: ['transactions'],
+        skipAuthRetry: true,
       });
-
-      if (prevCards) {
-        qc.setQueryData<Card[]>(
-          ['cards'],
-          prevCards.map((c) =>
-            c.bank === card.bank && c.card_no === card.card_no
-              ? { ...c, excluded: next }
-              : c,
+    },
+    onMutate: (next: boolean) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedCard(cache, card.bank, card.card_no, { excluded: next }),
+        'optimistic',
+        ownerEpoch,
+      );
+      return { previous: card.excluded };
+    },
+    onError: (_error, _next, context) => {
+      if (context) {
+        applyAccountTabCacheUpdate(
+          (cache) => updateCachedCard(
+            cache,
+            card.bank,
+            card.card_no,
+            { excluded: context.previous },
           ),
+          'rollback',
+          ownerEpoch,
         );
       }
-
-      // card_no 末四碼 (account_or_card 的格式)
-      const tail = card.card_no.slice(-4);
-      for (const [key, data] of prevTxns) {
-        if (!data || !Array.isArray(data.items)) continue;
-        qc.setQueryData(key, {
-          ...data,
-          items: data.items.map((t) =>
-            t.bank === card.bank && t.account_or_card === tail
-              ? { ...t, excluded: next }
-              : t,
-          ),
-        });
-      }
-
-      return { prevCards, prevTxns };
     },
-    onError: (_err, _next, ctx) => {
-      if (ctx?.prevCards) {
-        qc.setQueryData(['cards'], ctx.prevCards);
-      }
-      if (ctx?.prevTxns) {
-        for (const [key, data] of ctx.prevTxns) {
-          qc.setQueryData(key, data);
-        }
-      }
+    onSuccess: (_result, next) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedCard(cache, card.bank, card.card_no, { excluded: next }),
+        'confirmed',
+        ownerEpoch,
+      );
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['cards'] });
@@ -1233,12 +1538,25 @@ function CardRow({ card, isLast }: { card: Card; isLast: boolean }) {
 
   // Phase 8.2 C: PATCH /cards/{bank}/{card_no}/nickname
   const renameMut = useMutation({
-    mutationFn: (newName: string | null) =>
-      api(`/cards/${card.bank}/${card.card_no}/nickname`, {
+    mutationFn: (newName: string | null) => {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      return api(`/cards/${card.bank}/${card.card_no}/nickname`, {
         method: 'PATCH',
         body: { nickname_overwrite: newName },
-      }),
-    onSuccess: () => {
+        skipAuthRetry: true,
+      });
+    },
+    onSuccess: (_result, newName) => {
+      applyAccountTabCacheUpdate(
+        (cache) => updateCachedCard(
+          cache,
+          card.bank,
+          card.card_no,
+          { nickname_overwrite: newName },
+        ),
+        'durable',
+        ownerEpoch,
+      );
       qc.invalidateQueries({ queryKey: ['cards'] });
       setEditing(false);
     },

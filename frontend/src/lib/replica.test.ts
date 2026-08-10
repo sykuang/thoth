@@ -2,6 +2,7 @@ import {
   applyReplicaResponse,
   makeReplicaOwnerKey,
   projectReplicaDataset,
+  type ReplicaAccountTabCache,
   type ReplicaDashboardCache,
   type ReplicaEnvelope,
   type ReplicaResponse,
@@ -264,5 +265,76 @@ const corruptAsOfEnvelope = {
   },
 } as unknown as ReplicaEnvelope;
 equal(projectReplicaDataset(corruptAsOfEnvelope).dashboardCache, undefined);
+
+const validAccountTabCache: ReplicaAccountTabCache = {
+  cachedAt: '2026-08-10T03:00:00Z',
+  balances: [{
+    bank: 'cathay',
+    account_no: '1234',
+    currency: 'TWD',
+    nickname: '主帳戶',
+    product_type: 'deposit',
+    type: '活期存款',
+    balance: 1000,
+    snapshot_date: '2026-08-10',
+    is_stale: false,
+    twd_estimate: 1000,
+    fx_rate_used: 1,
+    excluded: false,
+  }],
+  accounts: [{
+    id: 1,
+    bank: 'cathay',
+    label: '主帳',
+    created_at: '2026-08-01T00:00:00Z',
+    updated_at: '2026-08-10T00:00:00Z',
+    has_creds: true,
+    fields_set: ['username'],
+  }],
+  cards: [{ card_no: '9999', bank: 'cathay', name: 'Card', type: 'credit' }],
+  manualAccounts: [{
+    id: 'manual-1',
+    source: 'manual',
+    source_ref: 'manual-1',
+    institution_name: null,
+    name: '現金',
+    account_ref: null,
+    product_type: 'deposit',
+    currency: 'TWD',
+    balance: '500',
+    as_of: '2026-08-10',
+    valuation_source: null,
+    included_in_net_worth: true,
+    editable: true,
+    deletable: true,
+  }],
+};
+const validAccountTabEnvelope = { ...envelope, accountTabCache: validAccountTabCache };
+equal(projectReplicaDataset(validAccountTabEnvelope).accountTabCache, validAccountTabCache);
+const preservedAccountTab = applyReplicaResponse(validAccountTabEnvelope, pull, ownerKey);
+ok(preservedAccountTab);
+equal(preservedAccountTab.accountTabCache, validAccountTabCache);
+
+for (const accountTabCache of [
+  {
+    ...validAccountTabCache,
+    balances: [{ ...validAccountTabCache.balances[0], is_stale: 'false' }],
+  },
+  {
+    ...validAccountTabCache,
+    accounts: [{ ...validAccountTabCache.accounts[0], fields_set: [7] }],
+  },
+  {
+    ...validAccountTabCache,
+    cards: [{ ...validAccountTabCache.cards[0], bill_due_amount: Number.NaN }],
+  },
+  {
+    ...validAccountTabCache,
+    manualAccounts: [{ ...validAccountTabCache.manualAccounts[0], balance: 500 }],
+  },
+]) {
+  const corrupt = { ...envelope, accountTabCache } as unknown as ReplicaEnvelope;
+  equal(projectReplicaDataset(corrupt).accountTabCache, undefined);
+}
 
 console.log('replica contract tests passed');

@@ -24,7 +24,10 @@ import {
   fetchCompleteDashboardCache,
   hasNewerDashboardRevision,
 } from '@/lib/dashboardCache';
-import type { ReplicaDashboardCache } from '@/lib/replica';
+import {
+  assertReplicaOwnerEpoch,
+  type ReplicaDashboardCache,
+} from '@/lib/replica';
 import { useAuthStore } from '@/stores/auth';
 import {
   type BankAccount,
@@ -45,28 +48,37 @@ export default function Dashboard() {
   const qc = useQueryClient();
   const datasetQ = useFrontendDatasetCache();
   const localDashboard = datasetQ.data?.dashboardCache;
-  const { ownerKey, persistDashboardCache } = datasetQ;
+  const { ownerKey, ownerEpoch, ownerApi, persistDashboardCache } = datasetQ;
   const [remoteDashboard, setRemoteDashboard] = useState<{
     ownerKey: string;
+    epoch: number;
     cache: ReplicaDashboardCache;
   }>();
   const activeOwnerRef = useRef(ownerKey);
-  const refreshRef = useRef<{ ownerKey: string; promise: Promise<void> } | undefined>(undefined);
-  const completeRevisionsRef = useRef<[number, number, number]>([0, 0, 0]);
+  const refreshRef = useRef<{
+    ownerKey: string;
+    epoch: number;
+    promise: Promise<void>;
+  } | undefined>(undefined);
+  const completeRevisionsRef = useRef<{
+    ownerKey: string;
+    epoch: number;
+    revisions: [number, number, number];
+  }>({ ownerKey: '', epoch: -1, revisions: [0, 0, 0] });
   const [refreshTick, bumpRefreshTick] = useState(0);
   useEffect(() => {
     activeOwnerRef.current = ownerKey;
   }, [ownerKey]);
 
   const accountsQ = useQuery<BankAccount[]>({
-    queryKey: ['accounts', ownerKey],
-    queryFn: () => api<BankAccount[]>('/accounts'),
+    queryKey: ['accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<BankAccount[]>('/accounts'),
     enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
   const jobsQ = useQuery<SyncJob[]>({
-    queryKey: ['sync', 'jobs', ownerKey],
-    queryFn: () => api<SyncJob[]>('/sync/jobs'),
+    queryKey: ['sync', 'jobs', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SyncJob[]>('/sync/jobs'),
     enabled: Boolean(ownerKey),
     refetchInterval: (q) => {
       const data = q.state.data;
@@ -81,14 +93,14 @@ export default function Dashboard() {
   // Primary dashboard cards render the last owner-scoped SQLite snapshot first;
   // these requests then refresh canonical server truth in the background.
   const portfolioQ = useQuery<PortfolioSummary>({
-    queryKey: ['portfolio', 'summary', ownerKey],
-    queryFn: () => api<PortfolioSummary>('/portfolio/summary'),
+    queryKey: ['portfolio', 'summary', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<PortfolioSummary>('/portfolio/summary'),
     enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
 
   const statsQ = useQuery<DashboardStats>({
-    queryKey: ['transactions', 'stats', ownerKey],
-    queryFn: () => api<DashboardStats>('/transactions/stats'),
+    queryKey: ['transactions', 'stats', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<DashboardStats>('/transactions/stats'),
     enabled: Boolean(ownerKey) && datasetQ.isFetched,
   });
   const refetchAccounts = accountsQ.refetch;
@@ -97,8 +109,15 @@ export default function Dashboard() {
 
   const refreshDashboard = useCallback((): Promise<void> => {
     if (!ownerKey || !datasetQ.isFetched) return Promise.resolve();
+    try {
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+    } catch {
+      return Promise.resolve();
+    }
     const inFlight = refreshRef.current;
-    if (inFlight?.ownerKey === ownerKey) return inFlight.promise;
+    if (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch) {
+      return inFlight.promise;
+    }
 
     const revisions: [number, number, number] = [0, 0, 0];
     let completed = false;
@@ -106,49 +125,57 @@ export default function Dashboard() {
       accounts: async () => {
         const result = await refetchAccounts({ cancelRefetch: false, throwOnError: true });
         if (!result.data) throw new Error('Accounts refresh returned no data');
-        revisions[0] = qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0;
+        revisions[0] = qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
         return result.data;
       },
       portfolio: async () => {
         const result = await refetchPortfolio({ cancelRefetch: false, throwOnError: true });
         if (!result.data) throw new Error('Portfolio refresh returned no data');
-        revisions[1] = qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0;
+        revisions[1] = qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
         return result.data;
       },
       stats: async () => {
         const result = await refetchStats({ cancelRefetch: false, throwOnError: true });
         if (!result.data) throw new Error('Statistics refresh returned no data');
-        revisions[2] = qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0;
+        revisions[2] = qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
         return result.data;
       },
     }).then((cache) => {
-      completed = true;
-      completeRevisionsRef.current = revisions;
+      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
       if (activeOwnerRef.current !== ownerKey) return;
-      setRemoteDashboard({ ownerKey, cache });
-      void persistDashboardCache(cache).catch(() => {
+      completed = true;
+      completeRevisionsRef.current = { ownerKey, epoch: ownerEpoch, revisions };
+      setRemoteDashboard({ ownerKey, epoch: ownerEpoch, cache });
+      void persistDashboardCache(cache, ownerEpoch).catch(() => {
         // Server truth stays visible even if the local snapshot write fails.
       });
     }).catch(() => {
       // Keep the previous complete snapshot when any authoritative read fails.
     }).finally(() => {
-      if (refreshRef.current?.ownerKey !== ownerKey) return;
+      const activeRefresh = refreshRef.current;
+      if (activeRefresh?.ownerKey !== ownerKey || activeRefresh.epoch !== ownerEpoch) return;
       refreshRef.current = undefined;
       if (!completed) return;
+      try {
+        assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
+      } catch {
+        return;
+      }
       const current: [number, number, number] = [
-        qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0,
-        qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0,
-        qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+        qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
       ];
       if (activeOwnerRef.current === ownerKey
         && hasNewerDashboardRevision(current, revisions)) {
         bumpRefreshTick((value) => value + 1);
       }
     });
-    refreshRef.current = { ownerKey, promise };
+    refreshRef.current = { ownerKey, epoch: ownerEpoch, promise };
     return promise;
   }, [
     datasetQ.isFetched,
+    ownerEpoch,
     ownerKey,
     persistDashboardCache,
     qc,
@@ -162,17 +189,22 @@ export default function Dashboard() {
   }, [refreshDashboard, refreshTick]);
 
   useEffect(() => {
-    if (!ownerKey || refreshRef.current?.ownerKey === ownerKey) return;
+    const inFlight = refreshRef.current;
+    if (!ownerKey || (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch)) return;
     const revisions: [number, number, number] = [
-      qc.getQueryState(['accounts', ownerKey])?.dataUpdateCount ?? 0,
-      qc.getQueryState(['portfolio', 'summary', ownerKey])?.dataUpdateCount ?? 0,
-      qc.getQueryState(['transactions', 'stats', ownerKey])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
+      qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
     ];
-    if (hasNewerDashboardRevision(revisions, completeRevisionsRef.current)) {
+    const complete = completeRevisionsRef.current;
+    if (complete.ownerKey !== ownerKey
+      || complete.epoch !== ownerEpoch
+      || hasNewerDashboardRevision(revisions, complete.revisions)) {
       void refreshDashboard();
     }
   }, [
     accountsQ.data,
+    ownerEpoch,
     ownerKey,
     portfolioQ.data,
     qc,
@@ -182,8 +214,8 @@ export default function Dashboard() {
 
   // Phase L10 (2026-06-20): 繳費提醒 (信用卡 auto-debit + 餘額不足/未設定)
   const remindersQ = useQuery<PaymentReminder[]>({
-    queryKey: ['auto-debit', 'reminders', ownerKey],
-    queryFn: () => api<PaymentReminder[]>('/cards/auto-debit/reminders'),
+    queryKey: ['auto-debit', 'reminders', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<PaymentReminder[]>('/cards/auto-debit/reminders'),
     enabled: Boolean(ownerKey),
     // days_until_due 是日期衍生值；app 跨日後回前景時不能沿用昨天的 cache。
     refetchOnWindowFocus: 'always',
@@ -214,6 +246,7 @@ export default function Dashboard() {
   }
 
   const dashboard = remoteDashboard?.ownerKey === ownerKey
+    && remoteDashboard.epoch === ownerEpoch
     ? remoteDashboard.cache
     : localDashboard;
   const accounts = dashboard?.accounts ?? [];
