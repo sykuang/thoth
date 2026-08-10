@@ -85,6 +85,8 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
             description TEXT,
             amount INTEGER,
             currency TEXT,
+            txn_type TEXT,
+            flow_type TEXT,
             auto_excluded INTEGER NOT NULL DEFAULT 0,
             splits_overwrite TEXT,
             refreshed_at TEXT NOT NULL
@@ -104,6 +106,8 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
             first_seen TEXT,
             dedup_key TEXT,
             category TEXT,
+            txn_type TEXT,
+            flow_type TEXT,
             auto_excluded INTEGER NOT NULL DEFAULT 0,
             splits_overwrite TEXT
         );
@@ -147,11 +151,12 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
     for r in (pending_rows or []):
         con.execute(
             """INSERT INTO card_pending_txns
-               (scope, card_no, consume_date, amount, currency, auto_excluded,
+               (scope, card_no, consume_date, amount, currency, txn_type, flow_type, auto_excluded,
                 splits_overwrite, refreshed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (r.get("scope", "unbilled"), r.get("card_no"), r.get("consume_date"),
              r["amount"], r.get("currency", "TWD"),
+             r.get("txn_type"), r.get("flow_type"),
              1 if r.get("auto_excluded") else 0,
              json.dumps(r["splits"]) if r.get("splits") else None, now),
         )
@@ -159,11 +164,12 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
         con.execute(
             """INSERT INTO card_billed_txns
                (card_no, bill_date, currency, consume_date, post_date, description,
-                amount, first_seen, dedup_key, auto_excluded, splits_overwrite)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                amount, first_seen, dedup_key, txn_type, flow_type, auto_excluded, splits_overwrite)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (r.get("card_no"), r.get("bill_date"), r.get("currency", "TWD"),
              r.get("consume_date"), r.get("post_date"), r.get("description"),
              r["amount"], now, f"test-{id(r)}",
+             r.get("txn_type"), r.get("flow_type"),
              1 if r.get("auto_excluded") else 0,
              json.dumps(r["splits"]) if r.get("splits") else None),
         )
@@ -260,18 +266,13 @@ def test_summary_aggregates_assets_and_real_liabilities(temp_data_root, client, 
 
 
 def test_summary_current_month_spending_from_pending_and_billed(temp_data_root, client, auth_headers):
-    """本月消費 = pending(全) + billed 本月 consume_date sum.
-
-    pending 表的本質是「最近同步抓到還沒出帳的」, refresh-by-scope 每次全清重寫,
-    所以 pending row 永遠是當下未出帳的, 視同本月. billed 才用 consume_date 過濾.
-    分期 12/12 在 pending、11/12 在 billed 都算本月消費.
-    """
+    """本月消費 = pending（有日期限本月、無日期fallback）+ billed本月消費日。"""
     month = _current_month_str()
 
     _seed_bank_db(temp_data_root, "ubot",
                   balance=100000, balance_date=f"{month}-13",
                   pending_rows=[
-                      # 全部 pending 都算本月消費, 不論 consume_date (ubot 真實 case 是空)
+                      # 無日期pending仍視為當下未出帳，避免漏掉不提供消費日的銀行。
                       {"amount": -41036, "currency": "TWD", "consume_date": ""},
                       {"amount": -29, "currency": "TWD", "consume_date": ""},
                   ],
@@ -286,9 +287,85 @@ def test_summary_current_month_spending_from_pending_and_billed(temp_data_root, 
     r = client.get("/portfolio/summary", headers=auth_headers)
     body = r.json()
     ubot = next(b for b in body["by_bank"] if b["bank"] == "ubot")
-    # 41036 + 29 (pending 全部) + 5000 (billed 本月) = 46065
+    # 41036 + 29 (無日期 pending fallback) + 5000 (billed 本月) = 46065
     assert ubot["current_month_spending"] == 46065
     assert body["current_month_spending"] == 46065
+
+
+def test_summary_current_month_spending_filters_stale_pending_and_non_expense(
+    temp_data_root, client, auth_headers,
+):
+    """有消費日的pending只算本月，且退款／轉帳不屬於本月消費。"""
+    month = _current_month_str()
+    _seed_bank_db(
+        temp_data_root,
+        "hsbc",
+        pending_rows=[
+            {
+                "amount": 1000,
+                "currency": "TWD",
+                "consume_date": f"{month}-02",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+            {
+                "amount": 2000,
+                "currency": "TWD",
+                "consume_date": "2026-07-31",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+            {
+                "amount": 300,
+                "currency": "TWD",
+                "consume_date": "",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+            {
+                "amount": 400,
+                "currency": "TWD",
+                "consume_date": "   ",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+            {
+                "amount": 50,
+                "currency": "TWD",
+                "consume_date": f"{month}-03",
+                "txn_type": "refund",
+                "flow_type": "income",
+            },
+            {
+                "amount": 70,
+                "currency": "TWD",
+                "consume_date": f"{month}-03",
+                "txn_type": "payment",
+                "flow_type": "transfer",
+            },
+        ],
+        billed_rows=[
+            {
+                "amount": 500,
+                "currency": "TWD",
+                "consume_date": f"{month}-04",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+            {
+                "amount": 200,
+                "currency": "TWD",
+                "consume_date": f"{month.replace('-', '/')}/05",
+                "txn_type": "spending",
+                "flow_type": "expense",
+            },
+        ],
+    )
+
+    response = client.get("/portfolio/summary", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["current_month_spending"] == 2400
 
 
 def test_summary_current_month_spending_respects_transaction_exclusions(

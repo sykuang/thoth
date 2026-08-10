@@ -101,6 +101,9 @@ class CardMonthAmountRow(BaseModel):
     amount: float | int | None
     currency: str | None
     card_no: str | None
+    consume_date: str | None = None
+    txn_type: str | None = None
+    flow_type: str | None = None
     splits_overwrite: str | None = None
 
 
@@ -313,9 +316,13 @@ class PortfolioReadMixin(_BaseHelpers):
                 "splits_overwrite" if "splits_overwrite" in cols
                 else "NULL AS splits_overwrite"
             )
+            consume_date_expr = "consume_date" if "consume_date" in cols else "NULL AS consume_date"
+            txn_type_expr = "txn_type" if "txn_type" in cols else "NULL AS txn_type"
+            flow_type_expr = "flow_type" if "flow_type" in cols else "NULL AS flow_type"
             try:
                 rows = con.execute(
-                    f"""SELECT amount, currency, card_no, {splits_expr}
+                    f"""SELECT amount, currency, card_no, {consume_date_expr},
+                               {txn_type_expr}, {flow_type_expr}, {splits_expr}
                         FROM card_pending_txns
                         WHERE user_id = ?{excl_filter}""",
                     (user_id,),
@@ -327,6 +334,9 @@ class PortfolioReadMixin(_BaseHelpers):
                     amount=r["amount"],
                     currency=r["currency"],
                     card_no=r["card_no"],
+                    consume_date=r["consume_date"],
+                    txn_type=r["txn_type"],
+                    flow_type=r["flow_type"],
                     splits_overwrite=r["splits_overwrite"],
                 )
                 for r in rows
@@ -341,11 +351,12 @@ class PortfolioReadMixin(_BaseHelpers):
         user_id: int,
         month_pattern: str,  # e.g. "2026-06-%"
     ) -> list[CardMonthAmountRow]:
-        """掃 card_billed_txns 本月 consume_date LIKE 'YYYY-MM-%' (該 user).
+        """掃 card_billed_txns 本月消費日（支援 YYYY-MM-DD／YYYY/MM/DD）。
 
         auto_excluded=1 過濾掉.
         Caller 端做 currency / excluded-card filter 後 sum.
         """
+        month = month_pattern[:7]
         con = db.open_bank_conn(bank)
         if con is None:
             return []
@@ -363,12 +374,16 @@ class PortfolioReadMixin(_BaseHelpers):
                 "splits_overwrite" if "splits_overwrite" in cols
                 else "NULL AS splits_overwrite"
             )
+            txn_type_expr = "txn_type" if "txn_type" in cols else "NULL AS txn_type"
+            flow_type_expr = "flow_type" if "flow_type" in cols else "NULL AS flow_type"
             try:
                 rows = con.execute(
-                    f"""SELECT amount, currency, card_no, {splits_expr}
+                    f"""SELECT amount, currency, card_no, consume_date,
+                               {txn_type_expr}, {flow_type_expr}, {splits_expr}
                         FROM card_billed_txns
-                        WHERE user_id = ? AND consume_date LIKE ?{excl_filter}""",
-                    (user_id, month_pattern),
+                        WHERE user_id = ?
+                          AND REPLACE(SUBSTR(consume_date, 1, 7), '/', '-') = ?{excl_filter}""",
+                    (user_id, month),
                 ).fetchall()
             except db.OperationalError:
                 return []
@@ -377,6 +392,9 @@ class PortfolioReadMixin(_BaseHelpers):
                     amount=r["amount"],
                     currency=r["currency"],
                     card_no=r["card_no"],
+                    consume_date=r["consume_date"],
+                    txn_type=r["txn_type"],
+                    flow_type=r["flow_type"],
                     splits_overwrite=r["splits_overwrite"],
                 )
                 for r in rows

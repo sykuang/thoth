@@ -362,18 +362,29 @@ def _included_card_spending_amount(row: Any) -> int:
     return included if total == parent_amount else parent_amount
 
 
+def _is_card_expense(row: Any) -> bool:
+    txn_type = (getattr(row, "txn_type", None) or "").lower()
+    if txn_type in {"cashback", "refund", "fee_waiver", "payment"}:
+        return False
+    flow_type = (getattr(row, "flow_type", None) or "").lower()
+    if flow_type:
+        return flow_type == "expense"
+    return bool(_to_int(getattr(row, "amount", None)) or 0)
+
+
+def _pending_belongs_to_month(row: Any, month: str) -> bool:
+    value = str(getattr(row, "consume_date", None) or "").strip()
+    return not value or value[:7].replace("/", "-") == month
+
+
 def _bank_current_month_spending(bank: str, user_id: int) -> int:
-    """本月消費 (TWD only) = card_pending_txns(全部) + card_billed_txns 本月 consume_date.
+    """本月消費 (TWD only) = 本月卡片支出，排除非支出與舊月 pending。
 
-    使用者規則 (2026-06-14):
-      - pending 表的本質就是「最近一次同步抓到還沒出帳的」, refresh-by-scope 每次
-        全清重寫, 所以 pending 表的 row **永遠是當下未出帳的, 視同本月**
-        (不依 consume_date 過濾, 因為 ubot 等銀行 pending 沒寫 consume_date)
-      - billed 表才用 consume_date 過濾本月 (分期 12/12 出在 billed 也算本月消費)
-      - **不依出帳狀態判斷**, 純看資料來源 + consume_date
-
-    Phase 6 (excluded, 2026-06-14 PM):
-      使用者手動標 excluded 的卡 → 本月消費跳過該卡 txn.
+    使用者規則:
+      - pending 有 consume_date 時只算本月；缺日期才視為當下未出帳並納入
+      - billed 以 consume_date 過濾本月
+      - cashback/refund/fee_waiver/payment 與 non-expense flow 不算消費
+      - card、parent 或 split exclusion 皆需排除
 
     Plan B B4: 全 SQL 走 db_facade. Caller 不再傳 con.
     """
@@ -386,12 +397,14 @@ def _bank_current_month_spending(bank: str, user_id: int) -> int:
     excluded_cards: set[str] = excluded_map.get(bank, set())
 
     total = 0
-    # pending 表 — 全算 (refresh-by-scope, 永遠是當下未出帳的)
+    # pending 有可用消費日時只算本月；無日期保留未出帳 fallback。
     for r in db_api.list_card_pending_amounts_for_user(bank=bank, user_id=user_id):
         currency = (r.currency or "TWD").upper()
         if currency != "TWD":
             continue
         if r.card_no in excluded_cards:
+            continue
+        if not _pending_belongs_to_month(r, month) or not _is_card_expense(r):
             continue
         total += _included_card_spending_amount(r)
     # billed 表 — 看 consume_date 過濾本月
@@ -402,6 +415,8 @@ def _bank_current_month_spending(bank: str, user_id: int) -> int:
         if currency != "TWD":
             continue
         if r.card_no in excluded_cards:
+            continue
+        if not _is_card_expense(r):
             continue
         total += _included_card_spending_amount(r)
     return total
