@@ -14,13 +14,14 @@
     },
     "ios": {
       "bundleIdentifier": "com.kenkuang.thoth",
+      "buildNumber": "59",
       "appleTeamId": "C72TPR683L",
       "supportsTablet": true,
       "infoPlist": {
         "NSFaceIDUsageDescription": "解鎖 Thoth app",
         "ITSAppUsesNonExemptEncryption": false,
         "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true,
+          "NSAllowsArbitraryLoads": false,
           "NSAllowsLocalNetworking": true
         },
         "UIBackgroundModes": [
