@@ -28,7 +28,8 @@ export function parseDateForMobileLayout(date: string | null | undefined): {
 /**
  * Phase 8.2 (2026-06-14): 取顯示用的說明 — overwrite 優先.
  * Phase 8.4 (2026-06-15): backend 統一給 display_description 欄 (raw description
- * 不動, transform 層 join desc + counterparty 對齊 MoneyBook), frontend 直接拿。
+ * 不動, transform 層 join desc + counterparty 對齊 MoneyBook), frontend 再把非空 memo
+ * 合併成同一個說明；使用者 overwrite 仍完整取代銀行原文。
  * 回傳 [shown_text, is_overwritten] — caller 可加 ✏️ 標記讓使用者看到這是覆寫.
  */
 export function getDisplayDescription(
@@ -36,15 +37,28 @@ export function getDisplayDescription(
     description: string | null;
     description_overwrite?: string | null;
     display_description?: string | null;
+    memo?: string | null;
   }
 ): [string, boolean] {
   const overwrite = t.description_overwrite;
   if (overwrite && overwrite.length > 0) return [overwrite, true];
-  // backend 給的 display_description 是 join 後的對外字串; 退守 description
-  return [t.display_description || t.description || '—', false];
+  const base = (t.display_description || t.description || '').trim();
+  const memo = formatTransactionMemo(t.memo);
+  if (!memo) return [base || '—', false];
+  if (!base) return [memo, false];
+
+  const baseKey = base.replace(/\s+/g, ' ').toLocaleLowerCase();
+  const memoKey = memo.toLocaleLowerCase();
+  if (
+    baseKey === memoKey
+    || memoKey.startsWith(`${baseKey} `)
+    || (baseKey.length === 30 && memoKey.startsWith(baseKey))
+  ) return [memo, false];
+  if (baseKey.includes(memoKey)) return [base, false];
+  return [`${base} - ${memo}`, false];
 }
 
-/** Bank-provided memo shown in detail view; collapse padded statement columns. */
+/** Bank-provided memo combined into the description; collapse padded statement columns. */
 export function formatTransactionMemo(memo: string | null | undefined): string | null {
   return memo?.trim().replace(/\s+/g, ' ') || null;
 }

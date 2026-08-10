@@ -33,7 +33,7 @@ import {
   renderAmount,
 } from '@/lib/currency';
 import { maskCardNo } from '@/lib/mask';
-import { SCOPE_LABEL, formatTransactionMemo, getDisplayDescription } from '@/lib/txnDisplay';
+import { SCOPE_LABEL, getDisplayDescription } from '@/lib/txnDisplay';
 import {
   type CardDateBasis,
   type SupportedBank,
@@ -292,7 +292,10 @@ export function TxnDetailModal({
   if (!txn) return null;
 
   const render = renderAmount(txn, fxMode);
-  const transactionMemo = formatTransactionMemo(txn.memo);
+  const [rawDisplayDescription] = getDisplayDescription({
+    ...txn,
+    description_overwrite: null,
+  });
   const amountColor =
     render.direction === 'income'
       ? 'text-accent-600 dark:text-accent-500'
@@ -357,9 +360,9 @@ export function TxnDetailModal({
                   return edited ? `✏️ ${shown}` : shown;
                 })()}
               </Text>
-              {txn.description_overwrite && txn.description ? (
+              {txn.description_overwrite && rawDisplayDescription !== '—' ? (
                 <Text className="text-ink-400 dark:text-ink-500 text-micro mb-1 italic">
-                  原文: {txn.description}
+                  原文: {rawDisplayDescription}
                 </Text>
               ) : null}
               <View className="flex-row items-center gap-2 flex-wrap">
@@ -437,7 +440,6 @@ export function TxnDetailModal({
             )}
             {txn.scope && <DetailRow label="範圍" value={SCOPE_LABEL[txn.scope] ?? txn.scope} />}
             {txn.datetime && <DetailRow label="完整時間" value={txn.datetime} />}
-            {transactionMemo && <DetailRow label="備註" value={transactionMemo} />}
           </View>
 
           {/* Phase 8.2: 說明覆寫 (overwrite) — raw description 永遠不動 */}
@@ -461,7 +463,7 @@ export function TxnDetailModal({
             <TextInput
               value={editDesc}
               onChangeText={setEditDesc}
-              placeholder={txn.description ?? '(原文為空)'}
+              placeholder={rawDisplayDescription}
               placeholderTextColor="#94a3b8"
               maxLength={200}
               testID="txn-detail-desc-input"
