@@ -12,6 +12,7 @@
  */
 import { router } from 'expo-router';
 
+import { SessionPromiseGate, storedCredentialsMatchSession } from '@/lib/authRetryPolicy';
 import { loadCredentials, hasCredentials } from '@/lib/credentials';
 import { queryClient } from '@/lib/queryClient';
 import { useAuthStore } from '@/stores/auth';
@@ -158,8 +159,12 @@ export function formatApiError(err: unknown): string {
 export type ApiInit = Omit<RequestInit, 'body'> & {
   body?: unknown;
   skipAuth?: boolean;
-  /** Fail on 401 without refreshing/retrying; use for owner-bound mutations. */
+  /** Fail on 401 without refreshing/retrying. Owner-bound callers should use authRetryGuard. */
   skipAuthRetry?: boolean;
+  /** Revalidate an owner/session boundary before token rotation and retry. */
+  authRetryGuard?: () => void;
+  /** Stable key for sharing auth recovery only within one owner/session epoch. */
+  authRetryKey?: string;
   /** If true, returns void on 204 instead of attempting JSON parse. */
   raw?: boolean;
   /** Request timeout in ms (default 30000). Set to 0 to disable. */
@@ -181,23 +186,31 @@ export type ApiInit = Omit<RequestInit, 'body'> & {
 // chain 設計：舊 refresh 用一次就 revoke），其餘全部被當 reuse 攻擊 → revoke
 // 整個 family → user 全部 device 強制重登。經典 race。
 //
-// 解法：module-level singleton promise。第一個 401 啟動 refresh，其餘 request
-// `await refreshPromise`，全部拿到同一個新 access token 後 retry。
+// 解法：以 owner/session epoch 為 key 的 promise gate。同 session 的 401 共用
+// 一次 rotation；切帳號後另開新 flight，避免加入舊 owner 的失敗結果。
 //
 // Refresh 失敗（401 / 410 / network error）→ 一律當 session 已死：
 //   1. clear queryClient cache (cross-user 防漏)
 //   2. logout() 清掉 access + refresh token
 //   3. router.replace('/login')
 
-let refreshPromise: Promise<string> | null = null;
+const refreshGate = new SessionPromiseGate<string>();
 
-/** 並發 401 的單例 refresh：第一個進來啟動 refresh，其餘等同一個 promise。
- *
- *  回 Promise<新 access_token>；失敗會 throw 並完成 hard logout。 */
-async function getOrStartRefresh(): Promise<string> {
-  if (refreshPromise) return refreshPromise;
+function currentAuthSessionKey(): string {
+  const { serverUrl, email, token, refreshToken } = useAuthStore.getState();
+  return JSON.stringify([serverUrl, email, token, refreshToken]);
+}
 
-  refreshPromise = (async () => {
+/** 並發 401 的單例 refresh：只讓同一 owner/session epoch 共用 promise。 */
+async function getOrStartRefresh(
+  authRetryKey: string | undefined,
+  authRetryGuard?: () => void,
+): Promise<string> {
+  authRetryGuard?.();
+  const gateKey = authRetryKey ?? currentAuthSessionKey();
+  return refreshGate.getOrStart(gateKey, async () => {
+    authRetryGuard?.();
+    const authSessionKeyAtStart = currentAuthSessionKey();
     const store = useAuthStore.getState();
     const refresh = store.refreshToken;
     if (!refresh) {
@@ -210,7 +223,6 @@ async function getOrStartRefresh(): Promise<string> {
     };
     if (store.apiKey) headers['X-API-Key'] = store.apiKey;
 
-    // Refresh 自己也設 timeout，避免卡死
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), DEFAULT_TIMEOUT_MS);
     let resp: Response;
@@ -235,20 +247,13 @@ async function getOrStartRefresh(): Promise<string> {
     if (!data.access_token || !data.refresh_token) {
       throw new ApiError(500, { detail: 'malformed refresh response' });
     }
-    // 寫回 store — 之後所有 API call 都用新 token
+    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
+      throw new ApiError(409, { detail: 'auth session changed during refresh' });
+    }
+    authRetryGuard?.();
     useAuthStore.getState().setTokens(data.access_token, data.refresh_token);
     return data.access_token;
-  })();
-
-  // 不論成功失敗，promise resolve / reject 後立即清掉，下次 401 才能重新啟動。
-  // （成功時 next 401 通常是 token 又過期才會發生 — 走全新流程）
-  refreshPromise
-    .catch(() => undefined) // 防 unhandled rejection 警告
-    .finally(() => {
-      refreshPromise = null;
-    });
-
-  return refreshPromise;
+  });
 }
 
 async function safeReadJson(resp: Response): Promise<unknown> {
@@ -286,15 +291,21 @@ function hardLogout(): void {
 //   4. 整段成功 = 使用者完全無感 (只看到 Face ID 一閃)
 //   5. 任何一步失敗 = hardLogout fallback (跟以前一樣)
 //
-// 這個 promise 也走 singleton pattern，跟 refreshPromise 同理 —— 多個 401
-// 一起進來不能各自 prompt Face ID 三次。
+// Face ID 也走同一套 session-keyed gate，多個 401 不會重複 prompt，
+// 不同 owner 則絕不共用舊 session 的登入結果。
 
-let biometricReLoginPromise: Promise<string> | null = null;
+const biometricReLoginGate = new SessionPromiseGate<string>();
 
-async function getOrStartBiometricReLogin(): Promise<string> {
-  if (biometricReLoginPromise) return biometricReLoginPromise;
-
-  biometricReLoginPromise = (async () => {
+async function getOrStartBiometricReLogin(
+  authRetryKey: string | undefined,
+  authRetryGuard?: () => void,
+): Promise<string> {
+  authRetryGuard?.();
+  const gateKey = authRetryKey ?? currentAuthSessionKey();
+  return biometricReLoginGate.getOrStart(gateKey, async () => {
+    authRetryGuard?.();
+    const authSessionKeyAtStart = currentAuthSessionKey();
+    const active = useAuthStore.getState();
     if (!(await hasCredentials())) {
       throw new ApiError(401, { detail: 'no saved credentials' });
     }
@@ -302,17 +313,25 @@ async function getOrStartBiometricReLogin(): Promise<string> {
     if (!creds) {
       throw new ApiError(401, { detail: 'biometric cancelled' });
     }
-    // Silent re-login (form-encoded OAuth2)
+    if (!storedCredentialsMatchSession(creds, {
+      serverUrl: active.serverUrl,
+      email: active.email ?? '',
+    })) {
+      throw new ApiError(409, { detail: 'saved credentials do not match active session' });
+    }
+    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
+      throw new ApiError(409, { detail: 'auth session changed before biometric re-login' });
+    }
+    authRetryGuard?.();
     const form = new URLSearchParams();
     form.append('username', creds.email);
     form.append('password', creds.password);
-    const url = `${getBaseUrl()}/auth/login`;
+    const url = `${active.serverUrl.replace(/\/+$/, '')}/auth/login`;
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
     };
-    const apiKey = useAuthStore.getState().apiKey;
-    if (apiKey) headers['X-API-Key'] = apiKey;
+    if (active.apiKey) headers['X-API-Key'] = active.apiKey;
 
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), DEFAULT_TIMEOUT_MS);
@@ -334,22 +353,29 @@ async function getOrStartBiometricReLogin(): Promise<string> {
     if (!data.access_token) {
       throw new ApiError(500, { detail: 'malformed re-login response' });
     }
+    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
+      throw new ApiError(409, { detail: 'auth session changed during biometric re-login' });
+    }
+    authRetryGuard?.();
     useAuthStore
       .getState()
       .setAuth(data.access_token, creds.email, data.refresh_token ?? null);
     return data.access_token;
-  })();
-
-  biometricReLoginPromise
-    .catch(() => undefined)
-    .finally(() => {
-      biometricReLoginPromise = null;
-    });
-
-  return biometricReLoginPromise;
+  });
 }
 
 export async function api<T = unknown>(path: string, init: ApiInit = {}): Promise<T> {
+  let requestAuthSessionKey = init.skipAuth ? null : currentAuthSessionKey();
+  const assertRequestAuthSession = () => {
+    if (requestAuthSessionKey !== null && currentAuthSessionKey() !== requestAuthSessionKey) {
+      throw new ApiError(409, { detail: 'auth session changed during request' });
+    }
+    init.authRetryGuard?.();
+  };
+  const adoptRecoveredAuthSession = () => {
+    init.authRetryGuard?.();
+    requestAuthSessionKey = currentAuthSessionKey();
+  };
   const headers: Record<string, string> = {
     Accept: 'application/json',
     ...(init.headers as Record<string, string> | undefined),
@@ -402,6 +428,7 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
     throw e;
   }
   if (timer) clearTimeout(timer);
+  if (!init.skipAuth) assertRequestAuthSession();
 
   // L9: 401 → 嘗試 refresh 一次 → retry 原 request；refresh 失敗才 hard logout。
   // L13: refresh 失敗 → 試 biometric silent re-login (有存 creds 的話) → retry。
@@ -411,70 +438,61 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
     throw new ApiError(401, await safeReadJson(res));
   }
   if (res.status === 401 && !init.skipAuth) {
-    // /auth/refresh 自己 401 → 試 biometric re-login (refresh token 已死)
-    if (path === '/auth/refresh') {
-      if (await hasCredentials()) {
-        try {
-          await getOrStartBiometricReLogin();
-          // 這是 refresh 端點被人手動 call,re-login 成功後不重 retry —
-          // caller 自己會拿新 token 再試
-          throw new ApiError(401, { detail: 'refresh-failed-but-bio-relogin-ok' });
-        } catch {
-          hardLogout();
-          throw new ApiError(401, { detail: 'refresh + biometric failed' });
-        }
-      }
+    const hasCredentialsForActiveSession = async () => {
+      const available = await hasCredentials();
+      assertRequestAuthSession();
+      return available;
+    };
+    if (init._retriedAfterBiometric) {
       hardLogout();
-      throw new ApiError(401, { detail: 'refresh failed' });
+      throw new ApiError(401, { detail: 'unauthorized after biometric re-login' });
     }
     if (init._retriedAfterRefresh) {
-      // Retry 又 401 → refresh chain 死透,試 biometric
-      if (await hasCredentials()) {
+      if (await hasCredentialsForActiveSession()) {
         try {
-          await getOrStartBiometricReLogin();
-          // 用 biometric re-login 後拿到的全新 token 再 retry 一次
-          return api<T>(path, { ...init, _retriedAfterRefresh: true, _retriedAfterBiometric: true });
+          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
+          adoptRecoveredAuthSession();
+          return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
-          // biometric 也失敗 — 真的沒救
+          assertRequestAuthSession();
         }
       }
       hardLogout();
       throw new ApiError(401, { detail: 'unauthorized after refresh retry' });
     }
-    if (init._retriedAfterBiometric) {
-      // biometric re-login 後又 401 (帳密真的錯了 / server 端 user 被刪)
-      hardLogout();
-      throw new ApiError(401, { detail: 'unauthorized after biometric re-login' });
-    }
-    // 沒 refresh token 可用 → 試 biometric,沒 creds 才登出
     if (!useAuthStore.getState().refreshToken) {
-      if (await hasCredentials()) {
+      if (await hasCredentialsForActiveSession()) {
         try {
-          await getOrStartBiometricReLogin();
+          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
+          adoptRecoveredAuthSession();
           return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
-          // 落到下面 hardLogout
+          assertRequestAuthSession();
         }
       }
       hardLogout();
       throw new ApiError(401, { detail: 'unauthorized' });
     }
     try {
-      await getOrStartRefresh();
+      await getOrStartRefresh(init.authRetryKey, assertRequestAuthSession);
+      adoptRecoveredAuthSession();
     } catch {
-      // Refresh failed — 試 biometric re-login 救一次
-      if (await hasCredentials()) {
+      // A stale request must fail without Face ID or hard-logout of the newly
+      // active session.
+      assertRequestAuthSession();
+      if (await hasCredentialsForActiveSession()) {
         try {
-          await getOrStartBiometricReLogin();
+          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
+          adoptRecoveredAuthSession();
           return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
-          // biometric 也失敗
+          assertRequestAuthSession();
         }
       }
       hardLogout();
       throw new ApiError(401, { detail: 'refresh failed' });
     }
-    // 用新 access token retry 原 request 一次
+    assertRequestAuthSession();
     return api<T>(path, { ...init, _retriedAfterRefresh: true });
   }
 
@@ -484,6 +502,7 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
   }
 
   const text = await res.text();
+  if (!init.skipAuth) assertRequestAuthSession();
   let parsed: unknown = undefined;
   if (text) {
     try {

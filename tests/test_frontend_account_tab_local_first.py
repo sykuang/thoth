@@ -46,7 +46,8 @@ def test_accounts_tab_queries_and_persistence_are_owner_bound() -> None:
     owner_hook = OWNER_HOOK.read_text(encoding="utf-8")
     dataset_hook = DATASET_HOOK.read_text(encoding="utf-8")
     assert "guardReplicaOwnerRequest" in owner_hook
-    assert "skipAuthRetry: true" in owner_hook
+    assert "skipAuthRetry: true" not in owner_hook
+    assert "authRetryGuard: () => assertReplicaOwnerEpoch(ownerKey, ownerEpoch)" in owner_hook
     assert "['frontend-dataset', 'replica', ownerKey, ownerEpoch]" in dataset_hook
     assert "await waitForReplicaOwner(ownerKey, ownerEpoch)" in dataset_hook
     assert "() => replicaStore.load(ownerKey)" in dataset_hook

@@ -2,6 +2,7 @@ import { useCallback, useMemo } from 'react';
 
 import { api, type ApiInit } from '@/lib/api';
 import {
+  assertReplicaOwnerEpoch,
   getReplicaOwnerEpoch,
   guardReplicaOwnerRequest,
   makeReplicaOwnerKey,
@@ -25,7 +26,11 @@ export function useOwnerBoundApi() {
     return guardReplicaOwnerRequest(
       ownerKey,
       ownerEpoch,
-      () => api<T>(path, { ...init, skipAuthRetry: true }),
+      () => api<T>(path, {
+        ...init,
+        authRetryKey: `${ownerKey}:${ownerEpoch}`,
+        authRetryGuard: () => assertReplicaOwnerEpoch(ownerKey, ownerEpoch),
+      }),
     );
   }, [ownerEpoch, ownerKey]);
 

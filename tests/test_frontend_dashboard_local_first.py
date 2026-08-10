@@ -35,7 +35,8 @@ def test_dashboard_remote_queries_and_persistence_are_owner_bound() -> None:
         assert query_key in source
     owner_hook = OWNER_HOOK.read_text(encoding="utf-8")
     assert "guardReplicaOwnerRequest" in owner_hook
-    assert "skipAuthRetry: true" in owner_hook
+    assert "skipAuthRetry: true" not in owner_hook
+    assert "authRetryGuard: () => assertReplicaOwnerEpoch(ownerKey, ownerEpoch)" in owner_hook
 
     assert "fetchCompleteDashboardCache" in source
     assert "activeOwnerRef.current !== ownerKey" in source

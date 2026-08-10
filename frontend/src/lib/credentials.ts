@@ -27,6 +27,7 @@ import { Platform } from 'react-native';
 const KEY = 'bank-crawlers-credentials';
 
 export type StoredCredentials = {
+  serverUrl: string;
   email: string;
   password: string;
 };
@@ -51,9 +52,13 @@ export async function hasCredentials(): Promise<boolean> {
  *  授權 — 我們把 requireAuthentication 設 true，OS 在 set 時就會 prompt。
  *
  *  Throws if user cancels biometric prompt or keychain write fails. */
-export async function saveCredentials(email: string, password: string): Promise<void> {
+export async function saveCredentials(
+  serverUrl: string,
+  email: string,
+  password: string,
+): Promise<void> {
   if (Platform.OS === 'web') return; // no-op
-  const value = JSON.stringify({ email, password } satisfies StoredCredentials);
+  const value = JSON.stringify({ serverUrl, email, password } satisfies StoredCredentials);
   await SecureStore.setItemAsync(KEY, value, {
     keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     requireAuthentication: true,
@@ -78,7 +83,9 @@ export async function loadCredentials(
     });
     if (!raw) return null;
     const parsed = JSON.parse(raw) as StoredCredentials;
-    if (!parsed.email || !parsed.password) return null;
+    // Old entries did not bind credentials to a server. Fail closed and ask
+    // the user to opt in again instead of sending a password to another host.
+    if (!parsed.serverUrl || !parsed.email || !parsed.password) return null;
     return parsed;
   } catch (err) {
     // 使用者取消 Face ID / 三次失敗 / keychain corrupted — 都當沒有

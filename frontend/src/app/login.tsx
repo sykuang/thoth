@@ -209,7 +209,7 @@ export default function LoginScreen() {
       //      失敗 (使用者取消 / 沒生物辨識) 不擋 login 流程,只是不存。
       if (rememberCreds && Platform.OS !== 'web') {
         try {
-          await saveCredentials(email, password);
+          await saveCredentials(v.normalized, email, password);
         } catch (saveErr) {
           // 不擋登入,只通知使用者沒存成功
           Alert.alert(
