@@ -613,8 +613,27 @@ class EsunCrawler(BankCrawler):
                 seen_keys: set = set()  # dedup: (date, merchant, billed_amount)
                 periods_results = []
                 all_periods_ok = True
-                for period_label in ("最近一個月", "最近二個月"):
-                    page.wait_for_timeout(5000)  # 等表單回到查詢狀態（不重點選表單）
+                for period_index, period_label in enumerate(("最近一個月", "最近二個月")):
+                    if period_index:
+                        # 查詢結果會取代 FCM01004 表單；下一期間必須從 menu 重載 widget。
+                        period_nav = self._navigate_menu(
+                            page, "信用卡消費明細查詢", debug_dir,
+                            f"card_txn_form_{period_index}.png",
+                        )
+                        if not any(
+                            fr.get("result", {}).get("clicked")
+                            for fr in period_nav.get("frames", [])
+                        ):
+                            all_periods_ok = False
+                            periods_results.append({
+                                "period": period_label,
+                                "navigation": period_nav,
+                                "submitted": {"strategy": None},
+                                "result_seen": False,
+                            })
+                            _log(f"[esun][collect] {period_label} 查詢表單未重新載入，跳過")
+                            continue
+                    page.wait_for_timeout(5000)
                     form_submitted = self._submit_card_txn_query(page, debug_dir, period_label)
                     period_result = {"period": period_label, "submitted": form_submitted,
                                      "result_seen": False}
@@ -1182,48 +1201,63 @@ class EsunCrawler(BankCrawler):
                 result = f.evaluate("""
                     (wanted) => {
                       const log = [];
-                      // 1) 找指定期間 radio label 並點
+                      // 結果頁證明「點到同文字 span/div」不代表 radio 真正切換；
+                      // 直接鎖定 JSF intervalrdo1/2/3，並以 checked 作成功條件。
+                      const periodIndex = {
+                        '最近一星期': '1',
+                        '最近一個月': '2',
+                        '最近二個月': '3',
+                      }[wanted];
+                      const radio = periodIndex ? document.querySelector(
+                        `input[type="radio"][id$="intervalrdo${periodIndex}"], ` +
+                        `input[type="radio"][id*="intervalrdo${periodIndex}"], ` +
+                        `input[type="radio"][value="${periodIndex}"]`
+                      ) : null;
                       let monthClicked = false;
-                      for (const lbl of document.querySelectorAll('label,span,div')) {
-                        const t = (lbl.textContent || '').trim();
-                        if (t === wanted) {
-                          const r = lbl.getBoundingClientRect();
-                          if (r.width > 0 && r.height > 0) {
-                            lbl.click();
-                            monthClicked = true;
-                            log.push('clicked label ' + wanted);
-                            break;
-                          }
-                        }
-                      }
-                      // 2) 退而求其次：找 input[type=radio][value="2"] 或 :intervalrdo2
-                      if (!monthClicked && wanted === '最近一個月') {
-                        const radio = document.querySelector('input[type=radio][id*="intervalrdo2"], input[type=radio][value="2"]');
-                        if (radio) {
+                      if (radio) {
+                        const label = [...document.querySelectorAll('label')].find(
+                          (lbl) => lbl.htmlFor === radio.id || lbl.contains(radio)
+                            || (lbl.textContent || '').trim() === wanted
+                        );
+                        if (label) label.click();
+                        if (!radio.checked) radio.click();
+                        if (!radio.checked) {
                           radio.checked = true;
+                          radio.dispatchEvent(new Event('input', {bubbles: true}));
                           radio.dispatchEvent(new Event('change', {bubbles: true}));
-                          monthClicked = true;
-                          log.push('checked radio fallback intervalrdo2');
                         }
+                        monthClicked = radio.checked;
+                        if (monthClicked) log.push('selected radio ' + wanted);
                       }
-                      // 3) 找「查詢」button
+                      const periodSelected = Boolean(radio && radio.checked);
+
+                      // 只有期間 radio 已確認 selected 才能送查詢，否則會默默查預設一星期。
                       let queryClicked = false;
-                      for (const btn of document.querySelectorAll('button,a,input[type=button],input[type=submit]')) {
-                        const t = (btn.textContent || btn.value || '').trim();
-                        if (t === '查詢' || t === '查 詢') {
-                          const r = btn.getBoundingClientRect();
-                          if (r.width > 0 && r.height > 0) {
-                            btn.click();
-                            queryClicked = true;
-                            log.push('clicked 查詢');
-                            break;
+                      if (periodSelected) {
+                        for (const btn of document.querySelectorAll('button,a,input[type=button],input[type=submit]')) {
+                          const t = (btn.textContent || btn.value || '').trim();
+                          if (t === '查詢' || t === '查 詢') {
+                            const r = btn.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                              btn.click();
+                              queryClicked = true;
+                              log.push('clicked 查詢');
+                              break;
+                            }
                           }
                         }
                       }
-                      return {monthClicked, queryClicked, log, frame_url: location.href};
+                      return {
+                        monthClicked,
+                        periodSelected,
+                        queryClicked,
+                        selectedRadioId: radio?.id || null,
+                        log,
+                        frame_url: location.href,
+                      };
                     }
                 """, period_label)
-                if result and (result.get("monthClicked") or result.get("queryClicked")):
+                if result and result.get("periodSelected") and result.get("queryClicked"):
                     info["strategy"] = result
                     _log(f"[esun][collect][txn-form] {f.url[:60]} {result.get('log')}")
                     with contextlib.suppress(Exception):
