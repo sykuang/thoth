@@ -44,6 +44,11 @@ export function getDisplayDescription(
   return [t.display_description || t.description || '—', false];
 }
 
+/** Bank-provided memo shown in detail view; collapse padded statement columns. */
+export function formatTransactionMemo(memo: string | null | undefined): string | null {
+  return memo?.trim().replace(/\s+/g, ' ') || null;
+}
+
 /**
  * Phase 7.5 (2026-06-15 使用者指示): scope (信用卡 pending 子範圍) 中文化.
  * backend 寫 unbilled (未出帳) / realtime (即時) 兩 enum, UI 顯示中文.

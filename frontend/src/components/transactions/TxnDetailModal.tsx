@@ -33,7 +33,7 @@ import {
   renderAmount,
 } from '@/lib/currency';
 import { maskCardNo } from '@/lib/mask';
-import { SCOPE_LABEL, getDisplayDescription } from '@/lib/txnDisplay';
+import { SCOPE_LABEL, formatTransactionMemo, getDisplayDescription } from '@/lib/txnDisplay';
 import {
   type CardDateBasis,
   type SupportedBank,
@@ -292,6 +292,7 @@ export function TxnDetailModal({
   if (!txn) return null;
 
   const render = renderAmount(txn, fxMode);
+  const transactionMemo = formatTransactionMemo(txn.memo);
   const amountColor =
     render.direction === 'income'
       ? 'text-accent-600 dark:text-accent-500'
@@ -436,6 +437,7 @@ export function TxnDetailModal({
             )}
             {txn.scope && <DetailRow label="範圍" value={SCOPE_LABEL[txn.scope] ?? txn.scope} />}
             {txn.datetime && <DetailRow label="完整時間" value={txn.datetime} />}
+            {transactionMemo && <DetailRow label="備註" value={transactionMemo} />}
           </View>
 
           {/* Phase 8.2: 說明覆寫 (overwrite) — raw description 永遠不動 */}
@@ -724,7 +726,7 @@ function DetailRow({ label, value, mono = false }: { label: string; value: strin
     <View className="flex-row items-center justify-between py-1.5 border-b border-ink-100 dark:border-ink-800">
       <Text className="text-ink-500 dark:text-ink-400 text-small">{label}</Text>
       <Text
-        className={`text-ink-700 dark:text-ink-300 text-small ${mono ? 'font-mono' : ''}`}
+        className={`text-ink-700 dark:text-ink-300 text-small flex-1 ml-4 text-right ${mono ? 'font-mono' : ''}`}
       >
         {value}
       </Text>
