@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from backend.core import account_classify
+from backend.core.store import canonical_display_description
 from backend.server import fx_service
 from backend.server.db_facade import db_api
 
@@ -94,6 +95,9 @@ def _transaction_fact(
         "counterparty_bank": _value(row, "counterparty_bank"),
         "counterparty_acct": _value(row, "counterparty_acct"),
         "memo": _value(row, "memo"),
+        "display_description": canonical_display_description(
+            _value(row, "description"), _value(row, "counterparty_acct"),
+        ),
         "scope": _value(row, "scope"),
         "excluded": (
             account_no in excluded_accounts if kind == "twd"

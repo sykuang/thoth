@@ -47,6 +47,46 @@ def test_upsert_twd_with_rules_writes_category(store):
     assert cats["未知商店"] is None
 
 
+def test_upsert_twd_persists_memo_in_canonical_description_before_categorizing(store):
+    rules = [
+        {"pattern": r"配息", "category": "利息股息", "priority": 200},
+        {"pattern": r"轉帳", "category": "轉帳", "priority": 90},
+    ]
+
+    store.upsert_twd_txns([{
+        "account_no": "001",
+        "datetime": "2026-08-10 09:00",
+        "desc": "轉帳",
+        "memo": "  0050FUND　基金配息  ",
+        "expend": None,
+        "income": 4494,
+        "balance": 10000,
+    }], rules=rules)
+
+    row = store.conn.execute(
+        "SELECT raw_description, description, memo, category "
+        "FROM twd_transactions",
+    ).fetchone()
+    assert dict(row) == {
+        "raw_description": "轉帳",
+        "description": "轉帳 - 0050FUND 基金配息",
+        "memo": "  0050FUND　基金配息  ",
+        "category": "利息股息",
+    }
+
+
+def test_canonical_description_is_idempotent_and_case_insensitive():
+    from backend.core.store import _canonical_description
+
+    assert _canonical_description(
+        "轉帳 0050FUND 基金配息", "0050FUND 基金配息",
+    ) == "轉帳 0050FUND 基金配息"
+    assert _canonical_description("PAYMENT", "payment") == "PAYMENT"
+    assert _canonical_description(
+        "轉帳 - 0050FUND 基金配息", "0050FUND 基金配息",
+    ) == "轉帳 - 0050FUND 基金配息"
+
+
 def test_upsert_twd_without_rules_leaves_category_null(store):
     """rules=None / [] 時不該動 category 欄（保持 NULL）。"""
     txns = [

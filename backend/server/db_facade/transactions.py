@@ -581,10 +581,10 @@ class TransactionsReadMixin(_BaseHelpers):
         bank: str,
         user_id: int,
     ) -> list[dict[str, Any]]:
-        """Recategorize 用 — 跨 3 表收 (id, description, category, subcategory,
-        auto_excluded, counterparty_acct, memo, table).
+        """Recategorize 用 — 跨 3 表收 (id, canonical description, category,
+        subcategory, auto_excluded, counterparty_acct, memo, table).
 
-        twd 才有 counterparty_acct/memo; card 兩表補 NULL.
+        twd description 已在 DB 合併 memo；memo 仍回傳供 audit，card 兩表補 NULL.
         Caller (router) 跑 categorizer 後再 call batch_update_categorization.
         """
         con = db.open_bank_conn(bank)

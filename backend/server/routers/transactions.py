@@ -64,6 +64,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from backend.core import bank_data
+from backend.core.store import canonical_display_description
 from backend.server.deps import current_user
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
@@ -122,47 +123,6 @@ def _row_get(r: db.Row, key: str, default=None):
         return r[key]
     except (IndexError, KeyError):
         return default
-
-
-def _join_display_description(
-    description: str | None,
-    counterparty_acct: str | None,
-    memo: str | None,
-) -> str | None:
-    """Phase 8.4 (2026-06-15): 拼 display_description 對齊 MoneyBook.
-
-    各銀行 raw description 常是「交易類別名」(永豐「台幣匯款」/玉山「跨行匯入」),
-    真正交易對象在 counterparty_acct (永豐 DataText8/玉山對方名稱)。
-    Memo 通常是 counterparty + 摘要冗餘, 故 fallback 順序:
-      1. description + counterparty_acct 主 token (不同則 join '·')
-      2. description 或 counterparty_acct 任一
-      3. memo 第一個 token (last resort)
-
-    Raw description 不動 (鐵則「修正≠刪除」), 給 audit/categorizer。
-    """
-    def _first_token(s: str | None, limit: int = 30) -> str:
-        if not s:
-            return ""
-        clean = s.replace("\u3000", " ").strip()
-        tok = clean.split()[0] if clean else ""
-        return tok[:limit]
-
-    desc = (description or "").strip()
-    cp = _first_token(counterparty_acct)
-    # desc 跟 counterparty 都有且不同 → join
-    if desc and cp and desc != cp:
-        return f"{desc} · {cp}"
-    # 只有 desc → 純 desc
-    if desc:
-        return desc
-    # desc 空 → 用 counterparty
-    if cp:
-        return cp
-    # 兩者都空 → memo 第一個 token
-    mtok = _first_token(memo)
-    if mtok:
-        return mtok
-    return None
 
 
 def _normalize_date(s: str | None) -> str | None:
@@ -490,12 +450,9 @@ def _twd_to_transaction(
         "counterparty_bank": _row_get(r, "counterparty_bank"),
         "counterparty_acct": _row_get(r, "counterparty_acct"),
         "memo": _row_get(r, "memo"),
-        # display_description: backend 統一 join — raw description 不動,
-        # frontend 直接拿這欄顯示對齊 MoneyBook。所有銀行通用。
-        "display_description": _join_display_description(
-            _row_get(r, "description"),
-            _row_get(r, "counterparty_acct"),
-            _row_get(r, "memo"),
+        # DB description already contains memo; shared backend enrichment adds counterparty only.
+        "display_description": canonical_display_description(
+            _row_get(r, "description"), _row_get(r, "counterparty_acct"),
         ),
         "excluded": is_excluded,
         # Phase 8.3 (2026-06-15): rule auto_excluded 命中 → stats skip 收支桶

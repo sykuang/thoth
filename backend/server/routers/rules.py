@@ -539,11 +539,10 @@ def recategorize(
                 skipped += 1
                 continue
 
-            # 用同 helper 跟 store.upsert_* 對齊 (desc + counterparty + memo join)
+            # description 已在 DB 持久化為 description + memo；規則直接吃 DB canonical truth。
             cat_text_parts = [
                 r["description"] or "",
                 r["counterparty_acct"] or "",
-                r["memo"] or "",
             ]
             seen_set = set()
             cat_text_clean = []

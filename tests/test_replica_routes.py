@@ -584,6 +584,26 @@ def test_postgres_reconcile_lock_uses_dedicated_connection(monkeypatch) -> None:
     ]
 
 
+def test_replica_fact_uses_shared_backend_display_description() -> None:
+    from backend.server.replica_facts import _transaction_fact
+
+    row = SimpleNamespace(
+        kind="twd",
+        id=1,
+        description="轉帳 - 0050FUND 基金配息",
+        counterparty_acct="0050FUND 001",
+        memo="0050FUND　基金配息",
+        income=4494,
+        expend=0,
+        txn_datetime="2026-08-10",
+        account_no="001",
+    )
+    fact = _transaction_fact("cathay", row, set(), set())
+
+    assert fact["description"] == "轉帳 - 0050FUND 基金配息"
+    assert fact["display_description"] == "轉帳 - 0050FUND 基金配息"
+
+
 def test_loan_metric_is_ignored_without_a_loan_account(monkeypatch) -> None:
     from backend.server import replica_facts
 

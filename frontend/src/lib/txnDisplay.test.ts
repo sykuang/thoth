@@ -1,6 +1,6 @@
 import ts from 'typescript';
 
-import { formatTransactionMemo, getDisplayDescription } from './txnDisplay';
+import { getDisplayDescription } from './txnDisplay';
 
 function equal(actual: unknown, expected: unknown, message: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -8,30 +8,21 @@ function equal(actual: unknown, expected: unknown, message: string): void {
   }
 }
 
-equal(
-  formatTransactionMemo('  0050FUND        基金配息                    '),
-  '0050FUND 基金配息',
-  'bank memo whitespace should be normalized for display',
-);
-equal(formatTransactionMemo('　0050FUND　基金配息　'), '0050FUND 基金配息', 'full-width spaces');
-equal(formatTransactionMemo('   '), null, 'blank memo should stay hidden');
-equal(formatTransactionMemo(null), null, 'missing memo should stay hidden');
-equal(formatTransactionMemo(undefined), null, 'undefined memo should stay hidden');
 
 equal(
-  getDisplayDescription({ description: '轉帳', memo: '  0050FUND        基金配息  ' }),
+  getDisplayDescription({ description: '轉帳 - 0050FUND 基金配息', memo: '0050FUND 基金配息' }),
   ['轉帳 - 0050FUND 基金配息', false],
-  'raw description and bank memo should share one description',
+  'frontend should use the canonical description already persisted by the database',
 );
 equal(
-  getDisplayDescription({ description: '轉帳', display_description: '轉帳 · 王小明', memo: '基金配息' }),
-  ['轉帳 · 王小明 - 基金配息', false],
-  'joined counterparty description should retain memo evidence',
+  getDisplayDescription({ description: '轉帳', display_description: '轉帳 - 0050FUND 基金配息', memo: '基金配息' }),
+  ['轉帳 - 0050FUND 基金配息', false],
+  'database display description should be authoritative without another UI join',
 );
 equal(
   getDisplayDescription({ description: null, display_description: '0050FUND', memo: '0050FUND 基金配息' }),
-  ['0050FUND 基金配息', false],
-  'memo fallback should not duplicate its leading token',
+  ['0050FUND', false],
+  'frontend must not expand a database fallback token from memo',
 );
 equal(
   getDisplayDescription({
@@ -39,8 +30,8 @@ equal(
     display_description: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ1234',
     memo: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789 基金配息',
   }),
-  ['ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789 基金配息', false],
-  'truncated memo fallback token should not be duplicated',
+  ['ABCDEFGHIJKLMNOPQRSTUVWXYZ1234', false],
+  'frontend must not reconstruct a truncated database token',
 );
 equal(
   getDisplayDescription({ description: '轉帳', description_overwrite: '皇上自訂', memo: '基金配息' }),

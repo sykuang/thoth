@@ -74,13 +74,11 @@ TAXONOMY_COLS = {
 
 
 def _categorizer_text(desc, counterparty, memo) -> str:
-    """跟 store._categorizer_text 同規則：desc | counterparty | memo 去重後 join。
+    """Match store semantics: canonical DB description (desc + memo) plus counterparty."""
+    from backend.core.store import _canonical_description
 
-    不 import store 的版本是因為它吃 dict（crawler payload shape），這裡吃的是
-    DB row 欄位。規則必須一致，改動時兩邊要同步。
-    """
     out, seen = [], set()
-    for p in (desc, counterparty, memo):
+    for p in (_canonical_description(desc, memo), counterparty):
         s = (p or "").strip()
         if s and s not in seen:
             seen.add(s)

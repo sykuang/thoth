@@ -515,18 +515,6 @@ function maskTail(value: unknown): string | null {
   return `${'*'.repeat(value.length - 4)}${value.slice(-4)}`;
 }
 
-function displayDescription(row: Record<string, unknown>): string | null {
-  const description = stringOrNull(row.description)?.trim() ?? '';
-  const firstToken = (value: unknown) => (
-    stringOrNull(value)?.replace(/\u3000/g, ' ').trim().split(/\s+/)[0]?.slice(0, 30) ?? ''
-  );
-  const counterparty = firstToken(row.counterparty_acct);
-  if (description && counterparty && description !== counterparty) {
-    return `${description} · ${counterparty}`;
-  }
-  return description || counterparty || firstToken(row.memo) || null;
-}
-
 function normalizedSplits(row: Record<string, unknown>): TransactionSplit[] | undefined {
   if (!Array.isArray(row.splits) || row.splits.length < 2 || row.splits.length > 20) {
     return undefined;
@@ -624,7 +612,7 @@ function projectParent(row: Record<string, unknown>): Transaction {
     counterparty_bank: stringOrNull(row.counterparty_bank),
     counterparty_acct: stringOrNull(row.counterparty_acct),
     memo: stringOrNull(row.memo),
-    display_description: displayDescription(row),
+    display_description: stringOrNull(row.display_description) ?? stringOrNull(row.description),
     excluded: Boolean(row.excluded),
     auto_excluded: Boolean(row.auto_excluded),
     tags,

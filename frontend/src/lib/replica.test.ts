@@ -82,6 +82,7 @@ const bootstrap: ReplicaResponse = {
             datetime: '2026-08-08T12:00:00',
             description: '轉帳',
             counterparty_acct: '御膳房 001',
+            display_description: '轉帳 · 御膳房',
             amount: -80,
             cashflow_direction: 'expense',
             cashflow_amount: 80,
@@ -198,7 +199,8 @@ const parityEnvelope = applyReplicaResponse(undefined, {
         {
           id: 4, bank: 'cathay', kind: 'billed', date: '2026-08-09', datetime: null,
           amount: 0, currency: 'TWD', consume_currency: 'USD', consume_amount: 10,
-          counterparty_acct: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789', splits: [],
+          counterparty_acct: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789',
+          display_description: 'SERVER CANONICAL DISPLAY', splits: [],
         },
       ],
     },
@@ -210,7 +212,7 @@ deepEqual(parityTransactions.map((row) => row.id), [10, 2, 4]);
 equal(parityTransactions[1].account_or_card, '*******-789');
 equal(parityTransactions[2].fx_rate, null);
 equal(parityTransactions[2].fx_rate_source, null);
-equal(parityTransactions[2].display_description, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ1234');
+equal(parityTransactions[2].display_description, 'SERVER CANONICAL DISPLAY');
 
 const validDashboardCache = {
   cachedAt: '2026-08-10T00:00:00Z',

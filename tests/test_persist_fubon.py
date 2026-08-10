@@ -188,13 +188,15 @@ def test_fubon_persist_writes_deposit_transactions(fubon_data, fubon_store):
     rows = [
         tuple(row)
         for row in fubon_store.conn.execute(
-            "SELECT account_no, txn_datetime, description, expend, income, balance, memo "
+            "SELECT account_no, txn_datetime, description, raw_description, "
+            "expend, income, balance, memo "
             "FROM twd_transactions ORDER BY txn_datetime"
         ).fetchall()
     ]
     assert rows == [
-        ("90000000267053", "2026-06-21 00:00:00", "利息", None, 5.0, 5.0, None),
-        ("90000000267053", "2026-06-30 19:21:08", "測試轉入", None, 7473.0, 7478.0, "********70019999"),
+        ("90000000267053", "2026-06-21 00:00:00", "利息", "利息", None, 5.0, 5.0, None),
+        ("90000000267053", "2026-06-30 19:21:08", "測試轉入 - ********70019999",
+         "測試轉入", None, 7473.0, 7478.0, "********70019999"),
     ]
 
 

@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3  # only allowed here + bank_pg.py + server/db.py (the 3 db layer files)
 from collections import Counter
+from collections.abc import Iterable
 from datetime import datetime, UTC
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
@@ -177,19 +178,39 @@ def _dedup_key(*parts) -> str:
     return "\x1f".join("" if p is None else str(p) for p in parts)
 
 
-def _categorizer_text(t: dict) -> str:
-    """Phase 8.4 (2026-06-15): 拼 categorizer 看的文字 — desc + counterparty + memo.
+def _canonical_description(description: object, memo: object) -> str | None:
+    """Persisted rule/display text while keeping the bank's raw description separately."""
+    desc = " ".join(str(description or "").split())
+    note = " ".join(str(memo or "").split())
+    if not desc:
+        return note or None
+    desc_key = desc.casefold()
+    note_key = note.casefold()
+    if not note or desc_key == note_key or note_key in desc_key:
+        return desc
+    return f"{desc} - {note}"
 
-    各銀行 raw description 常是「交易類別名」(永豐「台幣匯款」/玉山「跨行匯入」),
-    真正交易對象/識別在 counterparty_acct / memo 欄。Categorizer 改吃 join 後文字,
-    薪資 rule 才能命中 MICROSOFT 等 counterparty 字串。
-    Raw description 不動 — 保「修正≠刪除」鐵則。
+
+def canonical_display_description(description: object, counterparty: object) -> str | None:
+    """Enrich persisted description with a non-duplicated counterparty token."""
+    desc = " ".join(str(description or "").split())
+    party = " ".join(str(counterparty or "").split()).split(" ", 1)[0][:30]
+    if not desc:
+        return party or None
+    if not party or party.casefold() in desc.casefold():
+        return desc
+    return f"{desc} · {party}"
+
+
+def _categorizer_text(t: dict) -> str:
+    """Phase 8.4 (2026-06-15): categorizer sees persisted description + counterparty.
+
+    DB description 已持久化 raw description + memo；counterparty_acct 再作額外分類證據，
+    讓薪資 rule 能命中 MICROSOFT 等對方字串。銀行原文另存 raw_description，
+    保留「修正≠刪除」的 audit trail。
     """
-    parts = [
-        t.get("desc") or "",
-        t.get("counterparty_acct") or "",
-        t.get("memo") or "",
-    ]
+    parts = [_canonical_description(t.get("desc"), t.get("memo")) or "",
+             t.get("counterparty_acct") or ""]
     # 去重 + 空字串過濾 — 有些銀行 desc 跟 counterparty 完全一樣不必重複
     seen = set()
     out = []
@@ -309,6 +330,7 @@ CREATE TABLE IF NOT EXISTS twd_transactions (
     txn_datetime      TEXT NOT NULL,
     account_date      TEXT,
     description       TEXT,
+    raw_description   TEXT,
     expend            INTEGER,
     income            INTEGER,
     balance           INTEGER,
@@ -524,6 +546,30 @@ class BankStore:
             self.conn.execute("ALTER TABLE card_billed_txns ADD COLUMN post_date TEXT")
             self.conn.execute(
                 "UPDATE card_billed_txns SET post_date = consume_date WHERE post_date IS NULL")
+        # Bank memo is part of the persisted canonical description used by both UI and rules.
+        # Keep raw_description for audit/dedup provenance; description is the canonical value.
+        twd_cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(twd_transactions)").fetchall()}
+        if "memo" not in twd_cols:
+            self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN memo TEXT")
+        raw_description_added = "raw_description" not in twd_cols
+        if raw_description_added:
+            self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN raw_description TEXT")
+            self.conn.execute(
+                "UPDATE twd_transactions SET raw_description = description "
+                "WHERE raw_description IS NULL",
+            )
+        key_column = "id" if "id" in twd_cols else "dedup_key"
+        for row in self.conn.execute(
+            f"SELECT {key_column} AS migration_key, raw_description, memo, description "
+            "FROM twd_transactions",
+        ).fetchall():
+            canonical = _canonical_description(row["raw_description"], row["memo"])
+            if canonical != row["description"]:
+                self.conn.execute(
+                    f"UPDATE twd_transactions SET description = ? WHERE {key_column} = ?",
+                    (canonical, row["migration_key"]),
+                )
         # Phase 5.1：分類欄位（三張交易表都加）
         for tbl in ("twd_transactions", "card_billed_txns", "card_pending_txns"):
             tbl_cols = {r["name"] for r in self.conn.execute(
@@ -782,6 +828,8 @@ class BankStore:
         ]
         dedup_keys = _with_occurrence(content_keys)
         for t, key in zip(txns, dedup_keys, strict=True):
+            raw_description = t.get("desc")
+            description = _canonical_description(raw_description, t.get("memo"))
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
             # 台幣: amount 方向可信 (income - expend), 給 _flow_fields 當 fallback
@@ -789,14 +837,15 @@ class BankStore:
             flow, income_cat = _flow_fields(cat, sub, net)
             self.conn.execute(
                 """INSERT INTO twd_transactions
-                   (user_id, account_no, txn_datetime, account_date, description, expend, income,
+                   (user_id, account_no, txn_datetime, account_date, description, raw_description,
+                    expend, income,
                     balance, counterparty_bank, counterparty_acct, memo, first_seen, dedup_key,
                     category, subcategory, auto_excluded, flow_type, income_category,
                     is_subscription)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
-                 t.get("desc"), t.get("expend"), t.get("income"), t.get("balance"),
+                 description, raw_description, t.get("expend"), t.get("income"), t.get("balance"),
                  t.get("counterparty_bank"), t.get("counterparty_acct"), t.get("memo"),
                  now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
                  1 if _is_subscription(sub) else 0),
@@ -1560,3 +1609,13 @@ class BankStore:
                 (self.user_id,),
             ).fetchone()[0]
         return out
+
+
+def migrate_existing_bank_stores(banks: Iterable[str]) -> None:
+    """Run schema/data migrations at server startup without creating absent SQLite stores."""
+    root = _data_root()
+    for bank in banks:
+        if not bank_pg.enabled() and not (root / f"{bank}.sqlite").exists():
+            continue
+        store = BankStore(str(bank), user_id=1)
+        store.close()

@@ -220,7 +220,7 @@ def test_persist_writes_twd_transactions(store: BankStore):
     assert delta["twd_txn_new"] == 2
 
     cur = store.conn.execute(
-        "SELECT account_no, txn_datetime, description, expend, income, balance "
+        "SELECT account_no, txn_datetime, description, raw_description, expend, income, balance "
         "FROM twd_transactions ORDER BY txn_datetime"
     )
     rows = cur.fetchall()
@@ -228,13 +228,14 @@ def test_persist_writes_twd_transactions(store: BankStore):
     # 第 1 筆 跨行轉入
     assert rows[0][0] == "0000900000317011"
     assert rows[0][1] == "2026-06-02 14:53:14"
-    assert rows[0][2] == "跨行轉 永豐銀"
-    assert rows[0][3] == 0
-    assert rows[0][4] == 15943
-    assert rows[0][5] == 15950
+    assert rows[0][2] == "跨行轉 永豐銀 - ZD"
+    assert rows[0][3] == "跨行轉 永豐銀"
+    assert rows[0][4] == 0
+    assert rows[0][5] == 15943
+    assert rows[0][6] == 15950
     # 第 2 筆 中信卡扣繳
-    assert rows[1][3] == 15943
-    assert rows[1][4] == 0
+    assert rows[1][4] == 15943
+    assert rows[1][5] == 0
 
 
 def test_persist_dedup_idempotent_on_second_run(store: BankStore):

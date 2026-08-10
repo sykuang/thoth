@@ -138,10 +138,14 @@ def test_persist_esun_writes_twd_transaction_detail_rows(store_esun_twd) -> None
 
     assert delta["twd_txn_new"] == 1
     rows = [tuple(row) for row in store_esun_twd.conn.execute(
-        "SELECT account_no, txn_datetime, account_date, description, expend, income, balance, memo "
+        "SELECT account_no, txn_datetime, account_date, description, raw_description, "
+        "expend, income, balance, memo "
         "FROM twd_transactions"
     )]
-    assert rows == [("0900000087022", "2026-06-29", "2026-06-30", "跨行轉帳", 80.0, None, 4.0, "台新卡費")]
+    assert rows == [(
+        "0900000087022", "2026-06-29", "2026-06-30",
+        "跨行轉帳 - 台新卡費", "跨行轉帳", 80.0, None, 4.0, "台新卡費",
+    )]
 
 
 def test_persist_esun_empty_twd_query_does_not_create_rows(store_esun_twd) -> None:

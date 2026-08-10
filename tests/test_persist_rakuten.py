@@ -70,13 +70,14 @@ def test_persist_rakuten_writes_accounts_balances_and_transactions(store: BankSt
     }
 
     txns = store.conn.execute(
-        "SELECT txn_datetime, description, expend, income, balance, memo "
+        "SELECT txn_datetime, description, raw_description, expend, income, balance, memo "
         "FROM twd_transactions ORDER BY txn_datetime",
     ).fetchall()
     assert [dict(row) for row in txns] == [
         {
             "txn_datetime": "2026-07-25T18:05:00",
-            "description": "轉帳支出",
+            "description": "轉帳支出 - 生活費",
+            "raw_description": "轉帳支出",
             "expend": 200.0,
             "income": None,
             "balance": 10845.0,
@@ -84,7 +85,8 @@ def test_persist_rakuten_writes_accounts_balances_and_transactions(store: BankSt
         },
         {
             "txn_datetime": "2026-07-26T09:30:00",
-            "description": "跨行轉入",
+            "description": "跨行轉入 - 薪資",
+            "raw_description": "跨行轉入",
             "expend": None,
             "income": 1500.0,
             "balance": 12345.0,

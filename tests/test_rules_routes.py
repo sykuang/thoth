@@ -217,6 +217,48 @@ def test_recategorize_runs_and_returns_counts(client, tmp_path, monkeypatch):
     assert row["category"] == "交通"
 
 
+def test_recategorize_matches_memo_from_persisted_canonical_description(client):
+    import backend.core.store as store_mod
+
+    token = _register_and_token(client)
+    h = {"Authorization": f"Bearer {token}"}
+    client.post(
+        "/rules",
+        headers=h,
+        json={"name": "dividend", "pattern": "基金配息", "category": "利息股息", "priority": 999},
+    )
+
+    store = store_mod.BankStore("cathay", user_id=1)
+    store.upsert_twd_txns([{
+        "account_no": "001",
+        "datetime": "2026-08-10 09:00",
+        "desc": "轉帳",
+        "memo": "0050FUND　基金配息",
+        "income": 4494,
+        "expend": None,
+        "balance": 10000,
+    }])
+    stored = store.conn.execute(
+        "SELECT description, raw_description, category FROM twd_transactions",
+    ).fetchone()
+    store.close()
+    assert stored is not None
+    assert stored["description"] == "轉帳 - 0050FUND 基金配息"
+    assert stored["raw_description"] == "轉帳"
+    assert stored["category"] is None
+
+    response = client.post("/rules/recategorize", headers=h)
+    assert response.status_code == 200, response.text
+
+    store = store_mod.BankStore("cathay", user_id=1)
+    categorized = store.conn.execute(
+        "SELECT category FROM twd_transactions",
+    ).fetchone()
+    store.close()
+    assert categorized is not None
+    assert categorized["category"] == "利息股息"
+
+
 def test_recategorize_unauthorized_401(client):
     r = client.post("/rules/recategorize")
     assert r.status_code == 401

@@ -44,7 +44,7 @@ def _seed_bank_db(data_root: Path, bank: str, twd: list[dict] | None = None,
     con.execute("""CREATE TABLE IF NOT EXISTS twd_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_no TEXT NOT NULL, txn_datetime TEXT NOT NULL, account_date TEXT,
-        description TEXT, expend INTEGER, income INTEGER, balance INTEGER,
+        description TEXT, raw_description TEXT, expend INTEGER, income INTEGER, balance INTEGER,
         counterparty_bank TEXT, counterparty_acct TEXT, memo TEXT,
         first_seen TEXT NOT NULL, dedup_key TEXT NOT NULL, category TEXT,
         flow_type TEXT NOT NULL DEFAULT 'expense',
@@ -107,9 +107,11 @@ def _seed_bank_db(data_root: Path, bank: str, twd: list[dict] | None = None,
             )
     for i, t in enumerate(twd or []):
         con.execute(
-            "INSERT INTO twd_transactions (account_no, txn_datetime, description, expend, income, balance, first_seen, dedup_key, category, flow_type, is_subscription, income_category, subcategory, auto_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (t["account_no"], t["datetime"], t["desc"], t.get("expend"), t.get("income"),
-             t.get("balance"), "2026-06-13", f"twd-{bank}-{i}", t.get("category"),
+            "INSERT INTO twd_transactions (account_no, txn_datetime, description, raw_description, expend, income, balance, counterparty_acct, memo, first_seen, dedup_key, category, flow_type, is_subscription, income_category, subcategory, auto_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t["account_no"], t["datetime"], t["desc"], t.get("raw_desc", t["desc"]),
+             t.get("expend"), t.get("income"),
+             t.get("balance"), t.get("counterparty_acct"), t.get("memo"),
+             "2026-06-13", f"twd-{bank}-{i}", t.get("category"),
              t.get("flow_type", "expense"), 1 if t.get("is_subscription") else 0,
              t.get("income_category"), t.get("subcategory"),
              1 if t.get("auto_excluded") else 0),
@@ -216,6 +218,30 @@ def test_transactions_aggregates_across_banks(client, data_root):
     assert quan["amount"] == -350
     # account_no 末四 mask
     assert twd_atm["account_or_card"] == "****7050"
+
+
+def test_transactions_returns_database_canonical_description_without_api_join(client, data_root):
+    token = _register(client)
+    client.post("/accounts", json={"bank": "cathay", "label": "test"}, headers=_auth(token))
+    _seed_bank_db(data_root, "cathay", twd=[{
+        "account_no": "90007050",
+        "datetime": "2026-08-10T09:00:00",
+        "raw_desc": "轉帳",
+        "desc": "轉帳 - 0050FUND 基金配息",
+        "memo": "0050FUND　基金配息",
+        "counterparty_acct": "0050FUND",
+        "expend": 0,
+        "income": 4494,
+        "balance": 10000,
+    }])
+
+    response = client.get("/transactions", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    txn = response.json()["items"][0]
+    assert txn["description"] == "轉帳 - 0050FUND 基金配息"
+    assert txn["display_description"] == "轉帳 - 0050FUND 基金配息"
+    assert txn["memo"] == "0050FUND　基金配息"
+    assert txn["raw"]["raw_description"] == "轉帳"
 
 
 # ============================================================

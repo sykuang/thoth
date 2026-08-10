@@ -116,13 +116,17 @@ def test_taishin_persists_twd_transaction_detail_rows(store_taishin):
     rows = [
         tuple(row)
         for row in store_taishin.conn.execute(
-            "SELECT account_no, txn_datetime, account_date, description, expend, income, balance, memo "
+            "SELECT account_no, txn_datetime, account_date, description, raw_description, "
+            "expend, income, balance, memo "
             "FROM twd_transactions ORDER BY txn_datetime"
         )
     ]
     assert rows == [
-        ("90000000227031", "2026-06-26 16:53:41", "2026-06-26", "CD轉入", None, 80.0, 80.0, "ATM 807-0090000000197014"),
-        ("90000000227031", "2026-06-29 16:16:16", "2026-06-29", "媒體轉帳", 80.0, None, 0.0, "測試卡費"),
+        ("90000000227031", "2026-06-26 16:53:41", "2026-06-26",
+         "CD轉入 - ATM 807-0090000000197014", "CD轉入", None, 80.0, 80.0,
+         "ATM 807-0090000000197014"),
+        ("90000000227031", "2026-06-29 16:16:16", "2026-06-29",
+         "媒體轉帳 - 測試卡費", "媒體轉帳", 80.0, None, 0.0, "測試卡費"),
     ]
 
 

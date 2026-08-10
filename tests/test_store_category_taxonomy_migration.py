@@ -199,6 +199,78 @@ def test_existing_data_backfilled_to_default_on_migration(tmp_path, monkeypatch)
     s.close()
 
 
+def test_existing_twd_description_is_canonicalized_from_memo_on_migration(tmp_path, monkeypatch):
+    import sqlite3
+
+    data_root = tmp_path / "banks"
+    data_root.mkdir()
+    db = data_root / "legacy_description.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE twd_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_no TEXT NOT NULL,
+            txn_datetime TEXT NOT NULL,
+            description TEXT,
+            memo TEXT,
+            expend INTEGER,
+            income INTEGER,
+            balance INTEGER,
+            first_seen TEXT,
+            dedup_key TEXT NOT NULL
+        );
+        INSERT INTO twd_transactions
+            (account_no, txn_datetime, description, memo, income, balance, first_seen, dedup_key)
+        VALUES
+            ('001', '2026-08-10 09:00', '轉帳', '0050FUND　基金配息', 4494, 10000,
+             '2026-08-10T09:00:00Z', 'legacy-canonical-description');
+    """)
+    conn.commit()
+    conn.close()
+
+    import backend.core.store as store_mod
+    monkeypatch.setattr(store_mod, "DATA_ROOT", data_root)
+    store_mod._MIGRATED_DBS.clear()
+    store_mod.migrate_existing_bank_stores(["legacy_description", "absent"])
+    assert not (data_root / "absent.sqlite").exists()
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT raw_description, description, memo FROM twd_transactions",
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert dict(row) == {
+        "raw_description": "轉帳",
+        "description": "轉帳 - 0050FUND 基金配息",
+        "memo": "0050FUND　基金配息",
+    }
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO twd_transactions "
+        "(account_no, txn_datetime, description, raw_description, memo, income, balance, "
+        "first_seen, dedup_key, user_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("002", "2026-08-11 09:00", "純備註", None, "純備註", 1, 10001,
+         "2026-08-11T09:00:00Z", "memo-only", 1),
+    )
+    conn.commit()
+    conn.close()
+    store_mod._MIGRATED_DBS.clear()
+    store_mod.migrate_existing_bank_stores(["legacy_description"])
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    memo_only = conn.execute(
+        "SELECT raw_description, description FROM twd_transactions WHERE account_no='002'",
+    ).fetchone()
+    conn.close()
+    assert memo_only is not None
+    assert dict(memo_only) == {"raw_description": None, "description": "純備註"}
+
+
 # =============================================================================
 # Phase 7 (Income 5 類 2026-06-15) — income_category 專屬 test
 # =============================================================================

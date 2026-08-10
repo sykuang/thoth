@@ -102,6 +102,10 @@ def _scheduler_disabled() -> bool:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    from backend.core import bank_data
+    from backend.core.store import migrate_existing_bank_stores
+
+    migrate_existing_bank_stores(bank_data.KNOWN_BANKS)
     if not _scheduler_disabled():
         from backend.server import scheduler
         scheduler.start()
