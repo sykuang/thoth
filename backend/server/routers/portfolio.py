@@ -46,6 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.core import account_classify, bank_data
+from backend.core.card_status import CathayBillStatus, cathay_bill_status
 from backend.server.deps import current_user
 from backend.server import db, fx_service
 from backend.server.bank_account_projection import bank_accounts as _project_bank_accounts
@@ -242,13 +243,13 @@ def _liab_cathay(payload: dict) -> int | None:
     lb = (payload.get("latest_bill") or {}).get("twd") or {}
     if not lb:
         return None
-    status = lb.get("payBillStatus")
+    status = cathay_bill_status(lb.get("payBillStatus"))
     amount = _to_int(lb.get("billAmount"))
-    if amount is None:
+    if amount is None or status is None:
         return None
-    if str(status or "").strip().casefold() in {"paid", "payed"}:
+    if status is CathayBillStatus.PAID:
         return 0
-    # 'UnPaid' or 其他 status → 視為未繳, 回 billAmount
+    # Canonical unpaid → return the bill amount.
     return amount
 
 

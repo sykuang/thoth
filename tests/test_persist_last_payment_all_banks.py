@@ -529,6 +529,37 @@ def test_cathay_paid_status_with_non_finite_bill_amount_preserves_saved_due(
         store.close()
 
 
+@pytest.mark.parametrize("credit_card", [
+    {"cards": [], "quota": [None]},
+    {"cards": [], "bill_summary": [None]},
+    {"cards": [], "bill_summary": {"currencies": [None]}},
+    {"cards": [], "latest_bill": [None]},
+    {"cards": [], "latest_bill": {"twd": [None]}},
+])
+def test_cathay_malformed_shared_fact_shapes_preserve_known_card(
+    tmp_path, monkeypatch, credit_card,
+):
+    """空 inventory 遇 malformed shared objects 必須保留舊欄位，不可 crash。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "credit_limit": 999,
+            "used_credit": 123,
+            "bill_due_amount": 456,
+        }])
+        persist_cathay({"credit_card": credit_card}, store, rules=None)
+        row = store.conn.execute(
+            "SELECT credit_limit, used_credit, bill_due_amount FROM cards WHERE card_no = ?",
+            ("****9999",),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == (999.0, 123.0, 456.0)
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("current_amount", ["NaN", "Infinity", "-Infinity"])
 def test_cathay_non_finite_current_payment_amount_preserves_saved_due(
     tmp_path, monkeypatch, current_amount,

@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_status import cathay_bill_status
 from backend.core.creds import CathayCreds
 
 SEL_CUSTID = "#CustID"
@@ -373,10 +374,18 @@ class CathayCrawler(BankCrawler):
             ]
         lb = self._c(col.latest("C_CardInfo_Q_LatestBill"))
         if lb and isinstance(lb, dict):
+            twd = lb.get("twdBillDetail")
+            if isinstance(twd, dict) and "payBillStatus" in twd:
+                twd = dict(twd)
+                normalized_status = cathay_bill_status(
+                    twd["payBillStatus"], strict=True,
+                )
+                assert normalized_status is not None
+                twd["payBillStatus"] = normalized_status.value
             card["latest_bill"] = {
                 "due_date": lb.get("dueDate"),
                 "due_days": lb.get("dueDays"),
-                "twd": lb.get("twdBillDetail"),
+                "twd": twd,
                 "usd": lb.get("usdBillDetail"),
             }
         nb = self._c(col.latest("C_CardInfo_Q_NextBill"))

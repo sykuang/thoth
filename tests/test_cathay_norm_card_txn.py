@@ -12,6 +12,8 @@ API 對台幣消費根本沒給 `consumeCurrency` 欄,直接 `t.get("consumeCurr
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from backend.banks.cathay import CathayCrawler
@@ -116,3 +118,36 @@ def test_country_empty_string_normalized_to_none(crawler):
         "consumeCountry": "",
     })
     assert out["consume_country"] is None
+
+
+class _LatestBillCollector:
+    hits = []
+
+    def __init__(self, status):
+        self.status = status
+
+    def latest(self, endpoint):
+        if endpoint != "C_CardInfo_Q_LatestBill":
+            return None
+        return SimpleNamespace(resp_json={
+            "success": True,
+            "content": {
+                "twdBillDetail": {"billAmount": 4321, "payBillStatus": self.status},
+                "usdBillDetail": None,
+            },
+        })
+
+
+@pytest.mark.parametrize(("raw", "canonical"), [
+    ("Paid", "paid"),
+    ("Payed", "paid"),
+    ("UnPaid", "unpaid"),
+])
+def test_latest_bill_status_is_canonical_enum_value(crawler, raw, canonical):
+    result = crawler._parse(_LatestBillCollector(raw))
+    assert result["credit_card"]["latest_bill"]["twd"]["payBillStatus"] == canonical
+
+
+def test_latest_bill_rejects_unknown_status(crawler):
+    with pytest.raises(ValueError, match="unsupported Cathay bill status"):
+        crawler._parse(_LatestBillCollector("MaybePaid"))

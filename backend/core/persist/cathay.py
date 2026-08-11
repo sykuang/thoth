@@ -8,6 +8,7 @@ from datetime import datetime
 from math import isfinite
 
 from backend.core import account_classify, classify
+from backend.core.card_status import CathayBillStatus, cathay_bill_status
 from backend.core.store import BankStore
 from backend.core.persist._common import _num_real, _num_to_float
 
@@ -104,31 +105,36 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # 套到每張卡同一組值 (limit 是「整戶可用額度」, due_date/stmt_date 跨卡共用).
         # 國泰 raw API 設計就是整戶合併出帳 (`billed_detail.TWD[].card_no=''` 證實),
         # 沒有 per-card endpoint 可打;整戶套是目前可行的最大化解析,等國泰 API 升級才能改善.
-        quota = cc.get("quota") or {}
+        quota_raw = cc.get("quota")
+        quota = quota_raw if isinstance(quota_raw, dict) else {}
         cathay_limit = _finite_amount(quota.get("credit_limit"))
         cathay_used = _finite_amount(quota.get("current"))  # current=本期已動用
-        bill_summary = cc.get("bill_summary") or {}
+        bill_summary_raw = cc.get("bill_summary")
+        bill_summary = bill_summary_raw if isinstance(bill_summary_raw, dict) else {}
         # payment_deadline = '2026-05-05T00:00:00' → 切 'T' 取 YYYY-MM-DD
         deadline_raw = bill_summary.get("payment_deadline") or ""
-        cathay_due = deadline_raw.split("T")[0] if "T" in deadline_raw else (deadline_raw or None)
+        cathay_due = deadline_raw.split("T")[0] if isinstance(deadline_raw, str) and "T" in deadline_raw else (deadline_raw if isinstance(deadline_raw, str) and deadline_raw else None)
         # billDate 同樣處理
-        currencies = bill_summary.get("currencies") or []
-        bill_date_raw = (currencies[0].get("billDate") if currencies else "") or ""
-        cathay_stmt = bill_date_raw.split("T")[0] if "T" in bill_date_raw else (bill_date_raw or None)
+        currencies_raw = bill_summary.get("currencies")
+        currencies = currencies_raw if isinstance(currencies_raw, list) else []
+        cur0 = currencies[0] if currencies and isinstance(currencies[0], dict) else {}
+        bill_date_raw = cur0.get("billDate") or ""
+        cathay_stmt = bill_date_raw.split("T")[0] if isinstance(bill_date_raw, str) and "T" in bill_date_raw else (bill_date_raw if isinstance(bill_date_raw, str) and bill_date_raw else None)
         # 2026-07-02: bill_summary.currencies[0].paymentAmount 只是帳單彙總
         # 「上期已繳金額」，沒有真實繳款日；不能單獨生成 last_payment。
         # 真正最近繳款必須來自 billed_detail.TWD 的「本行自動扣繳」row。
         cathay_bill_due = None
         cathay_last_pay_amt = None
-        if currencies and isinstance(currencies[0], dict):
-            cur0 = currencies[0]
-            current_due = _finite_amount(cur0.get("currentPaymentAmount"))
-            if current_due is not None:
-                cathay_bill_due = current_due
-        latest_twd = (cc.get("latest_bill") or {}).get("twd") or {}
+        current_due = _finite_amount(cur0.get("currentPaymentAmount"))
+        if current_due is not None:
+            cathay_bill_due = current_due
+        latest_bill_raw = cc.get("latest_bill")
+        latest_bill = latest_bill_raw if isinstance(latest_bill_raw, dict) else {}
+        latest_twd_raw = latest_bill.get("twd")
+        latest_twd = latest_twd_raw if isinstance(latest_twd_raw, dict) else {}
         latest_bill_amount = _finite_amount(latest_twd.get("billAmount"))
         if (latest_bill_amount is not None
-                and str(latest_twd.get("payBillStatus") or "").strip().casefold() in {"paid", "payed"}):
+                and cathay_bill_status(latest_twd.get("payBillStatus")) is CathayBillStatus.PAID):
             cathay_bill_due = 0.0
 
         # 2026-06-23 v3 (使用者「你 cathay 有一頁一頁看嗎」, 逐項 dump billed_detail.TWD 發現):

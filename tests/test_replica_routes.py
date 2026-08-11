@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from backend.server import db
 
 
@@ -590,6 +592,31 @@ def test_replica_cathay_payed_status_has_zero_unpaid() -> None:
     assert _card_unpaid_twd("cathay", {
         "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
     }) == 0
+
+
+@pytest.mark.parametrize("status", ["UnPaid", "unpaid"])
+def test_cathay_unpaid_status_returns_bill_amount(status) -> None:
+    from backend.server.replica_facts import _card_unpaid_twd
+    from backend.server.routers.portfolio import _liab_cathay
+
+    payload = {"latest_bill": {"twd": {
+        "billAmount": 4321,
+        "payBillStatus": status,
+    }}}
+    assert _card_unpaid_twd("cathay", payload) == 4321
+    assert _liab_cathay(payload) == 4321
+
+
+def test_cathay_unknown_bill_status_is_unavailable() -> None:
+    from backend.server.replica_facts import _card_unpaid_twd
+    from backend.server.routers.portfolio import _liab_cathay
+
+    payload = {"latest_bill": {"twd": {
+        "billAmount": 4321,
+        "payBillStatus": "MaybePaid",
+    }}}
+    assert _card_unpaid_twd("cathay", payload) is None
+    assert _liab_cathay(payload) is None
 
 
 def test_cathay_invalid_bill_amount_is_unavailable() -> None:

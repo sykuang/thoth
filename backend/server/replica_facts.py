@@ -6,6 +6,7 @@ from math import isfinite
 from typing import Any
 
 from backend.core import account_classify
+from backend.core.card_status import CathayBillStatus, cathay_bill_status
 from backend.core.store import canonical_display_description
 from backend.server import fx_service
 from backend.server.db_facade import db_api
@@ -128,8 +129,10 @@ def _card_unpaid_twd(bank: str, payload: Any) -> int | None:
     if bank == "cathay" and isinstance(payload, dict):
         bill = (payload.get("latest_bill") or {}).get("twd") or {}
         amount = _to_int(bill.get("billAmount"))
-        status = str(bill.get("payBillStatus") or "").strip().casefold()
-        return 0 if amount is not None and status in {"paid", "payed"} else amount
+        status = cathay_bill_status(bill.get("payBillStatus"))
+        if amount is None or status is None:
+            return None
+        return 0 if status is CathayBillStatus.PAID else amount
     if bank == "ubot" and isinstance(payload, dict):
         return _to_int((payload.get("TotalData") or {}).get("Card"))
     if bank == "hsbc" and isinstance(payload, list):
