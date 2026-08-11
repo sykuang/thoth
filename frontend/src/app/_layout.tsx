@@ -26,6 +26,10 @@ import {
 } from '@/lib/push';
 import { queryClient } from '@/lib/queryClient';
 import { routeFromNotificationData } from '@/lib/pushRoutes';
+import {
+  invalidateAccountQueries,
+  invalidateSyncNotificationQueries,
+} from '@/lib/syncRefresh';
 import { useAuthStore } from '@/stores/auth';
 import { useThemeStore } from '@/stores/theme';
 
@@ -50,9 +54,10 @@ export default function RootLayout() {
     focusManager.setFocused(AppState.currentState === 'active');
     const subscription = AppState.addEventListener('change', (status) => {
       focusManager.setFocused(status === 'active');
+      if (status === 'active' && token) invalidateAccountQueries(queryClient);
     });
     return () => subscription.remove();
-  }, []);
+  }, [token]);
 
   // Biometric unlock — opt-in only. User toggles in Settings → 安全性 → 生物識別.
   // 預設 false → fresh install 不會跳 Face ID 權限 / 解鎖框。
@@ -82,10 +87,12 @@ export default function RootLayout() {
     });
   }, [hydrated, token]);
 
-  // L11: 收到通知後 tap → deep link 跳對應頁。
-  // 必須跟 push register 拆開 useEffect — 不該因為 token 變就重 attach listener。
+  // L11: foreground sync completion refreshes account data; tap also deep-links.
   useEffect(() => {
     const detach = attachNotificationListeners({
+      onNotificationReceived: (data) => {
+        invalidateSyncNotificationQueries(queryClient, data);
+      },
       onNotificationTap: (data) => {
         const route = routeFromNotificationData(data);
         if (!route) return;

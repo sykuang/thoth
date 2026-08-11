@@ -127,6 +127,7 @@ export async function registerForPushNotifications(): Promise<string | null> {
  * 回傳 cleanup function — caller useEffect return 它。
  */
 export function attachNotificationListeners(opts: {
+  onNotificationReceived?: (data: Record<string, unknown>) => void;
   onNotificationTap?: (data: Record<string, unknown>) => void;
 }): () => void {
   const subscriptions: Notifications.EventSubscription[] = [];
@@ -140,6 +141,17 @@ export function attachNotificationListeners(opts: {
       console.warn('[push] tap handler error:', e);
     }
   };
+
+  if (opts.onNotificationReceived) {
+    subscriptions.push(Notifications.addNotificationReceivedListener((notification) => {
+      const data = notification.request.content.data ?? {};
+      try {
+        opts.onNotificationReceived?.(data as Record<string, unknown>);
+      } catch (e) {
+        console.warn('[push] receive handler error:', e);
+      }
+    }));
+  }
 
   if (opts.onNotificationTap) {
     // Cold-start path: user taps notification while app is killed. Expo Router may first
