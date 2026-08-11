@@ -8,7 +8,7 @@
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -20,17 +20,8 @@ import { PaymentRemindersCard } from '@/components/PaymentRemindersCard';
 import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import { api } from '@/lib/api';
-import {
-  fetchCompleteDashboardCache,
-  hasNewerDashboardRevision,
-} from '@/lib/dashboardCache';
-import {
-  assertReplicaOwnerEpoch,
-  type ReplicaDashboardCache,
-} from '@/lib/replica';
 import { useAuthStore } from '@/stores/auth';
 import {
-  type BankAccount,
   type DashboardStats,
   type PaymentReminder,
   type PortfolioSummary,
@@ -47,34 +38,8 @@ export default function Dashboard() {
   const logout = useAuthStore((s) => s.logout);
   const qc = useQueryClient();
   const datasetQ = useFrontendDatasetCache();
-  const localDashboard = datasetQ.data?.dashboardCache;
-  const { ownerKey, ownerEpoch, ownerApi, persistDashboardCache } = datasetQ;
-  const [remoteDashboard, setRemoteDashboard] = useState<{
-    ownerKey: string;
-    epoch: number;
-    cache: ReplicaDashboardCache;
-  }>();
-  const activeOwnerRef = useRef(ownerKey);
-  const refreshRef = useRef<{
-    ownerKey: string;
-    epoch: number;
-    promise: Promise<void>;
-  } | undefined>(undefined);
-  const completeRevisionsRef = useRef<{
-    ownerKey: string;
-    epoch: number;
-    revisions: [number, number, number];
-  }>({ ownerKey: '', epoch: -1, revisions: [0, 0, 0] });
-  const [refreshTick, bumpRefreshTick] = useState(0);
-  useEffect(() => {
-    activeOwnerRef.current = ownerKey;
-  }, [ownerKey]);
-
-  const accountsQ = useQuery<BankAccount[]>({
-    queryKey: ['accounts', ownerKey, ownerEpoch],
-    queryFn: () => ownerApi<BankAccount[]>('/accounts'),
-    enabled: Boolean(ownerKey) && datasetQ.isFetched,
-  });
+  const dashboard = datasetQ.data?.dashboardCache;
+  const { ownerKey, ownerEpoch, ownerApi } = datasetQ;
 
   const jobsQ = useQuery<SyncJob[]>({
     queryKey: ['sync', 'jobs', ownerKey, ownerEpoch],
@@ -86,131 +51,6 @@ export default function Dashboard() {
       return data.some((j) => j.status === 'queued' || j.status === 'running') ? 2000 : false;
     },
   });
-
-  // W (2026-06-17): 砍 triggerSync (per-account) + triggerSyncAll —
-  // PortfolioHeader 重寫後完全沒同步按鈕了, 同步交給 /sync 頁面處理.
-
-  // Primary dashboard cards render the last owner-scoped SQLite snapshot first;
-  // these requests then refresh canonical server truth in the background.
-  const portfolioQ = useQuery<PortfolioSummary>({
-    queryKey: ['portfolio', 'summary', ownerKey, ownerEpoch],
-    queryFn: () => ownerApi<PortfolioSummary>('/portfolio/summary'),
-    enabled: Boolean(ownerKey) && datasetQ.isFetched,
-  });
-
-  const statsQ = useQuery<DashboardStats>({
-    queryKey: ['transactions', 'stats', ownerKey, ownerEpoch],
-    queryFn: () => ownerApi<DashboardStats>('/transactions/stats'),
-    enabled: Boolean(ownerKey) && datasetQ.isFetched,
-  });
-  const refetchAccounts = accountsQ.refetch;
-  const refetchPortfolio = portfolioQ.refetch;
-  const refetchStats = statsQ.refetch;
-
-  const refreshDashboard = useCallback((): Promise<void> => {
-    if (!ownerKey || !datasetQ.isFetched) return Promise.resolve();
-    try {
-      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
-    } catch {
-      return Promise.resolve();
-    }
-    const inFlight = refreshRef.current;
-    if (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch) {
-      return inFlight.promise;
-    }
-
-    const revisions: [number, number, number] = [0, 0, 0];
-    let completed = false;
-    const promise = fetchCompleteDashboardCache({
-      accounts: async () => {
-        const result = await refetchAccounts({ cancelRefetch: false, throwOnError: true });
-        if (!result.data) throw new Error('Accounts refresh returned no data');
-        revisions[0] = qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
-        return result.data;
-      },
-      portfolio: async () => {
-        const result = await refetchPortfolio({ cancelRefetch: false, throwOnError: true });
-        if (!result.data) throw new Error('Portfolio refresh returned no data');
-        revisions[1] = qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
-        return result.data;
-      },
-      stats: async () => {
-        const result = await refetchStats({ cancelRefetch: false, throwOnError: true });
-        if (!result.data) throw new Error('Statistics refresh returned no data');
-        revisions[2] = qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0;
-        return result.data;
-      },
-    }).then((cache) => {
-      assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
-      if (activeOwnerRef.current !== ownerKey) return;
-      completed = true;
-      completeRevisionsRef.current = { ownerKey, epoch: ownerEpoch, revisions };
-      setRemoteDashboard({ ownerKey, epoch: ownerEpoch, cache });
-      void persistDashboardCache(cache, ownerEpoch).catch(() => {
-        // Server truth stays visible even if the local snapshot write fails.
-      });
-    }).catch(() => {
-      // Keep the previous complete snapshot when any authoritative read fails.
-    }).finally(() => {
-      const activeRefresh = refreshRef.current;
-      if (activeRefresh?.ownerKey !== ownerKey || activeRefresh.epoch !== ownerEpoch) return;
-      refreshRef.current = undefined;
-      if (!completed) return;
-      try {
-        assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
-      } catch {
-        return;
-      }
-      const current: [number, number, number] = [
-        qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-        qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-        qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-      ];
-      if (activeOwnerRef.current === ownerKey
-        && hasNewerDashboardRevision(current, revisions)) {
-        bumpRefreshTick((value) => value + 1);
-      }
-    });
-    refreshRef.current = { ownerKey, epoch: ownerEpoch, promise };
-    return promise;
-  }, [
-    datasetQ.isFetched,
-    ownerEpoch,
-    ownerKey,
-    persistDashboardCache,
-    qc,
-    refetchAccounts,
-    refetchPortfolio,
-    refetchStats,
-  ]);
-
-  useEffect(() => {
-    void refreshDashboard();
-  }, [refreshDashboard, refreshTick]);
-
-  useEffect(() => {
-    const inFlight = refreshRef.current;
-    if (!ownerKey || (inFlight?.ownerKey === ownerKey && inFlight.epoch === ownerEpoch)) return;
-    const revisions: [number, number, number] = [
-      qc.getQueryState(['accounts', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-      qc.getQueryState(['portfolio', 'summary', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-      qc.getQueryState(['transactions', 'stats', ownerKey, ownerEpoch])?.dataUpdateCount ?? 0,
-    ];
-    const complete = completeRevisionsRef.current;
-    if (complete.ownerKey !== ownerKey
-      || complete.epoch !== ownerEpoch
-      || hasNewerDashboardRevision(revisions, complete.revisions)) {
-      void refreshDashboard();
-    }
-  }, [
-    accountsQ.data,
-    ownerEpoch,
-    ownerKey,
-    portfolioQ.data,
-    qc,
-    refreshDashboard,
-    statsQ.data,
-  ]);
 
   // Phase L10 (2026-06-20): 繳費提醒 (信用卡 auto-debit + 餘額不足/未設定)
   const remindersQ = useQuery<PaymentReminder[]>({
@@ -245,22 +85,11 @@ export default function Dashboard() {
     router.replace('/login');
   }
 
-  const dashboard = remoteDashboard?.ownerKey === ownerKey
-    && remoteDashboard.epoch === ownerEpoch
-    ? remoteDashboard.cache
-    : localDashboard;
   const accounts = dashboard?.accounts ?? [];
   const portfolio = dashboard?.portfolio;
   const stats = dashboard?.stats;
-  const dashboardLoading = !dashboard && (
-    (!datasetQ.isFetched && !datasetQ.isError)
-    || accountsQ.isPending
-    || portfolioQ.isPending
-    || statsQ.isPending
-  );
-  const dashboardError = !dashboard && !dashboardLoading && (
-    datasetQ.isError || accountsQ.isError || portfolioQ.isError || statsQ.isError
-  );
+  const dashboardLoading = !dashboard && (!datasetQ.isFetched || datasetQ.isRefetching);
+  const dashboardError = !dashboard && datasetQ.isFetched && !datasetQ.isRefetching;
   const ready = accounts.filter((a) => a.has_creds);
 
   // 是否有任何 job 正在跑 (queued / running) — 給「全部同步」按鈕看
@@ -271,17 +100,22 @@ export default function Dashboard() {
     );
   }, [jobsQ.data]);
 
-  // Phase X (2026-06-18): sync running → done 邊緣偵測 → invalidate dashboard
-  // 用的下游資料 (portfolio.summary / transactions.stats / portfolio.accounts).
-  // 之前只在 cards 頁有 transition hook, dashboard 開著時 sync 跑完不會自動刷新,
-  // 拉長 staleTime 5min 之後問題更明顯 — 在這裡也補一個.
+  const dashboardMonthRef = useRef(new Date().toISOString().slice(0, 7));
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const month = new Date().toISOString().slice(0, 7);
+      if (month === dashboardMonthRef.current) return;
+      dashboardMonthRef.current = month;
+      void qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [qc]);
+
+  // Sync completion refreshes the canonical replica; portfolio and stats are projected locally.
   const prevHasRunningRef = useRef(false);
   useEffect(() => {
     if (prevHasRunningRef.current && !hasRunningJob) {
-      qc.invalidateQueries({ queryKey: ['portfolio'] });
-      qc.invalidateQueries({ queryKey: ['transactions'] });
       qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
-      qc.invalidateQueries({ queryKey: ['accounts'] });
       qc.invalidateQueries({ queryKey: ['cards'] });
       qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
     }
@@ -326,7 +160,7 @@ export default function Dashboard() {
             </Text>
             <Pressable
               className="self-start bg-brand-600 active:bg-brand-700 rounded-xl px-4 py-2"
-              onPress={() => { void refreshDashboard(); }}
+              onPress={() => { void datasetQ.refetch(); }}
             >
               <Text className="text-white text-small font-semibold">重新載入</Text>
             </Pressable>

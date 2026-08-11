@@ -22,7 +22,7 @@ from backend.server.financial_accounts import manual_replica
 from backend.server.replica_facts import collect_bank_replica_facts
 from backend.server.replica_repo import ReplicaPartition, reconcile_partitions
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 router = APIRouter(prefix="/replica", tags=["replica"])
 

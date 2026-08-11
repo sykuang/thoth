@@ -15,7 +15,7 @@ async function database() {
           payload_json TEXT NOT NULL
         );
       `);
-      console.info('[replica-v1] native sqlite ready');
+      console.info('[replica-v2] native sqlite ready');
       return db;
     });
   }

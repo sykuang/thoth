@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ACCOUNTS_TAB = ROOT / "frontend/src/app/(tabs)/cards/index.tsx"
 DATASET_HOOK = ROOT / "frontend/src/hooks/useFrontendDatasetCache.ts"
+REPLICA_CORE = ROOT / "frontend/src/lib/replica.ts"
 OWNER_HOOK = ROOT / "frontend/src/hooks/useOwnerBoundApi.ts"
 SNAPTRADE = ROOT / "frontend/src/components/SnapTradeSections.tsx"
 AUTO_DEBIT = ROOT / "frontend/src/components/AutoDebitSettingModal.tsx"
@@ -45,12 +46,15 @@ def test_accounts_tab_queries_and_persistence_are_owner_bound() -> None:
         assert query_key in source
     owner_hook = OWNER_HOOK.read_text(encoding="utf-8")
     dataset_hook = DATASET_HOOK.read_text(encoding="utf-8")
+    replica_core = REPLICA_CORE.read_text(encoding="utf-8")
     assert "guardReplicaOwnerRequest" in owner_hook
     assert "skipAuthRetry: true" not in owner_hook
     assert "authRetryGuard: () => assertReplicaOwnerEpoch(ownerKey, ownerEpoch)" in owner_hook
     assert "['frontend-dataset', 'replica', ownerKey, ownerEpoch]" in dataset_hook
     assert "await waitForReplicaOwner(ownerKey, ownerEpoch)" in dataset_hook
-    assert "() => replicaStore.load(ownerKey)" in dataset_hook
+    assert "loadCompleteReplicaDataset(" in dataset_hook
+    assert "() => store.load(ownerKey)" in replica_core
+    assert "await discardReplica(store, ownerKey, epoch)" in replica_core
     assert "synchronizedOwnerRef.current = ownerSessionKey" in dataset_hook
     assert "fetchCompleteAccountTabCache" in source
     assert "persistAccountTabCache(cache, ownerEpoch)" in source

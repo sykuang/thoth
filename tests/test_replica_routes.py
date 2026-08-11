@@ -7,8 +7,6 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from backend.server import db
 
 
@@ -65,6 +63,7 @@ def _seed_bank(data_root: Path, *, user_id: int = 1, bank: str = "cathay") -> No
             card_no TEXT, user_id INTEGER NOT NULL, name TEXT, association TEXT,
             type TEXT, is_cube INTEGER, credit_limit REAL, used_credit REAL,
             statement_close_date TEXT, payment_due_date TEXT,
+            bill_due_amount REAL, last_payment_amount REAL, last_payment_date TEXT,
             active INTEGER NOT NULL DEFAULT 1, excluded INTEGER NOT NULL DEFAULT 0,
             nickname_overwrite TEXT, updated_at TEXT NOT NULL,
             PRIMARY KEY (user_id, card_no)
@@ -105,9 +104,9 @@ def _seed_bank(data_root: Path, *, user_id: int = 1, bank: str = "cathay") -> No
     )
     con.execute(
         """INSERT INTO cards
-           (card_no,user_id,name,type,active,updated_at)
-           VALUES (?,?,?,?,?,?)""",
-        ("****7015", user_id, "測試卡", "credit", 1, "2026-08-09T10:01:00Z"),
+           (card_no,user_id,name,type,bill_due_amount,active,updated_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        ("****7015", user_id, "測試卡", "credit", 0, 1, "2026-08-09T10:01:00Z"),
     )
     con.execute(
         """INSERT INTO twd_transactions
@@ -131,7 +130,7 @@ def _seed_bank(data_root: Path, *, user_id: int = 1, bank: str = "cathay") -> No
             user_id,
             "2026-08-09",
             "card_summary",
-            '{"latest_bill":{"twd":{"billAmount":321,"payBillStatus":"UnPaid"}},'
+            '{"latest_bill":{"twd":{"billAmount":5000,"payBillStatus":"UnPaid"}},'
             '"CardList":[{"private":"must-not-replicate"}]}',
             "2026-08-09T10:04:00Z",
         ),
@@ -155,7 +154,7 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 2
     assert body["owner_id"] == 1
     assert body["generations"]["user"] == 1
     assert body["generations"]["bank:cathay"] == 1
@@ -191,7 +190,8 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
     }
     assert cathay["portfolio_facts"]["card_unpaid"] == {
         "snapshot_date": "2026-08-09",
-        "amount_twd": 321,
+        "amount_twd": 0,
+        "recognized": True,
     }
     assert "must-not-replicate" not in json.dumps(cathay)
 
@@ -294,18 +294,82 @@ def test_replica_bootstrap_is_tenant_scoped(client, tmp_path, monkeypatch) -> No
     }
 
 
+def test_replica_transaction_exclusion_uses_all_cards_not_only_active_inventory(
+    monkeypatch,
+) -> None:
+    from backend.server import replica_facts
+
+    transaction = SimpleNamespace(
+        id=1,
+        kind="billed",
+        card_no="****0001",
+        account_no=None,
+        amount=100,
+        currency="TWD",
+        consume_date="2026-08-10",
+        post_date="2026-08-11",
+        description="legacy inactive card row",
+        txn_type="spending",
+        flow_type="expense",
+    )
+
+    class FakeApi:
+        @staticmethod
+        def list_accounts(**_kwargs):
+            return []
+
+        @staticmethod
+        def list_cards(**_kwargs):
+            return []
+
+        @staticmethod
+        def list_excluded_card_nos_all_banks(**_kwargs):
+            return {"cathay": {"****0001"}}
+
+        @staticmethod
+        def list_txns_for_bank(**_kwargs):
+            return [transaction]
+
+        @staticmethod
+        def list_latest_account_txn_balances(**_kwargs):
+            return {}
+
+        @staticmethod
+        def get_latest_twd_balance(**_kwargs):
+            return None
+
+        @staticmethod
+        def get_latest_metric(**_kwargs):
+            return None
+
+        @staticmethod
+        def get_latest_loan_balance(**_kwargs):
+            return None
+
+        @staticmethod
+        def list_loan_accounts(**_kwargs):
+            return []
+
+    monkeypatch.setattr(replica_facts, "db_api", FakeApi())
+
+    facts = replica_facts.collect_bank_replica_facts("cathay", 1)
+
+    assert facts["cards"] == []
+    assert facts["transactions"][0]["excluded"] is True
+
+
 def test_replica_pull_requires_reset_on_schema_mismatch(client) -> None:
     token = _register(client, email="replica-reset@palace.example")
 
     response = client.post(
         "/replica/pull",
-        json={"schema_version": 999, "generations": {}},
+        json={"schema_version": 1, "generations": {}},
         headers=_auth(token),
     )
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 2
     assert body["reset_required"] is True
     assert body["generations"] == {}
     assert body["partitions"] == []
@@ -584,64 +648,6 @@ def test_postgres_reconcile_lock_uses_dedicated_connection(monkeypatch) -> None:
         "SELECT pg_advisory_unlock(%s, %s)",
         "closed",
     ]
-
-
-def test_replica_cathay_payed_status_has_zero_unpaid() -> None:
-    from backend.server.replica_facts import _card_unpaid_twd
-
-    assert _card_unpaid_twd("cathay", {
-        "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
-    }) == 0
-
-
-@pytest.mark.parametrize("status", ["UnPaid", "unpaid"])
-def test_cathay_unpaid_status_returns_bill_amount(status) -> None:
-    from backend.server.replica_facts import _card_unpaid_twd
-    from backend.server.routers.portfolio import _liab_cathay
-
-    payload = {"latest_bill": {"twd": {
-        "billAmount": 4321,
-        "payBillStatus": status,
-    }}}
-    assert _card_unpaid_twd("cathay", payload) == 4321
-    assert _liab_cathay(payload) == 4321
-
-
-def test_cathay_unknown_bill_status_is_unavailable() -> None:
-    from backend.server.replica_facts import _card_unpaid_twd
-    from backend.server.routers.portfolio import _liab_cathay
-
-    payload = {"latest_bill": {"twd": {
-        "billAmount": 4321,
-        "payBillStatus": "MaybePaid",
-    }}}
-    assert _card_unpaid_twd("cathay", payload) is None
-    assert _liab_cathay(payload) is None
-
-
-def test_cathay_invalid_bill_amount_is_unavailable() -> None:
-    from backend.server.replica_facts import _card_unpaid_twd
-    from backend.server.routers.portfolio import _liab_cathay
-
-    for value in ("NaN", "Infinity", 10 ** 400, -(10 ** 400)):
-        payload = {"latest_bill": {"twd": {
-            "billAmount": value,
-            "payBillStatus": "Payed",
-        }}}
-        assert _card_unpaid_twd("cathay", payload) is None
-        assert _liab_cathay(payload) is None
-
-
-def test_cathay_boolean_bill_amount_is_unavailable() -> None:
-    from backend.server.replica_facts import _card_unpaid_twd
-    from backend.server.routers.portfolio import _liab_cathay
-
-    payload = {"latest_bill": {"twd": {
-        "billAmount": True,
-        "payBillStatus": "Payed",
-    }}}
-    assert _card_unpaid_twd("cathay", payload) is None
-    assert _liab_cathay(payload) is None
 
 
 def test_replica_fact_uses_shared_backend_display_description() -> None:

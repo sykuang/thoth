@@ -68,6 +68,33 @@ function decimalText({ digits, scale }: UnsignedDecimal): string {
   return `${padded.slice(0, -scale)}.${padded.slice(-scale)}`;
 }
 
+function signedDecimalText(digits: bigint, scale: number): string {
+  if (digits < 0n) return `-${decimalText({ digits: -digits, scale })}`;
+  return decimalText({ digits, scale });
+}
+
+function parseSignedDecimal(value: string): { digits: bigint; scale: number } | null {
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!match) return null;
+  const fraction = match[3] ?? '';
+  const digits = BigInt(`${match[2]}${fraction}`);
+  return {
+    digits: match[1] === '-' ? -digits : digits,
+    scale: fraction.length,
+  };
+}
+
+/** Exact fixed-point addition for signed decimal strings. */
+export function addDecimal(value: string, addend: string): string | null {
+  const left = parseSignedDecimal(value);
+  const right = parseSignedDecimal(addend);
+  if (!left || !right) return null;
+  const scale = Math.max(left.scale, right.scale);
+  const leftDigits = left.digits * powerOfTen(scale - left.scale);
+  const rightDigits = right.digits * powerOfTen(scale - right.scale);
+  return signedDecimalText(leftDigits + rightDigits, scale);
+}
+
 /** Exact fixed-point multiplication, rounded half-up only beyond maxFractionDigits. */
 export function multiplyDecimal(
   value: string,
@@ -83,6 +110,38 @@ export function multiplyDecimal(
     left.scale + right.scale,
     maxFractionDigits,
   ));
+}
+
+/** Exact fixed-point multiplication without intermediate rounding. */
+export function multiplyDecimalExact(value: string, multiplier: string): string | null {
+  const left = parseUnsignedDecimal(value);
+  const right = parseUnsignedDecimal(multiplier);
+  if (!left || !right) return null;
+  return decimalText({
+    digits: left.digits * right.digits,
+    scale: left.scale + right.scale,
+  });
+}
+
+/** Exact fixed-point multiplication rounded to an integer with banker's rounding. */
+export function multiplyDecimalToIntegerHalfEven(
+  value: string,
+  multiplier: string,
+): number | null {
+  const left = parseSignedDecimal(value);
+  const right = parseSignedDecimal(multiplier);
+  if (!left || !right) return null;
+  const product = left.digits * right.digits;
+  const negative = product < 0n;
+  const digits = negative ? -product : product;
+  const divisor = powerOfTen(left.scale + right.scale);
+  let rounded = digits / divisor;
+  const doubledRemainder = (digits % divisor) * 2n;
+  if (doubledRemainder > divisor || (doubledRemainder === divisor && rounded % 2n !== 0n)) {
+    rounded += 1n;
+  }
+  const result = Number(negative ? -rounded : rounded);
+  return Number.isSafeInteger(result) ? result : null;
 }
 
 /** Fixed-point division for display, rounded half-up and stripped to at most N decimals. */

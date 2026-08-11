@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRANSACTIONS_TSX = ROOT / "frontend/src/app/(tabs)/transactions.tsx"
 DATASET_HOOK_TS = ROOT / "frontend/src/hooks/useFrontendDatasetCache.ts"
+REPLICA_CORE_TS = ROOT / "frontend/src/lib/replica.ts"
 OWNER_HOOK_TS = ROOT / "frontend/src/hooks/useOwnerBoundApi.ts"
 
 
@@ -68,17 +69,19 @@ def test_transactions_tab_has_pull_to_refresh_that_forces_snapshot_refetch():
 def test_frontend_dataset_cache_uses_owner_scoped_replica_sync():
     """交易頁先讀owner-bound local replica，再以bootstrap/pull更新；畫面filter仍全在本地。"""
     hook = DATASET_HOOK_TS.read_text()
+    replica_core = REPLICA_CORE_TS.read_text()
     owner_hook = OWNER_HOOK_TS.read_text()
     screen = TRANSACTIONS_TSX.read_text()
 
     assert "makeReplicaOwnerKey(serverUrl, email)" in owner_hook
     assert "guardReplicaOwnerRequest" in owner_hook
-    assert "replicaStore.load(ownerKey)" in hook
+    assert "loadCompleteReplicaDataset(" in hook
+    assert "store.load(ownerKey)" in replica_core
     assert "syncReplica(replicaStore, ownerKey" in hook
     assert "const hydratedOwners = new Set<string>();" in hook
     assert "const firstHydration = !hydratedOwners.has(ownerSessionKey);" in hook
     assert "await waitForReplicaOwner(ownerKey, ownerEpoch)" in hook
-    assert "persisted?.schemaVersion === REPLICA_SCHEMA_VERSION" in hook
+    assert "envelope.schemaVersion !== REPLICA_SCHEMA_VERSION" in replica_core
     assert "catch (syncError)" in hook
     assert "return await refreshReplica();" in hook
     assert "'/replica/bootstrap'" in hook

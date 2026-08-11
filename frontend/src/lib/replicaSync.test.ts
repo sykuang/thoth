@@ -4,12 +4,12 @@ import {
   clearReplicaOwner,
   getReplicaOwnerEpoch,
   guardReplicaOwnerRequest,
+  loadCompleteReplicaDataset,
   makeReplicaOwnerKey,
   patchReplicaAccountTabCache,
   ReplicaSyncCancelledError,
   syncReplica,
   updateReplicaAccountTabCache,
-  updateReplicaDashboardCache,
   updateReplicaPreferences,
   waitForReplicaOwner,
   type ReplicaEnvelope,
@@ -51,7 +51,7 @@ class MemoryStore implements ReplicaStore {
 async function main() {
   const ownerKey = makeReplicaOwnerKey('https://money.example/', 'A@Example.COM');
   const full: ReplicaResponse = {
-    schema_version: 1,
+    schema_version: 2,
     owner_id: 7,
     reset_required: false,
     generations: { user: 1 },
@@ -68,11 +68,24 @@ async function main() {
   equal((bootstrapped.partitions.user as { marker: string }).marker, 'full');
   equal(emptyStore.value?.ownerId, 7);
 
+  const corruptStore = new MemoryStore();
+  corruptStore.value = bootstrapped;
+  equal(
+    await loadCompleteReplicaDataset(
+      corruptStore,
+      ownerKey,
+      getReplicaOwnerEpoch(ownerKey),
+    ),
+    undefined,
+  );
+  equal(corruptStore.clears, 1);
+  equal(corruptStore.value, undefined);
+
   const pullCalls: { path: string; body?: unknown }[] = [];
   const pulled = await syncReplica(emptyStore, ownerKey, async (path, body) => {
     pullCalls.push({ path, body });
     return {
-      schema_version: 1,
+      schema_version: 2,
       owner_id: 7,
       reset_required: false,
       generations: { user: 2 },
@@ -81,7 +94,7 @@ async function main() {
   });
   deepEqual(pullCalls, [{
     path: '/replica/pull',
-    body: { schema_version: 1, generations: { user: 1 } },
+    body: { schema_version: 2, generations: { user: 1 } },
   }]);
   equal((pulled.partitions.user as { marker: string }).marker, 'changed');
   equal(pulled.generations.user, 2);
@@ -91,7 +104,7 @@ async function main() {
     resetCalls.push(path);
     if (path === '/replica/pull') {
       return {
-        schema_version: 1,
+        schema_version: 2,
         owner_id: 7,
         reset_required: true,
         generations: {} as Record<string, number>,
@@ -119,7 +132,7 @@ async function main() {
     if (pullNumber === 1) await firstGate;
     const generation = pullNumber + 3;
     return {
-      schema_version: 1,
+      schema_version: 2,
       owner_id: 7,
       reset_required: false,
       generations: { user: generation },
@@ -133,8 +146,8 @@ async function main() {
   releaseFirst();
   await Promise.all([firstSync, secondSync]);
   deepEqual(pullBodies, [
-    { schema_version: 1, generations: { user: 3 } },
-    { schema_version: 1, generations: { user: 4 } },
+    { schema_version: 2, generations: { user: 3 } },
+    { schema_version: 2, generations: { user: 4 } },
   ]);
   equal(serializedStore.value?.generations.user, 5);
 
@@ -179,19 +192,6 @@ async function main() {
       .preferences.card_date_basis),
     'post',
   );
-  const dashboardCache = {
-    cachedAt: '2026-08-10T00:00:00Z',
-    accounts: [],
-    portfolio: { current_month_spending: 9479 },
-    stats: { total: 1 },
-  } as never;
-  await updateReplicaDashboardCache(
-    serializedStore,
-    ownerKey,
-    getReplicaOwnerEpoch(ownerKey),
-    dashboardCache,
-  );
-  equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
   const accountTabCache = {
     cachedAt: '2026-08-10T03:00:00Z',
     balances: [
@@ -227,7 +227,6 @@ async function main() {
     generations: { user: 2 },
     partitions: [{ name: 'user', generation: 2, data: { marker: 'server-refresh' } }],
   }));
-  equal(serializedStore.value?.dashboardCache?.portfolio.current_month_spending, 9479);
   equal(serializedStore.value?.accountTabCache?.balances[0]?.account_no, '1234');
 
   let releaseClear!: () => void;

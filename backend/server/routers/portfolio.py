@@ -46,6 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.core import account_classify, bank_data
+from backend.core.card_bills import summarize_persisted_card_bills
 from backend.core.card_status import CathayBillStatus, cathay_bill_status
 from backend.server.deps import current_user
 from backend.server import db, fx_service
@@ -505,18 +506,35 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
             assets_date, assets_val = balance_info
             assets = assets_val if assets_val is not None else None
 
-        # 信用卡未繳 = 真實負債（per-bank parser）
+        # 信用卡未繳 = canonical persisted card-bill facts；legacy metric 僅供舊資料 fallback。
         card_unpaid: int | None = None
-        parser_info = LIABILITY_PARSERS.get(bank)
         liab_snapshot_date: str | None = None
-        if parser_info:
-            category, parser_fn = parser_info
-            section_started = time.perf_counter()
-            latest = _latest_payload(bank, category, user_id)
-            liab_ms = (time.perf_counter() - section_started) * 1000
-            if latest:
-                liab_snapshot_date, payload = latest
-                card_unpaid = parser_fn(payload)
+        section_started = time.perf_counter()
+        try:
+            canonical_card = summarize_persisted_card_bills(
+                bank,
+                [
+                    row.model_dump()
+                    for row in db_api.list_cards(
+                        bank=bank,
+                        user_id=user_id,
+                        include_inactive=True,
+                    )
+                ],
+            )
+        except db.OperationalError:
+            canonical_card = None  # legacy pre-card-fact SQLite schema
+        if canonical_card is not None:
+            liab_snapshot_date, card_unpaid = canonical_card
+        else:
+            parser_info = LIABILITY_PARSERS.get(bank)
+            if parser_info:
+                category, parser_fn = parser_info
+                latest = _latest_payload(bank, category, user_id)
+                if latest:
+                    liab_snapshot_date, payload = latest
+                    card_unpaid = parser_fn(payload)
+        liab_ms = (time.perf_counter() - section_started) * 1000
 
         # 貸款餘額（信貸/房貸）— 使用者鐵律：所有爬蟲都要處理
         loan_balance: int | None = None

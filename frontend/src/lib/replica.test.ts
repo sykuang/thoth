@@ -1,9 +1,10 @@
+import { SUPPORTED_BANKS } from '@/types/api';
+
 import {
   applyReplicaResponse,
   makeReplicaOwnerKey,
   projectReplicaDataset,
   type ReplicaAccountTabCache,
-  type ReplicaDashboardCache,
   type ReplicaEnvelope,
   type ReplicaResponse,
 } from './replica';
@@ -38,7 +39,7 @@ notEqual(
 equal(makeReplicaOwnerKey('https://guest@money.example/', 'A@Example.COM').includes('guest'), false);
 
 const bootstrap: ReplicaResponse = {
-  schema_version: 1,
+  schema_version: 2,
   owner_id: 7,
   reset_required: false,
   generations: { user: 1, 'bank:cathay': 1 },
@@ -125,7 +126,7 @@ equal(envelope.ownerId, 7);
 deepEqual(envelope.generations, { user: 1, 'bank:cathay': 1 });
 
 const pull: ReplicaResponse = {
-  schema_version: 1,
+  schema_version: 2,
   owner_id: 7,
   reset_required: false,
   generations: { 'bank:cathay': 2 },
@@ -177,7 +178,7 @@ equal(pending.fx_rate_source, 'bank_pending_estimate');
 equal('raw' in pending, false);
 
 const parityEnvelope = applyReplicaResponse(undefined, {
-  schema_version: 1,
+  schema_version: 2,
   owner_id: 7,
   reset_required: false,
   generations: { 'bank:cathay': 1 },
@@ -214,59 +215,60 @@ equal(parityTransactions[2].fx_rate, null);
 equal(parityTransactions[2].fx_rate_source, null);
 equal(parityTransactions[2].display_description, 'SERVER CANONICAL DISPLAY');
 
-const validDashboardCache = {
-  cachedAt: '2026-08-10T00:00:00Z',
-  accounts: [{ has_creds: true }],
-  portfolio: {
-    total_assets: 1,
-    fx_assets_twd: 0,
-    brokerage_assets_twd: 0,
-    total_liabilities: 0,
-    total_card_unpaid: 0,
-    total_loan: 0,
-    current_month_spending: 9479,
-    net_worth_with_fx: 1,
-    by_bank: [],
+const completePartitions: Record<string, unknown> = {
+  ...envelope.partitions,
+  user: {
+    ...(envelope.partitions.user as Record<string, unknown>),
+    bank_accounts: [{
+      id: 1, bank: 'cathay', label: '主帳', created_at: envelope.syncedAt,
+      updated_at: envelope.syncedAt, has_creds: true, fields_set: [],
+    }],
   },
-  stats: {
-    total: 1,
-    total_income: 0,
-    total_expense: 9479,
-    total_net: -9479,
-    amount_by_month: {
-      '2026-08': { income: 0, expense: 9479, net: -9479, count: 1 },
+  manual: { accounts: [], transactions: [] },
+  brokerage: { accounts: [], balances: [], positions: [], activities: [], last_synced_at: null },
+  market: { fx: { rates: { TWD: 1 } }, quotes: [] },
+};
+for (const bank of SUPPORTED_BANKS) {
+  completePartitions[`bank:${bank}`] ??= {
+    accounts: [],
+    cards: [],
+    transactions: [],
+    portfolio_facts: {
+      latest_twd_balance: null,
+      latest_account_transaction_balances: [],
+      loan_balance: null,
+      card_unpaid: null,
     },
+  };
+}
+completePartitions['bank:cathay'] = {
+  accounts: [{
+    account_no: '1234', currency: 'TWD', product_type: 'deposit', raw_balance: 1234,
+    raw_balance_date: '2026-08-10', excluded: false,
+  }],
+  cards: [],
+  transactions: [],
+  portfolio_facts: {
+    latest_twd_balance: { snapshot_date: '2026-08-10', twd_balance: 1234 },
+    latest_account_transaction_balances: [],
+    loan_balance: null,
+    card_unpaid: null,
   },
-} as unknown as ReplicaDashboardCache;
-const validDashboardEnvelope = { ...envelope, dashboardCache: validDashboardCache };
-equal(projectReplicaDataset(validDashboardEnvelope).dashboardCache, validDashboardCache);
-
-const corruptAccountEnvelope = {
-  ...validDashboardEnvelope,
-  dashboardCache: { ...validDashboardCache, accounts: [{}] },
-} as unknown as ReplicaEnvelope;
-equal(projectReplicaDataset(corruptAccountEnvelope).dashboardCache, undefined);
-
-const corruptMonthEnvelope = {
-  ...validDashboardEnvelope,
+};
+const staleDashboardEnvelope = {
+  ...envelope,
+  partitions: completePartitions,
   dashboardCache: {
-    ...validDashboardCache,
-    stats: {
-      ...validDashboardCache.stats,
-      amount_by_month: { '2026-08': null },
-    },
+    cachedAt: '2026-08-10T00:00:00Z',
+    accounts: [{ has_creds: true }],
+    portfolio: { current_month_spending: 9479 },
+    stats: { total: 1 },
   },
 } as unknown as ReplicaEnvelope;
-equal(projectReplicaDataset(corruptMonthEnvelope).dashboardCache, undefined);
-
-const corruptAsOfEnvelope = {
-  ...validDashboardEnvelope,
-  dashboardCache: {
-    ...validDashboardCache,
-    portfolio: { ...validDashboardCache.portfolio, as_of: {} },
-  },
-} as unknown as ReplicaEnvelope;
-equal(projectReplicaDataset(corruptAsOfEnvelope).dashboardCache, undefined);
+const locallyProjectedDashboard = projectReplicaDataset(staleDashboardEnvelope).dashboardCache;
+ok(locallyProjectedDashboard);
+equal(locallyProjectedDashboard.portfolio.total_assets, 1234);
+equal(locallyProjectedDashboard.accounts[0].bank, 'cathay');
 
 const validAccountTabCache: ReplicaAccountTabCache = {
   cachedAt: '2026-08-10T03:00:00Z',

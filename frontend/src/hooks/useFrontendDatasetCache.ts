@@ -4,17 +4,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { queryClient } from '@/lib/queryClient';
 import {
   assertReplicaOwnerEpoch,
+  discardReplica,
   guardReplicaOwnerRequest,
+  loadCompleteReplicaDataset,
   patchReplicaAccountTabCache,
   projectReplicaDataset,
   REPLICA_SCHEMA_VERSION,
   ReplicaSyncCancelledError,
   syncReplica,
   updateReplicaAccountTabCache,
-  updateReplicaDashboardCache,
   waitForReplicaOwner,
   type ReplicaAccountTabCache,
-  type ReplicaDashboardCache,
   type ReplicaResponse,
   type ReplicaTransactionDataset,
 } from '@/lib/replica';
@@ -48,10 +48,28 @@ export function useFrontendDatasetCache() {
     syncCountRef.current += 1;
     setIsSyncing(true);
     try {
-      const envelope = await syncReplica(replicaStore, ownerKey, requestReplica);
-      const dataset = projectReplicaDataset(envelope);
+      const current = await guardReplicaOwnerRequest(
+        ownerKey,
+        ownerEpoch,
+        () => replicaStore.load(ownerKey),
+      );
+      const firstSyncWasPull = current?.schemaVersion === REPLICA_SCHEMA_VERSION;
+      let envelope = await syncReplica(replicaStore, ownerKey, requestReplica);
+      let dataset = projectReplicaDataset(envelope);
+      if (!dataset.dashboardCache) {
+        await discardReplica(replicaStore, ownerKey, ownerEpoch);
+        if (!firstSyncWasPull) {
+          throw new Error('Replica bootstrap did not produce a complete Dashboard');
+        }
+        envelope = await syncReplica(replicaStore, ownerKey, requestReplica);
+        dataset = projectReplicaDataset(envelope);
+        if (!dataset.dashboardCache) {
+          await discardReplica(replicaStore, ownerKey, ownerEpoch);
+          throw new Error('Replica bootstrap did not produce a complete Dashboard');
+        }
+      }
       console.info(
-        `[replica-v1] synced owner_id=${envelope.ownerId} partitions=${Object.keys(envelope.partitions).length} transactions=${dataset.transactions.length}`,
+        `[replica-v2] synced owner_id=${envelope.ownerId} partitions=${Object.keys(envelope.partitions).length} transactions=${dataset.transactions.length}`,
       );
       queryClient.setQueryData(queryKey, dataset);
       synchronizedOwnerRef.current = ownerSessionKey;
@@ -60,24 +78,7 @@ export function useFrontendDatasetCache() {
       syncCountRef.current -= 1;
       if (syncCountRef.current === 0) setIsSyncing(false);
     }
-  }, [ownerKey, ownerSessionKey, queryKey, requestReplica]);
-
-  const persistDashboardCache = useCallback(async (
-    dashboardCache: ReplicaDashboardCache,
-    expectedEpoch: number,
-  ): Promise<void> => {
-    if (!ownerKey) return;
-    await updateReplicaDashboardCache(
-      replicaStore,
-      ownerKey,
-      expectedEpoch,
-      dashboardCache,
-    );
-    assertReplicaOwnerEpoch(ownerKey, expectedEpoch);
-    queryClient.setQueryData<ReplicaTransactionDataset>(queryKey, (current) => (
-      current ? { ...current, dashboardCache } : current
-    ));
-  }, [ownerKey, queryKey]);
+  }, [ownerEpoch, ownerKey, ownerSessionKey, queryKey, requestReplica]);
 
   const persistAccountTabCache = useCallback(async (
     accountTabCache: ReplicaAccountTabCache,
@@ -118,15 +119,14 @@ export function useFrontendDatasetCache() {
       const firstHydration = !hydratedOwners.has(ownerSessionKey);
       hydratedOwners.add(ownerSessionKey);
       if (firstHydration) {
-        const persisted = await guardReplicaOwnerRequest(
+        const dataset = await loadCompleteReplicaDataset(
+          replicaStore,
           ownerKey,
           ownerEpoch,
-          () => replicaStore.load(ownerKey),
         );
-        if (persisted?.schemaVersion === REPLICA_SCHEMA_VERSION) {
-          const dataset = projectReplicaDataset(persisted);
+        if (dataset) {
           console.info(
-            `[replica-v1] hydrated owner_id=${persisted.ownerId} transactions=${dataset.transactions.length}`,
+            `[replica-v2] hydrated transactions=${dataset.transactions.length}`,
           );
           return dataset;
         }
@@ -135,14 +135,12 @@ export function useFrontendDatasetCache() {
         return await refreshReplica();
       } catch (syncError) {
         if (syncError instanceof ReplicaSyncCancelledError) throw syncError;
-        const persisted = await guardReplicaOwnerRequest(
+        const dataset = await loadCompleteReplicaDataset(
+          replicaStore,
           ownerKey,
           ownerEpoch,
-          () => replicaStore.load(ownerKey),
         );
-        if (persisted?.schemaVersion === REPLICA_SCHEMA_VERSION) {
-          return projectReplicaDataset(persisted);
-        }
+        if (dataset) return dataset;
         throw syncError;
       }
     },
@@ -166,7 +164,6 @@ export function useFrontendDatasetCache() {
     refreshSnapshot: refreshReplica,
     refreshChanges: refreshReplica,
     isRefreshingChanges: isSyncing,
-    persistDashboardCache,
     persistAccountTabCache,
     persistAccountTabCacheUpdate,
   };

@@ -92,6 +92,31 @@ def card_bill_date(value: Any) -> str | None:
     return _iso_date(value)
 
 
+def summarize_persisted_card_bills(
+    bank: str,
+    cards: list[dict[str, Any]],
+) -> tuple[str, int] | None:
+    """Return one bank liability from complete canonical persisted card facts."""
+    if not cards:
+        return None
+    amounts: list[Decimal] = []
+    dates: list[str] = []
+    for card in cards:
+        amount = _money(card.get("bill_due_amount"))
+        updated_on = _iso_date(card.get("updated_at"))
+        if amount is None or updated_on is None:
+            return None
+        amounts.append(Decimal(str(amount)))
+        dates.append(updated_on)
+    if bank == "hsbc":
+        total = sum(amounts, Decimal(0))
+    elif any(amount != amounts[0] for amount in amounts[1:]):
+        return None
+    else:
+        total = amounts[0]
+    return min(dates), int(total)
+
+
 def make_card_bill_fact(
     *,
     remaining_due: Any,

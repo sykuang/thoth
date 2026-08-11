@@ -6,7 +6,7 @@ from math import isfinite
 from typing import Any
 
 from backend.core import account_classify
-from backend.core.card_status import CathayBillStatus, cathay_bill_status
+from backend.core.card_bills import summarize_persisted_card_bills
 from backend.core.store import canonical_display_description
 from backend.server import fx_service
 from backend.server.db_facade import db_api
@@ -125,34 +125,6 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
-def _card_unpaid_twd(bank: str, payload: Any) -> int | None:
-    if bank == "cathay" and isinstance(payload, dict):
-        bill = (payload.get("latest_bill") or {}).get("twd") or {}
-        amount = _to_int(bill.get("billAmount"))
-        status = cathay_bill_status(bill.get("payBillStatus"))
-        if amount is None or status is None:
-            return None
-        return 0 if status is CathayBillStatus.PAID else amount
-    if bank == "ubot" and isinstance(payload, dict):
-        return _to_int((payload.get("TotalData") or {}).get("Card"))
-    if bank == "hsbc" and isinstance(payload, list):
-        values = [
-            amount
-            for card in payload
-            if isinstance(card, dict)
-            if (amount := _to_int(card.get("outstanding"))) is not None
-        ]
-        return sum(values) if values else None
-    if bank == "sinopac" and isinstance(payload, list) and payload:
-        first = payload[0] if isinstance(payload[0], dict) else {}
-        groups = first.get("SubInfo") or []
-        entries = groups[0] if groups and isinstance(groups[0], list) else []
-        for entry in entries:
-            if isinstance(entry, dict) and entry.get("DataText") == "本期應繳":
-                return _to_int(entry.get("DataValue"))
-    return None
-
-
 def _loan_fact(bank: str, user_id: int) -> dict[str, Any] | None:
     direct = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
     if direct is not None:
@@ -213,15 +185,19 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
         (row.model_dump() for row in db_api.list_accounts(bank=bank, user_id=user_id)),
         key=lambda row: row["account_no"],
     )
-    cards = sorted(
+    all_cards = sorted(
         (
             row.model_dump()
-            for row in db_api.list_cards(bank=bank, user_id=user_id, include_inactive=False)
+            for row in db_api.list_cards(bank=bank, user_id=user_id, include_inactive=True)
         ),
         key=lambda row: row["card_no"],
     )
+    cards = [row for row in all_cards if row["active"]]
     excluded_accounts = {row["account_no"] for row in accounts if row["excluded"]}
-    excluded_cards = {row["card_no"] for row in cards if row["excluded"]}
+    excluded_cards = db_api.list_excluded_card_nos_all_banks(
+        user_id=user_id,
+        banks=[bank],
+    ).get(bank, set())
     transactions = sorted(
         (
             _transaction_fact(bank, row, excluded_accounts, excluded_cards)
@@ -244,11 +220,7 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
         key=lambda row: row["account_no"],
     )
     balance = db_api.get_latest_twd_balance(bank=bank, user_id=user_id)
-    card_metric = db_api.get_latest_metric(
-        bank=bank,
-        category="card_summary",
-        user_id=user_id,
-    )
+    card_summary = summarize_persisted_card_bills(bank, all_cards)
     return {
         "accounts": accounts,
         "cards": cards,
@@ -259,10 +231,11 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
             "loan_balance": _loan_fact(bank, user_id),
             "card_unpaid": (
                 {
-                    "snapshot_date": card_metric.snapshot_date,
-                    "amount_twd": _card_unpaid_twd(bank, card_metric.payload),
+                    "snapshot_date": card_summary[0],
+                    "amount_twd": card_summary[1],
+                    "recognized": True,
                 }
-                if card_metric else None
+                if card_summary else None
             ),
         },
     }

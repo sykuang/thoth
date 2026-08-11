@@ -7,6 +7,7 @@ from backend.core.card_bills import (
     apply_card_bill_facts,
     make_card_bill_fact,
     publish_card_bill_facts,
+    summarize_persisted_card_bills,
 )
 from backend.core.store import BankStore
 
@@ -17,6 +18,21 @@ def _store(tmp_path, monkeypatch) -> BankStore:
     monkeypatch.setattr(store_mod, "DATA_ROOT", tmp_path)
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     return BankStore("demo", user_id=1)
+
+
+def test_summarize_persisted_card_bills_deduplicates_bank_scope_and_sums_hsbc():
+    bank_rows = [
+        {"bill_due_amount": 5000, "updated_at": "2026-08-11T08:00:00Z"},
+        {"bill_due_amount": 5000, "updated_at": "2026-08-11T08:00:01Z"},
+    ]
+    assert summarize_persisted_card_bills("sinopac", bank_rows) == ("2026-08-11", 5000)
+    assert summarize_persisted_card_bills("hsbc", bank_rows) == ("2026-08-11", 10000)
+    assert summarize_persisted_card_bills("sinopac", [
+        bank_rows[0], {**bank_rows[1], "bill_due_amount": 1},
+    ]) is None
+    assert summarize_persisted_card_bills("sinopac", [
+        bank_rows[0], {**bank_rows[1], "bill_due_amount": None},
+    ]) is None
 
 
 def test_make_card_bill_fact_fails_closed_and_keeps_payment_pair_atomic():

@@ -1,4 +1,11 @@
-import { divideDecimal, formatDecimal, formatDecimalFixed, multiplyDecimal } from './decimal';
+import {
+  addDecimal,
+  divideDecimal,
+  formatDecimal,
+  formatDecimalFixed,
+  multiplyDecimal,
+  multiplyDecimalToIntegerHalfEven,
+} from './decimal';
 
 function assertEqual(actual: string | null, expected: string | null): void {
   if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
@@ -20,11 +27,20 @@ assertEqual(multiplyDecimal('9007199254740993.01', '3'), '27021597764222979.03')
 assertEqual(multiplyDecimal('0.0000000000005', '1'), '0.000000000001');
 assertEqual(multiplyDecimal('0.0000000000004', '1'), '0');
 assertEqual(multiplyDecimal('NaN', '1'), null);
+assertEqual(addDecimal('0.1', '0.2'), '0.3');
+assertEqual(addDecimal('-2.5', '1.25'), '-1.25');
+assertEqual(addDecimal('9007199254740993.01', '0.99'), '9007199254740994');
 assertEqual(divideDecimal('100', '3'), '33.33');
 assertEqual(divideDecimal('10', '4'), '2.5');
 assertEqual(divideDecimal('1', '8'), '0.13');
 assertEqual(divideDecimal('9007199254740993', '3'), '3002399751580331');
 assertEqual(divideDecimal('10', '0'), null);
 assertEqual(formatDecimalFixed('NaN', 2), null);
+if (multiplyDecimalToIntegerHalfEven('2.5', '1') !== 2) throw new Error('2.5 must round half-even to 2');
+if (multiplyDecimalToIntegerHalfEven('3.5', '1') !== 4) throw new Error('3.5 must round half-even to 4');
+if (multiplyDecimalToIntegerHalfEven('-3.5', '1') !== -4) throw new Error('-3.5 must round half-even to -4');
+if (multiplyDecimalToIntegerHalfEven('+2.5', '1') !== 2) throw new Error('+2.5 must round half-even to 2');
+if (multiplyDecimalToIntegerHalfEven('1000', '0.2') !== 200) throw new Error('FX conversion failed');
+if (multiplyDecimalToIntegerHalfEven('NaN', '1') !== null) throw new Error('invalid decimal must fail');
 
 console.log('decimal formatting checks passed');
