@@ -65,22 +65,25 @@ def test_run_sync_job_creates_queued_row(isolated, monkeypatch):
 
 
 def test_sync_runner_updates_status_done_on_success(isolated, monkeypatch):
-    """假 crawler 成功跑完 → status=done、有 finished_at。"""
+    """假 crawler 成功跑完 → 清 Dashboard cache，再標 done。"""
     import backend.server.sync_runner as sr
 
     # 假 dispatch：直接 return {"data": {...}, "delta": {...}}
     def fake_dispatch(bank: str, user_id: int, headless: bool) -> dict:
         # 也驗證 user_id 真的從上層帶下來
         assert user_id == 1
-        return {"delta": {"twd_txn_new": 3}, "stats": {"twd_txn": 100}}
+        return {"delta": {"twd_txn_new": 3}, "stats": {}}
 
+    cleared: list[int] = []
     monkeypatch.setattr(sr, "_dispatch_crawler_and_persist", fake_dispatch)
+    monkeypatch.setattr(sr, "clear_dashboard_cache", lambda user_id: cleared.append(user_id))
 
     job_id = sr.run_sync_job(user_id=1, bank="sinopac", headless=True)
     row = _wait_for_status(job_id, {"done", "failed"})
     assert row["status"] == "done", f"unexpected: {row}"
     assert row["finished_at"]
     assert row["error_msg"] is None or row["error_msg"] == ""
+    assert cleared == [1]
     # result_summary 應該 JSON-able 且含 delta
     import json
     summary = json.loads(row["result_summary"])

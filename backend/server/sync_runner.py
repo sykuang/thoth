@@ -24,6 +24,7 @@ import threading
 import traceback
 
 from backend.server import sync_jobs_repo
+from backend.server.dashboard_cache import clear_dashboard_cache
 
 # Push notification taps must target Expo Router file-system routes, not stale
 # pseudo routes like /sync or /cards. Query metadata stays as separate data keys.
@@ -177,6 +178,9 @@ def _exec_sync(job_id: int) -> None:
 
     # 3. 寫回 DB
     if error is None:
+        # Persist 已落地後先清 process-local aggregate cache；frontend 看見 done
+        # 才會 refetch，不能讓 refetch 又拿到同步前的 30 秒舊值。
+        clear_dashboard_cache(user_id)
         sync_jobs_repo.mark_done(
             job_id,
             json.dumps(summary, ensure_ascii=False) if summary else "{}",
