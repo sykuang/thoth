@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import TaipeiFubonCreds
 
@@ -60,6 +61,31 @@ def _log(*a):
 
 class FubonLoginError(RuntimeError):
     """Fubon login 送出後失敗——立刻中止，絕不自動重打。"""
+
+
+def _fubon_card_bill_fact(amount_text: str):
+    payment = re.search(
+        r"繳款狀態.*?自動扣繳帳號.*?\n"
+        r"([^\t\n]+)\s*\t\s*(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*"
+        r"([\d,]+)\s*\t\s*([\d,]+)\s*\t",
+        amount_text,
+    )
+    bill = re.search(
+        r"本期帳單結帳日.*?繳款截止日.*?\n"
+        r"(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*[\d,]+\s*\t\s*[\d,]+"
+        r"\s*\t\s*([^\t\n]+)",
+        amount_text,
+    )
+    due_text = bill.group(2).strip() if bill else None
+    if due_text == "無需繳款":
+        due_text = None
+    return make_card_bill_fact(
+        remaining_due=payment.group(4) if payment else None,
+        statement_close_date=bill.group(1) if bill else None,
+        payment_due_date=due_text,
+        last_payment_amount=payment.group(3) if payment else None,
+        last_payment_date=payment.group(2) if payment else None,
+    )
 
 
 class FubonCrawler(BankCrawler):
@@ -960,6 +986,7 @@ class FubonCrawler(BankCrawler):
 
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
+        publish_card_bill_facts(out, [_fubon_card_bill_fact(out.get("amount_page_text") or "")])
         _log(f"[fubon][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")
         return BankCollectResult(**out)
 

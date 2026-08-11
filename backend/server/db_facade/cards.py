@@ -74,7 +74,7 @@ class CardSummary(BaseModel):
     statement_close_date: str | None = None
     payment_due_date: str | None = None
     updated_at: str | None = None
-    bill_due_amount: float = 0.0
+    bill_due_amount: float | None = None
     unbilled_amount: float = 0.0
     last_payment_date: str | None = None
     last_payment_amount: float | None = None
@@ -179,13 +179,11 @@ def _bill_summary_for_cards(
 ) -> dict[str, dict[str, Any]]:
     """產出每張卡的 bill_due_amount / unbilled_amount / last_payment_* summary.
 
-    2026-06-20 升級 (HSBC bill_due 1.3M bug 修): 先讀 cards 表 native 欄
-    (HSBC API 直給的「本期應繳/最近繳款」)，再走 card_billed_txns derive 路徑
-    當 fallback. native 為主, derive 補 NULL 那些卡.
+    `bill_due_amount` 只讀 crawler canonical fact；交易加總不是剩餘應繳。
     """
     summary: dict[str, dict[str, Any]] = {
         no: {
-            "bill_due_amount": 0.0,
+            "bill_due_amount": None,
             "unbilled_amount": 0.0,
             "last_payment_date": None,
             "last_payment_amount": None,
@@ -218,45 +216,6 @@ def _bill_summary_for_cards(
 
     if helpers._has_table(con, "card_billed_txns"):
         cols = helpers._columns(con, "card_billed_txns")
-        if {"card_no", "bill_date", "amount"}.issubset(cols):
-            latest_by_card: dict[str, str | None] = {}
-            for r in con.execute(
-                """SELECT COALESCE(NULLIF(card_no, ''), '__bank__') AS card_key,
-                          MAX(bill_date) AS latest_bill_date
-                   FROM card_billed_txns
-                   WHERE user_id = ?
-                   GROUP BY COALESCE(NULLIF(card_no, ''), '__bank__')""",
-                (user_id,),
-            ):
-                latest_by_card[r["card_key"]] = r["latest_bill_date"]
-
-            for card_key, latest_bill_date in latest_by_card.items():
-                if card_key == "__bank__":
-                    if len(card_nos) != 1:
-                        continue
-                    target = card_nos[0]
-                    rows = con.execute(
-                        """SELECT amount FROM card_billed_txns
-                           WHERE user_id = ?
-                             AND (card_no IS NULL OR card_no = '')
-                             AND (bill_date IS ? OR bill_date = ?)""",
-                        (user_id, latest_bill_date, latest_bill_date),
-                    )
-                else:
-                    if card_key not in summary:
-                        continue
-                    target = card_key
-                    rows = con.execute(
-                        """SELECT amount FROM card_billed_txns
-                           WHERE user_id = ?
-                             AND card_no = ?
-                             AND (bill_date IS ? OR bill_date = ?)""",
-                        (user_id, card_key, latest_bill_date, latest_bill_date),
-                    )
-                summary[target]["bill_due_amount"] = sum(
-                    helpers._positive(r["amount"]) for r in rows
-                )
-
         if "txn_type" in cols:
             payment_date_expr = (
                 "COALESCE(NULLIF(post_date, ''), consume_date)"
@@ -316,9 +275,7 @@ def _bill_summary_for_cards(
                     target = card_key
                 summary[target]["unbilled_amount"] = float(r["amount_sum"] or 0)
 
-    # === Native overlay (2026-06-20): cards 表 native 欄優先, derive 退為 fallback ===
-    # 邏輯: native 不是 NULL → 蓋過 derive 算出的值 (HSBC 「本期應繳」 71,032 蓋 derive 1.3M).
-    # native 是 NULL → 保留 derive 算出的值 (其他銀行如 cathay 不變).
+    # Canonical overlay: unknown stays NULL; never infer debt from purchases.
     for card_no, native in native_by_card.items():
         if card_no not in summary:
             continue

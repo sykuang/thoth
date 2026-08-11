@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from backend.core.persist import PERSISTERS
+
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "cli" / "cli.py"
 SYNC_RUNNER = ROOT / "backend" / "server" / "sync_runner.py"
@@ -167,33 +169,9 @@ def test_crawler_module_map_aligns_with_supported_banks():
 
 
 def test_cli_persist_dispatch_aligns_with_server_persist_dispatch():
-    """關鍵: CLI 跟 server-mode 的 bank → persist_X 對映必須完全一致.
-
-    這是 fubon silent regression (commit b21e721) 的根本防護:
-    cli 用 persist_fubon 但 sync_runner 用 persist_generic_dump 害 server-mode 空轉.
-    """
-    cli_persist = _extract_persist_dispatch(_parse(CLI))
-    sr_persist = _extract_persist_dispatch(_parse(SYNC_RUNNER))
-
-    cli_banks = set(cli_persist)
-    sr_banks = set(sr_persist)
-
-    assert cli_banks == sr_banks, (
-        f"cli vs sync_runner 處理的 bank set 不一致!\n"
-        f"  only in cli: {cli_banks - sr_banks}\n"
-        f"  only in sr:  {sr_banks - cli_banks}"
-    )
-
-    drift = {
-        b: (cli_persist[b], sr_persist[b])
-        for b in cli_banks
-        if cli_persist[b] != sr_persist[b]
-    }
-    assert not drift, (
-        f"cli vs sync_runner persist 函式漂移!\n"
-        f"  format: bank → (cli_uses, sr_uses)\n"
-        f"  {drift}"
-    )
+    """CLI and server both route through the same canonical registry."""
+    assert "persist_collected(" in CLI.read_text()
+    assert "persist_collected(" in SYNC_RUNNER.read_text()
 
 
 def test_cli_crawler_imports_align_with_sync_runner_crawler_map():
@@ -219,13 +197,6 @@ def test_cli_crawler_imports_align_with_sync_runner_crawler_map():
 
 
 def test_all_supported_banks_have_persist_function():
-    """SUPPORTED_BANKS 每家都必須有 persist_X 對映 (CLI 跟 sync_runner 都要有)."""
+    """SUPPORTED_BANKS 每家都必須有 shared registry entry."""
     supported = _extract_set_literal(_parse(SYNC_RUNNER), "SUPPORTED_BANKS")
-    cli_persist = _extract_persist_dispatch(_parse(CLI))
-    sr_persist = _extract_persist_dispatch(_parse(SYNC_RUNNER))
-
-    missing_in_cli = supported - set(cli_persist)
-    missing_in_sr = supported - set(sr_persist)
-
-    assert not missing_in_cli, f"CLI 缺 persist dispatch: {missing_in_cli}"
-    assert not missing_in_sr, f"sync_runner 缺 persist dispatch: {missing_in_sr}"
+    assert set(PERSISTERS) == supported

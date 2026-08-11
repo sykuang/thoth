@@ -14,11 +14,7 @@ CLI 卻早就用 persist_fubon 拿到 3 cards + 1 billed.
 """
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
-
-SYNC_RUNNER = Path(__file__).resolve().parents[1] / "backend" / "server" / "sync_runner.py"
+from backend.core.persist import PERSISTERS
 
 # 預期每家銀行該用哪個 persist_X 函式 (對齊 CLI cli/cli.py 的選擇)
 EXPECTED_PERSIST = {
@@ -39,47 +35,8 @@ EXPECTED_PERSIST = {
 
 
 def _extract_persist_map() -> dict[str, str]:
-    """從 sync_runner.py 解出 bank → persist_X 對應關係.
-
-    策略: ast.walk 整個 _dispatch_crawler_and_persist function, 找所有 If node
-    test 形如 bank == "xxx" 的, body 裡找 from backend.core.persist import persist_X.
-    """
-    src = SYNC_RUNNER.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-
-    func = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_dispatch_crawler_and_persist":
-            func = node
-            break
-    assert func is not None, "找不到 _dispatch_crawler_and_persist"
-
-    mapping: dict[str, str] = {}
-
-    for sub in ast.walk(func):
-        if not isinstance(sub, ast.If):
-            continue
-        test = sub.test
-        # bank == "xxx"
-        if not (isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Name)
-                and test.left.id == "bank"
-                and len(test.ops) == 1
-                and isinstance(test.ops[0], ast.Eq)
-                and len(test.comparators) == 1
-                and isinstance(test.comparators[0], ast.Constant)
-                and isinstance(test.comparators[0].value, str)):
-            continue
-        bank_name = test.comparators[0].value
-        # 找 body 裡的 import persist_X
-        for stmt in sub.body:
-            if isinstance(stmt, ast.ImportFrom):
-                for alias in stmt.names:
-                    if alias.name.startswith("persist_"):
-                        mapping[bank_name] = alias.name
-                        break
-
-    return mapping
+    """Single shared registry used by CLI and server-mode dispatch."""
+    return dict(PERSISTERS)
 
 
 def test_fubon_uses_persist_fubon_not_generic_dump():

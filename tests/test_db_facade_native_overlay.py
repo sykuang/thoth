@@ -7,7 +7,7 @@
 
    重點驗證:
    1. native 不是 NULL → bill_due_amount 用 native (蓋 derive 假象)
-   2. native 是 NULL → fallback derive (其他銀行 cathay/ubot 不受影響)
+   2. native 是 NULL → bill due 維持 unknown，不從交易加總猜測
    3. 部分 native (只 bill_due 有, last_payment_amount NULL) → 對應欄獨立覆寫
 """
 from __future__ import annotations
@@ -110,8 +110,7 @@ def test_native_overlay_overrides_derive_for_hsbc(con_with_native_and_derive):
     assert s["last_payment_date"] == "2026-06-11"
 
 
-def test_native_overlay_skips_derive_when_all_null(con_with_native_and_derive):
-    """CARD-DERIVE: native 三欄都 NULL → 走 derive (999999 / 99999 / '2026-06-15')."""
+def test_missing_native_bill_due_does_not_derive_from_transaction_sum(con_with_native_and_derive):
     from backend.server.db_facade.cards import _bill_summary_for_cards
     from backend.server.db_facade._base import _BaseHelpers
 
@@ -124,9 +123,8 @@ def test_native_overlay_skips_derive_when_all_null(con_with_native_and_derive):
         card_nos=["CARD-DERIVE"],
     )
     s = summary["CARD-DERIVE"]
-    # derive: bill_date=NULL → MAX(bill_date)=NULL → matches all, SUM positive = 999999
-    assert s["bill_due_amount"] == 999999.0
-    # payment derive
+    assert s["bill_due_amount"] is None
+    # Real payment rows may still supply history; they do not settle the bill fact.
     assert s["last_payment_amount"] == 99999.0
     assert s["last_payment_date"] == "2026-06-15"
 

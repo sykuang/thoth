@@ -589,47 +589,9 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
 
     store = BankStore(bank, user_id=user_id)
     try:
-        if bank == "cathay":
-            from backend.core.persist import persist_cathay
-            delta = persist_cathay(data, store, rules=rules)
-        elif bank == "ubot":
-            from backend.core.persist import persist_ubot
-            delta = persist_ubot(data, store, rules=rules)
-        elif bank == "hsbc":
-            from backend.core.persist import persist_hsbc
-            delta = persist_hsbc(data, store, rules=rules)
-        elif bank == "ctbc":
-            from backend.core.persist import persist_ctbc
-            delta = persist_ctbc(data, store, rules=rules)
-        elif bank == "sinopac":
-            from backend.core.persist import persist_sinopac
-            delta = persist_sinopac(data, store, rules=rules)
-        elif bank == "scsb":
-            from backend.core.persist import persist_scsb
-            delta = persist_scsb(data, store, rules=rules)
-        elif bank == "esun":
-            from backend.core.persist import persist_esun
-            delta = persist_esun(data, store, rules=rules)
-        elif bank == "taishin":
-            from backend.core.persist import persist_taishin
-            delta = persist_taishin(data, store, rules=rules)
-        elif bank == "fubon":
-            from backend.core.persist import persist_fubon
-            delta = persist_fubon(data, store, rules=rules)
-        elif bank == "dbs":
-            from backend.core.persist import persist_dbs
-            delta = persist_dbs(data, store, rules=rules)
-        elif bank == "scb":
-            from backend.core.persist import persist_scb
-            delta = persist_scb(data, store, rules=rules)
-        elif bank == "linebank":
-            from backend.core.persist import persist_linebank
-            delta = persist_linebank(data, store, rules=rules)
-        elif bank == "rakuten":
-            from backend.core.persist import persist_rakuten
-            delta = persist_rakuten(data, store, rules=rules)
-        else:  # pragma: no cover
-            raise RuntimeError(f"unknown persist: {bank}")
+        from backend.core.persist import persist_collected
+
+        delta = persist_collected(bank, data, store, rules=rules)
         stats = store.stats()
     finally:
         store.close()

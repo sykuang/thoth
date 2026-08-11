@@ -13,13 +13,7 @@ class _FakeDate(date):
         return cls(2026, 7, 3)
 
 
-def test_bill_status_treats_slash_due_date_with_recent_payment_as_paid(monkeypatch):
-    """Fubon stores payment_due_date as YYYY/MM/DD; it must still compare dates.
-
-    Regression: Costco card had due=2026/07/02 and latest payment=2026-07-03.
-    The old parser only accepted ISO hyphen dates, returned unknown, and frontend then
-    recomputed the slash due date as "逾期 1 天" despite the payment record.
-    """
+def test_positive_remaining_due_is_overdue_even_with_recent_partial_payment(monkeypatch):
     monkeypatch.setattr(cards_router, "date", _FakeDate)
 
     status = cards_router._compute_bill_status(CardSummary(
@@ -27,11 +21,11 @@ def test_bill_status_treats_slash_due_date_with_recent_payment_as_paid(monkeypat
         card_no="****7024",
         bill_due_amount=7473.0,
         payment_due_date="2026/07/02",
-        last_payment_amount=7473.0,
+        last_payment_amount=3000.0,
         last_payment_date="2026-07-03",
     ))
 
-    assert status == "paid"
+    assert status == "overdue"
 
 
 def test_bill_status_treats_slash_due_date_without_recent_payment_as_overdue(monkeypatch):
@@ -56,12 +50,6 @@ class _AfterHsbcDueDate(date):
 
 
 def test_bill_status_does_not_treat_previous_statement_payment_as_current_paid(monkeypatch):
-    """A payment before the current statement close cannot settle that statement.
-
-    HSBC 8926 regression: current statement closed 2026-06-18 and was due
-    2026-07-06, but the latest transaction-table payment was the previous cycle's
-    2026-06-08 auto debit.  The old due-30-days heuristic called it paid.
-    """
     monkeypatch.setattr(cards_router, "date", _AfterHsbcDueDate)
 
     status = cards_router._compute_bill_status(CardSummary(
@@ -77,13 +65,29 @@ def test_bill_status_does_not_treat_previous_statement_payment_as_current_paid(m
     assert status == "overdue"
 
 
-def test_bill_status_accepts_payment_after_current_statement_close(monkeypatch):
+def test_positive_remaining_due_stays_overdue_after_current_statement_payment(monkeypatch):
     monkeypatch.setattr(cards_router, "date", _AfterHsbcDueDate)
 
     status = cards_router._compute_bill_status(CardSummary(
         bank="hsbc",
         card_no="9059-****-****-7059",
-        bill_due_amount=34365.0,
+        bill_due_amount=1000.0,
+        statement_close_date="2026-06-18",
+        payment_due_date="2026-07-06",
+        last_payment_amount=33365.0,
+        last_payment_date="2026-07-07",
+    ))
+
+    assert status == "overdue"
+
+
+def test_zero_remaining_due_with_current_cycle_payment_is_paid(monkeypatch):
+    monkeypatch.setattr(cards_router, "date", _AfterHsbcDueDate)
+
+    status = cards_router._compute_bill_status(CardSummary(
+        bank="hsbc",
+        card_no="9059-****-****-7059",
+        bill_due_amount=0.0,
         statement_close_date="2026-06-18",
         payment_due_date="2026-07-06",
         last_payment_amount=34365.0,
@@ -91,6 +95,33 @@ def test_bill_status_accepts_payment_after_current_statement_close(monkeypatch):
     ))
 
     assert status == "paid"
+
+
+def test_zero_remaining_due_without_current_payment_needs_no_payment(monkeypatch):
+    monkeypatch.setattr(cards_router, "date", _AfterHsbcDueDate)
+
+    status = cards_router._compute_bill_status(CardSummary(
+        bank="hsbc",
+        card_no="9059-****-****-7059",
+        bill_due_amount=0.0,
+        statement_close_date="2026-06-18",
+        payment_due_date="2026-07-06",
+    ))
+
+    assert status == "no_payment_required"
+
+
+def test_missing_canonical_remaining_due_is_unknown(monkeypatch):
+    monkeypatch.setattr(cards_router, "date", _AfterHsbcDueDate)
+
+    status = cards_router._compute_bill_status(CardSummary(
+        bank="scb",
+        card_no="****7001",
+        bill_due_amount=None,
+        payment_due_date="2026-07-06",
+    ))
+
+    assert status == "unknown"
 
 
 def test_previous_month_same_day_clamps_month_end_and_rolls_year():

@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.banks.cathay import CathayCrawler
+from backend.banks.cathay import CathayCrawler, _cathay_card_bill_fact
 
 
 @pytest.fixture
@@ -146,8 +146,61 @@ class _LatestBillCollector:
 def test_latest_bill_status_is_canonical_enum_value(crawler, raw, canonical):
     result = crawler._parse(_LatestBillCollector(raw))
     assert result["credit_card"]["latest_bill"]["twd"]["payBillStatus"] == canonical
+    assert result["card_bill_facts_ok"] is True
+    assert result["card_bill_facts"] == [{
+        "scope": "bank",
+        "status": canonical,
+        "remaining_due": 0.0 if canonical == "paid" else 4321.0,
+    }]
 
 
 def test_latest_bill_rejects_unknown_status(crawler):
     with pytest.raises(ValueError, match="unsupported Cathay bill status"):
         crawler._parse(_LatestBillCollector("MaybePaid"))
+
+
+def test_latest_paid_bill_with_malformed_amount_is_unavailable(crawler):
+    collector = _LatestBillCollector("Payed")
+    original_latest = collector.latest
+
+    def latest(endpoint):
+        hit = original_latest(endpoint)
+        if hit is not None:
+            hit.resp_json["content"]["twdBillDetail"]["billAmount"] = True
+        return hit
+
+    collector.latest = latest
+    result = crawler._parse(collector)
+
+    assert result["card_bill_facts_ok"] is False
+    assert result["card_bill_facts"] == []
+
+
+def test_cathay_canonical_fact_carries_dates_and_newest_real_payment():
+    out = {
+        "credit_card": {
+            "latest_bill": {
+                "due_date": "2026-08-20",
+                "twd": {"payBillStatus": "paid", "billAmount": 1000},
+            },
+            "bill_summary": {
+                "currencies": [{"billDate": "2026-08-01"}],
+            },
+            "billed_detail": {"TWD": [{
+                "desc": "本行自動扣繳", "amount": -900,
+                "post_date": "2026-08-05",
+            }]},
+        },
+        "twd_transactions": [{"transactions": [{
+            "desc": "信用卡款", "expend": 1000,
+            "account_date": "2026-08-10",
+        }]}],
+    }
+
+    fact = _cathay_card_bill_fact(out)
+
+    assert fact is not None
+    assert fact.get("statement_close_date") == "2026-08-01"
+    assert fact.get("payment_due_date") == "2026-08-20"
+    assert fact.get("last_payment_amount") == 1000.0
+    assert fact.get("last_payment_date") == "2026-08-10"

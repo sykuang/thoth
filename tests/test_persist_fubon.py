@@ -27,10 +27,29 @@ from pathlib import Path
 
 import pytest
 
+from backend.banks.fubon import _fubon_card_bill_fact
 from backend.core.persist import persist_fubon
 from backend.core.store import BankStore
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "fubon_collected_fake.json"
+
+
+def test_fubon_collector_uses_explicit_remaining_due_not_statement_total():
+    text = (
+        "本期帳單結帳日\t應繳總金額\t最低應繳金額\t繳款截止日\t循環利率\n"
+        "2026/05/16\t7,271\t0\t無需繳款\t12.62%\n"
+        "繳款狀態\t最近繳款日\t繳款金額\t剩餘應繳\t自動扣繳帳號\n"
+        "已繳清\t2026/05/05\t7,271\t0\t台北富邦****7012\n"
+    )
+
+    assert _fubon_card_bill_fact(text) == {
+        "scope": "bank",
+        "status": "paid",
+        "remaining_due": 0.0,
+        "statement_close_date": "2026-05-16",
+        "last_payment_amount": 7271.0,
+        "last_payment_date": "2026-05-05",
+    }
 
 
 @pytest.fixture

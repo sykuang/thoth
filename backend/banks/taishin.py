@@ -20,6 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import (
+    card_bill_date,
+    card_bill_money,
+    make_card_bill_fact,
+    publish_card_bill_facts,
+)
 from backend.core.creds import TaishinCreds
 from backend.core.captcha import ocr_bytes
 
@@ -46,6 +52,36 @@ def _ph_sel(ph: str) -> str:
 
 class TaishinLoginError(RuntimeError):
     pass
+
+
+def _taishin_card_bill_fact(parsed: dict):
+    if not isinstance(parsed, dict) or parsed.get("fetch_ok") is not True:
+        return None
+    summary = parsed.get("summary")
+    period = parsed.get("billing_period")
+    payment_candidates = []
+    for row in parsed.get("billed_txns") or []:
+        if not isinstance(row, dict) or isinstance(row.get("amount"), bool):
+            continue
+        raw_amount = row.get("amount")
+        if raw_amount is None:
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        payment_date = card_bill_date(row.get("post_date") or row.get("txn_date"))
+        payment_amount = card_bill_money(abs(amount))
+        if amount < 0 and payment_date and payment_amount is not None:
+            payment_candidates.append((payment_date, payment_amount))
+    payment_date, payment_amount = max(payment_candidates, default=(None, None))
+    return make_card_bill_fact(
+        remaining_due=summary.get("remaining") if isinstance(summary, dict) else None,
+        statement_close_date=period.get("statement_date") if isinstance(period, dict) else None,
+        payment_due_date=period.get("pay_due_date") if isinstance(period, dict) else None,
+        last_payment_amount=payment_amount,
+        last_payment_date=payment_date,
+    )
 
 
 class TaishinCrawler(BankCrawler):
@@ -1118,6 +1154,8 @@ class TaishinCrawler(BankCrawler):
         out["api_responses"] = hits_by_endpoint
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted(hits_by_endpoint.keys())
+        parsed = out.get("credit_card_parsed") or {}
+        publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])
         _log(f"[taishin][collect] 攔到 {len(hits_by_endpoint)} 個 endpoint")
         return BankCollectResult(**out)
 

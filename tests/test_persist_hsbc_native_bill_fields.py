@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from backend.banks.hsbc import _hsbc_card_bill_facts
+from backend.core.card_bills import publish_card_bill_facts
 from backend.core.persist.hsbc import persist_hsbc
 from backend.core.store import BankStore
 
@@ -38,6 +40,7 @@ def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) ->
     return {
         "cards": [
             {
+                "id": f"id-{tail}",
                 "maskedCardNumber": masked,
                 "name": "滙豐旅人無限卡",
                 "cardType": "Credit",
@@ -67,6 +70,28 @@ def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) ->
             }
         },
     }
+
+
+def test_hsbc_collector_requires_complete_per_card_coverage():
+    out = _hsbc_card_payload()
+    out["cards"].append({
+        "id": "id-9999",
+        "maskedCardNumber": "4029-****-****-9999",
+        "paymentDueDate": "05 Jun 2026",
+    })
+
+    published = {}
+    publish_card_bill_facts(published, _hsbc_card_bill_facts(out))
+
+    assert published == {"card_bill_facts_ok": False, "card_bill_facts": []}
+
+
+def test_hsbc_collector_subtracts_only_same_cycle_payment():
+    facts = _hsbc_card_bill_facts(_hsbc_card_payload())
+
+    assert len(facts) == 1
+    assert facts[0] is not None
+    assert facts[0]["remaining_due"] == 70410.0
 
 
 def test_hsbc_persist_extracts_last_statement_amount(store):

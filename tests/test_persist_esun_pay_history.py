@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.banks.esun import EsunCrawler
+from backend.banks.esun import EsunCrawler, _esun_card_bill_fact
 from backend.core.persist import persist_esun
 from backend.core.store import BankStore
 
@@ -27,6 +27,24 @@ SAMPLE_TEXT = (
     "\n"
     "2026/03/06\n玉山自動扣繳　\n玉山自動轉帳\n臺幣 TWD\n12,792\n12,792\n"
 )
+
+
+def test_esun_collector_fact_carries_due_date_and_payment_pair():
+    out = {
+        "card_summary": {"payment_due_date_roc": "115/05/28"},
+        "card_bills": [{"due_amount": 1000, "paid_amount": 1000}],
+        "card_pay_history": {"records": [{
+            "post_date": "2026-05-20", "paid_amount": 1000,
+        }]},
+    }
+
+    fact = _esun_card_bill_fact(out)
+
+    assert fact is not None
+    assert fact.get("remaining_due") == 0.0
+    assert fact.get("payment_due_date") == "2026-05-28"
+    assert fact.get("last_payment_amount") == 1000.0
+    assert fact.get("last_payment_date") == "2026-05-20"
 
 
 def test_parse_card_pay_history_real_shape():

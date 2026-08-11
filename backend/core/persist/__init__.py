@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 from backend.core.persist.cathay import persist_cathay
 from backend.core.persist.ctbc import persist_ctbc
 from backend.core.persist.dbs import persist_dbs
@@ -18,9 +20,47 @@ from backend.core.persist.scsb import persist_scsb
 from backend.core.persist.sinopac import persist_sinopac
 from backend.core.persist.taishin import persist_taishin
 from backend.core.persist.ubot import persist_ubot
+from backend.core.card_bills import CardBillWriteBarrier, apply_card_bill_facts
+
+
+PERSISTERS = {
+    "cathay": "persist_cathay",
+    "ctbc": "persist_ctbc",
+    "dbs": "persist_dbs",
+    "esun": "persist_esun",
+    "fubon": "persist_fubon",
+    "hsbc": "persist_hsbc",
+    "linebank": "persist_linebank",
+    "rakuten": "persist_rakuten",
+    "scb": "persist_scb",
+    "scsb": "persist_scsb",
+    "sinopac": "persist_sinopac",
+    "taishin": "persist_taishin",
+    "ubot": "persist_ubot",
+}
+
+
+def persist_collected(bank, data, store, rules=None):
+    """Persist one collected result, then apply its canonical card-bill facts."""
+    try:
+        target = PERSISTERS[bank]
+    except KeyError as exc:
+        raise ValueError(f"unknown bank persist: {bank!r}") from exc
+    persist = globals()[target] if isinstance(target, str) else target
+    barrier: Any = CardBillWriteBarrier(store)
+    delta = persist(data, barrier, rules=rules)
+    applied = apply_card_bill_facts(
+        store,
+        facts_ok=data.get("card_bill_facts_ok"),
+        facts=data.get("card_bill_facts") or [],
+    )
+    if data.get("card_bill_facts_ok") is not None:
+        delta["card_bill_facts_applied"] = applied
+    return delta
 
 __all__ = [
     "persist_cathay",
+    "persist_collected",
     "persist_ctbc",
     "persist_dbs",
     "persist_esun",

@@ -19,6 +19,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import (
+    card_bill_date,
+    card_bill_money,
+    make_card_bill_fact,
+    publish_card_bill_facts,
+)
 from backend.core.creds import UbotCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
 
@@ -130,6 +136,42 @@ def _log(*a):
 
 class UbotLoginError(RuntimeError):
     """聯邦 UBOT login 送出後失敗——立刻中止，絕不自動重打（防鎖帳號）。"""
+
+
+def _ubot_card_bill_fact(out: dict):
+    limits = (out.get("card_limit") or {}).get("CardList") or []
+    summaries = (out.get("card_summary") or {}).get("CardList") or []
+    limit_summary = limits[0] if limits and isinstance(limits[0], dict) else {}
+    card_summary = summaries[0] if summaries and isinstance(summaries[0], dict) else {}
+    summary = {**card_summary, **limit_summary}
+
+    pay_records = []
+    history = out.get("card_pay_history") or {}
+    if isinstance(history, dict):
+        for key in ("DateList", "PayList", "payList", "records"):
+            if isinstance(history.get(key), list):
+                pay_records = [row for row in history[key] if isinstance(row, dict)]
+                break
+    latest_pay = max(
+        pay_records,
+        default={},
+        key=lambda row: str(row.get("postDate") or row.get("effectDate") or ""),
+    )
+    payment_amount = latest_pay.get("payAmt")
+    payment_date = latest_pay.get("postDate") or latest_pay.get("effectDate")
+    if card_bill_money(payment_amount) is None or card_bill_date(payment_date) is None:
+        payment_amount = summary.get("lastPayAmt")
+        payment_date = summary.get("lastPayDate")
+    if card_bill_money(payment_amount) is None or card_bill_date(payment_date) is None:
+        payment_amount = None
+        payment_date = None
+
+    return make_card_bill_fact(
+        remaining_due=summary.get("payAmt"),
+        payment_due_date=summary.get("dueDate"),
+        last_payment_amount=payment_amount,
+        last_payment_date=payment_date,
+    )
 
 
 class UbotCrawler(BankCrawler):
@@ -315,6 +357,8 @@ class UbotCrawler(BankCrawler):
 
         out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
+
+        publish_card_bill_facts(out, [_ubot_card_bill_fact(out)])
         return BankCollectResult(**out)
 
     # ---------- collect 輔助 ----------

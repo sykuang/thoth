@@ -21,6 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import (
+    card_bill_date, card_bill_money, make_card_bill_fact, publish_card_bill_facts,
+)
 from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import HsbcCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable, ocr_bytes
@@ -99,6 +102,44 @@ def _log(*a):
 
 class HsbcLoginError(RuntimeError):
     """HSBC login 送出後失敗——立刻中止，絕不自動重打（防鎖帳號）。"""
+
+
+def _hsbc_card_bill_facts(out: dict):
+    facts = []
+    details_by_tail = out.get("card_detail") or {}
+    expected_cards = [
+        card for card in out.get("cards") or []
+        if isinstance(card, dict) and card.get("maskedCardNumber")
+    ]
+    for card in expected_cards:
+        tail = str(card["maskedCardNumber"])[-4:]
+        entry = details_by_tail.get(tail) if isinstance(details_by_tail, dict) else None
+        if not isinstance(entry, dict):
+            facts.append(None)
+            continue
+        details = ((entry.get("detail") or {}).get("details") or [])
+        kv = {
+            str(row.get("key") or "").strip(): str(row.get("value") or "").strip()
+            for row in details if isinstance(row, dict) and row.get("key")
+        }
+        statement_amount = card_bill_money((kv.get("Last Statement Amount") or "").split(" ")[0])
+        payment_amount = card_bill_money((kv.get("Last Payment Amount") or "").split(" ")[0])
+        statement_date = card_bill_date(kv.get("Last Statement Date"))
+        payment_date = card_bill_date(kv.get("Last Payment Date"))
+        remaining = statement_amount
+        if (remaining is not None and payment_amount is not None and statement_date
+                and payment_date and payment_date >= statement_date):
+            remaining = max(remaining - payment_amount, 0)
+        facts.append(make_card_bill_fact(
+            scope="card",
+            card_no=entry.get("masked") or card.get("maskedCardNumber"),
+            remaining_due=remaining,
+            statement_close_date=statement_date or card.get("statementDate"),
+            payment_due_date=card.get("paymentDueDate"),
+            last_payment_amount=payment_amount,
+            last_payment_date=payment_date,
+        ))
+    return facts
 
 
 class HsbcCrawler(BankCrawler):
@@ -368,6 +409,7 @@ class HsbcCrawler(BankCrawler):
             for h in collector.hits if h.resp_json and "card.hsbc.com.tw" in h.url
             and "/v3.1/" not in h.url
         })
+        publish_card_bill_facts(out, _hsbc_card_bill_facts(out))
         return BankCollectResult(**out)
 
     @staticmethod

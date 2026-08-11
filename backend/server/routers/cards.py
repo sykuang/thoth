@@ -77,19 +77,24 @@ def _previous_month_same_day(value: date) -> date:
 def _compute_bill_status(card: CardSummary) -> str:
     """Phase 9.4 bill_status 規則 (純算術, 跟 DB 完全無關):
 
-      no_payment_required: bill_due_amount == 0
-      paid               : 已過 due_date 且 last_payment_date >= statement_close_date
-                           (沒有 statement_close_date 才 fallback due_date - 30d)
+      no_payment_required: remaining due == 0，且沒有本期付款
+      paid               : remaining due == 0，且有本期付款
       overdue            : 已過 due_date 且沒最近繳款紀錄
       due                : 還沒到 due_date (正常待繳)
       unknown            : 沒 payment_due_date 也沒 last_payment_date
     """
-    if card.bill_due_amount == 0:
-        return "no_payment_required"
-
     due = _parse_iso_date(card.payment_due_date)
     last_pay = _parse_iso_date(card.last_payment_date)
     today = date.today()
+
+    if card.bill_due_amount is None:
+        return "unknown"
+    statement_close = _parse_iso_date(card.statement_close_date)
+    payment_boundary = statement_close or ((due - timedelta(days=30)) if due else None)
+    if card.bill_due_amount == 0:
+        if last_pay and payment_boundary and last_pay >= payment_boundary:
+            return "paid"
+        return "no_payment_required"
 
     if due is None:
         return "unknown"
@@ -98,10 +103,6 @@ def _compute_bill_status(card: CardSummary) -> str:
     # today > due. A payment before the current statement close belongs to the
     # previous cycle and cannot settle the displayed statement. Keep the old
     # due-30 fallback only for banks without a statement close date.
-    statement_close = _parse_iso_date(card.statement_close_date)
-    payment_boundary = statement_close or (due - timedelta(days=30))
-    if last_pay and last_pay >= payment_boundary:
-        return "paid"
     return "overdue"
 
 

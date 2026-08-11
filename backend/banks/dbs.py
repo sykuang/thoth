@@ -41,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import DbsCreds
 
@@ -54,6 +55,31 @@ def _log(*a):
 
 class DbsLoginError(RuntimeError):
     """DBS login 送出後失敗——立刻中止，絕不自動重打。"""
+
+
+def _dbs_card_bill_fact(out: dict):
+    liabilities = (out.get("api_responses") or {}).get("liabilities") or []
+    liability = liabilities[0].get("resp") if liabilities and isinstance(liabilities[0], dict) else {}
+    payment = ((liability or {}).get("creditCard") or {}).get("paymentDetails") or {}
+    fee = out.get("dbs_card_fee_page") or {}
+    fee_amount = card_bill_money(fee.get("bill_due_amount"))
+    statement_amount = card_bill_money(payment.get("amount"))
+    already_paid = card_bill_money(payment.get("alreadyPaid"))
+    fee_due = fee.get("payment_due_date")
+    dashboard_due = payment.get("dueDate")
+
+    if fee_amount is not None:
+        if already_paid is None or not fee_due or fee_due != dashboard_due:
+            return None
+        remaining = max(fee_amount - already_paid, 0)
+    elif statement_amount is not None and already_paid is not None:
+        remaining = max(statement_amount - already_paid, 0)
+    else:
+        return None
+    return make_card_bill_fact(
+        remaining_due=remaining,
+        payment_due_date=fee_due or dashboard_due,
+    )
 
 
 class DbsCrawler(BankCrawler):
@@ -583,6 +609,8 @@ class DbsCrawler(BankCrawler):
             })
         out["api_responses"] = api_responses
         _log(f"[dbs][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
+
+        publish_card_bill_facts(out, [_dbs_card_bill_fact(out)])
 
         _log(f"[dbs][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")
         return BankCollectResult(**out)

@@ -18,6 +18,7 @@ import pytest
 # 加入專案根目錄到 sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from backend.banks.ubot import _ubot_card_bill_fact
 from backend.core.persist import persist_ubot
 from backend.core.store import BankStore
 
@@ -71,6 +72,24 @@ def _base_data(card_no: str = "9000000000387027",
         "investment": None,
         "twd_txns": [],
     }
+
+
+def test_ubot_collector_treats_pay_amt_as_current_due_without_double_subtract():
+    data = _base_data(pay_amt="1000")
+    data["card_limit"]["CardList"][0]["CTDpayAmt"] = "400"
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 1000.0
+
+
+def test_ubot_sentinel_payment_pair_is_omitted_not_fatal():
+    fact = _ubot_card_bill_fact(_base_data())
+
+    assert fact is not None
+    assert "last_payment_amount" not in fact
+    assert "last_payment_date" not in fact
 
 
 def _read_card(store: BankStore, card_no: str) -> dict | None:

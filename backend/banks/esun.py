@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import EsunCreds
 
@@ -45,6 +46,30 @@ def _sel(field_id: str) -> str:
 
 class EsunLoginError(RuntimeError):
     pass
+
+
+def _esun_card_bill_fact(out: dict):
+    bills = out.get("card_bills") or []
+    latest_bill = bills[0] if bills and isinstance(bills[0], dict) else {}
+    due = card_bill_money(latest_bill.get("due_amount"))
+    paid = card_bill_money(latest_bill.get("paid_amount"))
+    remaining = max(due - paid, 0) if due is not None and paid is not None else None
+    payments = (out.get("card_pay_history") or {}).get("records") or []
+    latest_payment = payments[0] if payments and isinstance(payments[0], dict) else {}
+
+    due_date = None
+    raw_due = (out.get("card_summary") or {}).get("payment_due_date_roc")
+    if isinstance(raw_due, str):
+        parts = raw_due.split("/")
+        if len(parts) == 3 and all(part.isdigit() for part in parts):
+            year, month, day = map(int, parts)
+            due_date = f"{year + 1911:04d}-{month:02d}-{day:02d}"
+    return make_card_bill_fact(
+        remaining_due=remaining,
+        payment_due_date=due_date,
+        last_payment_amount=latest_payment.get("paid_amount"),
+        last_payment_date=latest_payment.get("post_date"),
+    )
 
 
 class EsunCrawler(BankCrawler):
@@ -825,6 +850,7 @@ class EsunCrawler(BankCrawler):
 
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         out["_endpoint_count"] = len(out["_all_endpoints"])
+        publish_card_bill_facts(out, [_esun_card_bill_fact(out)])
         _log(f"[esun][collect] 攔到 {out['_endpoint_count']} 個 API endpoint")
         return BankCollectResult(**out)
 

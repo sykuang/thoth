@@ -11,6 +11,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import (
+    card_bill_date,
+    card_bill_money,
+    make_card_bill_fact,
+    publish_card_bill_facts,
+)
 from backend.core.card_status import cathay_bill_status
 from backend.core.creds import CathayCreds
 
@@ -75,6 +81,66 @@ def _log(*a):
 # session 仍存活 fallback 仍回 True (避免重打鎖卡), 只在「絕對失敗」raise.
 class CathayLoginError(RuntimeError):
     """Cathay 登入失敗（絕對失敗，重打也沒用，會鎖帳號）。"""
+
+
+def _cathay_card_bill_fact(out: dict):
+    credit_card = out.get("credit_card") or {}
+    latest = credit_card.get("latest_bill") or {}
+    twd_bill = latest.get("twd") if isinstance(latest, dict) else None
+    if not isinstance(twd_bill, dict):
+        return None
+    raw_status = twd_bill.get("payBillStatus")
+    if raw_status not in {"paid", "unpaid"}:
+        return None
+    statement_amount = card_bill_money(twd_bill.get("billAmount"))
+    if statement_amount is None:
+        return None
+
+    bill_summary = credit_card.get("bill_summary") or {}
+    currencies = bill_summary.get("currencies") if isinstance(bill_summary, dict) else []
+    current_currency = currencies[0] if isinstance(currencies, list) and currencies and isinstance(currencies[0], dict) else {}
+    statement_date = (
+        current_currency.get("billDate")
+        or (credit_card.get("total_consumption") or {}).get("last_stmt_date")
+    )
+    due_date = latest.get("due_date") or bill_summary.get("payment_deadline")
+
+    candidates = []
+    billed = (credit_card.get("billed_detail") or {}).get("TWD") or []
+    for row in billed:
+        if not isinstance(row, dict) or not any(
+            label in str(row.get("desc") or "") for label in ("自動扣繳", "繳款", "已繳")
+        ):
+            continue
+        raw_amount = row.get("amount")
+        if raw_amount is None:
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            continue
+        payment_date = card_bill_date(row.get("post_date"))
+        payment_amount = card_bill_money(abs(amount))
+        if amount < 0 and payment_date and payment_amount is not None:
+            candidates.append((payment_date, 0, payment_amount))
+    for account in out.get("twd_transactions") or []:
+        for txn in account.get("transactions") or []:
+            if str(txn.get("desc") or "").strip() != "信用卡款":
+                continue
+            payment_date = card_bill_date(txn.get("account_date") or txn.get("datetime"))
+            payment_amount = card_bill_money(txn.get("expend"))
+            if payment_date and payment_amount is not None and payment_amount > 0:
+                candidates.append((payment_date, 1, payment_amount))
+    payment_date, _, payment_amount = max(candidates, default=(None, -1, None))
+
+    return make_card_bill_fact(
+        remaining_due=0 if raw_status == "paid" else statement_amount,
+        status=raw_status,
+        statement_close_date=statement_date,
+        payment_due_date=due_date,
+        last_payment_amount=payment_amount,
+        last_payment_date=payment_date,
+    )
 
 
 class CathayCrawler(BankCrawler):
@@ -538,6 +604,8 @@ class CathayCrawler(BankCrawler):
                 })
         if twd_txns:
             out["twd_transactions"] = twd_txns
+
+        publish_card_bill_facts(out, [_cathay_card_bill_fact(out)])
 
         # 全部攔到的 endpoint 清單（debug 用）
         out["_all_endpoints"] = sorted({h.endpoint for h in col.hits if h.resp_json})

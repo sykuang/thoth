@@ -401,10 +401,10 @@ def test_cards_list_exposes_credit_limit_and_bill_dates(client, data_root):
 def test_cards_list_exposes_normalized_bill_amounts(client, data_root):
     """GET /cards 回 MoneyBook-style bill summary fields.
 
-    - bill_due_amount: 最新一期 billed txns sum, 只取正數 (payment/refund 不當待繳)
+    - bill_due_amount: 沒 canonical remaining-due fact 時為 null，不從交易猜測
     - unbilled_amount: pending txns sum, 只取正數
     - available_credit: credit_limit - used_credit
-    - bill_status: 有待繳 + due date → due
+    - bill_status: 沒 canonical remaining-due fact → unknown
     """
     token = _register(client, email="card-bill-summary@p.com")
     client.post("/accounts", json={"bank": "ubot", "label": "x"}, headers=_auth(token))
@@ -435,18 +435,17 @@ def test_cards_list_exposes_normalized_bill_amounts(client, data_root):
     assert r.status_code == 200, r.text
     cards = {c["card_no"]: c for c in r.json()}
 
-    assert cards["CARD-A"]["bill_due_amount"] == 41030.0
+    assert cards["CARD-A"]["bill_due_amount"] is None
     assert cards["CARD-A"]["unbilled_amount"] == 41065.0
     assert cards["CARD-A"]["available_credit"] == 258935.0
-    assert cards["CARD-A"]["bill_status"] == "due"
+    assert cards["CARD-A"]["bill_status"] == "unknown"
 
-    assert cards["CARD-B"]["bill_due_amount"] == 0.0
+    assert cards["CARD-B"]["bill_due_amount"] is None
     assert cards["CARD-B"]["unbilled_amount"] == 0.0
-    assert cards["CARD-B"]["bill_status"] == "no_payment_required"
+    assert cards["CARD-B"]["bill_status"] == "unknown"
 
 
-def test_cards_bill_summary_uses_bank_level_rows_when_card_no_blank(client, data_root):
-    """有些銀行 billed rows 沒 card_no (整戶帳單), 應 fallback 套到該銀行唯一 active card."""
+def test_cards_bill_summary_does_not_treat_bank_level_transactions_as_remaining_due(client, data_root):
     token = _register(client, email="card-bill-blank@p.com")
     client.post("/accounts", json={"bank": "fubon", "label": "x"}, headers=_auth(token))
     _seed_cards(data_root, "fubon", [
@@ -463,7 +462,7 @@ def test_cards_bill_summary_uses_bank_level_rows_when_card_no_blank(client, data
     r = client.get("/cards", headers=_auth(token))
     assert r.status_code == 200, r.text
     card = r.json()[0]
-    assert card["bill_due_amount"] == 7271.0
+    assert card["bill_due_amount"] is None
     assert card["bill_status"] == "unknown"
 
 

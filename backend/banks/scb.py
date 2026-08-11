@@ -45,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScbCreds
 
@@ -608,6 +609,7 @@ class ScbCrawler(BankCrawler):
                 "resp": h.resp_json, "req_body": h.req_body,
             })
         out["api_responses"] = api_responses
+        publish_card_bill_facts(out, [])
         _log(f"[scb][collect] dump {len(api_responses)} 個 endpoint resp_json")
         _log(f"[scb][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")
         return BankCollectResult(**out)

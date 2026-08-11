@@ -12,6 +12,7 @@ from __future__ import annotations
 
 
 
+from backend.banks.taishin import _taishin_card_bill_fact
 from backend.core.persist.taishin import persist_taishin
 from backend.core.store import BankStore
 
@@ -20,6 +21,7 @@ def _build_data(*, summary: dict, billed_txns: list[dict] | None = None) -> dict
     return {
         "api_responses": {},
         "credit_card_parsed": {
+            "fetch_ok": True,
             "cards": [
                 {
                     "number": "****7018",
@@ -44,6 +46,42 @@ def _build_data(*, summary: dict, billed_txns: list[dict] | None = None) -> dict
 def _open_store(tmp_path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     return BankStore("taishin", user_id=1)
+
+
+def test_taishin_collector_fact_uses_remaining_and_real_period_keys():
+    parsed = _build_data(summary={"bill_amount": 80, "paid": 80, "remaining": 0})[
+        "credit_card_parsed"
+    ]
+
+    assert _taishin_card_bill_fact(parsed) == {
+        "scope": "bank",
+        "status": "no_payment_required",
+        "remaining_due": 0.0,
+        "statement_close_date": "2026-06-14",
+        "payment_due_date": "2026-06-29",
+    }
+
+
+def test_taishin_failed_parse_cannot_clear_saved_due():
+    parsed = _build_data(summary={"remaining": 0})["credit_card_parsed"]
+    parsed["fetch_ok"] = False
+
+    assert _taishin_card_bill_fact(parsed) is None
+
+
+def test_taishin_collector_carries_real_payment_pair():
+    parsed = _build_data(
+        summary={"remaining": 0},
+        billed_txns=[{
+            "amount": -80, "post_date": "2026/06/20", "desc": "自動扣繳",
+        }],
+    )["credit_card_parsed"]
+
+    fact = _taishin_card_bill_fact(parsed)
+
+    assert fact is not None
+    assert fact.get("last_payment_amount") == 80.0
+    assert fact.get("last_payment_date") == "2026-06-20"
 
 
 def _query_card(store: BankStore) -> dict:

@@ -12,6 +12,11 @@ from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 
 
 BANK_MODULES = sorted(Path("backend/banks").glob("*.py"))
+CARD_BILL_BANK_MODULES = {
+    "cathay.py", "ctbc.py", "dbs.py", "esun.py", "fubon.py", "hsbc.py",
+    "linebank.py", "rakuten.py", "scb.py", "scsb.py", "sinopac.py",
+    "taishin.py", "ubot.py",
+}
 
 
 def _collect_methods(path: Path):
@@ -130,6 +135,67 @@ def test_bank_collect_result_serializes_pending_fetch_evidence():
     }
 
 
+def test_bank_collect_result_serializes_canonical_card_bill_fact():
+    result = BankCollectResult(
+        bank="demo",
+        card_bill_facts_ok=True,
+        card_bill_facts=[{
+            "scope": "bank",
+            "status": "paid",
+            "remaining_due": 0,
+            "statement_close_date": "2026-08-01",
+            "payment_due_date": "2026-08-20",
+            "last_payment_amount": 1000,
+            "last_payment_date": "2026-08-10",
+        }],
+    )
+
+    assert result.to_dict()["card_bill_facts"] == [{
+        "scope": "bank",
+        "status": "paid",
+        "remaining_due": 0,
+        "statement_close_date": "2026-08-01",
+        "payment_due_date": "2026-08-20",
+        "last_payment_amount": 1000,
+        "last_payment_date": "2026-08-10",
+    }]
+    assert result.to_dict()["card_bill_facts_ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("fact", "message"),
+    [
+        ({"scope": "bank", "status": "paid", "remaining_due": True}, "remaining_due"),
+        ({"scope": "bank", "status": "paid", "remaining_due": float("nan")}, "remaining_due"),
+        ({"scope": "bank", "status": "paid", "remaining_due": -1}, "remaining_due"),
+        ({"scope": "bank", "status": "unpaid", "remaining_due": 100_000_001}, "remaining_due"),
+        ({"scope": "bank", "status": "mystery", "remaining_due": 0}, "status"),
+        ({"scope": "bank", "status": "paid", "remaining_due": 1}, "conflicts"),
+        ({"scope": "card", "status": "paid", "remaining_due": 0}, "card_no"),
+        ({"scope": "bank", "status": "paid", "card_no": "****7001", "remaining_due": 0}, "card_no"),
+        ({"scope": "bank", "status": "paid", "remaining_due": 0, "payment_due_date": "2026/08/20"}, "payment_due_date"),
+        ({
+            "scope": "bank", "status": "paid", "remaining_due": 0,
+            "last_payment_amount": 1,
+        }, "atomic pair"),
+    ],
+)
+def test_bank_collect_result_rejects_invalid_card_bill_fact(fact, message):
+    with pytest.raises(ValueError, match=message):
+        BankCollectResult(card_bill_facts_ok=True, card_bill_facts=[fact])
+
+
+def test_bank_collect_result_rejects_card_bill_facts_without_success_evidence():
+    with pytest.raises(ValueError, match="card_bill_facts_ok"):
+        BankCollectResult(
+            card_bill_facts_ok=False,
+            card_bill_facts=[{"scope": "bank", "status": "paid", "remaining_due": 0}],
+        )
+
+    with pytest.raises(ValueError, match="at least one fact"):
+        BankCollectResult(card_bill_facts_ok=True, card_bill_facts=[])
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -158,13 +224,30 @@ def test_bank_modules_no_longer_use_legacy_data_or_raw_constructor():
     assert offenders == []
 
 
+def test_credit_card_collectors_publish_canonical_card_bill_contract():
+    offenders = []
+    for path in BANK_MODULES:
+        if path.name not in CARD_BILL_BANK_MODULES:
+            continue
+        text = path.read_text()
+        if "publish_card_bill_facts(" not in text and not (
+            "card_bill_facts=" in text and "card_bill_facts_ok=" in text
+        ):
+            offenders.append(str(path))
+    assert offenders == []
+
+
 @dataclass
 class _GoodCrawler(BankCrawler):
     def login(self, page) -> bool:
         return True
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
-        return BankCollectResult(final_url="https://example.com", cards=[{"number": "****7016"}])
+        return BankCollectResult(
+            final_url="https://example.com",
+            cards=[{"number": "****7016"}],
+            card_bill_facts_ok=False,
+        )
 
     def _host_filter(self) -> str:
         return "example.com"
@@ -177,6 +260,18 @@ class _BadCrawler(BankCrawler):
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:  # type: ignore[override]
         return {"ok": True}  # type: ignore[return-value]
+
+    def _host_filter(self) -> str:
+        return "example.com"
+
+
+@dataclass
+class _MissingBillContractCrawler(BankCrawler):
+    def login(self, page) -> bool:
+        return True
+
+    def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
+        return BankCollectResult(cards=[])
 
     def _host_filter(self) -> str:
         return "example.com"
@@ -211,7 +306,11 @@ def test_bankcrawler_run_serializes_bank_collect_result(monkeypatch, tmp_path):
 
     result = _GoodCrawler(name="good").run("https://example.com", headless=True)
 
-    assert result["data"] == {"cards": [{"number": "****7016"}], "final_url": "https://example.com"}
+    assert result["data"] == {
+        "cards": [{"number": "****7016"}],
+        "card_bill_facts_ok": False,
+        "final_url": "https://example.com",
+    }
 
 
 def test_bankcrawler_run_rejects_bare_dict_collect_result(monkeypatch, tmp_path):
@@ -224,6 +323,20 @@ def test_bankcrawler_run_rejects_bare_dict_collect_result(monkeypatch, tmp_path)
 
     assert "collect_failed: TypeError" in result["error"]
     assert "BankCollectResult" in result["error"]
+
+
+def test_bankcrawler_run_rejects_missing_card_bill_contract(monkeypatch, tmp_path):
+    import backend.core.base as base_mod
+
+    monkeypatch.setattr(base_mod, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(base_mod.StealthyFetcher, "fetch", _fake_fetch)
+
+    result = _MissingBillContractCrawler(name="missing").run(
+        "https://example.com", headless=True,
+    )
+
+    assert "collect_failed: ValueError" in result["error"]
+    assert "card_bill_facts_ok" in result["error"]
 
 
 def test_bankcrawler_run_surfaces_contract_validation_errors(monkeypatch, tmp_path):

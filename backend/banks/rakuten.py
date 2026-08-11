@@ -12,6 +12,7 @@ import time
 from urllib.parse import urlparse
 
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+
 from backend.core.captcha import solve_captcha, wait_captcha_stable
 from backend.core.creds import RakutenCreds
 
@@ -479,6 +480,8 @@ class RakutenCrawler(BankCrawler):
             final_url=page.url,
             twd_txn_results=results,
             _all_endpoints=endpoints,
+            card_bill_facts_ok=False,
+            card_bill_facts=[],
         )
 
 

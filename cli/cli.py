@@ -95,47 +95,9 @@ def cmd_sync(args):
     rules = rules_repo.list_rules(user_id=1, enabled_only=True)
     if not rules:
         rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
-    if args.bank == "cathay":
-        from backend.core.persist import persist_cathay
-        delta = persist_cathay(data, store, rules=rules)
-    elif args.bank == "ubot":
-        from backend.core.persist import persist_ubot
-        delta = persist_ubot(data, store, rules=rules)
-    elif args.bank == "hsbc":
-        from backend.core.persist import persist_hsbc
-        delta = persist_hsbc(data, store, rules=rules)
-    elif args.bank == "ctbc":
-        from backend.core.persist import persist_ctbc
-        delta = persist_ctbc(data, store, rules=rules)
-    elif args.bank == "sinopac":
-        from backend.core.persist import persist_sinopac
-        delta = persist_sinopac(data, store, rules=rules)
-    elif args.bank == "scsb":
-        from backend.core.persist import persist_scsb
-        delta = persist_scsb(data, store, rules=rules)
-    elif args.bank == "esun":
-        from backend.core.persist import persist_esun
-        delta = persist_esun(data, store, rules=rules)
-    elif args.bank == "taishin":
-        from backend.core.persist import persist_taishin
-        delta = persist_taishin(data, store, rules=rules)
-    elif args.bank == "fubon":
-        from backend.core.persist import persist_fubon
-        delta = persist_fubon(data, store, rules=rules)
-    elif args.bank == "dbs":
-        from backend.core.persist import persist_dbs
-        delta = persist_dbs(data, store, rules=rules)
-    elif args.bank == "scb":
-        from backend.core.persist import persist_scb
-        delta = persist_scb(data, store, rules=rules)
-    elif args.bank == "linebank":
-        from backend.core.persist import persist_linebank
-        delta = persist_linebank(data, store, rules=rules)
-    elif args.bank == "rakuten":
-        from backend.core.persist import persist_rakuten
-        delta = persist_rakuten(data, store, rules=rules)
-    else:
-        raise SystemExit(f"未支援的入庫: {args.bank}")
+    from backend.core.persist import persist_collected
+
+    delta = persist_collected(args.bank, data, store, rules=rules)
     stats = store.stats()
     store.close()
 

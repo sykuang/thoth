@@ -1575,6 +1575,54 @@ class BankStore:
         self.conn.commit()
         return len(cards)
 
+    def update_card_bill_facts(self, facts: list[dict]) -> int:
+        """Atomically apply canonical bill facts without regressing a newer payment pair."""
+        updated = 0
+        now = _now()
+        for fact in facts:
+            if not fact.get("number"):
+                continue
+            statement_date = _normalize_date_text(fact.get("statement_close_date"))
+            due_date = _normalize_date_text(fact.get("payment_due_date"))
+            payment_date = _normalize_date_text(fact.get("last_payment_date"))
+            cycle_date = due_date or statement_date
+            cursor = self.conn.execute(
+                """UPDATE cards
+                      SET bill_due_amount = CASE
+                            WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
+                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                            THEN ? ELSE bill_due_amount END,
+                          statement_close_date = CASE
+                            WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
+                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                            THEN COALESCE(?, statement_close_date) ELSE statement_close_date END,
+                          payment_due_date = CASE
+                            WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
+                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                            THEN COALESCE(?, payment_due_date) ELSE payment_due_date END,
+                          last_payment_amount = CASE
+                            WHEN ? IS NOT NULL
+                             AND (last_payment_date IS NULL OR ? >= last_payment_date)
+                            THEN ? ELSE last_payment_amount END,
+                          last_payment_date = CASE
+                            WHEN ? IS NOT NULL
+                             AND (last_payment_date IS NULL OR ? >= last_payment_date)
+                            THEN ? ELSE last_payment_date END,
+                          updated_at = ?
+                    WHERE user_id = ? AND card_no = ?""",
+                (
+                    cycle_date, cycle_date, fact.get("bill_due_amount"),
+                    cycle_date, cycle_date, statement_date,
+                    cycle_date, cycle_date, due_date,
+                    payment_date, payment_date, fact.get("last_payment_amount"),
+                    payment_date, payment_date, payment_date,
+                    now, self.user_id, fact.get("number"),
+                ),
+            )
+            updated += cursor.rowcount
+        self.conn.commit()
+        return updated
+
     # ---- 7. 每日數值快照：同日同 category 覆蓋 ----
     def put_daily_metric(self, category: str, payload, snapshot_date: str | None = None,
                          *, commit: bool = True) -> None:

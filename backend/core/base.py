@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NotRequired, Required, TypedDict
 
 from scrapling.fetchers import StealthyFetcher
 
@@ -153,6 +154,15 @@ NormalizedCard = dict[str, Any]
 NormalizedTwdTxn = dict[str, Any]
 NormalizedCardBilledTxn = dict[str, Any]
 NormalizedCardPendingTxn = dict[str, Any]
+class NormalizedCardBillFact(TypedDict, total=False):
+    scope: Required[str]
+    status: Required[str]
+    remaining_due: Required[float]
+    card_no: NotRequired[str]
+    statement_close_date: NotRequired[str]
+    payment_due_date: NotRequired[str]
+    last_payment_amount: NotRequired[float]
+    last_payment_date: NotRequired[str]
 NormalizedBalanceHistory = dict[str, Any]
 DailyMetric = dict[str, Any]
 
@@ -175,6 +185,69 @@ def _require_iso_date_or_datetime(value: Any, *, path: str) -> None:
         raise ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}")
 
 
+_CARD_BILL_FACT_FIELDS = frozenset({
+    "scope", "status", "card_no", "remaining_due", "statement_close_date",
+    "payment_due_date", "last_payment_amount", "last_payment_date",
+})
+
+
+def validate_card_bill_facts(facts: list[NormalizedCardBillFact], *, facts_ok: bool | None) -> None:
+    """Validate canonical remaining-due facts at the collector seam."""
+    if facts_ok is True and not facts:
+        raise ValueError("card_bill_facts_ok=True requires at least one fact")
+    if facts and facts_ok is not True:
+        raise ValueError("card_bill_facts require card_bill_facts_ok=True")
+    scopes: set[str] = set()
+    card_nos: set[str] = set()
+    for i, fact in enumerate(facts):
+        if not isinstance(fact, dict):
+            raise ValueError(f"card_bill_facts[{i}] must be a dict")
+        unknown = set(fact) - _CARD_BILL_FACT_FIELDS
+        if unknown:
+            raise ValueError(f"card_bill_facts[{i}] has unknown fields: {sorted(unknown)}")
+        scope = fact.get("scope")
+        if scope not in {"bank", "card"}:
+            raise ValueError(f"card_bill_facts[{i}].scope must be 'bank' or 'card'")
+        scopes.add(scope)
+        card_no = fact.get("card_no")
+        if scope == "card":
+            if not isinstance(card_no, str) or not card_no.strip():
+                raise ValueError(f"card_bill_facts[{i}].card_no is required for card scope")
+            if card_no in card_nos:
+                raise ValueError(f"card_bill_facts[{i}].card_no is duplicated")
+            card_nos.add(card_no)
+        elif card_no not in (None, ""):
+            raise ValueError(f"card_bill_facts[{i}].card_no is forbidden for bank scope")
+        status = fact.get("status")
+        if status not in {"paid", "unpaid", "no_payment_required"}:
+            raise ValueError(f"card_bill_facts[{i}].status is not canonical")
+        remaining = fact.get("remaining_due")
+        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+                or not math.isfinite(float(remaining)) or remaining < 0
+                or remaining > 100_000_000):
+            raise ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative")
+        if (status == "unpaid") != (remaining > 0):
+            raise ValueError(f"card_bill_facts[{i}] status conflicts with remaining_due")
+        payment_amount = fact.get("last_payment_amount")
+        payment_date = fact.get("last_payment_date")
+        if (payment_amount is None) != (payment_date is None):
+            raise ValueError(f"card_bill_facts[{i}] last payment must be an atomic pair")
+        if payment_amount is not None and (
+            isinstance(payment_amount, bool)
+            or not isinstance(payment_amount, (int, float))
+            or not math.isfinite(float(payment_amount))
+            or payment_amount < 0
+            or payment_amount > 100_000_000
+        ):
+            raise ValueError(
+                f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"
+            )
+        for key in ("statement_close_date", "payment_due_date", "last_payment_date"):
+            _require_iso_date(fact.get(key), path=f"card_bill_facts[{i}].{key}")
+    if len(scopes) > 1 or ("bank" in scopes and len(facts) > 1):
+        raise ValueError("card_bill_facts must be one bank fact or card-scoped facts")
+
+
 @dataclass(kw_only=True)
 class BankCollectResult:
     """Shared return contract for every `BankCrawler.collect()`.
@@ -191,6 +264,8 @@ class BankCollectResult:
     twd_txns: list[NormalizedTwdTxn] = field(default_factory=list)
     card_billed_txns: list[NormalizedCardBilledTxn] = field(default_factory=list)
     card_pending_txns: list[NormalizedCardPendingTxn] = field(default_factory=list)
+    card_bill_facts: list[NormalizedCardBillFact] = field(default_factory=list)
+    card_bill_facts_ok: bool | None = None
     balance_history: list[NormalizedBalanceHistory] = field(default_factory=list)
     daily_metrics: list[DailyMetric] = field(default_factory=list)
     telemetry: dict[str, Any] = field(default_factory=dict)
@@ -339,6 +414,7 @@ class BankCollectResult:
 
     def __post_init__(self) -> None:
         self._validate_normalized_dates()
+        validate_card_bill_facts(self.card_bill_facts, facts_ok=self.card_bill_facts_ok)
 
     def _validate_normalized_dates(self) -> None:
         for i, a in enumerate(self.accounts):
@@ -563,6 +639,11 @@ class BankCrawler(ABC):
                         raise TypeError(
                             f"{self.__class__.__name__}.collect() must return "
                             f"BankCollectResult, got {type(collect_result).__name__}"
+                        )
+                    if collect_result.error is None and collect_result.card_bill_facts_ok is None:
+                        raise ValueError(
+                            f"{self.__class__.__name__}.collect() must publish "
+                            "card_bill_facts_ok at the crawler boundary"
                         )
                     result["data"] = collect_result.to_dict()
                 except Exception as e:

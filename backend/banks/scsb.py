@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScsbCreds
 
@@ -476,6 +477,7 @@ class ScsbCrawler(BankCrawler):
 
         out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
+        publish_card_bill_facts(out, [])
         return BankCollectResult(**out)
 
     @staticmethod

@@ -183,22 +183,15 @@ def test_list_cards_excludes_cross_tenant(db):
     assert {"CARD-A", "CARD-B"}.issubset(nos)
 
 
-def test_list_cards_aggregates_bill_summary(db):
-    """list_cards 自動 join billed/pending 算出 bill_due/unbilled/last_payment.
-
-    caller 看 CardSummary.bill_due_amount 直接拿 ready-to-display 數字,
-    完全不知道背後跑了 3 個 query.
-    """
+def test_list_cards_requires_native_remaining_due_but_keeps_other_summary(db):
     cards = {c.card_no: c for c in db.list_cards(bank="hsbc", user_id=1)}
-    # CARD-A: bill 6/15 期, 正數 1000+500 = 1500 (payment -800 不算)
-    assert cards["CARD-A"].bill_due_amount == 1500.0
+    assert cards["CARD-A"].bill_due_amount is None
     # CARD-A: pending 150+250 = 400
     assert cards["CARD-A"].unbilled_amount == 400.0
     # CARD-A: payment effective date uses post_date 6/15, abs(-800) = 800
     assert cards["CARD-A"].last_payment_date == "2026-06-15"
     assert cards["CARD-A"].last_payment_amount == 800.0
-    # CARD-B 沒 billed, bill_due=0
-    assert cards["CARD-B"].bill_due_amount == 0.0
+    assert cards["CARD-B"].bill_due_amount is None
     assert cards["CARD-B"].unbilled_amount == 80.0
     assert cards["CARD-B"].last_payment_date is None
 
@@ -209,7 +202,7 @@ def test_get_card_returns_card_summary(db):
     assert isinstance(c, CardSummary)
     assert c.card_no == "CARD-A"
     assert c.name == "聯邦旅人卡"
-    assert c.bill_due_amount == 1500.0
+    assert c.bill_due_amount is None
 
 
 def test_get_card_returns_none_for_missing(db):

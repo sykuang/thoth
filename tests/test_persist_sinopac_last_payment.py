@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.banks.sinopac import _sinopac_card_bill_fact
 from backend.core.persist import persist_sinopac
 from backend.core.store import BankStore
 
@@ -22,6 +23,24 @@ def store(tmp_path: Path, monkeypatch):
     s = BankStore("sinopac_last_payment_test", user_id=1)
     yield s
     s.close()
+
+
+def test_sinopac_realtime_remaining_due_outranks_static_statement_total():
+    out = {
+        "card_summary": [{"SubInfo": [[
+            {"DataText": "本期應繳", "DataValue": "0"},
+            {"DataText": "繳款截止日", "DataValue": "2026/08/20"},
+        ]]}],
+        "card_statements": [{
+            "summary": {"current_due": 5000},
+            "payment_due_date": "2026/08/20",
+        }],
+    }
+
+    fact = _sinopac_card_bill_fact(out)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 0.0
 
 
 def test_sinopac_card_summary_latest_payment_writes_card_native_fields(store):

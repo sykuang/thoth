@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import CtbcCreds
 
@@ -516,6 +517,25 @@ class CtbcCrawler(BankCrawler):
             for h in collector.hits
             if "ebmwResource" in h.url and isinstance(h.req_body, dict)
         } - {""})
+
+        cc = (out.get("summary") or {}).get("creditCardSummary") or {}
+        payment_rows = []
+        for payload in (out.get("card_api_dump") or {}).values():
+            if not isinstance(payload, dict):
+                continue
+            for key, rows in payload.items():
+                if not str(key).startswith("billData") or not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if isinstance(row, dict) and row.get("payDt") and row.get("amt") is not None:
+                        payment_rows.append((str(row["payDt"]), row["amt"]))
+        last_date, last_amount = max(payment_rows, default=(None, None), key=lambda item: item[0])
+        publish_card_bill_facts(out, [make_card_bill_fact(
+            remaining_due=cc.get("unpaidStmt"),
+            payment_due_date=cc.get("pmtExpDt"),
+            last_payment_amount=last_amount,
+            last_payment_date=last_date,
+        )])
 
         return BankCollectResult(**out)
 

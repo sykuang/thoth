@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import publish_card_bill_facts
 from backend.core.creds import LinebankCreds
 
 BASE = "https://accessibility.linebank.com.tw/login"
@@ -457,6 +458,7 @@ class LinebankCrawler(BankCrawler):
                 "resp": h.resp_json, "req_body": h.req_body,
             })
         out["api_responses"] = api_responses
+        publish_card_bill_facts(out, [])
         _log(f"[linebank][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
         _log(f"[linebank][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:20]}")
         return BankCollectResult(**out)

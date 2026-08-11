@@ -23,6 +23,12 @@ from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.card_bills import (
+    card_bill_date,
+    card_bill_money,
+    make_card_bill_fact,
+    publish_card_bill_facts,
+)
 from backend.core.creds import SinopacCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
 
@@ -120,6 +126,36 @@ class SinopacLoginError(RuntimeError):
     def __init__(self, code: str, message: str):
         self.code = code
         super().__init__(f"[{code}] {message}")
+
+
+def _sinopac_card_bill_fact(out: dict):
+    kv = {}
+    summary_rows = out.get("card_summary") or []
+    if summary_rows and isinstance(summary_rows[0], dict):
+        for group in summary_rows[0].get("SubInfo") or []:
+            if isinstance(group, list):
+                for row in group:
+                    if isinstance(row, dict) and row.get("DataText"):
+                        kv[row["DataText"]] = row.get("DataValue")
+    statements = out.get("card_statements") or []
+    latest = statements[0] if statements and isinstance(statements[0], dict) else {}
+    latest_summary = latest.get("summary") if isinstance(latest, dict) else {}
+    remaining = kv.get("本期應繳")
+    if remaining is None and isinstance(latest_summary, dict):
+        remaining = latest_summary.get("current_due")
+
+    payment_amount = kv.get("最近繳款金額")
+    payment_date = kv.get("最近繳款日期")
+    if card_bill_money(payment_amount) is None or card_bill_date(payment_date) is None:
+        payment_amount = None
+        payment_date = None
+    return make_card_bill_fact(
+        remaining_due=remaining,
+        statement_close_date=kv.get("結帳日") or latest.get("billing_cycle_date"),
+        payment_due_date=kv.get("繳款截止日") or latest.get("payment_due_date"),
+        last_payment_amount=payment_amount,
+        last_payment_date=payment_date,
+    )
 
 
 class SinopacCrawler(BankCrawler):
@@ -351,6 +387,8 @@ class SinopacCrawler(BankCrawler):
         miss = [k for k, v in out.items() if v is None]
         if miss:
             _log(f"[collect] 未攔到: {miss}")
+
+        publish_card_bill_facts(out, [_sinopac_card_bill_fact(out)])
 
         out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
