@@ -205,6 +205,31 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
     assert cathay["portfolio_facts"]["card_unpaid"]["amount_twd"] == summary["card_unpaid"]
 
 
+def test_replica_omits_parsed_null_account_transaction_balance(
+    client, tmp_path, monkeypatch,
+) -> None:
+    """Malformed non-NULL DB values must not serialize as replica balance:null."""
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    headers = _auth(_register(client, email="replica-null-balance@palace.example"))
+    _seed_bank(tmp_path)
+    con = sqlite3.connect(tmp_path / "cathay.sqlite")
+    con.execute(
+        "UPDATE twd_transactions SET balance=?, txn_datetime=? WHERE user_id=1",
+        ("malformed", "2026-08-11T04:17:46"),
+    )
+    con.commit()
+    con.close()
+
+    response = client.get("/replica/bootstrap", headers=headers)
+
+    assert response.status_code == 200, response.text
+    cathay = next(
+        item["data"] for item in response.json()["partitions"]
+        if item["name"] == "bank:cathay"
+    )
+    assert cathay["portfolio_facts"]["latest_account_transaction_balances"] == []
+
+
 def _set_cathay_balance_sources(
     data_root: Path,
     *,

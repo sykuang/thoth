@@ -279,10 +279,13 @@ class PortfolioReadMixin(_BaseHelpers):
                 account_no = r["account_no"]
                 if not account_no:
                     continue
+                balance = _to_int_safe(r["balance"])
+                if balance is None:
+                    continue
                 out[account_no] = AccountTxnBalance(
                     account_no=account_no,
                     txn_datetime=r["txn_datetime"],
-                    balance=_to_int_safe(r["balance"]),
+                    balance=balance,
                 )
             return out
         finally:
