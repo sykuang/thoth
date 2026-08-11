@@ -1590,22 +1590,22 @@ class BankStore:
                 """UPDATE cards
                       SET bill_due_amount = CASE
                             WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
-                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                              OR (CAST(? AS TEXT) IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
                             THEN ? ELSE bill_due_amount END,
                           statement_close_date = CASE
                             WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
-                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                              OR (CAST(? AS TEXT) IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
                             THEN COALESCE(?, statement_close_date) ELSE statement_close_date END,
                           payment_due_date = CASE
                             WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
-                              OR (? IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
+                              OR (CAST(? AS TEXT) IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
                             THEN COALESCE(?, payment_due_date) ELSE payment_due_date END,
                           last_payment_amount = CASE
-                            WHEN ? IS NOT NULL
+                            WHEN CAST(? AS TEXT) IS NOT NULL
                              AND (last_payment_date IS NULL OR ? >= last_payment_date)
                             THEN ? ELSE last_payment_amount END,
                           last_payment_date = CASE
-                            WHEN ? IS NOT NULL
+                            WHEN CAST(? AS TEXT) IS NOT NULL
                              AND (last_payment_date IS NULL OR ? >= last_payment_date)
                             THEN ? ELSE last_payment_date END,
                           updated_at = ?

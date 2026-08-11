@@ -141,6 +141,27 @@ def test_unknown_bank_raises(isolated):
         sr.run_sync_job(user_id=1, bank="zionsbank", headless=True)
 
 
+def test_card_bill_cycle_coverage_summary_is_non_sensitive_and_nullable():
+    from backend.server.sync_runner import _summarize_card_bill_cycle_coverage
+
+    assert _summarize_card_bill_cycle_coverage({
+        "card_bill_facts_ok": True,
+        "card_bill_facts": [
+            {"scope": "bank", "statement_close_date": "2026-08-01"},
+            {"scope": "card", "payment_due_date": "2026-08-20"},
+            {"scope": "card"},
+        ],
+    }) == {
+        "ok": True,
+        "facts": 3,
+        "bank_scope": 1,
+        "card_scope": 2,
+        "statement_date": 1,
+        "due_date": 1,
+        "without_cycle": 1,
+    }
+
+
 def test_sync_dispatcher_loads_user_rules_and_passes_to_persist(isolated, monkeypatch):
     """Phase 5.1：_dispatch_crawler_and_persist 必須撈 user 的 rules，
     並透過 BANK_CRAWLER_RULES env 或直接 inject 給 persist/store 用。

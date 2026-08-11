@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 from backend.core import persist as persist_mod
 from backend.core.card_bills import (
@@ -163,6 +164,34 @@ def test_older_incoming_payment_does_not_regress_saved_pair(tmp_path, monkeypatc
         assert tuple(row) == (900.0, 500.0, "2026-08-10")
     finally:
         store.close()
+
+
+def test_postgres_accepts_card_bill_fact_without_cycle_or_payment_dates():
+    from backend.core.bank_pg import q
+
+    class Cursor:
+        rowcount = 1
+
+    class PgTypeCheckingConnection:
+        def execute(self, sql, params=()):
+            translated = q(sql)
+            if "%s IS NOT NULL" in translated:
+                raise RuntimeError("PostgreSQL cannot infer a standalone NULL parameter type")
+            assert params[0] is None
+            assert params[9] is None
+            return Cursor()
+
+        def commit(self):
+            pass
+
+    store: Any = object.__new__(BankStore)
+    store.user_id = 1
+    store.conn = PgTypeCheckingConnection()
+
+    assert store.update_card_bill_facts([{
+        "number": "****7001",
+        "bill_due_amount": 0,
+    }]) == 1
 
 
 def test_same_due_cycle_can_add_statement_date_and_refresh_amount(tmp_path, monkeypatch):

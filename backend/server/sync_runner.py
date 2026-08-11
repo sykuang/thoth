@@ -531,6 +531,25 @@ _BANK_LABELS = {
 }
 
 
+def _summarize_card_bill_cycle_coverage(data: dict) -> dict[str, int | bool]:
+    facts = data.get("card_bill_facts")
+    if not isinstance(facts, list):
+        facts = []
+    rows = [fact for fact in facts if isinstance(fact, dict)]
+    return {
+        "ok": data.get("card_bill_facts_ok") is True,
+        "facts": len(rows),
+        "bank_scope": sum(fact.get("scope") == "bank" for fact in rows),
+        "card_scope": sum(fact.get("scope") == "card" for fact in rows),
+        "statement_date": sum(bool(fact.get("statement_close_date")) for fact in rows),
+        "due_date": sum(bool(fact.get("payment_due_date")) for fact in rows),
+        "without_cycle": sum(
+            not fact.get("statement_close_date") and not fact.get("payment_due_date")
+            for fact in rows
+        ),
+    }
+
+
 def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True) -> dict:
     """Phase 1：真正跑 Scrapling crawler + persist_* 入庫。
 
@@ -596,4 +615,8 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
     finally:
         store.close()
 
-    return {"delta": delta, "stats": stats}
+    return {
+        "delta": delta,
+        "stats": stats,
+        "card_bill_cycle_coverage": _summarize_card_bill_cycle_coverage(data),
+    }
