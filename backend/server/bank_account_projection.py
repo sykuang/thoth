@@ -78,7 +78,13 @@ def bank_accounts(
         latest = txn_balances.get(account.account_no)
         raw_date = _normalize_iso_date(account.raw_balance_date)
         txn_date = _normalize_iso_date(latest.txn_datetime) if latest else None
-        if latest is not None and raw_date is not None and txn_date is not None and txn_date > raw_date:
+        if (
+            latest is not None
+            and latest.balance is not None
+            and raw_date is not None
+            and txn_date is not None
+            and txn_date > raw_date
+        ):
             balance = latest.balance
             snapshot_date = txn_date
         elif account.raw_balance is not None:

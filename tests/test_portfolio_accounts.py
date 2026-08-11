@@ -665,6 +665,39 @@ def test_portfolio_accounts_newer_txn_balance_beats_older_raw_balance(
     assert r.json()[0]["snapshot_date"] == "2026-08-11"
 
 
+def test_portfolio_accounts_newer_null_txn_balance_keeps_valid_raw_balance(
+    temp_data_root, client, auth_headers, monkeypatch
+):
+    """較新交易日期不能讓解析失敗的 NULL 餘額清掉有效帳戶快照。"""
+    from backend.server import bank_account_projection as projection
+    from backend.server.db_facade import AccountTxnBalance
+
+    _seed_accounts_db(temp_data_root, "cathay",
+        accounts=[
+            {"account_no": "C1", "currency": "TWD",
+             "product_type": "deposit",
+             "raw_balance": 1808044.0, "raw_balance_date": "2026-08-10"},
+        ])
+    original = projection.db_api.list_latest_account_txn_balances
+    monkeypatch.setattr(
+        projection.db_api,
+        "list_latest_account_txn_balances",
+        lambda **kwargs: (
+            {"C1": AccountTxnBalance(
+                account_no="C1", txn_datetime="2026-08-11T04:17:46", balance=None,
+            )}
+            if kwargs["bank"] == "cathay"
+            else original(**kwargs)
+        ),
+    )
+
+    r = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert r.status_code == 200
+    assert r.json()[0]["balance"] == 1808044
+    assert r.json()[0]["snapshot_date"] == "2026-08-10"
+
+
 def test_portfolio_accounts_raw_balance_zero_shown_as_zero_not_dash(
     temp_data_root, client, auth_headers
 ):
