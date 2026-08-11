@@ -178,8 +178,30 @@ class RakutenCrawler(BankCrawler):
         return bool(page.evaluate("""() => [...document.querySelectorAll('input[name="otpCode"]')]
             .some(e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length))"""))
 
+    def _recover_startup_connection(self, page) -> None:
+        """Use Rakuten's own bounded reload when browser bootstrap failed."""
+        popup = page.locator("#ib_init_connect_error_popup:visible")
+        if popup.count() == 0:
+            return
+        reload_link = popup.locator("a.btn.btn-primary:visible").filter(
+            has_text=re.compile(r"^\s*重新載入\s*$"),
+        )
+        if reload_link.count() != 1 or not reload_link.first.is_visible():
+            raise RakutenLoginError("樂天網銀初始化連線失敗；找不到重新載入按鈕")
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                reload_link.first.click()
+        except Exception as exc:
+            raise RakutenLoginError("樂天網銀初始化連線失敗；重新載入未完成") from exc
+        # browserStartup chains a 3s token request and a 15s handshake.
+        page.wait_for_timeout(20000)
+        if page.locator("#ib_init_connect_error_popup:visible").count():
+            raise RakutenLoginError("樂天網銀初始化連線失敗；重新載入後仍未恢復")
+
     def login(self, page) -> bool:
-        page.wait_for_timeout(5000)
+        # browserStartup may take 3s for a token plus 15s for its handshake.
+        page.wait_for_timeout(20000)
+        self._recover_startup_connection(page)
         if self._logged_in(page):
             return True
 

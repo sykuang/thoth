@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from unittest.mock import Mock
+
 import pytest
 
 from backend.banks.rakuten import (
@@ -37,6 +40,37 @@ def test_account_number_accepts_display_separators() -> None:
         "81234567890123",
         "81234567890123",
     ], "81234567890123") is None
+
+
+def test_login_recovers_public_startup_connection_modal_before_using_session(monkeypatch) -> None:
+    events: list[str] = []
+    page, popup, hidden, reload_link = Mock(), Mock(), Mock(), Mock()
+    popup.count.return_value = reload_link.count.return_value = 1
+    hidden.count.return_value = 0
+    popup.locator.return_value = reload_link
+    reload_link.filter.return_value = reload_link
+    reload_link.first = reload_link
+    reload_link.is_visible.return_value = True
+    reload_link.click.side_effect = lambda: events.append("reload")
+    page.locator.side_effect = [popup, hidden]
+    page.wait_for_timeout.side_effect = lambda milliseconds: events.append(f"wait:{milliseconds}")
+    page.expect_navigation.side_effect = (
+        lambda **_kwargs: events.append("expect-navigation") or nullcontext()
+    )
+    crawler = object.__new__(RakutenCrawler)
+    monkeypatch.setattr(crawler, "_logged_in", lambda _page: events.append("logged-in") or True)
+
+    assert crawler.login(page)
+    assert events == [
+        "wait:20000",
+        "expect-navigation",
+        "reload",
+        "wait:20000",
+        "logged-in",
+    ]
+    page.expect_navigation.assert_called_once_with(wait_until="domcontentloaded", timeout=30000)
+    popup.locator.assert_called_once_with("a.btn.btn-primary:visible")
+    assert reload_link.filter.call_args.kwargs["has_text"].fullmatch("重新載入")
 
 
 def test_login_click_requires_one_visible_enabled_button() -> None:
