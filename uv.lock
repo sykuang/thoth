@@ -2024,7 +2024,7 @@ wheels = [
 
 [[package]]
 name = "thoth"
-version = "0.3.102"
+version = "0.3.103"
 source = { virtual = "." }
 dependencies = [
     { name = "apscheduler" },
