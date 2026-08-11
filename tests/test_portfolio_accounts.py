@@ -623,6 +623,48 @@ def test_portfolio_accounts_raw_balance_takes_precedence_over_txn(
     assert rows[0]["snapshot_date"] == "2026-06-14"
 
 
+def test_portfolio_accounts_same_day_raw_balance_beats_ambiguous_txn(
+    temp_data_root, client, auth_headers
+):
+    """同日交易順序不可靠時，保留 crawler 直接帳戶快照。"""
+    _seed_accounts_db(temp_data_root, "scsb",
+        accounts=[
+            {"account_no": "S1", "currency": "TWD",
+             "product_type": "deposit",
+             "raw_balance": 13065.0, "raw_balance_date": "2026-06-14"},
+        ],
+        txns=[
+            {"account_no": "S1", "txn_datetime": "2026-06-14T00:00:00", "balance": 72377},
+        ])
+
+    r = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert r.status_code == 200
+    assert r.json()[0]["balance"] == 13065
+    assert r.json()[0]["snapshot_date"] == "2026-06-14"
+
+
+def test_portfolio_accounts_newer_txn_balance_beats_older_raw_balance(
+    temp_data_root, client, auth_headers
+):
+    """較新的交易餘額不得被前一日的 crawler 帳戶快照壓回去。"""
+    _seed_accounts_db(temp_data_root, "cathay",
+        accounts=[
+            {"account_no": "C1", "currency": "TWD",
+             "product_type": "deposit",
+             "raw_balance": 1808044.0, "raw_balance_date": "2026-08-10"},
+        ],
+        txns=[
+            {"account_no": "C1", "txn_datetime": "2026-08-11T04:17:46", "balance": 608386},
+        ])
+
+    r = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert r.status_code == 200
+    assert r.json()[0]["balance"] == 608386
+    assert r.json()[0]["snapshot_date"] == "2026-08-11"
+
+
 def test_portfolio_accounts_raw_balance_zero_shown_as_zero_not_dash(
     temp_data_root, client, auth_headers
 ):

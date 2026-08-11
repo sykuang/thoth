@@ -48,8 +48,8 @@ class AccountNotFound(Exception):
 class AccountRow(BaseModel):
     """單一 accounts row — 給 portfolio.py 拼餘額時用.
 
-    保留 raw_balance / raw_balance_date 給 caller 套餘額優先順序邏輯
-    (raw_balance > twd_transactions latest > balance_history.loan_balance > None).
+    保留 raw_balance / raw_balance_date 給 caller 依日期在直接 crawler 快照與
+    最新交易餘額間選較新者；同日／日期不可比時仍優先直接快照。
     """
 
     model_config = ConfigDict(extra="forbid")

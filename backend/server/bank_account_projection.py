@@ -57,7 +57,12 @@ def bank_accounts(
     *,
     include_fx_estimates: bool = True,
 ) -> list[BankAccountBalance]:
-    """Return one bank's accounts using the canonical balance precedence."""
+    """Return one bank's accounts using the canonical balance precedence.
+
+    Prefer the newer dated fact between the crawler account snapshot and the
+    latest transaction balance. Same-day or incomparable facts keep the direct
+    crawler snapshot, which avoids ambiguous same-timestamp transaction rows.
+    """
     accounts = db_api.list_accounts(bank=bank, user_id=user_id)
     if not accounts:
         return []
@@ -70,14 +75,19 @@ def bank_accounts(
     for account in accounts:
         balance: float | None = None
         snapshot_date: str | None
-        if account.raw_balance is not None:
+        latest = txn_balances.get(account.account_no)
+        raw_date = _normalize_iso_date(account.raw_balance_date)
+        txn_date = _normalize_iso_date(latest.txn_datetime) if latest else None
+        if latest is not None and raw_date is not None and txn_date is not None and txn_date > raw_date:
+            balance = latest.balance
+            snapshot_date = txn_date
+        elif account.raw_balance is not None:
             raw = account.raw_balance
             balance = raw if isinstance(raw, float) and raw != int(raw) else int(raw)
-            snapshot_date = _normalize_iso_date(account.raw_balance_date)
-        elif account.account_no in txn_balances:
-            latest = txn_balances[account.account_no]
+            snapshot_date = raw_date
+        elif latest is not None:
             balance = latest.balance
-            snapshot_date = _normalize_iso_date(latest.txn_datetime)
+            snapshot_date = txn_date
         elif account_classify.is_liability_type(account.product_type) and loan_balance is not None:
             balance = loan_balance
             snapshot_date = loan_date

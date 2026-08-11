@@ -724,9 +724,9 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
 # 給 frontend「帳戶」tab 用。回每帳戶最新餘額（原幣 or TWD, 看 currency 欄）。
 #
 # 設計鐵則:
-#   - 餘額來源優先 twd_transactions 該 account_no 最新 txn_datetime 的 balance
-#     (sinopac JPY 帳戶 balance 直接以 JPY 存進去, 不分 currency)
-#   - 若該 account_no 沒對應 txn (e.g. cathay 數位帳戶 account_no 不對齊),
+#   - 同帳戶有 crawler raw_balance 與交易餘額時，日期較新者勝；同日或日期不可比
+#     仍信 raw_balance，避免 SCSB 同 timestamp 多筆交易的 MAX() 歧義。
+#   - 若該 account_no 兩者都沒有 (e.g. cathay 數位帳戶 account_no 不對齊),
 #     balance=None, snapshot_date=accounts.updated_at[:10]
 #   - 沒 accounts 表 / 沒 rows 該銀行 skip (不 raise)
 #   - is_stale 用 ACCOUNT_STALE_DAYS=7 (短一點, 帳戶餘額過 7 天沒更新就 stale)
