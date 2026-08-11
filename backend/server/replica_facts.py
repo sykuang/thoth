@@ -9,6 +9,7 @@ from backend.core import account_classify
 from backend.core.card_bills import summarize_persisted_card_bills
 from backend.core.store import canonical_display_description
 from backend.server import fx_service
+from backend.server.bank_account_projection import latest_twd_asset_balance
 from backend.server.db_facade import db_api
 
 
@@ -219,7 +220,7 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
         ),
         key=lambda row: row["account_no"],
     )
-    balance = db_api.get_latest_twd_balance(bank=bank, user_id=user_id)
+    balance = latest_twd_asset_balance(bank, user_id)
     card_summary = summarize_persisted_card_bills(bank, all_cards)
     return {
         "accounts": accounts,

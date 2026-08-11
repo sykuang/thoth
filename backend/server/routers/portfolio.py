@@ -50,7 +50,10 @@ from backend.core.card_bills import summarize_persisted_card_bills
 from backend.core.card_status import CathayBillStatus, cathay_bill_status
 from backend.server.deps import current_user
 from backend.server import db, fx_service
-from backend.server.bank_account_projection import bank_accounts as _project_bank_accounts
+from backend.server.bank_account_projection import (
+    bank_accounts as _project_bank_accounts,
+    latest_twd_asset_balance,
+)
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
     clear_dashboard_cache,  # noqa: F401 — intentional router-level cache control API
@@ -113,8 +116,8 @@ def _latest_payload(bank: str, category: str, user_id: int) -> tuple[str, dict] 
 
 
 def _latest_balance(bank: str, user_id: int) -> tuple[str, int | None] | None:
-    """銀行 balance_history 最新一筆 (snapshot_date, twd_balance)."""
-    b = db_api.get_latest_twd_balance(bank=bank, user_id=user_id)
+    """Return the freshest complete bank-level TWD asset snapshot."""
+    b = latest_twd_asset_balance(bank, user_id)
     if b is None:
         return None
     return (b.snapshot_date, b.twd_balance)

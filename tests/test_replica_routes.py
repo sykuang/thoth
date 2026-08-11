@@ -205,6 +205,150 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
     assert cathay["portfolio_facts"]["card_unpaid"]["amount_twd"] == summary["card_unpaid"]
 
 
+def _set_cathay_balance_sources(
+    data_root: Path,
+    *,
+    account_balance: int | None,
+    account_date: str,
+    aggregate_balance: int | None,
+    aggregate_date: str,
+    add_incomplete_account: bool = False,
+) -> None:
+    con = sqlite3.connect(data_root / "cathay.sqlite")
+    con.execute(
+        "UPDATE accounts SET raw_balance=?, raw_balance_date=? WHERE user_id=1",
+        (account_balance, account_date),
+    )
+    if add_incomplete_account:
+        con.execute(
+            """INSERT INTO accounts
+               (account_no,user_id,currency,nickname,type,product_type,raw_balance,
+                raw_balance_date,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            ("SECOND", 1, "TWD", "第二帳戶", "活存", "deposit", None,
+             account_date, f"{account_date}T10:00:00Z"),
+        )
+    con.execute("DELETE FROM balance_history WHERE user_id=1")
+    if aggregate_balance is not None:
+        con.execute(
+            """INSERT INTO balance_history
+               (user_id,snapshot_date,twd_balance,fx_balance,loan_balance,updated_at)
+               VALUES (?,?,?,?,?,?)""",
+            (1, aggregate_date, aggregate_balance, None, None,
+             f"{aggregate_date}T10:00:00Z"),
+        )
+    con.commit()
+    con.close()
+
+
+def _cathay_replica_and_summary(client, headers: dict[str, str]) -> tuple[dict, dict]:
+    bootstrap = client.get("/replica/bootstrap", headers=headers)
+    assert bootstrap.status_code == 200, bootstrap.text
+    cathay = next(
+        item["data"] for item in bootstrap.json()["partitions"]
+        if item["name"] == "bank:cathay"
+    )
+    summary_response = client.get("/portfolio/summary", headers=headers)
+    assert summary_response.status_code == 200, summary_response.text
+    summary = next(
+        row for row in summary_response.json()["by_bank"] if row["bank"] == "cathay"
+    )
+    return cathay, summary
+
+
+def test_replica_and_summary_prefer_complete_newer_account_balance(
+    client, tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    headers = _auth(_register(client, email="replica-newer-account@palace.example"))
+    _seed_bank(tmp_path)
+    _set_cathay_balance_sources(
+        tmp_path,
+        account_balance=1255,
+        account_date="2026-08-11",
+        aggregate_balance=80,
+        aggregate_date="2026-07-27",
+    )
+
+    cathay, summary = _cathay_replica_and_summary(client, headers)
+
+    assert cathay["portfolio_facts"]["latest_twd_balance"] == {
+        "snapshot_date": "2026-08-11",
+        "twd_balance": 1255,
+    }
+    assert summary["assets"] == 1255
+
+
+def test_replica_and_summary_use_complete_account_balance_without_aggregate(
+    client, tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    headers = _auth(_register(client, email="replica-missing-aggregate@palace.example"))
+    _seed_bank(tmp_path)
+    _set_cathay_balance_sources(
+        tmp_path,
+        account_balance=1255,
+        account_date="2026-08-11",
+        aggregate_balance=None,
+        aggregate_date="2026-08-11",
+    )
+
+    cathay, summary = _cathay_replica_and_summary(client, headers)
+
+    assert cathay["portfolio_facts"]["latest_twd_balance"] == {
+        "snapshot_date": "2026-08-11",
+        "twd_balance": 1255,
+    }
+    assert summary["assets"] == 1255
+
+
+def test_replica_and_summary_keep_aggregate_when_newer_accounts_are_incomplete(
+    client, tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    headers = _auth(_register(client, email="replica-incomplete-account@palace.example"))
+    _seed_bank(tmp_path)
+    _set_cathay_balance_sources(
+        tmp_path,
+        account_balance=1255,
+        account_date="2026-08-11",
+        aggregate_balance=80,
+        aggregate_date="2026-07-27",
+        add_incomplete_account=True,
+    )
+
+    cathay, summary = _cathay_replica_and_summary(client, headers)
+
+    assert cathay["portfolio_facts"]["latest_twd_balance"] == {
+        "snapshot_date": "2026-07-27",
+        "twd_balance": 80,
+    }
+    assert summary["assets"] == 80
+
+
+def test_replica_and_summary_keep_newer_aggregate_than_complete_accounts(
+    client, tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    headers = _auth(_register(client, email="replica-newer-aggregate@palace.example"))
+    _seed_bank(tmp_path)
+    _set_cathay_balance_sources(
+        tmp_path,
+        account_balance=1255,
+        account_date="2026-08-10",
+        aggregate_balance=80,
+        aggregate_date="2026-08-11",
+    )
+
+    cathay, summary = _cathay_replica_and_summary(client, headers)
+
+    assert cathay["portfolio_facts"]["latest_twd_balance"] == {
+        "snapshot_date": "2026-08-11",
+        "twd_balance": 80,
+    }
+    assert summary["assets"] == 80
+
+
 def test_replica_pull_returns_no_partitions_when_generations_match(
     client, tmp_path, monkeypatch,
 ) -> None:

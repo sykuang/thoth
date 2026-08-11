@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from backend.core import account_classify
 from backend.server import fx_service
-from backend.server.db_facade import db_api
+from backend.server.db_facade import LatestBalance, db_api
 
 ACCOUNT_STALE_DAYS = 7
 
@@ -51,7 +51,12 @@ def _is_stale(snapshot_iso: str | None) -> bool:
     return datetime.now(UTC) - value > timedelta(days=ACCOUNT_STALE_DAYS)
 
 
-def bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
+def bank_accounts(
+    bank: str,
+    user_id: int,
+    *,
+    include_fx_estimates: bool = True,
+) -> list[BankAccountBalance]:
     """Return one bank's accounts using the canonical balance precedence."""
     accounts = db_api.list_accounts(bank=bank, user_id=user_id)
     if not accounts:
@@ -87,7 +92,7 @@ def bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
             if currency == "TWD":
                 twd_estimate = round(balance)
                 fx_rate_used = 1.0
-            else:
+            elif include_fx_estimates:
                 try:
                     rate = fx_service.get_rate(currency)
                     if rate is not None:
@@ -112,3 +117,40 @@ def bank_accounts(bank: str, user_id: int) -> list[BankAccountBalance]:
             excluded=account.excluded,
         ))
     return out
+
+
+def latest_twd_asset_balance(bank: str, user_id: int) -> LatestBalance | None:
+    """Choose the freshest complete TWD asset snapshot for one bank.
+
+    Account rows are the direct crawler facts. Use their sum when every TWD
+    asset account has a dated balance and that complete snapshot is newer than
+    the bank-level ``balance_history`` aggregate. Otherwise preserve the
+    same-date/newer aggregate because it can include accounts absent from the
+    account inventory; never publish a partial account sum.
+    """
+    aggregate = db_api.get_latest_twd_balance(bank=bank, user_id=user_id)
+    accounts = bank_accounts(bank, user_id, include_fx_estimates=False)
+    twd_non_liabilities = [
+        account for account in accounts
+        if account.currency == "TWD"
+        and not account_classify.is_liability_type(account.product_type)
+    ]
+    if not twd_non_liabilities:
+        return aggregate
+    account_dates: list[str] = []
+    account_total = 0
+    for account in twd_non_liabilities:
+        if (
+            not account_classify.is_asset_type(account.product_type)
+            or account.twd_estimate is None
+            or account.snapshot_date is None
+        ):
+            return aggregate
+        account_dates.append(account.snapshot_date)
+        account_total += account.twd_estimate
+
+    account_date = min(account_dates)
+    aggregate_date = _normalize_iso_date(aggregate.snapshot_date) if aggregate else None
+    if aggregate is not None and aggregate_date is not None and aggregate_date >= account_date:
+        return aggregate
+    return LatestBalance(snapshot_date=account_date, twd_balance=account_total)
