@@ -231,7 +231,7 @@ def test_summary_aggregates_assets_and_real_liabilities(temp_data_root, client, 
                   balance=888987, balance_date="2026-06-12",
                   card_summary_category="card_summary",
                   card_summary_payload={
-                      "latest_bill": {"twd": {"billAmount": 0, "payBillStatus": "Paid"}},
+                      "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
                       "total_consumption": {"unpaid": 0, "current_balance": 0},
                   })
     # hsbc: 沒 balance, 兩張卡 outstanding sum 130393 (真實負債)

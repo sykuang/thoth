@@ -39,6 +39,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, UTC
+from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -72,16 +73,15 @@ KNOWN_BANKS = bank_data.KNOWN_BANKS
 
 def _to_int(val: Any) -> int | None:
     """安全把 raw value 轉 int. 支援 '1,234' / '1234.0' / int / None."""
-    if val is None or val == "":
+    if val is None or val == "" or isinstance(val, bool):
         return None
     try:
-        if isinstance(val, (int, float)):
-            return int(val)
         s = str(val).replace(",", "").strip()
         if not s or s == "-":
             return None
-        return int(float(s))
-    except (ValueError, TypeError):
+        number = float(s)
+        return int(number) if isfinite(number) else None
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -233,7 +233,7 @@ def _liab_cathay(payload: dict) -> int | None:
 
     語意對照:
       - billAmount=上期帳單應繳金額 (出帳當下)
-      - payBillStatus='Paid' → 0 (已繳); 'UnPaid' → billAmount (未繳)
+      - payBillStatus='Paid'/'Payed' → 0 (已繳); 'UnPaid' → billAmount (未繳)
       - total_consumption.unpaid 其實在 cathay schema 是「累計未繳」
         但目前 cathay user 永遠是 0, 跟 latest_bill 對齊, 用任一個都行
 
@@ -246,7 +246,7 @@ def _liab_cathay(payload: dict) -> int | None:
     amount = _to_int(lb.get("billAmount"))
     if amount is None:
         return None
-    if status == "Paid":
+    if str(status or "").strip().casefold() in {"paid", "payed"}:
         return 0
     # 'UnPaid' or 其他 status → 視為未繳, 回 billAmount
     return amount

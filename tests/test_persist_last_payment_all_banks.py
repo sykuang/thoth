@@ -18,6 +18,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -208,6 +210,474 @@ def test_cathay_payment_amount_zero_without_real_row_does_not_create_payment(tmp
         assert card["bill_due_amount"] == 0.0
         assert card["last_payment_amount"] is None
         assert card["last_payment_date"] is None
+    finally:
+        store.close()
+
+
+def test_cathay_paid_status_zeroes_due(tmp_path, monkeypatch):
+    """國泰最新帳單標記已繳時，剩餘應繳必須為零。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        data = {
+            "credit_card": {
+                "cards": [{"number": "****7016", "name": "國泰卡", "association": "VISA",
+                           "type": "credit", "is_cube": False}],
+                "latest_bill": {
+                    "twd": {"billAmount": 4321, "payBillStatus": "Payed"},
+                },
+                "bill_summary": {
+                    "payment_deadline": "2026-08-05T00:00:00",
+                    "currencies": [{
+                        "currencyDataType": "TWD", "currency": "TWD",
+                        "currentPaymentAmount": 4321,
+                        "billDate": "2026-07-19T00:00:00",
+                    }],
+                },
+            },
+        }
+        persist_cathay(data, store, rules=None)
+        card = _read_card_fields(store, "****7016")
+        assert card is not None
+        assert card["bill_due_amount"] == 0.0
+    finally:
+        store.close()
+
+
+def test_cathay_newer_deposit_payment_wins_over_old_billed_payment(tmp_path, monkeypatch):
+    """活存「信用卡款」是真實入帳列，應比舊帳單扣繳列更新。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        data = {
+            "credit_card": {
+                "cards": [{"number": "****7016", "name": "國泰卡", "association": "VISA",
+                           "type": "credit", "is_cube": False}],
+                "billed_detail": {"TWD": [{
+                    "card_no": "", "date": "2026-03-04", "post_date": "2026-03-04",
+                    "desc": "本行自動扣繳", "amount": -1200, "currency": "TWD",
+                }]},
+            },
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026-08-07T04:56:44",
+                    "account_date": "2026-08-07T00:00:00",
+                    "desc": "信用卡款",
+                    "expend": 4321,
+                    "income": None,
+                    "memo": "國泰世華卡 信用卡款",
+                }],
+            }],
+        }
+        persist_cathay(data, store, rules=None)
+        card = _read_card_fields(store, "****7016")
+        assert card is not None
+        assert card["last_payment_date"] == "2026-08-07"
+        assert card["last_payment_amount"] == 4321.0
+    finally:
+        store.close()
+
+
+def test_cathay_payment_ignores_memo_only_match(tmp_path, monkeypatch):
+    """自由文字 memo 提到信用卡款，不是銀行產生的付款描述。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        data = {
+            "credit_card": {"cards": [{"number": "****7016", "name": "國泰卡"}]},
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026-08-07T04:56:44",
+                    "account_date": "2026-08-07T00:00:00",
+                    "desc": "一般轉帳",
+                    "memo": "朋友代墊信用卡款",
+                    "expend": 999,
+                }],
+            }],
+        }
+        persist_cathay(data, store, rules=None)
+        card = _read_card_fields(store, "****7016")
+        assert card is not None
+        assert card["last_payment_date"] is None
+        assert card["last_payment_amount"] is None
+    finally:
+        store.close()
+
+
+def test_cathay_payment_candidates_sort_normalized_dates(tmp_path, monkeypatch):
+    """候選日期需先正規化；slash 八月不能在 ISO 十二月之後。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        data = {
+            "credit_card": {
+                "cards": [{"number": "****7016", "name": "國泰卡"}],
+                "billed_detail": {"TWD": [{
+                    "post_date": "2026-12-01",
+                    "desc": "本行自動扣繳",
+                    "amount": -1200,
+                }]},
+            },
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026/08/07T04:56:44",
+                    "account_date": "2026/08/07T00:00:00",
+                    "desc": "信用卡款",
+                    "expend": 999,
+                }],
+            }],
+        }
+        persist_cathay(data, store, rules=None)
+        card = _read_card_fields(store, "****7016")
+        assert card is not None
+        assert card["last_payment_date"] == "2026-12-01"
+        assert card["last_payment_amount"] == 1200.0
+    finally:
+        store.close()
+
+
+def test_cathay_shared_payment_updates_known_card_missing_from_current_inventory(tmp_path, monkeypatch):
+    """整戶繳款事實需套到既有 sibling 卡，不得只更新本次卡片清單。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{"number": "****9999", "name": "既有卡"}])
+        data = {
+            "credit_card": {
+                "cards": [{"number": "****7016", "name": "目前卡"}],
+                "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
+                "bill_summary": {
+                    "currencies": [{"currentPaymentAmount": 4321}],
+                },
+            },
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026-08-07T04:56:44",
+                    "account_date": "2026-08-07T00:00:00",
+                    "desc": "信用卡款",
+                    "expend": 4321,
+                }],
+            }],
+        }
+        persist_cathay(data, store, rules=None)
+        stale = _read_card_fields(store, "****9999")
+        assert stale is not None
+        assert stale["bill_due_amount"] == 0.0
+        assert stale["last_payment_date"] == "2026-08-07"
+        assert stale["last_payment_amount"] == 4321.0
+    finally:
+        store.close()
+
+
+def test_cathay_shared_payment_updates_known_card_when_current_inventory_is_empty(tmp_path, monkeypatch):
+    """卡片清單暫時為空時，已成功取得的整戶繳款仍要更新既有卡。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "bill_due_amount": 999,
+            "last_payment_date": "2026-01-01",
+            "last_payment_amount": 999,
+        }])
+        data = {
+            "credit_card": {
+                "cards": [],
+                "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
+                "bill_summary": {"currencies": [{"currentPaymentAmount": 4321}]},
+            },
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026-08-07T04:56:44",
+                    "account_date": "2026-08-07T00:00:00",
+                    "desc": "信用卡款",
+                    "expend": 4321,
+                }],
+            }],
+        }
+        persist_cathay(data, store, rules=None)
+        stale = _read_card_fields(store, "****9999")
+        assert stale is not None
+        assert stale["bill_due_amount"] == 0.0
+        assert stale["last_payment_date"] == "2026-08-07"
+        assert stale["last_payment_amount"] == 4321.0
+    finally:
+        store.close()
+
+
+def test_cathay_older_payload_payment_does_not_replace_newer_saved_payment(tmp_path, monkeypatch):
+    """近 30 日付款消失後，舊帳單列不得讓已保存的最近繳款倒退。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "last_payment_date": "2026-08-07",
+            "last_payment_amount": 4321,
+        }])
+        data = {
+            "credit_card": {
+                "cards": [],
+                "billed_detail": {"TWD": [{
+                    "post_date": "2026-03-04",
+                    "desc": "本行自動扣繳",
+                    "amount": -1200,
+                }]},
+            },
+        }
+        persist_cathay(data, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["last_payment_date"] == "2026-08-07"
+        assert card["last_payment_amount"] == 4321.0
+    finally:
+        store.close()
+
+
+def test_cathay_same_date_payment_uses_authoritative_source_precedence(tmp_path, monkeypatch):
+    """同日事實：活存明確付款 > 已保存事實 > 舊帳單付款列。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "last_payment_date": "2026-08-07",
+            "last_payment_amount": 4321,
+        }])
+        base = {
+            "credit_card": {
+                "cards": [],
+                "billed_detail": {"TWD": [{
+                    "post_date": "2026-08-07",
+                    "desc": "本行自動扣繳",
+                    "amount": -1200,
+                }]},
+            },
+        }
+        persist_cathay(base, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["last_payment_amount"] == 4321.0
+
+        data_with_deposit = {
+            **base,
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [{
+                    "datetime": "2026-08-07T12:00:00",
+                    "account_date": "2026-08-07",
+                    "desc": "信用卡款",
+                    "expend": 5555,
+                }],
+            }],
+        }
+        persist_cathay(data_with_deposit, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["last_payment_date"] == "2026-08-07"
+        assert card["last_payment_amount"] == 5555.0
+    finally:
+        store.close()
+
+
+def test_cathay_paid_status_without_bill_amount_preserves_saved_due(tmp_path, monkeypatch):
+    """只有 paid status、缺 billAmount 時，不足以清掉已保存應繳。"""
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "bill_due_amount": 999,
+        }])
+        persist_cathay({
+            "credit_card": {
+                "cards": [],
+                "latest_bill": {"twd": {"payBillStatus": "Payed"}},
+            },
+        }, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["bill_due_amount"] == 999.0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("bill_amount", ["NaN", "Infinity"])
+def test_cathay_paid_status_with_non_finite_bill_amount_preserves_saved_due(
+    tmp_path, monkeypatch, bill_amount,
+):
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "bill_due_amount": 999,
+        }])
+        persist_cathay({
+            "credit_card": {
+                "cards": [],
+                "latest_bill": {"twd": {
+                    "payBillStatus": "Payed",
+                    "billAmount": bill_amount,
+                }},
+            },
+        }, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["bill_due_amount"] == 999.0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("current_amount", ["NaN", "Infinity", "-Infinity"])
+def test_cathay_non_finite_current_payment_amount_preserves_saved_due(
+    tmp_path, monkeypatch, current_amount,
+):
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "bill_due_amount": 999,
+        }])
+        persist_cathay({
+            "credit_card": {
+                "cards": [],
+                "bill_summary": {"currencies": [{
+                    "currentPaymentAmount": current_amount,
+                }]},
+            },
+        }, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["bill_due_amount"] == 999.0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("credit_card", [
+    {"cards": [], "bill_summary": {"currencies": [{"currentPaymentAmount": True}]}},
+    {"cards": [], "latest_bill": {"twd": {
+        "billAmount": True,
+        "payBillStatus": "Payed",
+    }}},
+])
+def test_cathay_boolean_amounts_preserve_saved_due(tmp_path, monkeypatch, credit_card):
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "bill_due_amount": 999,
+        }])
+        persist_cathay({"credit_card": credit_card}, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["bill_due_amount"] == 999.0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("quota", [
+    {"credit_limit": True, "current": "Infinity"},
+    {"credit_limit": "-Infinity", "current": False},
+])
+def test_cathay_invalid_quota_amounts_preserve_saved_fields(tmp_path, monkeypatch, quota):
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "credit_limit": 999,
+            "used_credit": 123,
+        }])
+        persist_cathay({
+            "credit_card": {"cards": [], "quota": quota},
+        }, store, rules=None)
+        row = store.conn.execute(
+            "SELECT credit_limit, used_credit FROM cards WHERE card_no = ?",
+            ("****9999",),
+        ).fetchone()
+        assert row is not None
+        assert row["credit_limit"] == 999.0
+        assert row["used_credit"] == 123.0
+    finally:
+        store.close()
+
+
+def test_cathay_non_finite_payment_candidates_are_ignored(tmp_path, monkeypatch):
+    store = _make_store(tmp_path, monkeypatch, "cathay")
+    try:
+        store.upsert_cards([{
+            "number": "****9999",
+            "name": "既有卡",
+            "last_payment_date": "2026-08-07",
+            "last_payment_amount": 4321,
+        }])
+        delta = persist_cathay({
+            "credit_card": {
+                "cards": [],
+                "billed_detail": {"TWD": [
+                    {
+                        "post_date": "2026-10-01",
+                        "desc": "本行自動扣繳",
+                        "amount": float("-inf"),
+                    },
+                    {
+                        "post_date": "2026-12-01",
+                        "desc": "本行自動扣繳",
+                        "amount": -(10 ** 400),
+                    },
+                    {
+                        "date": "2026-12-02",
+                        "post_date": "2026-12-03",
+                        "desc": "FOREIGN BOOL",
+                        "amount": 100,
+                        "consume_amount": True,
+                    },
+                    {
+                        "date": "2026-12-04",
+                        "post_date": "2026-12-05",
+                        "desc": "FOREIGN INF",
+                        "amount": 100,
+                        "consume_amount": float("inf"),
+                    },
+                    {
+                        "date": "2026-12-06",
+                        "post_date": "2026-12-07",
+                        "desc": "FOREIGN HUGE",
+                        "amount": 100,
+                        "consume_amount": 10 ** 400,
+                    },
+                ]},
+            },
+            "twd_transactions": [{
+                "account": "SYNTHETIC-ACCOUNT",
+                "transactions": [
+                    {
+                        "datetime": "2026-09-01T04:56:44",
+                        "account_date": "2026-09-01T00:00:00",
+                        "desc": "信用卡款",
+                        "expend": float("inf"),
+                    },
+                    {
+                        "datetime": "2026-11-01T04:56:44",
+                        "account_date": "2026-11-01T00:00:00",
+                        "desc": "信用卡款",
+                        "expend": True,
+                    },
+                ],
+            }],
+        }, store, rules=None)
+        card = _read_card_fields(store, "****9999")
+        assert card is not None
+        assert card["last_payment_date"] == "2026-08-07"
+        assert card["last_payment_amount"] == 4321.0
+        assert delta is not None
+        assert delta["card_billed_skipped_invalid_amount"] == 5
+        assert delta["twd_txn_skipped_invalid_amount"] == 2
+        assert store.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 0
+        assert store.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == 0
     finally:
         store.close()
 

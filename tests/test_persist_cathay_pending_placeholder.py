@@ -161,3 +161,44 @@ def test_persist_zero_amount_with_desc_is_real(store):
     ]})
     assert delta["card_current"] == 1
     assert "card_current_skipped_placeholder" not in delta
+
+
+@pytest.mark.parametrize(("detail_key", "scope"), [
+    ("unbilled_detail", "unbilled"),
+    ("current_detail", "current"),
+])
+@pytest.mark.parametrize(("field", "value"), [
+    ("amount", True),
+    ("amount", "Infinity"),
+    ("amount", 10 ** 400),
+    ("consume_amount", True),
+    ("consume_amount", float("nan")),
+    ("consume_amount", 10 ** 400),
+])
+def test_persist_invalid_pending_money_preserves_saved_scope(
+    store, detail_key, scope, field, value,
+):
+    store.refresh_card_pending(scope, [{
+        "card_no": "9062****7033",
+        "date": "2026-06-20",
+        "desc": "OLD SAVED ROW",
+        "amount": -50,
+    }], fetch_ok=True)
+    malformed = {
+        "card_no": "9062****7033",
+        "date": "2026-06-22",
+        "desc": "MALFORMED ROW",
+        "amount": -100,
+    }
+    malformed[field] = value
+
+    delta = _persist(store, **{detail_key: {"TWD": [malformed]}})
+
+    rows = store.conn.execute(
+        "SELECT description, amount FROM card_pending_txns WHERE scope = ?",
+        (scope,),
+    ).fetchall()
+    assert [(row["description"], row["amount"]) for row in rows] == [
+        ("OLD SAVED ROW", -50),
+    ]
+    assert delta[f"card_{scope}_skipped_invalid_amount"] == 1

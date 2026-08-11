@@ -584,6 +584,39 @@ def test_postgres_reconcile_lock_uses_dedicated_connection(monkeypatch) -> None:
     ]
 
 
+def test_replica_cathay_payed_status_has_zero_unpaid() -> None:
+    from backend.server.replica_facts import _card_unpaid_twd
+
+    assert _card_unpaid_twd("cathay", {
+        "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": "Payed"}},
+    }) == 0
+
+
+def test_cathay_invalid_bill_amount_is_unavailable() -> None:
+    from backend.server.replica_facts import _card_unpaid_twd
+    from backend.server.routers.portfolio import _liab_cathay
+
+    for value in ("NaN", "Infinity", 10 ** 400, -(10 ** 400)):
+        payload = {"latest_bill": {"twd": {
+            "billAmount": value,
+            "payBillStatus": "Payed",
+        }}}
+        assert _card_unpaid_twd("cathay", payload) is None
+        assert _liab_cathay(payload) is None
+
+
+def test_cathay_boolean_bill_amount_is_unavailable() -> None:
+    from backend.server.replica_facts import _card_unpaid_twd
+    from backend.server.routers.portfolio import _liab_cathay
+
+    payload = {"latest_bill": {"twd": {
+        "billAmount": True,
+        "payBillStatus": "Payed",
+    }}}
+    assert _card_unpaid_twd("cathay", payload) is None
+    assert _liab_cathay(payload) is None
+
+
 def test_replica_fact_uses_shared_backend_display_description() -> None:
     from backend.server.replica_facts import _transaction_fact
 

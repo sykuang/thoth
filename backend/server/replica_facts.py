@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 from typing import Any
 
 from backend.core import account_classify
@@ -114,11 +115,12 @@ def _transaction_fact(
 
 
 def _to_int(value: Any) -> int | None:
-    if value in (None, "", "-"):
+    if value in (None, "", "-") or isinstance(value, bool):
         return None
     try:
-        return int(float(str(value).replace(",", "").strip()))
-    except (TypeError, ValueError):
+        number = float(str(value).replace(",", "").strip())
+        return int(number) if isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -126,7 +128,8 @@ def _card_unpaid_twd(bank: str, payload: Any) -> int | None:
     if bank == "cathay" and isinstance(payload, dict):
         bill = (payload.get("latest_bill") or {}).get("twd") or {}
         amount = _to_int(bill.get("billAmount"))
-        return 0 if amount is not None and bill.get("payBillStatus") == "Paid" else amount
+        status = str(bill.get("payBillStatus") or "").strip().casefold()
+        return 0 if amount is not None and status in {"paid", "payed"} else amount
     if bank == "ubot" and isinstance(payload, dict):
         return _to_int((payload.get("TotalData") or {}).get("Card"))
     if bank == "hsbc" and isinstance(payload, list):

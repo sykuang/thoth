@@ -5,10 +5,26 @@
 from __future__ import annotations
 
 from datetime import datetime
+from math import isfinite
 
 from backend.core import account_classify, classify
 from backend.core.store import BankStore
 from backend.core.persist._common import _num_real, _num_to_float
+
+
+def _payment_date(value) -> str | None:
+    text = str(value or "").strip()[:10].replace("/", "-")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def _finite_amount(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    amount = _num_to_float(value)
+    return amount if amount is not None and isfinite(amount) else None
 
 
 def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
@@ -82,14 +98,15 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     if all_accts:
         store.upsert_accounts(all_accts)
     cc = data.get("credit_card", {})
-    if cc.get("cards"):
+    known_cards = store.list_cards()
+    if cc.get("cards") or known_cards:
         # Step 2 (2026-06-14): Cathay quota / bill_summary 是整戶層 (不是 per-card),
         # 套到每張卡同一組值 (limit 是「整戶可用額度」, due_date/stmt_date 跨卡共用).
         # 國泰 raw API 設計就是整戶合併出帳 (`billed_detail.TWD[].card_no=''` 證實),
         # 沒有 per-card endpoint 可打;整戶套是目前可行的最大化解析,等國泰 API 升級才能改善.
         quota = cc.get("quota") or {}
-        cathay_limit = _num_to_float(quota.get("credit_limit"))
-        cathay_used = _num_to_float(quota.get("current"))  # current=本期已動用
+        cathay_limit = _finite_amount(quota.get("credit_limit"))
+        cathay_used = _finite_amount(quota.get("current"))  # current=本期已動用
         bill_summary = cc.get("bill_summary") or {}
         # payment_deadline = '2026-05-05T00:00:00' → 切 'T' 取 YYYY-MM-DD
         deadline_raw = bill_summary.get("payment_deadline") or ""
@@ -105,7 +122,14 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         cathay_last_pay_amt = None
         if currencies and isinstance(currencies[0], dict):
             cur0 = currencies[0]
-            cathay_bill_due = _num_to_float(cur0.get("currentPaymentAmount"))
+            current_due = _finite_amount(cur0.get("currentPaymentAmount"))
+            if current_due is not None:
+                cathay_bill_due = current_due
+        latest_twd = (cc.get("latest_bill") or {}).get("twd") or {}
+        latest_bill_amount = _finite_amount(latest_twd.get("billAmount"))
+        if (latest_bill_amount is not None
+                and str(latest_twd.get("payBillStatus") or "").strip().casefold() in {"paid", "payed"}):
+            cathay_bill_due = 0.0
 
         # 2026-06-23 v3 (使用者「你 cathay 有一頁一頁看嗎」, 逐項 dump billed_detail.TWD 發現):
         # billed_detail.TWD 內有 records 帶「本行自動扣繳」desc + post_date 真實上次繳款日!
@@ -114,37 +138,74 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # 找最新一筆「本行自動扣繳」(或「自動扣繳」keyword) 取 post_date 寫 last_payment_date.
         # 之前 audit 漏看 billed_detail — collector OK, persist 沒讀 (跟 0.3.25 ubot 同 pattern).
         cathay_last_pay_date = None
+        # source priority on the same posting date:
+        # billed history < already-saved fact < explicit deposit-side payment.
+        payment_candidates: list[tuple[str, int, float]] = []
         billed_twd = (cc.get("billed_detail") or {}).get("TWD") or []
         if isinstance(billed_twd, list):
-            pay_records = [
-                r for r in billed_twd
-                if isinstance(r, dict) and r.get("post_date")
-                and isinstance(r.get("desc"), str)
-                and ("自動扣繳" in r["desc"] or "繳款" in r["desc"] or "已繳" in r["desc"])
-                and isinstance(r.get("amount"), (int, float)) and r["amount"] < 0
-            ]
-            if pay_records:
-                # 新→舊排序 (post_date 字串字典序對齊時序), 取最新一筆
-                latest = max(pay_records, key=lambda r: r.get("post_date", ""))
-                pd = latest.get("post_date", "")
-                # ISO format 'YYYY-MM-DDTHH:MM:SS' → 'YYYY-MM-DD'
-                cathay_last_pay_date = pd.split("T")[0] if "T" in pd else pd
-                # 同時更新 last_payment_amount (用此筆絕對值, 比 paymentAmount 更精準)
-                amt_abs = abs(latest.get("amount", 0))
-                if amt_abs > 0:
-                    cathay_last_pay_amt = float(amt_abs)
+            for record in billed_twd:
+                if (not isinstance(record, dict) or not record.get("post_date")
+                        or not isinstance(record.get("desc"), str)
+                        or not any(label in record["desc"] for label in ("自動扣繳", "繳款", "已繳"))):
+                    continue
+                raw_amount = _finite_amount(record.get("amount"))
+                if raw_amount is None or raw_amount >= 0:
+                    continue
+                pay_date = _payment_date(record.get("post_date"))
+                if pay_date:
+                    payment_candidates.append((pay_date, 0, abs(raw_amount)))
+
+        # 國泰活存明細的「信用卡款」是銀行已入帳的真實付款列。它可能比
+        # C_BILL_Q_RecentBillDetail 裡上一期的自動扣繳更早更新。
+        for account in data.get("twd_transactions") or []:
+            for txn in account.get("transactions") or []:
+                description = str(txn.get("desc") or "").strip()
+                amount = _finite_amount(txn.get("expend"))
+                pay_date = _payment_date(txn.get("account_date") or txn.get("datetime"))
+                if description != "信用卡款" or amount is None or amount <= 0 or not pay_date:
+                    continue
+                payment_candidates.append((pay_date, 2, float(amount)))
+
+        # 近 30 日活存列會自然消失；既有較新付款必須參與 max，避免倒退到舊帳單列。
+        for row in known_cards:
+            pay_date = _payment_date(row.get("last_payment_date"))
+            amount = _finite_amount(row.get("last_payment_amount"))
+            if pay_date and amount is not None and amount > 0:
+                payment_candidates.append((pay_date, 1, float(amount)))
+
+        if payment_candidates:
+            cathay_last_pay_date, _, cathay_last_pay_amt = max(
+                payment_candidates, key=lambda item: (item[0], item[1]))
+
+        # 國泰帳單／繳款是整戶事實；本次卡片清單未必包含所有既有 sibling 卡。
+        # 目前回應優先，既有卡只補 inventory，避免舊卡停在歷史未繳狀態。
+        cards_by_no = {
+            card.get("number"): card
+            for card in (cc.get("cards") or [])
+            if card.get("number")
+        }
+        for row in known_cards:
+            cards_by_no.setdefault(row["card_no"], {
+                "number": row["card_no"],
+                "name": row["name"],
+                "association": row["association"],
+                "type": row["type"],
+                "is_cube": bool(row["is_cube"]),
+                "active": bool(row["active"]),
+            })
 
         # 套到每張卡 (覆蓋舊值)
-        for card in cc["cards"]:
+        cards = list(cards_by_no.values())
+        for card in cards:
             card["credit_limit"] = cathay_limit
             card["used_credit"] = cathay_used
             card["statement_close_date"] = cathay_stmt
             card["payment_due_date"] = cathay_due
             card["bill_due_amount"] = cathay_bill_due
             card["last_payment_amount"] = cathay_last_pay_amt
-            # 2026-06-23 v3: 從 billed_detail.TWD 找「本行自動扣繳」record post_date
+            # 最近繳款取 billed detail 或活存「信用卡款」中較新的真實入帳列
             card["last_payment_date"] = cathay_last_pay_date
-        store.upsert_cards(cc["cards"])
+        store.upsert_cards(cards)
 
     # 餘額走勢（同日 UPSERT，跨日累積）
     if data.get("balance_history"):
@@ -155,18 +216,28 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     # （'0000900000057055' vs accounts.account_no '900000057055'），
     # lstrip("0") 對齊讓 portfolio _bank_accounts 的 txn_balances lookup 找得到。
     twd_new = 0
+    twd_skipped_invalid_amount = 0
     for acct in data.get("twd_transactions", []):
         acct_no_raw = acct.get("account") or ""
         # 去掉前綴 0；但若全 0 或變空字串就用原值（防呆）
         acct_no = acct_no_raw.lstrip("0") if acct_no_raw else acct_no_raw
         if not acct_no:
             acct_no = acct_no_raw
-        txns = acct.get("transactions", [])
+        txns = []
         # 外層帳號帶進每筆交易（交易本身沒有 account_no）
-        for t in txns:
+        for t in acct.get("transactions", []):
+            if any(
+                t.get(field) is not None and _finite_amount(t.get(field)) is None
+                for field in ("expend", "income", "balance")
+            ):
+                twd_skipped_invalid_amount += 1
+                continue
             t.setdefault("account_no", acct_no)
+            txns.append(t)
         twd_new += store.upsert_twd_txns(txns, rules=rules)
     delta["twd_txn_new"] = twd_new
+    if twd_skipped_invalid_amount:
+        delta["twd_txn_skipped_invalid_amount"] = twd_skipped_invalid_amount
 
     # 信用卡已出帳明細（append-only）
     # 2026-06-20 修：filter「上期帳單總額」「上期應繳金額」這類 summary header row
@@ -176,6 +247,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     billed = cc.get("billed_detail") or {}
     billed_new = 0
     billed_skipped_summary = 0
+    billed_skipped_invalid_amount = 0
     for _cur, txns in billed.items():
         real_txns = []
         for t in txns:
@@ -186,12 +258,20 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
                 continue
             desc = (t.get("desc") or "").strip()
             amt = t.get("amount")
+            if any(
+                t.get(field) is not None and _finite_amount(t.get(field)) is None
+                for field in ("amount", "consume_amount")
+            ):
+                billed_skipped_invalid_amount += 1
+                continue
             t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
             real_txns.append(t)
         billed_new += store.upsert_card_billed(real_txns, rules=rules)
     delta["card_billed_new"] = billed_new
     if billed_skipped_summary:
         delta["card_billed_skipped_summary"] = billed_skipped_summary
+    if billed_skipped_invalid_amount:
+        delta["card_billed_skipped_invalid_amount"] = billed_skipped_invalid_amount
 
     # 信用卡未出帳 / 即時（refresh-by-scope）
     # 2026-06-22 Bug 5: persist 層對稱 filter NULL placeholder row（amount 全空 + desc 全空）。
@@ -212,6 +292,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     ))
     unb_txns_raw = [t for lst in unb.values() if isinstance(lst, list) for t in lst]
     unb_skipped = 0
+    unb_skipped_invalid_amount = 0
     unb_txns = []
     for t in unb_txns_raw:
         desc = (t.get("desc") or "").strip()
@@ -219,16 +300,24 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         if amt is None and not desc:
             unb_skipped += 1
             continue
+        if any(
+            t.get(field) is not None and _finite_amount(t.get(field)) is None
+            for field in ("amount", "consume_amount")
+        ):
+            unb_skipped_invalid_amount += 1
+            continue
         t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
         unb_txns.append(t)
     # fetch_ok: collector 明確帶回 unbilled_detail dict 才算可信；空 dict 是成功零筆，
     # key 缺失／非 dict 才是抓取失敗，必須保留舊 pending。
     delta["card_unbilled"] = store.refresh_card_pending(
         "unbilled", unb_txns, rules=rules,
-        fetch_ok=unb_ok,
+        fetch_ok=unb_ok and unb_skipped_invalid_amount == 0,
         commit=False)
     if unb_skipped:
         delta["card_unbilled_skipped_placeholder"] = unb_skipped
+    if unb_skipped_invalid_amount:
+        delta["card_unbilled_skipped_invalid_amount"] = unb_skipped_invalid_amount
 
     cur_raw = cc.get("current_detail")
     cur_d = cur_raw if isinstance(cur_raw, dict) else {}
@@ -244,6 +333,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     ))
     cur_txns_raw = [t for lst in cur_d.values() if isinstance(lst, list) for t in lst]
     cur_skipped = 0
+    cur_skipped_invalid_amount = 0
     cur_txns = []
     for t in cur_txns_raw:
         desc = (t.get("desc") or "").strip()
@@ -251,14 +341,22 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         if amt is None and not desc:
             cur_skipped += 1
             continue
+        if any(
+            t.get(field) is not None and _finite_amount(t.get(field)) is None
+            for field in ("amount", "consume_amount")
+        ):
+            cur_skipped_invalid_amount += 1
+            continue
         t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
         cur_txns.append(t)
     # current_detail 同樣以 key 存在＋dict type 判可信，空 dict 可安全清 stale current。
     delta["card_current"] = store.refresh_card_pending(
         "current", cur_txns, rules=rules,
-        fetch_ok=cur_ok)
+        fetch_ok=cur_ok and cur_skipped_invalid_amount == 0)
     if cur_skipped:
         delta["card_current_skipped_placeholder"] = cur_skipped
+    if cur_skipped_invalid_amount:
+        delta["card_current_skipped_invalid_amount"] = cur_skipped_invalid_amount
 
     # 每日數值快照（同日覆蓋，跨日保留時序）
     store.put_daily_metric("net_present", data.get("net_present"), today)

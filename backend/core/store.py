@@ -1511,7 +1511,8 @@ class BankStore:
         return [
             dict(row)
             for row in self.conn.execute(
-                "SELECT card_no, name, association, type, is_cube, active "
+                "SELECT card_no, name, association, type, is_cube, active, "
+                "last_payment_amount, last_payment_date "
                 "FROM cards WHERE user_id = ?",
                 (self.user_id,),
             )
