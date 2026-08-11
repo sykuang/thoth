@@ -174,6 +174,8 @@ def test_bank_collect_result_serializes_canonical_card_bill_fact():
         ({"scope": "card", "status": "paid", "remaining_due": 0}, "card_no"),
         ({"scope": "bank", "status": "paid", "card_no": "****7001", "remaining_due": 0}, "card_no"),
         ({"scope": "bank", "status": "paid", "remaining_due": 0, "payment_due_date": "2026/08/20"}, "payment_due_date"),
+        ({"scope": "bank", "status": "paid", "remaining_due": 0, "payment_due_date": "2026-02-29"}, "payment_due_date"),
+        ({"scope": "bank", "status": "paid", "remaining_due": 0, "statement_close_date": "2026-02-31"}, "statement_close_date"),
         ({
             "scope": "bank", "status": "paid", "remaining_due": 0,
             "last_payment_amount": 1,
@@ -202,6 +204,8 @@ def test_bank_collect_result_rejects_card_bill_facts_without_success_evidence():
         ({"cards": [{"number": "x", "payment_due_date": "2026/07/02"}]}, "payment_due_date"),
         ({"accounts": [{"account_no": "x", "raw_balance_date": "2026/07/03"}]}, "raw_balance_date"),
         ({"twd_txns": [{"datetime": "2026/06/0919:13"}]}, "twd_txns"),
+        ({"twd_txns": [{"datetime": "2026-02-31T19:13:00"}]}, "twd_txns"),
+        ({"twd_txns": [{"datetime": "2026-08-20T19:13+01:60"}]}, "twd_txns"),
         ({"card_billed_txns": [{"bill_date": "2026/05/17"}]}, "card_billed_txns"),
         ({"card_pending_txns": [{"date": "2026/07/03"}]}, "card_pending_txns"),
         ({"balance_history": [{"snapshotDate": "2026/07/03"}]}, "snapshotDate"),

@@ -15,6 +15,7 @@ import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, ClassVar, NotRequired, Required, TypedDict
 
@@ -176,6 +177,10 @@ def _require_iso_date(value: Any, *, path: str) -> None:
         return
     if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
         raise ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}")
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}") from exc
 
 
 def _require_iso_date_or_datetime(value: Any, *, path: str) -> None:
@@ -183,6 +188,13 @@ def _require_iso_date_or_datetime(value: Any, *, path: str) -> None:
         return
     if not isinstance(value, str) or not (_ISO_DATE_RE.match(value) or _ISO_DATETIME_RE.match(value)):
         raise ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}")
+    try:
+        offset = re.search(r"[+-](\d{2}):?(\d{2})$", value)
+        if offset and (int(offset.group(1)) > 23 or int(offset.group(2)) > 59):
+            raise ValueError
+        (datetime.fromisoformat if "T" in value or " " in value else date.fromisoformat)(value)
+    except ValueError as exc:
+        raise ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}") from exc
 
 
 _CARD_BILL_FACT_FIELDS = frozenset({
