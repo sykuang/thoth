@@ -60,8 +60,9 @@ def test_settings_home_uses_grouped_rows_without_future_placeholders() -> None:
     for group in ("資料與顯示", "分類與自動化", "安全性"):
         assert group in home
     assert 'testID="settings-classification-group"' in home
-    assert home.count('className="md:flex-row md:items-center gap-3 py-2 px-1"') == 2
-    assert home.count("self-start md:self-auto mt-2 md:mt-0 flex-row") == 2
+    assert 'testID="settings-fx-disclosure"' in home
+    assert 'testID="settings-card-date-disclosure"' in home
+    assert "accessibilityState={{ expanded }}" in home
     assert "更多設定 (主題 / 語系 / 備份匯出) 之後加進來" not in home
 
 

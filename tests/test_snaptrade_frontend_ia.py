@@ -12,6 +12,7 @@ BROKERAGE_DETAIL = ROOT / "frontend/src/app/(tabs)/cards/brokerage/[account_id].
 BROKERAGE_TXN_ROW = ROOT / "frontend/src/components/transactions/BrokerageTxnRow.tsx"
 DASHBOARD = ROOT / "frontend/src/app/(tabs)/dashboard.tsx"
 API_TYPES = ROOT / "frontend/src/types/api.ts"
+CURRENCY = ROOT / "frontend/src/lib/currency.ts"
 
 
 def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
@@ -104,13 +105,15 @@ def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
     assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions
 
 
-def test_brokerage_usd_amounts_use_fixed_two_decimal_formatter():
+def test_brokerage_amounts_use_shared_currency_formatter():
     sections = SECTIONS.read_text()
     transaction_row = BROKERAGE_TXN_ROW.read_text()
+    currency = CURRENCY.read_text()
 
-    expected = "currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value)"
+    expected = "return formatDecimalCurrency(value, currency ?? '') ?? '—';"
     assert expected in sections
     assert expected in transaction_row
+    assert "USD: 2" in currency
 
 
 def test_brokerage_desktop_transaction_date_stays_in_fixed_width_column():
