@@ -1,14 +1,13 @@
 import { Text, View } from 'react-native';
 
 import { BankBadge } from '@/components/BankBadge';
-import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
+import { formatDecimalCurrency } from '@/lib/currency';
 import { parseDateForMobileLayout } from '@/lib/txnDisplay';
 import type { BrokerageAccount, BrokerageActivity } from '@/types/api';
 
 function money(value: string | null, currency: string | null): string {
   if (value == null) return '—';
-  const formatted = currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value);
-  return formatted == null ? '—' : `${currency ?? ''} ${formatted}`.trim();
+  return formatDecimalCurrency(value, currency ?? '') ?? '—';
 }
 
 export function BrokerageTxnRow({
@@ -31,7 +30,6 @@ export function BrokerageTxnRow({
   if (!wide) {
     return (
       <View className="flex-row items-stretch border-b border-ink-100 dark:border-ink-800">
-        <View className="w-1 bg-brand-500" />
         <View className="w-10 ml-3 mr-2 items-start justify-center py-3">
           <Text className="text-ink-400 dark:text-ink-500 text-micro">{dateParts.month}</Text>
           <Text className="text-ink-700 dark:text-ink-300 text-large font-semibold leading-tight">

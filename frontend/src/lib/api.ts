@@ -309,7 +309,7 @@ async function getOrStartBiometricReLogin(
     if (!(await hasCredentials())) {
       throw new ApiError(401, { detail: 'no saved credentials' });
     }
-    const creds = await loadCredentials('使用 Face ID 重新登入銀行爬蟲');
+    const creds = await loadCredentials('使用 Face ID 重新登入 Thoth');
     if (!creds) {
       throw new ApiError(401, { detail: 'biometric cancelled' });
     }

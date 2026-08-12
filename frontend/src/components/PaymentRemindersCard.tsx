@@ -15,15 +15,12 @@
 import { useRouter } from 'expo-router';
 import { Pressable, Text, View } from 'react-native';
 
+import { formatCurrency } from '@/lib/currency';
 import { BANK_LABELS, type PaymentReminder, type SupportedBank } from '@/types/api';
 
 type Props = {
   reminders: PaymentReminder[];
 };
-
-function fmtTWD(n: number): string {
-  return `NT$${Math.round(n).toLocaleString('en-US')}`;
-}
 
 function daysLabel(days: number): string {
   if (days === 0) return '今天到期';
@@ -77,12 +74,12 @@ export function PaymentRemindersCard({ reminders }: Props) {
                 <Text className="text-ink-600 dark:text-ink-400 text-small flex-1">
                   {isInsufficient
                     ? `扣繳戶餘額不足${
-                        r.shortfall != null ? `（差 ${fmtTWD(r.shortfall)}）` : ''
+                        r.shortfall != null ? `（差 ${formatCurrency(r.shortfall, 'TWD')}）` : ''
                       }`
                     : '尚未設定自動扣繳帳號'}
                 </Text>
                 <Text className="text-ink-900 dark:text-ink-50 text-small font-semibold ml-2">
-                  {fmtTWD(r.bill_due_amount)}
+                  {formatCurrency(r.bill_due_amount, 'TWD')}
                 </Text>
               </View>
             </View>

@@ -17,6 +17,7 @@ import { ActivityIndicator, Modal, Pressable, Text, View } from 'react-native';
 import { Dropdown, type DropdownOption } from '@/components/Dropdown';
 import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { formatApiError } from '@/lib/api';
+import { formatSignedCurrency } from '@/lib/currency';
 import {
   type AutoDebitSetting,
   type EligibleAccount,
@@ -34,11 +35,6 @@ type Props = {
 function maskAccount(no: string): string {
   if (no.length <= 4) return no;
   return `****${no.slice(-4)}`;
-}
-
-function fmtBalance(b: number | null): string {
-  if (b == null) return '—';
-  return `NT$${Math.round(b).toLocaleString('en-US')}`;
 }
 
 export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }: Props) {
@@ -105,7 +101,7 @@ export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }:
     return {
       label: `${bLabel}・${nick}`,
       value: `${a.bank}|${a.account_no}`,
-      hint: `${maskAccount(a.account_no)}・${fmtBalance(a.raw_balance)}`,
+      hint: `${maskAccount(a.account_no)}・${a.raw_balance == null ? '—' : formatSignedCurrency(a.raw_balance, 'TWD')}`,
     };
   });
 

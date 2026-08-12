@@ -42,6 +42,7 @@ import {
 } from '@/lib/period';
 import { api, formatApiError } from '@/lib/api';
 import { categorySortRank, sortCategoryKeys } from '@/lib/category-color';
+import { formatCurrency, formatSignedCurrency } from '@/lib/currency';
 import { mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
 import {
   applyTxnFilters,
@@ -480,7 +481,7 @@ export default function TransactionsScreen() {
               }`}
               numberOfLines={1}
             >
-              $ {incomeAmt.toLocaleString('zh-TW')}
+              {formatCurrency(incomeAmt, 'TWD')}
             </Text>
           </Pressable>
           <Pressable
@@ -515,7 +516,7 @@ export default function TransactionsScreen() {
               }`}
               numberOfLines={1}
             >
-              $ {expenseAmt.toLocaleString('zh-TW')}
+              {formatCurrency(expenseAmt, 'TWD')}
             </Text>
           </Pressable>
         </View>
@@ -748,8 +749,7 @@ export default function TransactionsScreen() {
                           {g.label}
                         </Text>
                         <Text className={`text-body font-semibold ${amountColor}`}>
-                          {g.subtotal > 0 ? '+' : g.subtotal < 0 ? '-' : ''}$
-                          {Math.abs(g.subtotal).toLocaleString('zh-TW', { maximumFractionDigits: 0 })}
+                          {formatSignedCurrency(g.subtotal, 'TWD', true)}
                         </Text>
                       </View>
                       {/* 行 2: progress bar (跨寬) + % 標籤 (右) */}
@@ -1001,16 +1001,7 @@ export default function TransactionsScreen() {
         </Pressable>
       </View>
     )}
-    {/* 橘色 FAB — 對標 MoneyBook 編輯按鈕 (暫不接 backend)。selection mode 時隱藏避免遮 bar */}
-    {!selectionMode && (
-      <Pressable
-        onPress={() => console.log('FAB tapped')}
-        className="absolute bottom-6 right-6 w-14 h-14 rounded-full bg-amber-500 dark:bg-amber-600 items-center justify-center shadow-pop active:bg-amber-600 dark:active:bg-amber-700"
-        testID="transactions-fab"
-      >
-        <Text className="text-white text-h2">✏️</Text>
-      </Pressable>
-    )}
+
     {/* Phase 9.2: BulkEditSheet — 跨平台 modal, 收 N 筆 Promise.all 連發 single PATCH */}
     <BulkEditSheet
       visible={bulkSheetOpen}

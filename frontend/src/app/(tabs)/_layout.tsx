@@ -6,13 +6,17 @@
 import { Redirect, Tabs } from 'expo-router';
 import { LayoutDashboard, ReceiptText, Settings, WalletCards } from 'lucide-react-native';
 import { useColorScheme } from 'nativewind';
+import { Platform } from 'react-native';
 
+import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useAuthStore } from '@/stores/auth';
 
 export default function TabsLayout() {
   const token = useAuthStore((s) => s.token);
   const { colorScheme } = useColorScheme();
+  const bp = useBreakpoint();
   const isDark = colorScheme === 'dark';
+  const isDesktop = Platform.OS === 'web' && bp.isLg;
 
   if (!token) {
     return <Redirect href="/login" />;
@@ -20,14 +24,22 @@ export default function TabsLayout() {
   return (
     <Tabs
       screenOptions={{
-        headerStyle: { backgroundColor: isDark ? '#0f172a' : '#7e22ce' }, // ink-900 / brand-700
-        headerTintColor: '#fff',
-        headerTitleStyle: { fontWeight: '600' },
+        headerShown: false,
         tabBarActiveTintColor: isDark ? '#c084fc' : '#7e22ce', // brand-400 / brand-700
         tabBarInactiveTintColor: isDark ? '#64748b' : '#94a3b8',
+        tabBarPosition: isDesktop ? 'left' : 'bottom',
+        tabBarVariant: isDesktop ? 'material' : 'uikit',
+        tabBarLabelPosition: isDesktop ? 'below-icon' : undefined,
         tabBarStyle: {
           backgroundColor: isDark ? '#0f172a' : '#ffffff',
-          borderTopColor: isDark ? '#1e293b' : '#e2e8f0',
+          ...(isDesktop
+            ? {
+                width: 92,
+                borderRightColor: isDark ? '#1e293b' : '#e2e8f0',
+              }
+            : {
+                borderTopColor: isDark ? '#1e293b' : '#e2e8f0',
+              }),
         },
         tabBarIconStyle: { marginBottom: 2 },
         sceneStyle: { backgroundColor: isDark ? '#020617' : '#f8fafc' },

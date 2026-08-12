@@ -6,7 +6,8 @@ import { Platform, Pressable, Text, View } from 'react-native';
 
 import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { formatApiError } from '@/lib/api';
-import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
+import { formatDecimalCurrency } from '@/lib/currency';
+import { formatDecimal } from '@/lib/decimal';
 import type {
   BrokerageAccount,
   SnapTradePortfolio,
@@ -24,8 +25,7 @@ const PORTAL_URL_MAX_AGE_MS = 4 * 60 * 1000;
 
 function money(value: string | null, currency: string | null): string {
   if (value == null) return '—';
-  const formatted = currency === 'USD' ? formatDecimalFixed(value, 2) : formatDecimal(value);
-  return formatted == null ? '—' : `${currency ?? ''} ${formatted}`.trim();
+  return formatDecimalCurrency(value, currency ?? '') ?? '—';
 }
 
 function accountLabel(account: BrokerageAccount): string {

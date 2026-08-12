@@ -14,7 +14,7 @@ export async function biometricAvailable(): Promise<boolean> {
   return has && enrolled;
 }
 
-export async function authenticate(reason = '解鎖銀行爬蟲'): Promise<boolean> {
+export async function authenticate(reason = '解鎖 Thoth'): Promise<boolean> {
   if (Platform.OS === 'web') return true; // web bypass
   const result = await LocalAuthentication.authenticateAsync({
     promptMessage: reason,

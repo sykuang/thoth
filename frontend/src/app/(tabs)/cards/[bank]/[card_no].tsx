@@ -28,6 +28,7 @@ import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { BankBadge } from '@/components/BankBadge';
 import { api, formatApiError } from '@/lib/api';
 import { bankMeta } from '@/lib/banks';
+import { formatCurrency, formatSignedCurrency } from '@/lib/currency';
 import { maskCardNo } from '@/lib/mask';
 import type { CardDetail } from '@/types/api';
 
@@ -93,7 +94,7 @@ export default function CardDetailPage() {
               : 'text-emerald-600 dark:text-emerald-400'
           }`}
         >
-          {formatTwd(billDue)}
+          {formatCurrency(billDue, 'TWD')}
         </Text>
         <View className="flex-row items-center gap-2 mt-2 flex-wrap">
           <StatusBadge status={status} />
@@ -240,8 +241,7 @@ function TxnRow({
               : 'text-ink-900 dark:text-ink-50'
         }`}
       >
-        {positive || displayedNegative ? '+' : ''}
-        {formatTwd(displayAmt)}
+        {formatSignedCurrency(displayAmt, 'TWD', positive || displayedNegative)}
       </Text>
     </View>
   );
@@ -289,8 +289,4 @@ function categoryMeta(
 ): string | null {
   if (category && subcategory) return `${category} / ${subcategory}`;
   return category || subcategory || null;
-}
-
-function formatTwd(amount: number): string {
-  return `NT$ ${Math.round(amount).toLocaleString('zh-TW')}`;
 }

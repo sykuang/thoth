@@ -18,6 +18,7 @@
  *   - 外幣 (consume_amount): 保留 2 位小數 (符合大部分國際匯率慣例)
  */
 import type { FxDisplayMode, Transaction } from '@/types/api';
+import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
 
 /**
  * 把數字格式化成 "1,234" / "1,234.56" 風格。
@@ -31,28 +32,64 @@ function formatNumber(n: number, fractionDigits: number = 0): string {
   });
 }
 
-/** Currency code → display prefix. 已知列出常用, 其餘 fallback 大寫代碼+空白。 */
-const CCY_SYMBOL: Record<string, string> = {
-  TWD: 'NT$',
-  USD: 'US$',
-  EUR: '€',
-  JPY: '¥',
-  CNY: '¥',
-  GBP: '£',
-  HKD: 'HK$',
-  SGD: 'S$',
-  AUD: 'A$',
-  KRW: '₩',
+const CURRENCY_FRACTION_DIGITS: Record<string, number> = {
+  TWD: 0,
+  JPY: 0,
+  KRW: 0,
+  USD: 2,
+  EUR: 2,
+  GBP: 2,
+  HKD: 2,
+  AUD: 2,
+  CAD: 2,
+  SGD: 2,
+  CHF: 2,
+  CNY: 2,
 };
+
+function currencyPrefix(currency: string): string {
+  const code = currency.trim().toUpperCase();
+  return code === 'TWD' ? 'NT$' : code;
+}
+
+function currencyFractionDigits(currency: string): number | undefined {
+  return CURRENCY_FRACTION_DIGITS[currency.trim().toUpperCase()];
+}
 
 /** 格式化單一金額 → "NT$ 1,234" / "EUR 12.34" / "JPY 1,234" */
 export function formatCurrency(amount: number, currency: string): string {
-  const sym = CCY_SYMBOL[currency];
-  // JPY/TWD/KRW 等沒小數的幣; 其餘 default 2 位
-  const noFraction = currency === 'TWD' || currency === 'JPY' || currency === 'KRW';
-  const formatted = formatNumber(Math.abs(amount), noFraction ? 0 : 2);
-  if (sym) return `${sym} ${formatted}`;
-  return `${currency} ${formatted}`;
+  const formatted = formatNumber(Math.abs(amount), currencyFractionDigits(currency) ?? 2);
+  const prefix = currencyPrefix(currency);
+  return prefix ? `${prefix} ${formatted}` : formatted;
+}
+
+/** 顯示 signed numeric 金額；aggregate/KPI 不再各自拼 `$`。 */
+export function formatSignedCurrency(
+  amount: number,
+  currency: string,
+  showPositiveSign = false,
+): string {
+  const sign = amount < 0 ? '-' : showPositiveSign && amount > 0 ? '+' : '';
+  return `${sign}${formatCurrency(amount, currency)}`;
+}
+
+/**
+ * 顯示 exact decimal string，不先轉 Number，保留券商／手動帳戶精度。
+ * Invalid decimal returns null so callers can render an honest em dash.
+ */
+export function formatDecimalCurrency(
+  value: string | number,
+  currency: string,
+): string | null {
+  const fractionDigits = currencyFractionDigits(currency);
+  const formatted = fractionDigits == null
+    ? formatDecimal(String(value))
+    : formatDecimalFixed(String(value), fractionDigits);
+  if (formatted == null) return null;
+  const negative = formatted.startsWith('-');
+  const digits = negative ? formatted.slice(1) : formatted;
+  const prefix = currencyPrefix(currency);
+  return `${negative ? '-' : ''}${prefix ? `${prefix} ` : ''}${digits}`;
 }
 
 /** 一個交易渲染結果 — primary 大字, sub 副字, sub 可為 null */

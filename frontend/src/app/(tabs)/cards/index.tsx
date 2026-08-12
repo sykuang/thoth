@@ -5,7 +5,7 @@
  *   - 子帳戶 (新 endpoint /portfolio/accounts): nickname + currency 餘額 + 同步時間
  *   - 信用卡 (/cards): 卡名 + 末四碼
  *
- * Phase 8.2 C (2026-06-14): 三層 nickname 都可編輯 (✏️ icon → inline rename modal)
+ * Phase 8.2 C (2026-06-14): 三層 nickname 都可編輯 (inline rename modal)
  *   - bank_accounts.label (跨銀行群組名): PUT /accounts/{id}
  *   - accounts.nickname_overwrite (per-bank 帳戶名): PATCH /portfolio/accounts/{bank}/{no}/nickname
  *   - cards.nickname_overwrite (per-bank 卡片名): PATCH /cards/{bank}/{no}/nickname
@@ -15,7 +15,18 @@
  *     UI 顯示 fallback overwrite || raw; ↺ 重設按鈕清成 NULL.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
+import {
+  ChevronRight,
+  Cloud,
+  CreditCard,
+  Eye,
+  EyeOff,
+  MoreHorizontal,
+  Pencil,
+  Settings as SettingsIcon,
+  X,
+} from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -31,6 +42,7 @@ import {
 import { BankBadge } from '@/components/BankBadge';
 import { AutoDebitSettingModal } from '@/components/AutoDebitSettingModal';
 import { SnapTradeAccountsSection } from '@/components/SnapTradeSections';
+import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import {
   consumeTerminalSyncJobIds,
@@ -43,9 +55,8 @@ import {
   type AccountTabRevisionTuple,
 } from '@/lib/accountTabCache';
 import { api, ApiError, formatApiError } from '@/lib/api';
-import { bankMeta } from '@/lib/banks';
+import { formatDecimalCurrency, formatSignedCurrency } from '@/lib/currency';
 import { formatRelativeTime } from '@/lib/datetime';
-import { formatDecimalFixed } from '@/lib/decimal';
 import { maskCardNo } from '@/lib/mask';
 import {
   assertReplicaOwnerEpoch,
@@ -226,6 +237,8 @@ type BankGroup = {
 
 export default function AccountsTabScreen() {
   const router = useRouter();
+  const bp = useBreakpoint();
+  const isDesktop = Platform.OS === 'web' && bp.isLg;
   const qc = useQueryClient();
   const datasetQ = useFrontendDatasetCache();
   const localAccountTab = datasetQ.data?.accountTabCache;
@@ -274,8 +287,8 @@ export default function AccountsTabScreen() {
 
   // Sync infrastructure (Phase 8.6 — 從 dashboard 搬過來 + 改 moneybook 風)
   // - jobsQ: 監聽 /sync/jobs 輪詢 (有 running 時 2s,否則停)
-  // - triggerSync: 單一 account_id sync (per-bank ☁️ icon 觸發)
-  // - triggerSyncAll: 全部同步 (header ☁️ icon 觸發)
+  // - triggerSync: 單一 account_id sync (per-bank action 觸發)
+  // - triggerSyncAll: 全部同步 (header action 觸發)
   const jobsQ = useQuery<SyncJob[]>({
     queryKey: ['sync', 'jobs', ownerKey, ownerEpoch],
     queryFn: () => ownerApi<SyncJob[]>('/sync/jobs'),
@@ -598,7 +611,7 @@ export default function AccountsTabScreen() {
 
   // === Sync helpers (Phase 8.6) ===
   // 1. lastJobByBank: 該銀行最近一筆 sync job (任一 account)
-  //    bank 粒度而非 account_id 粒度,因為 BankGroupCard ☁️ 是 per-bank icon
+  //    bank 粒度而非 account_id 粒度，因為 BankGroupCard sync 是 per-bank action
   //    (內部會同時 sync 該銀行所有 cred account — 在 triggerBankSync 處理)
   const lastJobByBank = useMemo(() => {
     const m: Record<string, SyncJob | undefined> = {};
@@ -611,7 +624,7 @@ export default function AccountsTabScreen() {
     return m;
   }, [jobsQ.data]);
 
-  // bankToAccountIds: 同銀行的所有 account_id (per-bank ☁️ 觸發時要逐個 trigger)
+  // bankToAccountIds: 同銀行的所有 account_id (per-bank sync 時要逐個 trigger)
   const bankToAccountIds: Record<string, number[]> = {};
   for (const account of bankAccounts) {
     if (!bankToAccountIds[account.bank]) bankToAccountIds[account.bank] = [];
@@ -626,7 +639,7 @@ export default function AccountsTabScreen() {
   // 3. allSyncBusy: 全部同步按鈕的 disabled 條件 (mutation pending 或已有 job 在跑)
   const allSyncBusy = triggerSyncAll.isPending || hasRunningJob;
 
-  // 4. triggerBankSync: per-bank ☁️ 處理. 對該銀行所有 account_id 平行觸發 sync.
+  // 4. triggerBankSync: per-bank 處理，對該銀行所有 account_id 平行觸發 sync。
   //    backend /sync/account/{id} 是 per-account,所以一家銀行 N 個 account 要 trigger N 次.
   //    triggerSync.mutate 內部已 invalidate jobs query,輪詢會自動接手.
   //
@@ -655,7 +668,7 @@ export default function AccountsTabScreen() {
 
   return (
     <ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
-      <View className="px-4 py-6 max-w-[800px] w-full mx-auto">
+      <View className="px-4 py-6 max-w-[1180px] w-full mx-auto">
         {/* Header — 帳戶新增與同步的單一全域入口 */}
         <View className="flex-row items-start mb-1">
           <View className="flex-1">
@@ -683,22 +696,25 @@ export default function AccountsTabScreen() {
                 {triggerSyncAll.isPending ? (
                   <View className="flex-row items-center gap-2">
                     <ActivityIndicator color="#fff" size="small" />
-                    <Text className="text-white text-small font-semibold">啟動中...</Text>
+                    <Text className="text-white text-small font-semibold">啟動中…</Text>
                   </View>
                 ) : hasRunningJob ? (
                   <View className="flex-row items-center gap-2">
                     <ActivityIndicator color="#fff" size="small" />
-                    <Text className="text-white text-small font-semibold">同步中...</Text>
+                    <Text className="text-white text-small font-semibold">同步中…</Text>
                   </View>
                 ) : (
-                  <Text className="text-white text-small font-semibold">☁️ 全部同步</Text>
+                  <View className="flex-row items-center gap-2">
+                    <Cloud size={16} color="#fff" strokeWidth={2.4} />
+                    <Text className="text-white text-small font-semibold">全部同步</Text>
+                  </View>
                 )}
               </Pressable>
             )}
           </View>
         </View>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
-          管理銀行帳戶、信用卡與已連結券商。銀行資料可用「☁️」同步，券商資料列於下方。
+          管理銀行帳戶、信用卡與已連結券商。銀行資料可從各銀行卡片同步，券商資料列於下方。
         </Text>
 
         {triggerSync.isError && (
@@ -742,18 +758,24 @@ export default function AccountsTabScreen() {
             </Text>
           </View>
         ) : (
-          groups.map((g) => (
-            <BankGroupCard
-              key={g.bank}
-              group={g}
-              lastJob={lastJobByBank[g.bank]}
-              onSync={() => triggerBankSync(g.bank)}
-              syncBusy={syncingBanks.has(g.bank)}
-              ownerKey={ownerKey}
-              ownerEpoch={ownerEpoch}
-              applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
-            />
-          ))
+          <View className={isDesktop ? 'flex-row flex-wrap gap-4' : ''}>
+            {groups.map((g) => (
+              <View
+                key={g.bank}
+                style={isDesktop ? { flexBasis: '48%', flexGrow: 0, flexShrink: 1 } : undefined}
+              >
+                <BankGroupCard
+                  group={g}
+                  lastJob={lastJobByBank[g.bank]}
+                  onSync={() => triggerBankSync(g.bank)}
+                  syncBusy={syncingBanks.has(g.bank)}
+                  ownerKey={ownerKey}
+                  ownerEpoch={ownerEpoch}
+                  applyAccountTabCacheUpdate={applyAccountTabCacheUpdate}
+                />
+              </View>
+            ))}
+          </View>
         )}
         {!accountTabError && (
           <ManualAccountsSection
@@ -923,8 +945,9 @@ function ManualAccountRow({
           <Text className={`text-small font-semibold ${excluded
             ? 'text-ink-400 dark:text-ink-500 line-through'
             : 'text-ink-900 dark:text-ink-50'}`}>
-            {account.currency}{' '}
-            {account.balance == null ? '—' : (formatDecimalFixed(account.balance, 2) ?? '—')}
+            {account.balance == null
+              ? '—'
+              : (formatDecimalCurrency(account.balance, account.currency) ?? '—')}
           </Text>
         </View>
       </Pressable>
@@ -937,7 +960,9 @@ function ManualAccountRow({
         testID={`manual-account-toggle-${account.id}`}
         accessibilityLabel={excluded ? '納入淨資產統計' : '不納入淨資產統計'}
       >
-        <Text className="text-h3">{excluded ? '🙈' : '👁️'}</Text>
+        {excluded
+          ? <EyeOff size={20} color="#94a3b8" strokeWidth={2.2} />
+          : <Eye size={20} color="#64748b" strokeWidth={2.2} />}
       </Pressable>
     </View>
   );
@@ -963,9 +988,10 @@ function BankGroupCard({
   ownerEpoch: number;
   applyAccountTabCacheUpdate: ApplyAccountTabCacheUpdate;
 }) {
+  const router = useRouter();
   const bankLabel = BANK_LABELS[group.bank as SupportedBank] ?? group.bank;
-  const meta = bankMeta(group.bank);
   const [autoDebitOpen, setAutoDebitOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
 
   // 同步狀態 (Phase 8.6)
   const isSyncing = syncBusy || lastJob?.status === 'queued' || lastJob?.status === 'running';
@@ -978,10 +1004,9 @@ function BankGroupCard({
       className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4 overflow-hidden"
       testID={`bank-group-${group.bank}`}
     >
-      {/* Bank header — BankBadge + 銀行名 + ☁️ 同步 + ⚙️ 管理登入 (Phase 8.6) */}
+      {/* Bank header — primary sync plus one low-frequency actions menu. */}
       <View
         className="flex-row items-center gap-2 px-4 py-3 border-b border-ink-100 dark:border-ink-800"
-        style={{ borderLeftColor: meta.color, borderLeftWidth: 4 }}
       >
         <BankBadge bank={group.bank} size="sm" />
         <View className="flex-1">
@@ -1005,7 +1030,6 @@ function BankGroupCard({
             <Text className="text-ink-400 dark:text-ink-500 text-micro mt-0.5">尚未同步</Text>
           )}
         </View>
-        {/* ☁️ 同步該銀行 (Phase 8.6 — 取代原本到 dashboard 才能 sync) */}
         <Pressable
           onPress={onSync}
           disabled={isSyncing}
@@ -1018,31 +1042,17 @@ function BankGroupCard({
           {isSyncing ? (
             <ActivityIndicator size="small" />
           ) : (
-            <Text className="text-h3">{isFailed ? '🔁' : '☁️'}</Text>
+            <Cloud size={20} color={isFailed ? '#dc2626' : '#64748b'} strokeWidth={2.2} />
           )}
         </Pressable>
-        {/* Phase L10 (2026-06-20): 💳 自動扣繳設定 — 只在有信用卡時顯示 */}
-        {group.cards.length > 0 && (
-          <Pressable
-            onPress={() => setAutoDebitOpen(true)}
-            className="w-9 h-9 items-center justify-center rounded-full active:bg-ink-100 dark:active:bg-ink-800"
-            testID={`bank-auto-debit-${group.bank}`}
-            accessibilityLabel={`設定 ${bankLabel} 自動扣繳`}
-          >
-            <Text className="text-h3">💳</Text>
-          </Pressable>
-        )}
-        {/* Phase 8.2 (2026-06-15 使用者指示 IA 重整 A 路線):
-            ⚙️ 按鈕 push 到 cred 編輯, 讓使用者直接從帳戶 tab 改該銀行的登入欄位 */}
-        <Link href={`/(tabs)/cards/credentials/${group.bank}`} asChild>
-          <Pressable
-            className="w-9 h-9 items-center justify-center rounded-full active:bg-ink-100 dark:active:bg-ink-800"
-            testID={`bank-creds-${group.bank}`}
-            accessibilityLabel={`管理 ${bankLabel} 登入`}
-          >
-            <Text className="text-h3">⚙️</Text>
-          </Pressable>
-        </Link>
+        <Pressable
+          onPress={() => setActionsOpen(true)}
+          className="w-9 h-9 items-center justify-center rounded-full active:bg-ink-100 dark:active:bg-ink-800"
+          testID={`bank-actions-${group.bank}`}
+          accessibilityLabel={`${bankLabel} 更多操作`}
+        >
+          <MoreHorizontal size={21} color="#64748b" strokeWidth={2.2} />
+        </Pressable>
       </View>
 
       {/* 子帳戶 list (存款帳戶) */}
@@ -1098,7 +1108,64 @@ function BankGroupCard({
           </View>
         )}
 
-      {/* Phase L10: 自動扣繳設定 modal (per-bank, 跨銀行 TWD 戶 picker) */}
+      <Modal
+        visible={actionsOpen}
+        transparent
+        animationType={Platform.OS === 'ios' ? 'slide' : 'fade'}
+        onRequestClose={() => setActionsOpen(false)}
+      >
+        <Pressable
+          className="flex-1 bg-black/40 justify-end web:items-center web:justify-center web:p-4"
+          onPress={() => setActionsOpen(false)}
+        >
+          <Pressable
+            className="bg-white dark:bg-ink-900 rounded-t-3xl web:rounded-2xl w-full max-w-md p-5 shadow-pop"
+            onPress={(event) => event.stopPropagation()}
+            testID={`bank-actions-menu-${group.bank}`}
+            accessibilityViewIsModal
+            accessibilityLabel={`${bankLabel} 操作選單`}
+          >
+            <View className="flex-row items-center mb-3">
+              <Text className="text-ink-900 dark:text-ink-50 text-h3 flex-1">{bankLabel} 操作</Text>
+              <Pressable
+                onPress={() => setActionsOpen(false)}
+                className="w-9 h-9 items-center justify-center rounded-full active:bg-ink-100 dark:active:bg-ink-800"
+                accessibilityRole="button"
+                accessibilityLabel="關閉操作選單"
+              >
+                <X size={19} color="#64748b" strokeWidth={2.2} />
+              </Pressable>
+            </View>
+            {group.cards.length > 0 && (
+              <Pressable
+                onPress={() => {
+                  setActionsOpen(false);
+                  setAutoDebitOpen(true);
+                }}
+                className="flex-row items-center gap-3 py-3 border-b border-ink-100 dark:border-ink-800 active:opacity-60"
+                testID={`bank-auto-debit-${group.bank}`}
+                accessibilityRole="button"
+              >
+                <CreditCard size={20} color="#64748b" strokeWidth={2.2} />
+                <Text className="text-ink-900 dark:text-ink-50 text-body">自動扣繳設定</Text>
+              </Pressable>
+            )}
+            <Pressable
+              onPress={() => {
+                setActionsOpen(false);
+                router.push(`/(tabs)/cards/credentials/${group.bank}`);
+              }}
+              className="flex-row items-center gap-3 py-3 active:opacity-60"
+              testID={`bank-creds-${group.bank}`}
+              accessibilityRole="button"
+            >
+              <SettingsIcon size={20} color="#64748b" strokeWidth={2.2} />
+              <Text className="text-ink-900 dark:text-ink-50 text-body">管理銀行登入</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       <AutoDebitSettingModal
         visible={autoDebitOpen}
         onClose={() => setAutoDebitOpen(false)}
@@ -1113,7 +1180,7 @@ function BankGroupCard({
 // Phase 8.5 — 「已建 cred slot 但還沒 sync」的 row
 // ============================================================
 // Phase 8.5 — 「已建 cred slot 但還沒 sync」的 row
-// 灰底 + 「未同步」徽章 + 「☁️ 初次同步」CTA (Phase 8.6: 不再跳 dashboard,就地觸發)
+// 灰底 + 「未同步」徽章 + 初次同步 CTA (Phase 8.6: 不再跳 dashboard,就地觸發)
 // 跟一般 AccountRow 對比要明顯區分（沒餘額、沒幣別、沒最後同步時間）
 // ============================================================
 function PendingBankAccountRow({
@@ -1152,8 +1219,8 @@ function PendingBankAccountRow({
     : failedAt
       ? `上次同步失敗${lastJob?.error_msg ? ` — ${lastJob.error_msg}` : ''}`
       : account.has_creds
-        ? '已設定登入 — 按右側「☁️」初次同步抓帳'
-        : '尚未設定登入 — 點上方「⚙️」填寫銀行登入資訊';
+        ? '已設定登入 — 按右側按鈕初次同步抓帳'
+        : '尚未設定登入 — 從更多操作管理銀行登入';
 
   return (
     <View
@@ -1188,7 +1255,10 @@ function PendingBankAccountRow({
           {syncBusy ? (
             <ActivityIndicator color="#fff" size="small" />
           ) : (
-            <Text className="text-white text-micro font-semibold">☁️ 初次同步</Text>
+            <View className="flex-row items-center gap-1.5">
+              <Cloud size={14} color="#fff" strokeWidth={2.4} />
+              <Text className="text-white text-micro font-semibold">初次同步</Text>
+            </View>
           )}
         </Pressable>
       )}
@@ -1199,7 +1269,7 @@ function PendingBankAccountRow({
 // ============================================================
 // 存款帳戶 row (MoneyBook 風 — icon 圖示 + 名稱 + 餘額 + 同步時間)
 // Phase 6 (2026-06-14): excluded → 整列 opacity-40 反灰 + 右側切換按鈕
-// Phase 8.2 C (2026-06-14): ✏️ 加暱稱編輯 — PATCH /portfolio/accounts/.../nickname
+// Phase 8.2 C (2026-06-14): 加暱稱編輯 — PATCH /portfolio/accounts/.../nickname
 // ============================================================
 function AccountRow({
   account,
@@ -1219,12 +1289,14 @@ function AccountRow({
   const [editing, setEditing] = useState(false);
   const borderClass = isLast ? '' : 'border-b border-ink-100 dark:border-ink-800';
   const isTwd = (account.currency || 'TWD').toUpperCase() === 'TWD';
-  const balanceText = formatBalance(account.balance, account.currency);
+  const balanceText = account.balance == null
+    ? '—'
+    : formatSignedCurrency(account.balance, account.currency);
   const hasBalance = account.balance !== null && account.balance !== undefined;
   const excluded = account.excluded === true;
 
   // 帳戶名稱 fallback: overwrite > nickname > type > account_no
-  // nickname_overwrite 只影響名稱內容；row 右側保留獨立 ✏️ affordance，不在名稱前再加標記。
+  // nickname_overwrite 只影響名稱內容；row 右側保留獨立編輯 affordance。
   const rawName = account.nickname || account.type || account.account_no;
   const overwriteName = (account.nickname_overwrite ?? '').trim();
   const displayName = overwriteName.length > 0 ? overwriteName : rawName;
@@ -1235,15 +1307,6 @@ function AccountRow({
     ? formatRelativeTime(account.snapshot_date)
     : null;
 
-  // === UI 鐵令 brand strip ===
-  // accent(綠 TWD) / amber(外幣) / ink(無資料 / 排除)
-  const stripColor = excluded
-    ? 'bg-ink-300 dark:bg-ink-700'
-    : !hasBalance
-      ? 'bg-ink-200 dark:bg-ink-700'
-      : isTwd
-        ? 'bg-accent-500'
-        : 'bg-amber-500';
 
   // PATCH /portfolio/accounts/{bank}/{account_no}/excluded
   // 帳戶 snapshot 先樂觀反灰；server 成功後同一 delta 寫回 owner-scoped replica。
@@ -1335,10 +1398,8 @@ function AccountRow({
       className={`flex-row items-stretch ${borderClass} ${excluded ? 'opacity-50' : ''}`}
       testID={`account-row-${account.account_no}`}
     >
-      {/* UI 鐵令: 4px brand strip */}
-      <View className={`w-1 ${stripColor}`} />
       <Pressable
-        className="flex-1 min-w-0 py-3 pl-3 pr-2"
+        className="flex-1 min-w-0 py-3 pl-4 pr-2"
         onPress={() => router.push({
           pathname: '/(tabs)/transactions',
           params: {
@@ -1379,7 +1440,7 @@ function AccountRow({
               className="text-ink-400 dark:text-ink-500 text-micro font-mono"
               numberOfLines={1}
             >
-              ≈ NT$ {account.twd_estimate.toLocaleString('zh-TW')}
+              ≈ {formatSignedCurrency(account.twd_estimate, 'TWD')}
             </Text>
           ) : syncedLabel ? (
             <View className="flex-row items-center gap-1">
@@ -1406,7 +1467,7 @@ function AccountRow({
         testID={`account-rename-${account.account_no}`}
         accessibilityLabel="編輯帳戶暱稱"
       >
-        <Text className="text-ink-400 dark:text-ink-500 text-small">✏️</Text>
+        <Pencil size={16} color="#94a3b8" strokeWidth={2.2} />
       </Pressable>
 
       {/* 排除統計 toggle */}
@@ -1417,7 +1478,9 @@ function AccountRow({
         testID={`account-toggle-${account.account_no}`}
         accessibilityLabel={excluded ? '納入淨資產統計' : '不納入淨資產統計'}
       >
-        <Text className="text-h3">{excluded ? '🙈' : '👁️'}</Text>
+        {excluded
+          ? <EyeOff size={20} color="#94a3b8" strokeWidth={2.2} />
+          : <Eye size={20} color="#64748b" strokeWidth={2.2} />}
       </Pressable>
 
       <RenameModal
@@ -1438,10 +1501,9 @@ function AccountRow({
 // === UI 鐵令 (使用者 2026-06-17) ===
 //   - 兩行: (左)卡名+末四碼 / (右)額度+到期日
 //   - 廢除 emoji 卡 icon、未出帳；帳單應繳移到卡片詳情頁
-//   - 左 4px brand strip (red=逾期 / amber=即將到期 / brand=正常)
-//   - 廢除 px-4 換成 strip + flex-1, 整體仍 py-3
+//   - 狀態以到期文字語意色呈現，不再讓每列共用模糊的左色條。
 // Phase 6 (2026-06-14 PM): excluded → 整列反灰 + 卡名劃線 + 右側 toggle
-// Phase 8.2 C (2026-06-14): ✏️ 加暱稱編輯 — PATCH /cards/{bank}/{card_no}/nickname
+// Phase 8.2 C (2026-06-14): 加暱稱編輯 — PATCH /cards/{bank}/{card_no}/nickname
 // ============================================================
 function CardRow({
   card,
@@ -1473,16 +1535,7 @@ function CardRow({
     ? card.used_credit
     : card.credit_limit;
 
-  // brand strip 顏色: dueLabel.kind 決定
-  const stripColor = excluded
-    ? 'bg-ink-300 dark:bg-ink-700'
-    : dueLabel.kind === 'overdue'
-      ? 'bg-red-500'
-      : dueLabel.kind === 'dueSoon'
-        ? 'bg-amber-500'
-        : 'bg-brand-500';
-
-  // Phase 8.2 C: 顯示 fallback overwrite || raw；row 右側保留獨立 ✏️ affordance，不在卡名/帳戶名前再加標記。
+  // Phase 8.2 C: 顯示 fallback overwrite || raw；row 右側保留獨立編輯 affordance。
   const rawName = card.name ?? '(未命名)';
   const overwriteName = (card.nickname_overwrite ?? '').trim();
   const displayName = overwriteName.length > 0 ? overwriteName : rawName;
@@ -1567,10 +1620,8 @@ function CardRow({
       className={`flex-row items-stretch ${borderClass} ${excluded ? 'opacity-50' : ''}`}
       testID={`credit-card-${card.card_no}`}
     >
-      {/* UI 鐵令: 4px brand strip (dynamic color) */}
-      <View className={`w-1 ${stripColor}`} />
       <Pressable
-        className="flex-1 min-w-0 py-3 pl-3 pr-2"
+        className="flex-1 min-w-0 py-3 pl-4 pr-2"
         onPress={() => router.push({
           pathname: '/(tabs)/transactions',
           params: {
@@ -1602,7 +1653,7 @@ function CardRow({
             }`}
             numberOfLines={1}
           >
-            {formatTwdAmount(primaryAmount)}
+            {primaryAmount == null ? '—' : formatSignedCurrency(primaryAmount, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 末四碼 (左) + 到期日/狀態 (右) */}
@@ -1632,7 +1683,7 @@ function CardRow({
         testID={`card-detail-amount-${card.card_no}`}
         accessibilityLabel="開啟帳單明細"
       >
-        <Text className="text-ink-400 dark:text-ink-500 text-h3">›</Text>
+        <ChevronRight size={19} color="#94a3b8" strokeWidth={2.2} />
       </Pressable>
       <Pressable
         onPress={() => setEditing(true)}
@@ -1641,7 +1692,7 @@ function CardRow({
         testID={`card-rename-${card.card_no}`}
         accessibilityLabel="編輯卡片暱稱"
       >
-        <Text className="text-ink-400 dark:text-ink-500 text-small">✏️</Text>
+        <Pencil size={16} color="#94a3b8" strokeWidth={2.2} />
       </Pressable>
       {/* 排除統計 toggle */}
       <Pressable
@@ -1651,7 +1702,9 @@ function CardRow({
         testID={`card-toggle-${card.card_no}`}
         accessibilityLabel={excluded ? '納入淨資產統計' : '不納入淨資產統計'}
       >
-        <Text className="text-h3">{excluded ? '🙈' : '👁️'}</Text>
+        {excluded
+          ? <EyeOff size={20} color="#94a3b8" strokeWidth={2.2} />
+          : <Eye size={20} color="#64748b" strokeWidth={2.2} />}
       </Pressable>
 
       <RenameModal
@@ -1671,20 +1724,7 @@ function CardRow({
 // Helpers
 // ============================================================
 
-/** 格式化餘額 — 原幣顯示 (TWD: $1,088,682 / JPY: JPY 1,201,387). */
-function formatBalance(amount: number | null | undefined, currency: string): string {
-  if (amount === null || amount === undefined) return '—';
-  const cur = (currency || 'TWD').toUpperCase();
-  const formatted = amount.toLocaleString('zh-TW');
-  if (cur === 'TWD') return `$ ${formatted}`;
-  return `${cur} ${formatted}`;
-}
-
-function formatTwdAmount(amount: number | null | undefined): string {
-  if (amount === null || amount === undefined) return '—';
-  return `$ ${Math.round(amount).toLocaleString('zh-TW')}`;
-}
-
+/** Parse YYYY-MM-DD as a local calendar date. */
 function parseDateOnly(date: string | null | undefined): Date | null {
   if (!date) return null;
   const m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(date.trim());

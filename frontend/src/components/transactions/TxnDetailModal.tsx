@@ -27,7 +27,7 @@ import { TagPicker } from '@/components/TagPicker';
 import { ApiError, api, formatApiError } from '@/lib/api';
 import { sortCategoryKeys } from '@/lib/category-color';
 import {
-  formatCurrency,
+  formatSignedCurrency,
   formatFxRate,
   fxRateSourceLabel,
   renderAmount,
@@ -431,7 +431,7 @@ export function TxnDetailModal({
               <DetailRow label="帳號 / 卡號" value={maskCardNo(txn.account_or_card)} mono />
             )}
             {txn.balance != null && (
-              <DetailRow label="帳戶餘額" value={formatCurrency(txn.balance, 'TWD')} mono />
+              <DetailRow label="帳戶餘額" value={formatSignedCurrency(txn.balance, 'TWD')} mono />
             )}
             {txn.consume_date && <DetailRow label="消費日" value={txn.consume_date} />}
             {txn.post_date && <DetailRow label="入帳日" value={txn.post_date} />}

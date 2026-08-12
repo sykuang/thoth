@@ -15,19 +15,28 @@
  * 未來新設定 (主題 / 語系 / 備份匯出) 都加在這頁.
  */
 import { Link, type Href } from 'expo-router';
-import { ChevronRight, Clock3, Tags, Workflow, type LucideIcon } from 'lucide-react-native';
+import { Bell, ChevronRight, Clock3, Tags, Workflow, type LucideIcon } from 'lucide-react-native';
 import { useEffect, useState, type ReactNode } from 'react';
-import { Alert, Platform, Pressable, Switch, Text, View } from 'react-native';
+import { Alert, AppState, Linking, Platform, Pressable, Switch, Text, View } from 'react-native';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { SnapTradeConnectionSettings } from '@/components/SnapTradeSections';
 
 import { usePreferences } from '@/hooks/usePreferences';
 import { biometricAvailable } from '@/lib/biometric';
 import { clearCredentials, hasCredentials } from '@/lib/credentials';
+import {
+  getPushPermissionStatus,
+  getPushProvider,
+  registerForPushNotifications,
+  requestPushNotifications,
+} from '@/lib/push';
 import { useAuthStore } from '@/stores/auth';
 import { FX_DISPLAY_MODES, CARD_DATE_BASIS_MODES, type CardDateBasis } from '@/types/api';
 
 export default function SettingsHomeScreen() {
+  const pushProvider = getPushProvider();
+  const showDevicePush = Platform.OS !== 'web' && pushProvider !== 'none' && pushProvider !== 'webhook';
+
   return (
     <KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-6 py-6 max-w-[800px] w-full mx-auto">
@@ -47,14 +56,14 @@ export default function SettingsHomeScreen() {
             href="/(tabs)/settings/labels"
             icon={Tags}
             title="分類與標籤"
-            description="管理主分類、子分類與 Hashtags"
+            description="管理主分類、子分類與自訂標籤"
             testID="settings-labels-link"
           />
           <SettingsLinkRow
             href="/(tabs)/settings/categories"
             icon={Workflow}
             title="自動分類規則"
-            description="管理 Regex 條件、優先順序與排除規則"
+            description="依交易內容自動套用分類與排除條件"
             testID="settings-categories-link"
           />
           <SettingsLinkRow
@@ -70,6 +79,12 @@ export default function SettingsHomeScreen() {
         <SettingsGroup title="券商連結">
           <SnapTradeConnectionSettings />
         </SettingsGroup>
+
+        {showDevicePush && (
+          <SettingsGroup title="通知">
+            <PushNotificationSetting />
+          </SettingsGroup>
+        )}
 
         {/* 安全性 — iOS native 才顯示 (web 沒有 Face ID) */}
         {Platform.OS !== 'web' && (
@@ -141,6 +156,43 @@ function SettingsLinkRow({
   );
 }
 
+function SettingsDisclosure({
+  title,
+  summary,
+  testID,
+  children,
+}: {
+  title: string;
+  summary: string;
+  testID: string;
+  children: ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <View>
+      <Pressable
+        onPress={() => setExpanded((value) => !value)}
+        className="flex-row items-center py-4 active:opacity-60"
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        testID={testID}
+      >
+        <View className="flex-1 pr-3">
+          <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">{title}</Text>
+          <Text className="text-ink-500 dark:text-ink-400 text-small mt-0.5">{summary}</Text>
+        </View>
+        <ChevronRight
+          size={18}
+          color="#94a3b8"
+          style={{ transform: [{ rotate: expanded ? '90deg' : '0deg' }] }}
+        />
+      </Pressable>
+      {expanded && <View className="pb-4">{children}</View>}
+    </View>
+  );
+}
+
 // ============================================================
 // FxDisplayToggle (Phase 6 → 保留, Phase 8.2 從原 cred 編輯頁搬過來) —
 // 外幣顯示偏好 (auto / always_twd / always_original).
@@ -152,55 +204,50 @@ function FxDisplayToggle() {
   const activeOpt = FX_DISPLAY_MODES.find((o) => o.value === mode);
 
   return (
-    <View>
-      <View className="md:flex-row md:items-center gap-3 py-2 px-1">
-        <View className="flex-1">
-          <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-1">外幣交易顯示</Text>
-          <Text className="text-ink-500 dark:text-ink-400 text-small">
-            刷外幣卡時 (歐元 / 美金 / 日圓), 主交易表 / 明細的金額怎麼顯示。
-          </Text>
-        </View>
-        <View
-          className={`self-start md:self-auto mt-2 md:mt-0 flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${
-            isMutating ? 'opacity-50' : ''
-          }`}
-        >
-          {FX_DISPLAY_MODES.map((opt) => {
-            const isSel = mode === opt.value;
-            return (
-              <Pressable
-                key={opt.value}
-                onPress={() => {
-                  if (!isMutating && !isSel) {
-                    mutate({ fx_display_mode: opt.value });
-                  }
-                }}
-                disabled={isMutating}
-                testID={`fx-mode-${opt.value}`}
-                className={`px-3 py-1.5 rounded-md ${
-                  isSel ? 'bg-white dark:bg-ink-700' : ''
+    <SettingsDisclosure
+      title="外幣交易顯示"
+      summary={activeOpt?.label ?? '自動'}
+      testID="settings-fx-disclosure"
+    >
+      <Text className="text-ink-500 dark:text-ink-400 text-small mb-3">
+        選擇外幣交易在交易表與明細中的主要顯示幣別。
+      </Text>
+      <View
+        className={`self-start flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${
+          isMutating ? 'opacity-50' : ''
+        }`}
+      >
+        {FX_DISPLAY_MODES.map((opt) => {
+          const isSel = mode === opt.value;
+          return (
+            <Pressable
+              key={opt.value}
+              onPress={() => {
+                if (!isMutating && !isSel) mutate({ fx_display_mode: opt.value });
+              }}
+              disabled={isMutating}
+              testID={`fx-mode-${opt.value}`}
+              className={`px-3 py-1.5 rounded-md ${isSel ? 'bg-white dark:bg-ink-700' : ''}`}
+            >
+              <Text
+                className={`text-small ${
+                  isSel
+                    ? 'text-ink-900 dark:text-ink-50 font-semibold'
+                    : 'text-ink-500 dark:text-ink-400'
                 }`}
               >
-                <Text
-                  className={`text-small ${
-                    isSel
-                      ? 'text-ink-900 dark:text-ink-50 font-semibold'
-                      : 'text-ink-500 dark:text-ink-400'
-                  }`}
-                >
-                  {opt.label}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
+                {opt.label}
+              </Text>
+            </Pressable>
+          );
+        })}
       </View>
       {activeOpt && (
-        <Text className="text-ink-500 dark:text-ink-400 text-micro px-1 mt-1">
-          目前: {activeOpt.hint}
+        <Text className="text-ink-500 dark:text-ink-400 text-micro mt-2">
+          {activeOpt.hint}
         </Text>
       )}
-    </View>
+    </SettingsDisclosure>
   );
 }
 
@@ -211,51 +258,149 @@ function FxDisplayToggle() {
 function CardDateBasisToggle() {
   const { data: prefs, mutate, isMutating } = usePreferences();
   const mode: CardDateBasis = prefs.card_date_basis ?? 'consume';
+  const activeLabel = CARD_DATE_BASIS_MODES.find((option) => option.value === mode)?.label;
 
   return (
-    <View>
-      <View className="md:flex-row md:items-center gap-3 py-2 px-1">
-        <View className="flex-1">
-          <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-1">信用卡交易日期認列</Text>
-          <Text className="text-ink-500 dark:text-ink-400 text-small">
-            選擇信用卡交易要歸在消費日或入帳日。此設定會影響明細篩選、月份歸屬與統計。
-          </Text>
-        </View>
-        <View
-          className={`self-start md:self-auto mt-2 md:mt-0 flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${
-            isMutating ? 'opacity-50' : ''
-          }`}
-        >
-          {CARD_DATE_BASIS_MODES.map((opt) => {
-            const isSel = mode === opt.value;
-            return (
-              <Pressable
-                key={opt.value}
-                onPress={() => {
-                  if (!isMutating && !isSel) {
-                    mutate({ card_date_basis: opt.value });
-                  }
-                }}
-                disabled={isMutating}
-                testID={`card-date-basis-${opt.value}`}
-                className={`px-3 py-1.5 rounded-md ${
-                  isSel ? 'bg-white dark:bg-ink-700' : ''
+    <SettingsDisclosure
+      title="信用卡交易日期認列"
+      summary={activeLabel ?? '消費日'}
+      testID="settings-card-date-disclosure"
+    >
+      <Text className="text-ink-500 dark:text-ink-400 text-small mb-3">
+        此設定會影響明細篩選、月份歸屬與統計。
+      </Text>
+      <View
+        className={`self-start flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${
+          isMutating ? 'opacity-50' : ''
+        }`}
+      >
+        {CARD_DATE_BASIS_MODES.map((opt) => {
+          const isSel = mode === opt.value;
+          return (
+            <Pressable
+              key={opt.value}
+              onPress={() => {
+                if (!isMutating && !isSel) mutate({ card_date_basis: opt.value });
+              }}
+              disabled={isMutating}
+              testID={`card-date-basis-${opt.value}`}
+              className={`px-3 py-1.5 rounded-md ${isSel ? 'bg-white dark:bg-ink-700' : ''}`}
+            >
+              <Text
+                className={`text-small ${
+                  isSel
+                    ? 'text-ink-900 dark:text-ink-50 font-semibold'
+                    : 'text-ink-500 dark:text-ink-400'
                 }`}
               >
-                <Text
-                  className={`text-small ${
-                    isSel
-                      ? 'text-ink-900 dark:text-ink-50 font-semibold'
-                      : 'text-ink-500 dark:text-ink-400'
-                  }`}
-                >
-                  {opt.label}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
+                {opt.label}
+              </Text>
+            </Pressable>
+          );
+        })}
       </View>
+    </SettingsDisclosure>
+  );
+}
+
+function PushNotificationSetting() {
+  const [permission, setPermission] = useState<'granted' | 'denied' | 'undetermined' | 'unavailable' | null>(null);
+  const [registrationFailed, setRegistrationFailed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const refresh = async () => {
+      const status = await getPushPermissionStatus();
+      const failed = status === 'granted' && (await registerForPushNotifications()) == null;
+      if (!mounted) return;
+      setPermission(status);
+      setRegistrationFailed(failed);
+    };
+    void refresh();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void refresh();
+    });
+    return () => {
+      mounted = false;
+      subscription.remove();
+    };
+  }, []);
+
+  const handlePress = async () => {
+    setBusy(true);
+    try {
+      if (permission === 'denied') {
+        await Linking.openSettings();
+        return;
+      }
+      const result = await requestPushNotifications();
+      setPermission(
+        result === 'registered' || result === 'registration_failed'
+          ? 'granted'
+          : result === 'permission_denied'
+            ? 'denied'
+            : 'unavailable',
+      );
+      setRegistrationFailed(result === 'registration_failed');
+    } catch {
+      Alert.alert('無法啟用通知', '請稍後再試，或到系統設定檢查 Thoth 的通知權限。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disabled =
+    busy ||
+    permission === null ||
+    permission === 'unavailable' ||
+    (permission === 'granted' && !registrationFailed);
+
+  return (
+    <View className="flex-row items-center gap-3 py-4">
+      <View className="w-9 h-9 rounded-xl bg-brand-100 dark:bg-brand-900 items-center justify-center">
+        <Bell size={18} color="#9333ea" strokeWidth={2.3} />
+      </View>
+      <View className="flex-1">
+        <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">推播通知</Text>
+        <Text className="text-ink-500 dark:text-ink-400 text-small mt-0.5">
+          {permission === 'granted' && registrationFailed
+            ? '權限已開啟，但裝置註冊失敗，請重試'
+            : permission === 'granted'
+              ? '已啟用帳單與同步狀態通知'
+              : permission === 'unavailable'
+                ? '此裝置不支援推播通知'
+                : permission === 'denied'
+                  ? '系統權限已關閉，請到設定重新開啟'
+                  : '只在你按下啟用後才會要求系統權限'}
+        </Text>
+      </View>
+      <Pressable
+        onPress={handlePress}
+        disabled={disabled}
+        accessibilityRole="button"
+        accessibilityState={{ disabled }}
+        className={`rounded-lg px-3 py-2 ${
+          (permission === 'granted' && !registrationFailed) || permission === 'unavailable'
+            ? 'bg-ink-100 dark:bg-ink-800'
+            : 'bg-brand-600 active:bg-brand-700'
+        } ${busy || permission === null ? 'opacity-50' : ''}`}
+        testID="settings-push-enable"
+      >
+        <Text className={disabled ? 'text-ink-500 text-small' : 'text-white text-small font-semibold'}>
+          {busy
+            ? '處理中…'
+            : registrationFailed
+              ? '重試'
+              : permission === 'granted'
+                ? '已啟用'
+                : permission === 'unavailable'
+                  ? '不可用'
+                  : permission === 'denied'
+                    ? '系統設定'
+                    : '啟用'}
+        </Text>
+      </Pressable>
     </View>
   );
 }

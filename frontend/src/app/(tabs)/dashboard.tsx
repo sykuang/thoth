@@ -11,6 +11,7 @@ import { useRouter } from 'expo-router';
 import { useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   Text,
   View,
@@ -20,6 +21,7 @@ import { PaymentRemindersCard } from '@/components/PaymentRemindersCard';
 import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import { api } from '@/lib/api';
+import { formatSignedCurrency } from '@/lib/currency';
 import { useAuthStore } from '@/stores/auth';
 import {
   type DashboardStats,
@@ -34,6 +36,7 @@ import {
 export default function Dashboard() {
   const router = useRouter();
   const bp = useBreakpoint();
+  const isDesktop = Platform.OS === 'web' && bp.isLg;
   const email = useAuthStore((s) => s.email);
   const logout = useAuthStore((s) => s.logout);
   const qc = useQueryClient();
@@ -91,6 +94,12 @@ export default function Dashboard() {
   const dashboardLoading = !dashboard && (!datasetQ.isFetched || datasetQ.isRefetching);
   const dashboardError = !dashboard && datasetQ.isFetched && !datasetQ.isRefetching;
   const ready = accounts.filter((a) => a.has_creds);
+  const now = new Date();
+  const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const showPortfolioCard = dashboardLoading || Boolean(portfolio);
+  const showKpiCard = dashboardLoading || Boolean(stats && stats.total > 0);
+  const showSubscription = Boolean(stats?.subscription_total);
+  const showPassive = Boolean(stats?.passive_income_by_month?.[currentMonthKey]);
 
   // 是否有任何 job 正在跑 (queued / running) — 給「全部同步」按鈕看
   // (避免重複觸發整批; 個別卡仍可按 — 進 queue 等 backend 序列化執行)
@@ -147,11 +156,20 @@ export default function Dashboard() {
           </Pressable>
         </View>
 
-        {/* Phase 6 Plan A — Portfolio header (淨資產主數字 + 資產/負債/本月消費) */}
-        <PortfolioHeader portfolio={portfolio} isLoading={dashboardLoading} bp={bp} />
-
-        {/* L8.5 — KPI 卡 (本月收支詳細 — 補 portfolio 沒有的 income / expense 拆分) */}
-        <KpiBar stats={stats} isLoading={dashboardLoading} bp={bp} />
+        {(showPortfolioCard || showKpiCard) && (
+          <View className={isDesktop ? 'flex-row gap-4' : ''}>
+            {showPortfolioCard && (
+              <View className="flex-1">
+                <PortfolioHeader portfolio={portfolio} isLoading={dashboardLoading} bp={bp} />
+              </View>
+            )}
+            {showKpiCard && (
+              <View className="flex-1">
+                <KpiBar stats={stats} isLoading={dashboardLoading} bp={bp} />
+              </View>
+            )}
+          </View>
+        )}
 
         {dashboardError && (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
@@ -171,15 +189,24 @@ export default function Dashboard() {
             H2 位置: KPI 後, Subscription 前. 空 list 自動 hide. */}
         <PaymentRemindersCard reminders={remindersQ.data ?? []} />
 
-        {/* Phase 6 (category taxonomy 2026-06-15) — 訂閱合計卡 (0 自動隱藏) */}
-        <SubscriptionCard stats={stats} bp={bp} />
-
-        {/* Phase 7 (Income 5 類 FIRE 2026-06-15) — 被動收入卡 (0 自動隱藏) */}
-        <PassiveIncomeCard stats={stats} bp={bp} />
+        {(showSubscription || showPassive) && (
+          <View className={isDesktop ? 'flex-row gap-4' : ''}>
+            {showSubscription && (
+              <View className="flex-1">
+                <SubscriptionCard stats={stats} bp={bp} />
+              </View>
+            )}
+            {showPassive && (
+              <View className="flex-1">
+                <PassiveIncomeCard stats={stats} bp={bp} />
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Phase 8.6 — sync UI 已搬到「帳戶」tab。
-            (a) 帳戶 tab header 有「☁️ 全部同步」按鈕
-            (b) 每家銀行 group 有 ☁️ 圖示同步該銀行
+            (a) 帳戶 tab header 有「全部同步」按鈕
+            (b) 每家銀行 group 有同步操作
             (c) 「初次同步」按鈕在 PendingBankAccountRow 就地觸發
             Dashboard 留淨資產 / KPI / 訂閱 / 被動收入 等財務數字面板. */}
         {hasRunningJob && (
@@ -206,7 +233,7 @@ export default function Dashboard() {
             <Text className="text-ink-700 dark:text-ink-200 text-h3 mb-1.5">還沒有任何設定好的帳號</Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center mb-4 leading-5">
               到「帳戶」tab 點「+ 新增銀行帳號」選擇銀行並填密碼{'\n'}
-              設好後按「☁️ 全部同步」抓帳, 這裡會顯示資產數字
+              設好後按「全部同步」抓帳，這裡會顯示資產數字
             </Text>
             <Pressable
               className="bg-brand-600 active:bg-brand-700 rounded-xl px-5 py-2.5 shadow-brand"
@@ -236,12 +263,6 @@ export default function Dashboard() {
 // 害 timezone / 假月份顯示 0）
 
 type StatsForKpi = DashboardStats;
-
-function fmtTWD(n: number): string {
-  // 數字 → "$1,234,567" / 負值 → "-$1,234,567"
-  const abs = Math.abs(n).toLocaleString('en-US');
-  return n < 0 ? `-$${abs}` : `$${abs}`;
-}
 
 function KpiBar({
   stats,
@@ -282,7 +303,6 @@ function KpiBar({
   const netColor = net >= 0
     ? 'text-accent-600 dark:text-accent-500'
     : 'text-red-600 dark:text-red-400';
-  const netStripColor = net >= 0 ? 'bg-accent-500' : 'bg-red-500';
 
   // === UI 鐵令 (使用者 2026-06-17) ===
   // 兩行極簡:
@@ -290,13 +310,12 @@ function KpiBar({
   //   行 2: 筆數(小字) | (空)
   // 廢除: 收入 vs 支出 stacked bar、結餘/透支 label、紅綠雙 row 數字、bg-ink 條
   // 詳細收支拆分移到 transactions 篩選 + cards 詳情頁
-  // 白底 + 4px brand strip(綠/紅 dynamic by 結餘方向)
+  // 金額本身已用綠／紅表達方向，不再重複加左色條。
   return (
     <View
-      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4 overflow-hidden flex-row"
+      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4"
       testID="dashboard-kpi-bar"
     >
-      <View className={`w-1 ${netStripColor}`} />
       <View className="flex-1 px-6 py-5">
         {/* 行 1: 月份 + 結餘大字 */}
         <View className="flex-row items-baseline justify-between">
@@ -309,7 +328,7 @@ function KpiBar({
             adjustsFontSizeToFit
             minimumFontScale={0.6}
           >
-            {fmtTWD(net)}
+            {formatSignedCurrency(net, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 筆數 */}
@@ -357,13 +376,12 @@ function SubscriptionCard({
   //   行 1: 訂閱服務(label) | 本月金額(大字)
   //   行 2: 上月 / 月份(小字) | (空)
   // 廢除: 累計、卡片內 emoji icon、紫色 border、subtotals
-  // 白底 + 4px brand strip(violet 對齊訂閱主題色)
+  // 金額色已表達訂閱 domain，不再重複加左色條。
   return (
     <View
-      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4 overflow-hidden flex-row"
+      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4"
       testID="dashboard-subscription-card"
     >
-      <View className="w-1 bg-violet-500" />
       <View className="flex-1 px-6 py-5">
         {/* 行 1: 訂閱本月 */}
         <View className="flex-row items-baseline justify-between">
@@ -376,7 +394,7 @@ function SubscriptionCard({
             adjustsFontSizeToFit
             minimumFontScale={0.6}
           >
-            {fmtTWD(thisAmt)}
+            {formatSignedCurrency(thisAmt, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 月份 + 上月 */}
@@ -386,7 +404,7 @@ function SubscriptionCard({
           </Text>
           {lastMonth ? (
             <Text className="text-small font-mono text-ink-500 dark:text-ink-400" numberOfLines={1}>
-              上月 {fmtTWD(lastAmt)}
+              上月 {formatSignedCurrency(lastAmt, 'TWD')}
             </Text>
           ) : null}
         </View>
@@ -407,7 +425,7 @@ function SubscriptionCard({
 // 廢除: Layer 2 5 類分布 + 6 月趨勢 sparkline + emoji + 累計總收入
 // 廢除: 卡片內 emoji icon、emerald border、subtotals
 // 廢除: tap-to-expand 互動(細項移到 portfolio/passive-income 詳情頁)
-// 白底 + 4px brand strip(emerald 對齊被動收入主題色)
+// 金額色已表達被動收入 domain，不再重複加左色條。
 //
 // 對應 wiki [[income-classifier-and-fire-passive-income-spec]] § 五 Plan A.
 // 被動收入 = interest_dividend + investment_gain (FIRE 公式分子).
@@ -443,10 +461,9 @@ function PassiveIncomeCard({
 
   return (
     <View
-      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4 overflow-hidden flex-row"
+      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4"
       testID="dashboard-passive-income-card"
     >
-      <View className="w-1 bg-emerald-500" />
       <View className="flex-1 px-6 py-5">
         {/* 行 1: 被動收入本月 */}
         <View className="flex-row items-baseline justify-between">
@@ -459,7 +476,7 @@ function PassiveIncomeCard({
             adjustsFontSizeToFit
             minimumFontScale={0.6}
           >
-            {fmtTWD(passive)}
+            {formatSignedCurrency(passive, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 本月占比 + YTD */}
@@ -490,12 +507,6 @@ function PassiveIncomeCard({
 //   - 負債 = 上期帳單未繳, NOT 本月已刷
 //   - 本月消費 = pending + billed 本月 consume_date, 資訊性, 不扣 net worth
 //   - 帳單跟本月消費是兩件事
-
-function fmtNTD(n: number): string {
-  // 數字 → "NT$ 1,234,567" / 負值 → "-NT$ 1,234,567"
-  const abs = Math.abs(n).toLocaleString('zh-TW');
-  return n < 0 ? `-NT$ ${abs}` : `NT$ ${abs}`;
-}
 
 function PortfolioHeader({
   portfolio,
@@ -567,14 +578,12 @@ function PortfolioHeader({
   //   行 1: 淨資產大字
   //   行 2: 本月消費小字
   // 廢除 subRows（資產/負債明細移到 portfolio/cards 頁）
-  // 廢除 gradient（白底 + 左 4px brand strip）
+  // 廢除 gradient；淨資產文字色已表達正負，不再重複加左色條。
   return (
     <View
-      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4 overflow-hidden flex-row"
+      className="bg-white dark:bg-ink-900 rounded-2xl shadow-card mb-4"
       testID="portfolio-header"
     >
-      {/* 左側 brand strip — UI 鐵令 */}
-      <View className="w-1 bg-brand-500" />
       <View className="flex-1 px-6 py-5">
         {/* === 行 1: 淨資產 === */}
         <View className="flex-row items-baseline justify-between">
@@ -588,7 +597,7 @@ function PortfolioHeader({
             adjustsFontSizeToFit
             minimumFontScale={0.6}
           >
-            {fmtNTD(netWorthDisplay)}
+            {formatSignedCurrency(netWorthDisplay, 'TWD')}
           </Text>
         </View>
         {/* === 行 2: 本月消費 + 更新時間（一行內，左 label 右 value）=== */}
@@ -602,7 +611,7 @@ function PortfolioHeader({
             )}
           </View>
           <Text className="text-small font-mono text-accent-600 dark:text-accent-500" numberOfLines={1}>
-            {fmtNTD(monthSpending)}
+            {formatSignedCurrency(monthSpending, 'TWD')}
           </Text>
         </View>
       </View>

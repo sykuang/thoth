@@ -251,30 +251,30 @@ export default function LoginScreen() {
       {isWide && (
         <View className="flex-1 bg-brand-700 dark:bg-brand-900 p-12 justify-center">
           <View className="max-w-md">
-            <Text className="text-white text-display mb-3">銀行爬蟲</Text>
+            <Text className="text-white text-display mb-3">Thoth</Text>
             <Text className="text-brand-100 text-h2 mb-8 font-normal">
-              一站管理台灣銀行帳號的個人金融儀表板
+              自架的台灣銀行與資產管理工具
             </Text>
             <View className="gap-4">
               <BrandFeature
                 icon={<Users size={20} color="#fff" strokeWidth={2.4} />}
                 label="多帳號管理"
-                desc="同一家銀行可建多組帳密 (主帳 / 老婆 / 公司)"
+                desc="同一家銀行可管理多組登入資料（個人／家庭／公司）"
               />
               <BrandFeature
                 icon={<Lock size={20} color="#fff" strokeWidth={2.4} />}
                 label="加密儲存"
-                desc="Fernet 對稱加密, 永遠不會回明文"
+                desc="敏感資料加密保存，不在畫面顯示完整內容"
               />
               <BrandFeature
                 icon={<RefreshCw size={20} color="#fff" strokeWidth={2.4} />}
                 label="一鍵同步"
-                desc="背景自動爬, 帳務即時更新"
+                desc="自動更新銀行資料，隨時查看最新帳務"
               />
               <BrandFeature
                 icon={<Smartphone size={20} color="#fff" strokeWidth={2.4} />}
                 label="跨平台"
-                desc="桌機 web + iOS 原生 app 共用同一份 backend"
+                desc="桌機與行動裝置共用同一套資料"
               />
             </View>
           </View>
@@ -288,10 +288,10 @@ export default function LoginScreen() {
           {!isWide && (
             <View className="items-center mb-8 mt-12">
               <View className="bg-brand-600 dark:bg-brand-700 rounded-2xl px-5 py-4 mb-3 shadow-brand">
-                <Text className="text-white text-display">銀行爬蟲</Text>
+                <Text className="text-white text-display">Thoth</Text>
               </View>
               <Text className="text-ink-500 dark:text-ink-400 text-body text-center">
-                一站管理台灣銀行帳號的個人金融儀表板
+                自架的台灣銀行與資產管理工具
               </Text>
             </View>
           )}
