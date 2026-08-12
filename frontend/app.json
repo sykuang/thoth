@@ -14,7 +14,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.kenkuang.thoth",
-      "buildNumber": "59",
+      "buildNumber": "60",
       "appleTeamId": "C72TPR683L",
       "supportsTablet": true,
       "infoPlist": {
