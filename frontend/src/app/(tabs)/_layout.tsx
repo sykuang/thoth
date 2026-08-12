@@ -7,6 +7,7 @@ import { Redirect, Tabs } from 'expo-router';
 import { LayoutDashboard, ReceiptText, Settings, WalletCards } from 'lucide-react-native';
 import { useColorScheme } from 'nativewind';
 import { Platform } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useAuthStore } from '@/stores/auth';
@@ -15,6 +16,7 @@ export default function TabsLayout() {
   const token = useAuthStore((s) => s.token);
   const { colorScheme } = useColorScheme();
   const bp = useBreakpoint();
+  const insets = useSafeAreaInsets();
   const isDark = colorScheme === 'dark';
   const isDesktop = Platform.OS === 'web' && bp.isLg;
 
@@ -42,7 +44,10 @@ export default function TabsLayout() {
               }),
         },
         tabBarIconStyle: { marginBottom: 2 },
-        sceneStyle: { backgroundColor: isDark ? '#020617' : '#f8fafc' },
+        sceneStyle: {
+          backgroundColor: isDark ? '#020617' : '#f8fafc',
+          paddingTop: isDesktop ? 0 : insets.top,
+        },
       }}
     >
       <Tabs.Screen

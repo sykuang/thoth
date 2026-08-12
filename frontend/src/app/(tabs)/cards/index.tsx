@@ -667,7 +667,11 @@ export default function AccountsTabScreen() {
   };
 
   return (
-    <ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
+    <ScrollView
+      className="flex-1 bg-ink-50 dark:bg-ink-950"
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={{ paddingBottom: 32 }}
+    >
       <View className="px-4 py-6 max-w-[1180px] w-full mx-auto">
         {/* Header — 帳戶新增與同步的單一全域入口 */}
         <View className="flex-row items-start mb-1">

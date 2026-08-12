@@ -35,6 +35,8 @@ for (const [name, text] of [['login', login], ['biometric', biometric], ['api', 
 }
 
 includes(tabs, 'headerShown: false', 'root tab screens must not duplicate their in-page titles');
+includes(tabs, 'useSafeAreaInsets()', 'headerless root tabs must read the native safe area');
+includes(tabs, 'paddingTop: isDesktop ? 0 : insets.top', 'headerless native root tabs must clear the status bar');
 includes(tabs, "tabBarPosition: isDesktop ? 'left' : 'bottom'", 'web desktop must use a rail instead of stretched bottom tabs');
 includes(tabs, "tabBarVariant: isDesktop ? 'material' : 'uikit'", 'desktop below-icon rail requires the material variant');
 
@@ -58,6 +60,8 @@ for (const glyph of ['☁️', '💳', '⚙️', '✏️', '👁️', '🙈']) {
   excludes(accounts, glyph, `accounts actions still use OS emoji glyph ${glyph}`);
 }
 includes(accounts, 'MoreHorizontal', 'low-frequency bank actions must be grouped behind one overflow control');
+includes(accounts, 'contentInsetAdjustmentBehavior="automatic"', 'accounts scroll view must respect native insets');
+includes(accounts, 'contentContainerStyle={{ paddingBottom: 32 }}', 'accounts list must retain scrollable bottom spacing');
 excludes(accounts, 'borderLeftWidth: 4', 'normal bank groups must not use warning-style side stripes');
 excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transactions must not use status-style side stripes');
 includes(accounts, "flexBasis: '48%', flexGrow: 0", 'desktop bank groups must keep stable two-column width');
