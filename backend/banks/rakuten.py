@@ -145,7 +145,14 @@ class RakutenOtpRequired(RuntimeError):
 
 class RakutenCrawler(BankCrawler):
     FETCH_REAL_CHROME = True  # Imperva/Incapsula 會擋 bundled Chromium。
-    DUP_LOGIN_KICK_BTN_TEXTS = ("是，我要登入", *BankCrawler.DUP_LOGIN_KICK_BTN_TEXTS)
+    VISIBLE_CONFIRM_SELECTOR = (
+        "modal-confirm .modal.show:visible, modal-projection .modal.show:visible"
+    )
+    DUP_LOGIN_PROMPT = (
+        "帳號重複登入 您已在其他裝置登入，繼續登入將會 "
+        "登出前一個裝置，是否以此裝置登入？ 否，不要登入 是，我要登入"
+    )
+    LOGOUT_PROMPT = "登出網路銀行 確認登出本系統？ 取消 確認"
 
     def __init__(self) -> None:
         super().__init__(name="rakuten")
@@ -198,11 +205,47 @@ class RakutenCrawler(BankCrawler):
         if page.locator("#ib_init_connect_error_popup:visible").count():
             raise RakutenLoginError("樂天網銀初始化連線失敗；重新載入後仍未恢復")
 
+    def _resolve_duplicate_login_modal(self, page) -> bool:
+        """Confirm Rakuten's visible duplicate-login prompt and no other modal."""
+        modals = page.locator(self.VISIBLE_CONFIRM_SELECTOR)
+        submit_pattern = re.compile(r"^\s*是，我要登入\s*$")
+        for index in range(modals.count()):
+            modal = modals.nth(index)
+            if " ".join(modal.inner_text().split()) != self.DUP_LOGIN_PROMPT:
+                continue
+            submit = modal.locator(
+                "a:visible, button:visible, [role=button]:visible",
+            ).filter(has_text=submit_pattern)
+            if submit.count() != 1 or not submit.first.is_visible():
+                raise RakutenLoginError("樂天重複登入提示缺少唯一確認按鈕")
+            submit.first.click()
+            page.wait_for_timeout(5000)
+            return True
+        return False
+
+    @staticmethod
+    def _blocking_modal_text(page) -> str | None:
+        blockers = page.locator(
+            "modal-confirm .modal.show:visible, modal-projection .modal.show:visible, "
+            "#ib_init_connect_error_popup:visible",
+        )
+        if blockers.count() == 0:
+            return None
+        text = " ".join(blockers.first.inner_text().split())
+        return text[:240] or "（無文字）"
+
+    def _session_ready(self, page) -> bool:
+        """Resolve a blocking duplicate-login prompt before trusting the shell."""
+        self._resolve_duplicate_login_modal(page)
+        if blocker := self._blocking_modal_text(page):
+            raise RakutenLoginError(f"樂天登入後仍有阻擋對話框：{blocker}")
+        return self._logged_in(page)
+
     def login(self, page) -> bool:
         # browserStartup may take 3s for a token plus 15s for its handshake.
         page.wait_for_timeout(20000)
         self._recover_startup_connection(page)
-        if self._logged_in(page):
+        if self._session_ready(page):
             return True
 
         for selector in ("#custNo", "#userNo", "#pcode"):
@@ -275,9 +318,7 @@ class RakutenCrawler(BankCrawler):
             page.wait_for_timeout(1000)
             if self._otp_visible(page):
                 raise RakutenOtpRequired("樂天要求 OTP 驗證；目前不自動填寫")
-            if self._logged_in(page):
-                return True
-            if self.handle_dup_login_modal(page) and self._logged_in(page):
+            if self._session_ready(page):
                 return True
 
         raise RakutenLoginError(f"送出後未登入成功（url={page.url}）")
@@ -288,10 +329,25 @@ class RakutenCrawler(BankCrawler):
             candidates = frame.locator("a, button").filter(has_text=pattern)
             for index in range(candidates.count()):
                 candidate = candidates.nth(index)
-                if candidate.is_visible():
-                    candidate.click()
-                    page.wait_for_timeout(1000)
+                if not candidate.is_visible():
+                    continue
+                candidate.click()
+                modal_selector = self.VISIBLE_CONFIRM_SELECTOR
+                page.wait_for_selector(modal_selector, state="visible", timeout=10000)
+                modals = page.locator(modal_selector)
+                for modal_index in range(modals.count()):
+                    modal = modals.nth(modal_index)
+                    if " ".join(modal.inner_text().split()) != self.LOGOUT_PROMPT:
+                        continue
+                    submit = modal.locator(
+                        "a:visible, button:visible, [role=button]:visible",
+                    ).filter(has_text=re.compile(r"^\s*確認\s*$"))
+                    if submit.count() != 1 or not submit.first.is_visible():
+                        raise RakutenLoginError("樂天登出提示缺少唯一確認按鈕")
+                    submit.first.click()
+                    page.wait_for_selector("#custNo", state="visible", timeout=30000)
                     return True
+                raise RakutenLoginError("樂天登出後未出現預期確認提示")
         return False
 
     @staticmethod
