@@ -92,6 +92,15 @@ export function formatDecimalCurrency(
   return `${negative ? '-' : ''}${prefix ? `${prefix} ` : ''}${digits}`;
 }
 
+/** Exact decimal magnitude for account surfaces where color owns direction. */
+export function formatAbsoluteDecimalCurrency(
+  value: string | number,
+  currency: string,
+): string | null {
+  const magnitude = String(value).trim().replace(/^[+-]/, '');
+  return formatDecimalCurrency(magnitude, currency);
+}
+
 /** 一個交易渲染結果 — primary 大字, sub 副字, sub 可為 null */
 export type AmountRender = {
   /** 大字, 含正負號 (例 "+NT$ 1,234" / "-EUR 18.60") */

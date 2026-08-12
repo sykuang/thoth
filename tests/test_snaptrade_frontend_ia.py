@@ -136,7 +136,9 @@ def test_account_snapshot_does_not_report_unrelated_live_status_error():
 def test_accounts_tab_uses_plain_scroll_view_without_keyboard_insets():
     accounts = ACCOUNTS.read_text()
 
-    assert '<ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' in accounts
+    assert 'className="flex-1 bg-ink-50 dark:bg-ink-950"' in accounts
+    assert 'contentInsetAdjustmentBehavior="automatic"' in accounts
+    assert "contentContainerStyle={{ paddingBottom: 32 }}" in accounts
     assert '<KeyboardAwareScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">' not in accounts
 
 

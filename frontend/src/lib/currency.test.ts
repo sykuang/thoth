@@ -1,5 +1,6 @@
 import {
   formatCurrency,
+  formatAbsoluteDecimalCurrency,
   formatDecimalCurrency,
   formatSignedCurrency,
   renderAmount,
@@ -39,6 +40,7 @@ assertEqual(formatSignedCurrency(-1234, 'TWD'), '-NT$ 1,234');
 assertEqual(formatSignedCurrency(1234, 'TWD', true), '+NT$ 1,234');
 assertEqual(formatDecimalCurrency('42350.55', 'USD'), 'USD 42,350.55');
 assertEqual(formatDecimalCurrency('-1234', 'TWD'), '-NT$ 1,234');
+assertEqual(formatAbsoluteDecimalCurrency('-1234.50', 'USD'), 'USD 1,234.50');
 assertEqual(formatDecimalCurrency('42.5', ''), '42.5');
 assertEqual(formatDecimalCurrency('0.12345678', 'BTC'), 'BTC 0.12345678');
 assertEqual(formatDecimalCurrency('1000', 'JPY'), 'JPY 1,000');

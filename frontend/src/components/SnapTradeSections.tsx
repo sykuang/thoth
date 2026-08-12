@@ -6,7 +6,7 @@ import { Platform, Pressable, Text, View } from 'react-native';
 
 import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { formatApiError } from '@/lib/api';
-import { formatDecimalCurrency } from '@/lib/currency';
+import { formatAbsoluteDecimalCurrency, formatDecimalCurrency } from '@/lib/currency';
 import { formatDecimal } from '@/lib/decimal';
 import type {
   BrokerageAccount,
@@ -244,6 +244,7 @@ function AccountCard({
   account: BrokerageAccount;
   onPress: () => void;
 }) {
+  const isLiability = account.balance_total?.trim().startsWith('-') === true;
   return (
     <Pressable
       onPress={onPress}
@@ -261,8 +262,13 @@ function AccountCard({
             {accountLabel(account)}
           </Text>
         </View>
-        <Text className="text-emerald-600 dark:text-emerald-400 text-h3 font-semibold font-mono" numberOfLines={1}>
-          {money(account.balance_total, account.balance_currency)}
+        <Text
+          className={`${isLiability ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'} text-h3 font-semibold font-mono`}
+          numberOfLines={1}
+        >
+          {account.balance_total == null
+            ? '—'
+            : (formatAbsoluteDecimalCurrency(account.balance_total, account.balance_currency ?? '') ?? '—')}
         </Text>
       </View>
     </Pressable>

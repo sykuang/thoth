@@ -55,7 +55,10 @@ import {
   type AccountTabRevisionTuple,
 } from '@/lib/accountTabCache';
 import { api, ApiError, formatApiError } from '@/lib/api';
-import { formatDecimalCurrency, formatSignedCurrency } from '@/lib/currency';
+import {
+  formatAbsoluteDecimalCurrency,
+  formatCurrency,
+} from '@/lib/currency';
 import { formatRelativeTime } from '@/lib/datetime';
 import { maskCardNo } from '@/lib/mask';
 import {
@@ -867,6 +870,11 @@ function ManualAccountRow({
   const router = useRouter();
   const qc = useQueryClient();
   const excluded = !account.included_in_net_worth;
+  const isLiability =
+    account.product_type === 'loan'
+    || account.product_type === 'mortgage'
+    || account.product_type === 'credit_line'
+    || account.balance?.trim().startsWith('-') === true;
   const toggleMut = useMutation({
     mutationFn: (next: boolean) => {
       assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
@@ -948,10 +956,12 @@ function ManualAccountRow({
           </View>
           <Text className={`text-small font-semibold ${excluded
             ? 'text-ink-400 dark:text-ink-500 line-through'
-            : 'text-ink-900 dark:text-ink-50'}`}>
+            : isLiability
+              ? 'text-red-600 dark:text-red-400'
+              : 'text-emerald-600 dark:text-emerald-400'}`}>
             {account.balance == null
               ? '—'
-              : (formatDecimalCurrency(account.balance, account.currency) ?? '—')}
+              : (formatAbsoluteDecimalCurrency(account.balance, account.currency) ?? '—')}
           </Text>
         </View>
       </Pressable>
@@ -1295,8 +1305,9 @@ function AccountRow({
   const isTwd = (account.currency || 'TWD').toUpperCase() === 'TWD';
   const balanceText = account.balance == null
     ? '—'
-    : formatSignedCurrency(account.balance, account.currency);
+    : formatCurrency(account.balance, account.currency);
   const hasBalance = account.balance !== null && account.balance !== undefined;
+  const isLiability = account.balance != null && account.balance < 0;
   const excluded = account.excluded === true;
 
   // 帳戶名稱 fallback: overwrite > nickname > type > account_no
@@ -1424,7 +1435,11 @@ function AccountRow({
           </View>
           {hasBalance ? (
             <Text
-              className={`text-h3 font-semibold font-mono ml-2 ${excluded ? 'text-ink-400 dark:text-ink-500 line-through' : 'text-emerald-600 dark:text-emerald-400'}`}
+              className={`text-h3 font-semibold font-mono ml-2 ${excluded
+                ? 'text-ink-400 dark:text-ink-500 line-through'
+                : isLiability
+                  ? 'text-red-600 dark:text-red-400'
+                  : 'text-emerald-600 dark:text-emerald-400'}`}
               numberOfLines={1}
             >
               {balanceText}
@@ -1444,7 +1459,7 @@ function AccountRow({
               className="text-ink-400 dark:text-ink-500 text-micro font-mono"
               numberOfLines={1}
             >
-              ≈ {formatSignedCurrency(account.twd_estimate, 'TWD')}
+              ≈ {formatCurrency(account.twd_estimate, 'TWD')}
             </Text>
           ) : syncedLabel ? (
             <View className="flex-row items-center gap-1">
@@ -1657,7 +1672,7 @@ function CardRow({
             }`}
             numberOfLines={1}
           >
-            {primaryAmount == null ? '—' : formatSignedCurrency(primaryAmount, 'TWD')}
+            {primaryAmount == null ? '—' : formatCurrency(primaryAmount, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 末四碼 (左) + 到期日/狀態 (右) */}

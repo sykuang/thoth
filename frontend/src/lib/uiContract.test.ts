@@ -21,6 +21,7 @@ const accounts = source('src/app/(tabs)/cards/index.tsx');
 const settings = source('src/app/(tabs)/settings/index.tsx');
 const transactionDetail = source('src/components/transactions/TxnDetailModal.tsx');
 const brokerageTransaction = source('src/components/transactions/BrokerageTxnRow.tsx');
+const brokerageAccounts = source('src/components/SnapTradeSections.tsx');
 const login = source('src/app/login.tsx');
 const biometric = source('src/lib/biometric.ts');
 const api = source('src/lib/api.ts');
@@ -62,6 +63,10 @@ for (const glyph of ['☁️', '💳', '⚙️', '✏️', '👁️', '🙈']) {
 includes(accounts, 'MoreHorizontal', 'low-frequency bank actions must be grouped behind one overflow control');
 includes(accounts, 'contentInsetAdjustmentBehavior="automatic"', 'accounts scroll view must respect native insets');
 includes(accounts, 'contentContainerStyle={{ paddingBottom: 32 }}', 'accounts list must retain scrollable bottom spacing');
+excludes(accounts, 'formatSignedCurrency', 'account-tab amounts must use color rather than signs');
+includes(accounts, "'text-red-600 dark:text-red-400'", 'account-tab liabilities must use the red amount tone');
+includes(accounts, "'text-emerald-600 dark:text-emerald-400'", 'account-tab assets must use the green amount tone');
+includes(brokerageAccounts, 'formatAbsoluteDecimalCurrency', 'brokerage account totals must use color rather than signs');
 excludes(accounts, 'borderLeftWidth: 4', 'normal bank groups must not use warning-style side stripes');
 excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transactions must not use status-style side stripes');
 includes(accounts, "flexBasis: '48%', flexGrow: 0", 'desktop bank groups must keep stable two-column width');
