@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
-**Thoth 是麻布記帳（Moneybook）的非官方開源、自架替代方案**，專注於自動同步台灣銀行帳戶、交易明細與信用卡帳單。它將 12 家銀行的資料整理成一致格式，透過 FastAPI API 與 Expo 應用程式提供個人財務管理、收支分析、交易分類與繳款提醒。
+**Thoth 是麻布記帳（Moneybook）的非官方開源、自架替代方案**，專注於自動同步台灣銀行帳戶、交易明細與信用卡帳單，也能管理手動帳戶並透過 SnapTrade 整合券商資產。它將 13 家銀行與其他資產來源整理成一致格式，透過 FastAPI API 與 Expo 應用程式提供個人財務管理、收支分析、投資持倉、交易分類與繳款提醒。
 
 如果你正在尋找「麻布記帳替代品」、「台灣銀行自動記帳」、「銀行帳戶整合」或「self-hosted personal finance」工具，Thoth 提供可自行部署、可審查原始碼、可擴充銀行連接器的 MIT 授權方案。
 
@@ -25,41 +25,53 @@
 ## 應用畫面
 
 <p align="center">
-  <img src="docs/screenshots/dashboard.png" alt="Thoth 淨資產與本月收支儀表板" width="30%">
-  <img src="docs/screenshots/transactions.png" alt="Thoth 跨銀行交易明細、分類與篩選畫面" width="30%">
-  <img src="docs/screenshots/accounts.png" alt="Thoth 台灣銀行帳戶與信用卡整合畫面" width="30%">
+  <img src="docs/screenshots/app-store/01-hero.webp" alt="Thoth 一眼看懂財務全貌" width="23%">
+  <img src="docs/screenshots/app-store/02-two-devices.webp" alt="Thoth 銀行與信用卡一次掌握" width="23%">
+  <img src="docs/screenshots/app-store/03-device-top.webp" alt="Thoth 每筆收支清楚呈現" width="23%">
+  <img src="docs/screenshots/app-store/04-device-bottom.webp" alt="Thoth 所有帳戶一鍵同步" width="23%">
 </p>
 
-<p align="center"><sub>儀表板・收支表・帳戶整合</sub></p>
+<p align="center">
+  <img src="docs/screenshots/app-store/05-no-device.webp" alt="Thoth self-hosted 財務資料自主掌控" width="30%">
+  <img src="docs/screenshots/app-store/06-two-devices.webp" alt="Thoth 從財務總覽追到每筆明細" width="30%">
+  <img src="docs/screenshots/app-store/07-no-device.webp" alt="Thoth 完整個人財務工具" width="30%">
+</p>
+
+<p align="center"><sub>財務總覽・帳戶整合・收支追蹤・一鍵同步・資料自主</sub></p>
 
 > 畫面中的 Email、帳號、卡號、交易與金額均為合成展示資料，不含任何真實金融資訊。
 
 ## 為什麼選擇 Thoth 作為 Moneybook 開源替代方案？
 
-[Moneybook 官網](https://moneybook.com.tw/)主打同步 30+ 家銀行、投資、電子票證與電子發票等全資產管理；Thoth 的目標不同：先把「台灣銀行帳戶與信用卡自動同步」做成可自行掌控、可持續維護的開源基礎設施。
+[Moneybook 官網](https://moneybook.com.tw/)主打同步 30+ 家銀行、投資、電子票證與電子發票等全資產管理；Thoth 的目標不同：把「台灣銀行與信用卡自動同步、手動帳戶、券商持倉」做成可自行掌控、可持續維護的開源基礎設施。
 
 | 比較面向 | Thoth | 麻布記帳 Moneybook |
 |---|---|---|
 | 產品型態 | MIT 開源、可 self-host | 商業理財記帳服務 |
-| 核心定位 | 台灣銀行帳戶、交易與信用卡聚合 | 銀行、投資、電子票證、發票等全資產管理 |
-| 銀行範圍 | 12 家銀行連接器，支援深度依銀行而異 | 官網標示 30+ 家銀行與多元資產 |
+| 核心定位 | 台灣銀行、手動帳戶與券商資產聚合 | 銀行、投資、電子票證、發票等全資產管理 |
+| 銀行範圍 | 13 家銀行連接器，支援深度依銀行而異 | 官網標示 30+ 家銀行與多元資產 |
+| 其他資產 | 手動存款／負債／投資帳戶；可選 SnapTrade 券商同步 | 由官方服務提供多元資產整合 |
 | 資料與部署 | 部署在自己的電腦或伺服器 | 使用官方 App 與服務 |
 | 擴充方式 | 可修改 crawler、API、分類規則與 UI | 由官方產品團隊維護 |
 | 適合對象 | 開發者、self-hoster、重視可審查性者 | 希望直接使用完整消費型 App 的一般使用者 |
 
-Thoth 目前不包含 Moneybook 的所有功能，例如電子發票、電子票證、完整投資資產串接與官方繳費服務；它不是 drop-in replacement，而是一個聚焦台灣網銀資料的開源起點。
+Thoth 目前不包含 Moneybook 的所有功能，例如電子發票、電子票證與官方繳費服務；SnapTrade 覆蓋範圍也取決於其支援的券商與帳戶。它不是 drop-in replacement，而是一個聚焦台灣網銀、手動帳戶與券商資產的開源起點。
 
 ### 適合哪些人？
 
 - 想找麻布記帳替代品，但希望資料與服務部署在自己掌控的環境
 - 想自動同步多家台灣銀行帳戶、信用卡與交易明細
+- 想把無法自動同步的存款、貸款、房貸或投資以手動帳戶納入淨資產
+- 想透過 SnapTrade 將支援券商的帳戶、餘額、持倉與活動整合進同一介面
 - 想研究台灣 Open Banking、網路銀行 SPA 與金融資料正規化
 - 想在 FastAPI、Expo、SQLite／PostgreSQL 基礎上打造自己的記帳 App
 - 願意因應銀行改版維護 crawler，並理解自架服務的安全責任
 
 ## 主要功能
 
-- 整合 12 家台灣銀行的登入、帳戶、交易與信用卡資料
+- 整合 13 家台灣銀行的登入、帳戶、交易與信用卡資料
+- 支援手動建立存款、定存、外幣、支票、貸款、房貸、信用額度與投資帳戶
+- 可選用 SnapTrade 同步券商帳戶、現金餘額、持倉與活動紀錄
 - 將存款交易、信用卡已入帳與未入帳消費正規化為一致資料模型
 - 支援同一使用者管理多家銀行與多個銀行帳戶
 - 以 Fernet 加密保存銀行登入資料，不在資料庫中儲存明文密碼
@@ -71,24 +83,36 @@ Thoth 目前不包含 Moneybook 的所有功能，例如電子發票、電子票
 
 ## 支援銀行
 
-目前程式碼包含下列 12 家銀行連接器：
+目前 `sync_runner.SUPPORTED_BANKS` 登記 13 家銀行。下表依目前程式碼實際寫入 canonical store 的路徑整理；它描述的是**已實作能力**，不保證銀行網站此刻可用。
 
-| 代碼 | 銀行 |
-|---|---|
-| `cathay` | 國泰世華 |
-| `ctbc` | 中國信託 |
-| `dbs` | 星展銀行 |
-| `esun` | 玉山銀行 |
-| `fubon` | 台北富邦 |
-| `hsbc` | 滙豐銀行 |
-| `linebank` | LINE Bank |
-| `scb` | 渣打銀行 |
-| `scsb` | 上海商銀 |
-| `sinopac` | 永豐銀行 |
-| `taishin` | 台新銀行 |
-| `ubot` | 聯邦銀行 |
+| 代碼 | 銀行 | 存款帳戶／餘額 | 存款交易 | 信用卡資料 |
+|---|---|---|---|---|
+| `cathay` | 國泰世華 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `ctbc` | 中國信託 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `dbs` | 星展銀行 | ✅ | ◐ 交易 endpoint／parser | ◐ 卡片與應繳摘要 |
+| `esun` | 玉山銀行 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `fubon` | 台北富邦 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `hsbc` | 滙豐銀行 | — 信用卡專用 | — | ✅ 卡片、已入帳、未入帳 |
+| `linebank` | LINE Bank | ✅ | ✅ | — |
+| `rakuten` | 樂天國際銀行 | ✅ | ✅ | — |
+| `scb` | 渣打銀行 | ◐ 總覽摘要 | — | ◐ 卡片與已入帳；未入帳未實作 |
+| `scsb` | 上海商銀 | ✅ | ◐ 依頁面表格可解析性 | ◐ 即時／未入帳與帳單摘要 |
+| `sinopac` | 永豐銀行 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `taishin` | 台新銀行 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
+| `ubot` | 聯邦銀行 | ✅ | ✅ | ✅ 卡片、已入帳、未入帳 |
 
-各銀行網站提供的資料與操作流程不同，因此帳戶、存款交易、信用卡帳單與未入帳消費的支援深度不一定相同。銀行改版後，對應連接器也可能需要更新。
+`✅` 代表已有 canonical store 寫入路徑；`◐` 代表摘要、條件式 parser 或尚未覆蓋完整明細；`—` 代表目前沒有對應路徑。銀行頁面、登入驗證與 API 隨時可能改版；欄位完整度也會依帳戶產品與使用者實際持有資料而異。
+
+### 手動帳戶與 SnapTrade
+
+銀行連接器以外，Thoth 目前還有兩種資產來源：
+
+| 來源 | 支援內容 | 注意事項 |
+|---|---|---|
+| 手動帳戶 | 存款、定存、外幣存款、支票帳戶、貸款、房貸、信用額度、投資 | 可手動維護餘額與是否納入淨資產；投資帳戶可保存交易與持倉，並在可用時以 Yahoo Finance 估值 |
+| SnapTrade | 券商帳戶、現金餘額、持倉、交易／活動紀錄 | 可選整合；必須由伺服器設定 SnapTrade，實際券商與欄位依 SnapTrade 連線回傳為準 |
+
+銀行同步、手動帳戶與 SnapTrade 資料會共同出現在帳戶與淨資產介面，但仍保留各自的資料來源與更新時間，不會把手動值冒充成銀行或券商即時資料。
 
 ## 系統架構
 
@@ -103,13 +127,14 @@ Thoth 目前不包含 Moneybook 的所有功能，例如電子發票、電子票
 │ FastAPI Server               │
 │ auth・accounts・sync・cards  │
 │ transactions・portfolio     │
+│ manual accounts・SnapTrade  │
 └──────────┬───────────┬───────┘
            │           │
            ▼           ▼
 ┌─────────────────┐  ┌────────────────────┐
-│ SQLite /        │  │ 銀行連接器          │
-│ PostgreSQL      │  │ Scrapling Fetchers │
-│ 使用者與帳務資料 │  │ CAPTCHA / SPA API  │
+│ SQLite /        │  │ Bank / SnapTrade   │
+│ PostgreSQL      │  │ Scrapling / REST   │
+│ Manual + sync   │  │ CAPTCHA / SPA API  │
 └─────────────────┘  └────────────────────┘
 ```
 
@@ -373,7 +398,7 @@ CI 會對每次推送與 Pull Request 執行後端測試與前端型別檢查。
 
 ### Thoth 是什麼？
 
-Thoth 是一套針對台灣銀行的開源個人財務與自動記帳平台。它可同步多家銀行帳戶、存款交易與信用卡資料，並提供 Web、iOS 與可選桌面介面。
+Thoth 是一套開源個人財務與自動記帳平台。它可同步多家台灣銀行帳戶、存款交易與信用卡資料，也支援手動帳戶與可選 SnapTrade 券商整合，並提供 Web、iOS 與可選桌面介面。
 
 ### Thoth 是麻布記帳 Moneybook 的官方版本嗎？
 
@@ -381,11 +406,15 @@ Thoth 是一套針對台灣銀行的開源個人財務與自動記帳平台。�
 
 ### Thoth 可以完全取代 Moneybook 嗎？
 
-目前不能完整取代。Thoth 聚焦 12 家台灣銀行的帳戶、交易與信用卡資料；Moneybook 官網列出的投資、電子票證、電子發票與官方繳費等功能並非 Thoth 的完整支援範圍。
+目前不能完整取代。Thoth 聚焦 13 家台灣銀行、手動帳戶與可選 SnapTrade 券商資料；Moneybook 官網列出的電子票證、電子發票與官方繳費等功能並非 Thoth 的完整支援範圍。
 
 ### Thoth 支援哪些台灣銀行？
 
-目前包含國泰世華、中國信託、星展、玉山、台北富邦、滙豐、LINE Bank、渣打、上海商銀、永豐、台新與聯邦共 12 家連接器。實際可取得的帳戶、交易與信用卡欄位依銀行而異。
+目前包含國泰世華、中國信託、星展、玉山、台北富邦、滙豐、LINE Bank、樂天國際銀行、渣打、上海商銀、永豐、台新與聯邦共 13 家連接器。實際可取得的帳戶、交易與信用卡欄位依銀行而異，詳見上方支援矩陣。
+
+### Thoth 可以加入無法自動同步的帳戶或券商嗎？
+
+可以。手動帳戶可記錄存款、負債與投資，並選擇是否納入淨資產；伺服器完成 SnapTrade 設定後，也能同步其支援券商的帳戶、餘額、持倉與活動紀錄。
 
 ### Thoth 是否能 self-host？
 
