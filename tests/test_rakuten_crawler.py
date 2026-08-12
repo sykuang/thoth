@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
 from backend.banks.rakuten import (
+    LOADER_SELECTOR,
     RakutenCrawler,
     RakutenLoginError,
     _account_number,
@@ -59,7 +60,7 @@ def test_login_recovers_public_startup_connection_modal_before_using_session(mon
         lambda **_kwargs: events.append("expect-navigation") or nullcontext()
     )
     crawler = object.__new__(RakutenCrawler)
-    monkeypatch.setattr(crawler, "_resolve_duplicate_login_modal", lambda _page: False)
+    monkeypatch.setattr(crawler, "_resolve_known_blocking_modals", lambda _page: False)
     monkeypatch.setattr(crawler, "_blocking_modal_text", lambda _page: None)
     monkeypatch.setattr(crawler, "_logged_in", lambda _page: events.append("logged-in") or True)
 
@@ -78,6 +79,14 @@ def test_login_recovers_public_startup_connection_modal_before_using_session(mon
 
 def test_login_resolves_only_visible_duplicate_session_modal() -> None:
     events: list[str] = []
+
+    class Body:
+        @staticmethod
+        def inner_text() -> str:
+            return (
+                "帳號重複登入\n您已在其他裝置登入，繼續登入將會\n"
+                "登出前一個裝置，是否以此裝置登入？"
+            )
 
     class Button:
         @staticmethod
@@ -112,13 +121,12 @@ def test_login_resolves_only_visible_duplicate_session_modal() -> None:
 
         @staticmethod
         def inner_text() -> str:
-            return (
-                "帳號重複登入\n您已在其他裝置登入，繼續登入將會\n"
-                "登出前一個裝置，是否以此裝置登入？\n否，不要登入\n是，我要登入"
-            )
+            return "帳號重複登入…否，不要登入是，我要登入"
 
         @staticmethod
-        def locator(selector: str) -> Button:
+        def locator(selector: str):
+            if selector == ".modal-body":
+                return Body()
             assert selector == "a:visible, button:visible, [role=button]:visible"
             return Button()
 
@@ -138,6 +146,11 @@ def test_login_resolves_only_visible_duplicate_session_modal() -> None:
 
 
 def test_duplicate_like_unknown_modal_is_not_confirmed() -> None:
+    class Body:
+        @staticmethod
+        def inner_text() -> str:
+            return "重複登入安全提醒\n請洽客服確認後續操作"
+
     class Modal:
         @staticmethod
         def count() -> int:
@@ -151,6 +164,11 @@ def test_duplicate_like_unknown_modal_is_not_confirmed() -> None:
         def inner_text() -> str:
             return "重複登入安全提醒\n請洽客服確認後續操作"
 
+        @staticmethod
+        def locator(selector: str) -> Body:
+            assert selector == ".modal-body"
+            return Body()
+
     class Page:
         @staticmethod
         def locator(selector: str) -> Modal:
@@ -159,6 +177,32 @@ def test_duplicate_like_unknown_modal_is_not_confirmed() -> None:
 
     crawler = object.__new__(RakutenCrawler)
     assert not crawler._resolve_duplicate_login_modal(Page())
+
+
+def test_known_referral_modal_clicks_only_later_action() -> None:
+    events: list[str] = []
+    page, modals, modal, body, actions, later = (Mock() for _ in range(6))
+    page.locator.return_value = modals
+    modals.count.return_value = 1
+    modals.nth.return_value = modal
+    body.inner_text.return_value = (
+        "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~\n"
+        "★推薦禮：活動說明\n活動期間: 2026/7/1~2026/9/30"
+    )
+    modal.locator.side_effect = lambda selector: body if selector == ".modal-body" else actions
+    actions.filter.return_value = actions
+    actions.count.return_value = 1
+    actions.first = later
+    later.is_visible.return_value = True
+    later.click.side_effect = lambda: events.append("later")
+    modal.wait_for.side_effect = lambda **kwargs: events.append(
+        f"wait:{kwargs['state']}:{kwargs['timeout']}"
+    )
+    crawler = object.__new__(RakutenCrawler)
+
+    assert crawler._dismiss_referral_promo(page)
+    assert events == ["later", "wait:hidden:10000"]
+    assert actions.filter.call_args.kwargs["has_text"].fullmatch("稍後再看")
 
 
 def test_hidden_static_modals_are_not_blockers() -> None:
@@ -203,7 +247,7 @@ def test_session_ready_rejects_unknown_visible_blocking_modal(monkeypatch) -> No
             return Modal()
 
     crawler = object.__new__(RakutenCrawler)
-    monkeypatch.setattr(crawler, "_resolve_duplicate_login_modal", lambda _page: False)
+    monkeypatch.setattr(crawler, "_resolve_known_blocking_modals", lambda _page: False)
     monkeypatch.setattr(crawler, "_logged_in", lambda _page: True)
 
     with pytest.raises(RakutenLoginError, match="尚有未處理的銀行提示"):
@@ -222,8 +266,8 @@ def test_login_resolves_duplicate_session_before_accepting_logged_in_shell(monke
     )
     monkeypatch.setattr(
         crawler,
-        "_resolve_duplicate_login_modal",
-        lambda _page: events.append("resolve-duplicate") or True,
+        "_resolve_known_blocking_modals",
+        lambda _page: events.append("resolve-known") or True,
     )
     monkeypatch.setattr(crawler, "_blocking_modal_text", lambda _page: None)
     monkeypatch.setattr(
@@ -236,7 +280,7 @@ def test_login_resolves_duplicate_session_before_accepting_logged_in_shell(monke
     assert events == [
         "wait:20000",
         "recover-startup",
-        "resolve-duplicate",
+        "resolve-known",
         "logged-in",
     ]
 
@@ -291,7 +335,7 @@ def test_login_click_requires_one_visible_enabled_button() -> None:
 
 def test_logout_confirms_bank_modal_before_reporting_success() -> None:
     events: list[str] = []
-    page, frame, links, link, modals, stale, modal, buttons, button = (Mock() for _ in range(9))
+    page, frame, links, link, modals, stale, modal, body, buttons, button = (Mock() for _ in range(10))
     page.frames = [frame]
     frame.locator.return_value = links
     links.filter.return_value = links
@@ -303,8 +347,10 @@ def test_logout_confirms_bank_modal_before_reporting_success() -> None:
     modals.count.return_value = 2
     modals.nth.side_effect = [stale, modal]
     stale.inner_text.return_value = "其他可見提示\n取消\n確認"
-    modal.inner_text.return_value = "登出網路銀行\n確認登出本系統？\n取消\n確認"
-    modal.locator.return_value = buttons
+    stale.locator.return_value.inner_text.return_value = "其他可見提示"
+    modal.inner_text.return_value = "登出網路銀行…取消確認"
+    body.inner_text.return_value = "登出網路銀行\n確認登出本系統？"
+    modal.locator.side_effect = lambda selector: body if selector == ".modal-body" else buttons
     buttons.filter.return_value = buttons
     buttons.count.return_value = 1
     buttons.first = button
@@ -321,6 +367,41 @@ def test_logout_confirms_bank_modal_before_reporting_success() -> None:
         "wait:modal-confirm .modal.show:visible, modal-projection .modal.show:visible:visible:10000",
         "confirm-logout",
         "wait:#custNo:visible:30000",
+    ]
+
+
+def test_goto_twd_recovers_one_late_duplicate_modal_before_retrying(monkeypatch) -> None:
+    events: list[str] = []
+    page, nav, subnav = Mock(), Mock(), Mock()
+    nav.first = nav
+    nav.click.side_effect = [RuntimeError("modal intercepted click"), None]
+    page.get_by_role.return_value = nav
+    page.locator.return_value = subnav
+    subnav.first = subnav
+    subnav.click.side_effect = lambda: events.append("click-twd")
+    page.wait_for_selector.side_effect = lambda selector, **kwargs: events.append(
+        f"wait:{selector}:{kwargs['state']}:{kwargs['timeout']}"
+    )
+    page.wait_for_url.side_effect = lambda _predicate, **kwargs: events.append(
+        f"wait-url:{kwargs['timeout']}"
+    )
+    crawler = object.__new__(RakutenCrawler)
+    monkeypatch.setattr(
+        crawler,
+        "_resolve_known_blocking_modals",
+        lambda _page: events.append("resolve-late-modal") or True,
+    )
+    monkeypatch.setattr(crawler, "_blocking_modal_text", lambda _page: None)
+
+    crawler._goto_twd(page)
+
+    assert nav.click.call_args_list == [call(timeout=5000), call(timeout=5000)]
+    assert events == [
+        f"wait:{LOADER_SELECTOR}:hidden:60000",
+        "resolve-late-modal",
+        "wait:a.sub-nav-link:has-text('臺幣存款'):visible:15000",
+        "click-twd",
+        "wait-url:30000",
     ]
 
 

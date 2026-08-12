@@ -148,11 +148,12 @@ class RakutenCrawler(BankCrawler):
     VISIBLE_CONFIRM_SELECTOR = (
         "modal-confirm .modal.show:visible, modal-projection .modal.show:visible"
     )
-    DUP_LOGIN_PROMPT = (
+    DUP_LOGIN_BODY = (
         "帳號重複登入 您已在其他裝置登入，繼續登入將會 "
-        "登出前一個裝置，是否以此裝置登入？ 否，不要登入 是，我要登入"
+        "登出前一個裝置，是否以此裝置登入？"
     )
-    LOGOUT_PROMPT = "登出網路銀行 確認登出本系統？ 取消 確認"
+    REFERRAL_PROMO_PREFIX = "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~"
+    LOGOUT_BODY = "登出網路銀行 確認登出本系統？"
 
     def __init__(self) -> None:
         super().__init__(name="rakuten")
@@ -211,7 +212,8 @@ class RakutenCrawler(BankCrawler):
         submit_pattern = re.compile(r"^\s*是，我要登入\s*$")
         for index in range(modals.count()):
             modal = modals.nth(index)
-            if " ".join(modal.inner_text().split()) != self.DUP_LOGIN_PROMPT:
+            body = " ".join(modal.locator(".modal-body").inner_text().split())
+            if body != self.DUP_LOGIN_BODY:
                 continue
             submit = modal.locator(
                 "a:visible, button:visible, [role=button]:visible",
@@ -222,6 +224,29 @@ class RakutenCrawler(BankCrawler):
             page.wait_for_timeout(5000)
             return True
         return False
+
+    def _dismiss_referral_promo(self, page) -> bool:
+        modals = page.locator(self.VISIBLE_CONFIRM_SELECTOR)
+        later_pattern = re.compile(r"^\s*稍後再看\s*$")
+        for index in range(modals.count()):
+            modal = modals.nth(index)
+            body = " ".join(modal.locator(".modal-body").inner_text().split())
+            if not body.startswith(self.REFERRAL_PROMO_PREFIX):
+                continue
+            later = modal.locator(
+                "a:visible, button:visible, [role=button]:visible",
+            ).filter(has_text=later_pattern)
+            if later.count() != 1 or not later.first.is_visible():
+                raise RakutenLoginError("樂天推薦活動提示缺少唯一稍後再看按鈕")
+            later.first.click()
+            modal.wait_for(state="hidden", timeout=10000)
+            return True
+        return False
+
+    def _resolve_known_blocking_modals(self, page) -> bool:
+        duplicate = self._resolve_duplicate_login_modal(page)
+        referral = self._dismiss_referral_promo(page)
+        return duplicate or referral
 
     @staticmethod
     def _blocking_modal_text(page) -> str | None:
@@ -236,7 +261,7 @@ class RakutenCrawler(BankCrawler):
 
     def _session_ready(self, page) -> bool:
         """Resolve a blocking duplicate-login prompt before trusting the shell."""
-        self._resolve_duplicate_login_modal(page)
+        self._resolve_known_blocking_modals(page)
         if blocker := self._blocking_modal_text(page):
             raise RakutenLoginError(f"樂天登入後仍有阻擋對話框：{blocker}")
         return self._logged_in(page)
@@ -337,7 +362,8 @@ class RakutenCrawler(BankCrawler):
                 modals = page.locator(modal_selector)
                 for modal_index in range(modals.count()):
                     modal = modals.nth(modal_index)
-                    if " ".join(modal.inner_text().split()) != self.LOGOUT_PROMPT:
+                    body = " ".join(modal.locator(".modal-body").inner_text().split())
+                    if body != self.LOGOUT_BODY:
                         continue
                     submit = modal.locator(
                         "a:visible, button:visible, [role=button]:visible",
@@ -495,7 +521,18 @@ class RakutenCrawler(BankCrawler):
         不會被 SPA 還原，結果被踢回登入頁（2026-07-28 real-account probe 實證，
         final_url 落在 /cgn/cgnot0001/010）。只能點側邊導覽。
         """
-        page.get_by_role("link", name="存款", exact=True).first.click()
+        page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=60000)
+        deposit = page.get_by_role("link", name="存款", exact=True).first
+        try:
+            deposit.click(timeout=5000)
+        except Exception as exc:
+            if not self._resolve_known_blocking_modals(page):
+                if blocker := self._blocking_modal_text(page):
+                    raise RakutenLoginError(f"樂天導覽前仍有阻擋對話框：{blocker}") from exc
+                raise
+            if blocker := self._blocking_modal_text(page):
+                raise RakutenLoginError(f"樂天重複登入確認後仍有阻擋對話框：{blocker}") from exc
+            deposit.click(timeout=5000)
         page.wait_for_selector("a.sub-nav-link:has-text('臺幣存款')", state="visible", timeout=15000)
         page.locator("a.sub-nav-link", has_text="臺幣存款").first.click()
         page.wait_for_url(lambda url: TWD_PATH_HINT in url, timeout=30000)

@@ -1,6 +1,6 @@
 [project]
 name = "thoth"
-version = "0.3.110"
+version = "0.3.111"
 description = "Thoth — Taiwan bank account aggregator. Python crawlers + FastAPI server + Expo web/iOS frontend. Named after the Egyptian god of writing, accounting, and record-keeping."
 readme = "README.md"
 requires-python = ">=3.12"
