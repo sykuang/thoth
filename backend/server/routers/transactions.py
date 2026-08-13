@@ -391,7 +391,7 @@ def _cashflow_fields(amount: int | float, txn_type: str | None) -> dict[str, Any
     return {
         "cashflow_direction": direction,
         "cashflow_amount": abs(value),
-        "display_amount": abs(value),
+        "display_amount": abs(amount),
     }
 
 

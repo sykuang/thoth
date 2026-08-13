@@ -79,6 +79,7 @@ def _transaction_fact(
         "amount": amount,
         "cashflow_direction": direction,
         "cashflow_amount": cashflow_amount,
+        "display_amount": abs(amount),
         "currency": str(_value(row, "currency", "TWD")).upper(),
         "consume_currency": (
             str(_value(row, "consume_currency")).upper()

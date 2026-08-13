@@ -527,6 +527,25 @@ def test_replica_transaction_exclusion_uses_all_cards_not_only_active_inventory(
     assert facts["transactions"][0]["excluded"] is True
 
 
+def test_replica_payment_is_neutral_but_preserves_display_magnitude() -> None:
+    from backend.server.replica_facts import _transaction_fact
+
+    payment = SimpleNamespace(
+        id=925,
+        kind="pending",
+        amount=-12729,
+        txn_type="payment",
+        card_no="****3254",
+        currency="TWD",
+    )
+
+    fact = _transaction_fact("hsbc", payment, set(), set())
+
+    assert fact["cashflow_direction"] == "neutral"
+    assert fact["cashflow_amount"] == 0
+    assert fact["display_amount"] == 12729
+
+
 def test_replica_pull_requires_reset_on_schema_mismatch(client) -> None:
     token = _register(client, email="replica-reset@palace.example")
 

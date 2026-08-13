@@ -573,6 +573,27 @@ def test_transactions_api_exposes_user_cashflow_fields_for_refund(client, data_r
     assert stats["amount_by_month"]["2026-06"]["expense"] == 1000
 
 
+def test_payment_is_neutral_but_preserves_display_magnitude(client, data_root):
+    token = _register(client, email="payment-display-contract@p.com")
+    client.post("/accounts", json={"bank": "hsbc", "label": "x"}, headers=_auth(token))
+    _seed_bank_db(data_root, "hsbc", pending=[{
+        "card_no": "****3254",
+        "date": "2026-08-06",
+        "desc": "匯豐銀行自動扣款",
+        "amount": -12729,
+        "txn_type": "payment",
+        "flow_type": "transfer",
+    }])
+
+    response = client.get("/transactions?bank=hsbc", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    payment = response.json()["items"][0]
+    assert payment["amount"] == -12729
+    assert payment["cashflow_direction"] == "neutral"
+    assert payment["cashflow_amount"] == 0
+    assert payment["display_amount"] == 12729
+
+
 # ============================================================
 # 日期格式正規化 (各家銀行寫入格式不一致)
 # 真實 case (2026-06-13 11 家盤點):

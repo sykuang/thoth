@@ -113,6 +113,24 @@ const bootstrap: ReplicaResponse = {
             tags: [],
             splits: [],
           },
+          {
+            id: 4,
+            bank: 'cathay',
+            kind: 'pending',
+            date: '2026-08-06',
+            datetime: null,
+            description: '匯豐銀行自動扣款',
+            amount: -12729,
+            cashflow_direction: 'neutral',
+            cashflow_amount: 0,
+            currency: 'TWD',
+            category: '還款',
+            card_no: '3254',
+            excluded: false,
+            auto_excluded: true,
+            tags: [],
+            splits: [],
+          },
         ],
         portfolio_facts: {},
       },
@@ -158,7 +176,7 @@ deepEqual(dataset.preferences, {
   fx_display_mode: 'always_original',
   card_date_basis: 'post',
 });
-equal(dataset.transactions.length, 4);
+equal(dataset.transactions.length, 5);
 const children = dataset.transactions.filter((row) => row.split_of === 1);
 deepEqual(children.map((row) => row.id), ['1#0', '1#1']);
 deepEqual(children.map((row) => row.amount), [-40, -60]);
@@ -176,6 +194,11 @@ equal(pending.consume_amount, 10);
 equal(pending.fx_rate, 31);
 equal(pending.fx_rate_source, 'bank_pending_estimate');
 equal('raw' in pending, false);
+const payment = dataset.transactions.find((row) => row.id === 4);
+ok(payment);
+equal(payment.cashflow_direction, 'neutral');
+equal(payment.cashflow_amount, 0);
+equal(payment.display_amount, 12729);
 
 const parityEnvelope = applyReplicaResponse(undefined, {
   schema_version: 2,

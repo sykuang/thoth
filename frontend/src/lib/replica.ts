@@ -490,6 +490,7 @@ function normalizedSplits(row: Record<string, unknown>): TransactionSplit[] | un
 function projectParent(row: Record<string, unknown>): Transaction {
   const amount = numberOrNull(row.amount) ?? 0;
   const cashflowAmount = Math.abs(numberOrNull(row.cashflow_amount) ?? amount);
+  const displayAmount = Math.abs(numberOrNull(row.display_amount) ?? amount);
   const kind = row.kind === 'billed' || row.kind === 'pending' ? row.kind : 'twd';
   const currency = stringOrNull(row.currency) ?? 'TWD';
   let consumeCurrency = stringOrNull(row.consume_currency);
@@ -543,7 +544,7 @@ function projectParent(row: Record<string, unknown>): Transaction {
       ? row.cashflow_direction
       : undefined,
     cashflow_amount: cashflowAmount,
-    display_amount: cashflowAmount,
+    display_amount: displayAmount,
     currency,
     category: stringOrNull(row.category),
     subcategory: stringOrNull(row.subcategory),
