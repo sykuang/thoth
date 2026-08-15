@@ -160,7 +160,9 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
             amt = _num(t.get("txAmt"))
             desc = (t.get("txDesc") or "").strip()
             unb_rows.append({
-                "card_no": t.get("cardNo"), "date": _ubot_date(t.get("effectiveDate")),
+                "card_no": t.get("cardNo"),
+                "date": _ubot_date(t.get("effectiveDate")),
+                "post_date": _ubot_date(t.get("postingDate") or t.get("postDate")),
                 "desc": desc, "amount": amt,
                 "currency": "TWD",  # amount=txAmt 是台幣估算/入帳金額
                 "consume_currency": (t.get("Currency") or "").strip() or "TWD",

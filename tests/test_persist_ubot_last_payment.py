@@ -394,3 +394,29 @@ def test_ubot_unbilled_preserves_original_currency_amount(store):
     assert row["currency"] == "TWD"
     assert row["consume_currency"] == "USD"
     assert row["consume_amount"] == 100.2
+
+
+def test_ubot_unbilled_preserves_posting_date_for_installment_month(store):
+    """分期授權沿用原消費日，但當期歸屬必須使用銀行提供的 postingDate。"""
+    data = _base_data()
+    data["card_unbilled"] = {
+        "CardSum": "45756",
+        "DispStmtAmt": "45756",
+        "CardList": [{
+            "cardNo": "", "effectiveDate": "20260505", "postingDate": "20260811",
+            "txDesc": "１１４年綜所稅款 549073元 03/12", "txAmt": "45756",
+            "Currency": "", "oriAmt": "", "txCode": "40",
+        }],
+    }
+
+    persist_ubot(data, store, rules=None)
+
+    row = store.conn.execute(
+        "SELECT consume_date, post_date, description, amount FROM card_pending_txns"
+    ).fetchone()
+    assert dict(row) == {
+        "consume_date": "2026-05-05",
+        "post_date": "2026-08-11",
+        "description": "１１４年綜所稅款 549073元 03/12",
+        "amount": 45756,
+    }
