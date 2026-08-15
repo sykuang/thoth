@@ -1,10 +1,17 @@
 from pathlib import Path
 from collections.abc import Iterator
+import inspect
 
 import pytest
 
 from backend.core import store as store_mod
 from backend.core.store import BankStore
+
+
+def test_post_date_transition_sql_uses_typed_null_safe_comparison() -> None:
+    source = inspect.getsource(BankStore.upsert_card_billed)
+    assert "? IS NULL" not in source
+    assert source.count("IS NOT DISTINCT FROM ?") == 4
 
 
 @pytest.fixture

@@ -869,10 +869,10 @@ class BankStore:
                     """SELECT card_no FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
                          AND consume_date = ? AND amount = ? AND description = ?
-                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                         AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
                     (self.user_id, t.get("date"), t.get("amount"), t.get("desc"),
-                     t.get("consume_amount"), t.get("consume_amount")),
+                     t.get("consume_amount")),
                 ).fetchall()
                 if len(candidates) == 1:
                     t["card_no"] = candidates[0]["card_no"]
@@ -902,10 +902,10 @@ class BankStore:
                        WHERE user_id = ? AND (card_no IS NULL OR card_no = '')
                          AND consume_date = ? AND post_date = ?
                          AND amount = ? AND description = ?
-                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                         AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
                     (self.user_id, t.get("date"), post_date, t.get("amount"),
-                     t.get("desc"), t.get("consume_amount"), t.get("consume_amount")),
+                     t.get("desc"), t.get("consume_amount")),
                 ).fetchall()
                 if len(blank_candidates) > 1:
                     continue
@@ -927,13 +927,12 @@ class BankStore:
                 candidates = self.conn.execute(
                     """SELECT id FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
-                         AND (card_no = ? OR (card_no IS NULL AND ? IS NULL))
+                         AND card_no IS NOT DISTINCT FROM ?
                          AND consume_date = ? AND amount = ? AND description = ?
-                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                         AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                    (self.user_id, t.get("card_no"), t.get("card_no"), t.get("date"),
-                     t.get("amount"), t.get("desc"), t.get("consume_amount"),
-                     t.get("consume_amount")),
+                    (self.user_id, t.get("card_no"), t.get("date"), t.get("amount"),
+                     t.get("desc"), t.get("consume_amount")),
                 ).fetchall()
                 existing_key = self.conn.execute(
                     "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
