@@ -71,6 +71,20 @@ class InvestmentHolding(BaseModel):
     currency: str
 
 
+class LiabilityRepayment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    account_id: str
+    occurred_on: str
+    principal: str
+    interest: str
+    fee: str
+    note: str | None
+    created_at: str
+    updated_at: str
+
+
 class ManualAccountNotFound(LookupError):
     pass
 
@@ -276,10 +290,17 @@ def _investment_market_balance(
 
 def update_manual_account(user_id: int, account_id: str, **values) -> FinancialAccount:
     row_id = parse_manual_id(account_id)
+    expected_balance = values.pop("expected_balance", None)
     normalized = _normalize_account_values(**values)
-    outcome = repo.update_account(user_id, row_id, normalized, db.now_iso())
+    outcome = repo.update_account(
+        user_id, row_id, normalized, db.now_iso(), expected_balance=expected_balance,
+    )
     if outcome == "has_transactions":
         raise InvalidManualAccount("delete investment transactions before changing account type")
+    if outcome == "has_repayments":
+        raise InvalidManualAccount("delete liability repayments before changing account type")
+    if outcome == "balance_conflict":
+        raise InvalidManualAccount("account balance changed; reload before saving")
     if outcome == "not_found":
         raise ManualAccountNotFound(account_id)
     return get_manual_account(user_id, account_id)
@@ -577,3 +598,125 @@ def delete_investment_transaction(user_id: int, account_id: str, transaction_id:
     )
     if not deleted:
         raise ManualAccountNotFound(str(transaction_id))
+
+
+def _require_liability_account(user_id: int, account_id: str) -> int:
+    account = get_manual_account(user_id, account_id)
+    if not account_classify.is_liability_type(account.product_type):
+        raise InvalidManualAccount("repayments are supported only for manual liability accounts")
+    return parse_manual_id(account_id)
+
+
+def _normalize_repayment_values(
+    *,
+    occurred_on: str,
+    principal: object,
+    interest: object,
+    fee: object,
+    note: str | None = None,
+) -> dict[str, str | None]:
+    parsed_principal = _decimal(principal)
+    parsed_interest = _decimal(interest)
+    parsed_fee = _decimal(fee)
+    if parsed_principal <= 0:
+        raise InvalidManualAccount("principal must be positive")
+    if parsed_interest < 0 or parsed_fee < 0:
+        raise InvalidManualAccount("interest and fee must be non-negative")
+    return {
+        "occurred_on": occurred_on,
+        "principal": format(parsed_principal, "f"),
+        "interest": format(parsed_interest, "f"),
+        "fee": format(parsed_fee, "f"),
+        "note": note.strip() if note and note.strip() else None,
+    }
+
+
+def _adjust_liability_balance(
+    balance: str,
+    old_principal: str | None,
+    new_principal: str | None,
+) -> str:
+    try:
+        current = Decimal(balance)
+    except (InvalidOperation, ValueError) as exc:
+        raise InvalidManualAccount("invalid stored liability balance") from exc
+    if not current.is_finite() or current > 0:
+        raise InvalidManualAccount("invalid stored liability balance")
+    adjusted = current - Decimal(old_principal or "0") + Decimal(new_principal or "0")
+    if adjusted > 0:
+        raise InvalidManualAccount("principal exceeds outstanding balance")
+    return format(adjusted, "f")
+
+
+def _row_to_repayment(row) -> LiabilityRepayment:
+    return LiabilityRepayment(
+        id=int(_row_value(row, 0, "id")),
+        account_id=_manual_id(int(_row_value(row, 1, "account_id"))),
+        occurred_on=_row_value(row, 2, "occurred_on"),
+        principal=_row_value(row, 3, "principal"),
+        interest=_row_value(row, 4, "interest"),
+        fee=_row_value(row, 5, "fee"),
+        note=_row_value(row, 6, "note"),
+        created_at=_row_value(row, 7, "created_at"),
+        updated_at=_row_value(row, 8, "updated_at"),
+    )
+
+
+def get_liability_repayment(
+    user_id: int,
+    account_id: str,
+    repayment_id: int,
+) -> LiabilityRepayment:
+    row_id = _require_liability_account(user_id, account_id)
+    row = repo.get_repayment(user_id, row_id, repayment_id)
+    if row is None:
+        raise ManualAccountNotFound(str(repayment_id))
+    return _row_to_repayment(row)
+
+
+def list_liability_repayments(user_id: int, account_id: str) -> list[LiabilityRepayment]:
+    row_id = _require_liability_account(user_id, account_id)
+    return [_row_to_repayment(row) for row in repo.list_repayments(user_id, row_id)]
+
+
+def create_liability_repayment(user_id: int, account_id: str, **values) -> LiabilityRepayment:
+    row_id = parse_manual_id(account_id)
+    normalized = _normalize_repayment_values(**values)
+    repayment_id = repo.mutate_repayment(
+        user_id, row_id, "insert", normalized, None, db.now_iso(), _adjust_liability_balance,
+    )
+    if repayment_id is None:
+        _require_liability_account(user_id, account_id)
+        raise RuntimeError("manual repayment insert returned no id")
+    return get_liability_repayment(user_id, account_id, int(repayment_id))
+
+
+def update_liability_repayment(
+    user_id: int,
+    account_id: str,
+    repayment_id: int,
+    **values,
+) -> LiabilityRepayment:
+    row_id = parse_manual_id(account_id)
+    normalized = _normalize_repayment_values(**values)
+    updated = repo.mutate_repayment(
+        user_id, row_id, "update", normalized, repayment_id, db.now_iso(), _adjust_liability_balance,
+    )
+    if updated is None:
+        _require_liability_account(user_id, account_id)
+        raise RuntimeError("manual repayment update returned no result")
+    if updated is False:
+        raise ManualAccountNotFound(str(repayment_id))
+    return get_liability_repayment(user_id, account_id, repayment_id)
+
+
+def delete_liability_repayment(user_id: int, account_id: str, repayment_id: int) -> None:
+    row_id = parse_manual_id(account_id)
+    deleted = repo.mutate_repayment(
+        user_id, row_id, "delete", None, repayment_id, db.now_iso(), _adjust_liability_balance,
+    )
+    if deleted is None:
+        _require_liability_account(user_id, account_id)
+        raise RuntimeError("manual repayment delete returned no result")
+    if deleted is False:
+        raise ManualAccountNotFound(str(repayment_id))

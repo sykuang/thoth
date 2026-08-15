@@ -14,17 +14,22 @@ from backend.server.financial_accounts import (
     InvalidManualAccount,
     InvestmentHolding,
     InvestmentTransaction,
+    LiabilityRepayment,
     ManualAccountNotFound,
     create_investment_transaction,
+    create_liability_repayment,
     create_manual_account,
     delete_investment_transaction,
+    delete_liability_repayment,
     delete_manual_account,
     get_manual_account,
     list_financial_accounts,
     list_investment_holdings,
     list_investment_transactions,
+    list_liability_repayments,
     list_manual_accounts,
     update_investment_transaction,
+    update_liability_repayment,
     update_manual_account,
     update_manual_account_inclusion,
 )
@@ -61,12 +66,22 @@ def _decimal_text(value: str, *, allow_zero: bool = True) -> str:
     return raw
 
 
+def _signed_decimal_text(value: str) -> str:
+    raw = value.strip()
+    if raw.startswith("-"):
+        return f"-{_decimal_text(raw[1:])}"
+    return _decimal_text(raw)
+
+
 class ManualAccountPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     product_type: ProductType
     name: str = Field(min_length=1, max_length=120)
     currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
     balance: str
     manual_balance: str | None = None
+    expected_balance: str | None = None
     included_in_net_worth: bool = True
 
     @field_validator("balance")
@@ -79,8 +94,13 @@ class ManualAccountPayload(BaseModel):
     def validate_manual_balance(cls, value: str | None) -> str | None:
         return _decimal_text(value) if value is not None else None
 
+    @field_validator("expected_balance")
+    @classmethod
+    def validate_expected_balance(cls, value: str | None) -> str | None:
+        return _signed_decimal_text(value) if value is not None else None
+
     def domain_values(self) -> dict:
-        return self.model_dump(exclude={"manual_balance"})
+        return self.model_dump(exclude={"manual_balance", "expected_balance"})
 
 
 class ManualAccountInclusionPayload(BaseModel):
@@ -117,6 +137,31 @@ class InvestmentTransactionPayload(BaseModel):
                 raise ValueError("fee requires amount")
             self.amount = _decimal_text(self.amount, allow_zero=False)
         return self
+
+    def domain_values(self) -> dict:
+        values = self.model_dump()
+        values["occurred_on"] = self.occurred_on.isoformat()
+        return values
+
+
+class LiabilityRepaymentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    occurred_on: date
+    principal: str
+    interest: str = "0"
+    fee: str = "0"
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("principal")
+    @classmethod
+    def validate_principal(cls, value: str) -> str:
+        return _decimal_text(value, allow_zero=False)
+
+    @field_validator("interest", "fee")
+    @classmethod
+    def validate_non_negative_amount(cls, value: str) -> str:
+        return _decimal_text(value)
 
     def domain_values(self) -> dict:
         values = self.model_dump()
@@ -221,6 +266,7 @@ def update_account(
     try:
         values = body.domain_values()
         existing = get_manual_account(user["id"], account_id)
+        values["expected_balance"] = body.expected_balance
         if existing.product_type == "investment":
             values["balance"] = body.manual_balance or (existing.balance or "0").lstrip("-")
         account = update_manual_account(user["id"], account_id, **values)
@@ -339,6 +385,79 @@ def delete_transaction(
 ) -> None:
     try:
         delete_investment_transaction(user["id"], account_id, transaction_id)
+    except ManualAccountNotFound as exc:
+        raise _not_found(exc) from exc
+    except InvalidManualAccount as exc:
+        raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+
+
+@router.get("/{account_id}/repayments", response_model=list[LiabilityRepayment])
+def list_repayments(
+    account_id: str,
+    user: dict = Depends(current_user),
+) -> list[LiabilityRepayment]:
+    try:
+        return list_liability_repayments(user["id"], account_id)
+    except ManualAccountNotFound as exc:
+        raise _not_found(exc) from exc
+    except InvalidManualAccount as exc:
+        raise _invalid(exc) from exc
+
+
+@router.post(
+    "/{account_id}/repayments",
+    status_code=status.HTTP_201_CREATED,
+    response_model=LiabilityRepayment,
+)
+def create_repayment(
+    account_id: str,
+    body: LiabilityRepaymentPayload,
+    user: dict = Depends(current_user),
+) -> LiabilityRepayment:
+    try:
+        repayment = create_liability_repayment(user["id"], account_id, **body.domain_values())
+    except ManualAccountNotFound as exc:
+        raise _not_found(exc) from exc
+    except InvalidManualAccount as exc:
+        raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+    return repayment
+
+
+@router.patch(
+    "/{account_id}/repayments/{repayment_id}",
+    response_model=LiabilityRepayment,
+)
+def update_repayment(
+    account_id: str,
+    repayment_id: int,
+    body: LiabilityRepaymentPayload,
+    user: dict = Depends(current_user),
+) -> LiabilityRepayment:
+    try:
+        repayment = update_liability_repayment(
+            user["id"], account_id, repayment_id, **body.domain_values(),
+        )
+    except ManualAccountNotFound as exc:
+        raise _not_found(exc) from exc
+    except InvalidManualAccount as exc:
+        raise _invalid(exc) from exc
+    clear_dashboard_cache(user["id"])
+    return repayment
+
+
+@router.delete(
+    "/{account_id}/repayments/{repayment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_repayment(
+    account_id: str,
+    repayment_id: int,
+    user: dict = Depends(current_user),
+) -> None:
+    try:
+        delete_liability_repayment(user["id"], account_id, repayment_id)
     except ManualAccountNotFound as exc:
         raise _not_found(exc) from exc
     except InvalidManualAccount as exc:

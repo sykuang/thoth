@@ -661,6 +661,18 @@ export type ManualInvestmentHolding = {
   currency: string;
 };
 
+export type ManualLiabilityRepayment = {
+  id: number;
+  account_id: string;
+  occurred_on: string;
+  principal: string;
+  interest: string;
+  fee: string;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 // =====================================================================
 // Phase 5.1 — Categorization Rules
 // =====================================================================

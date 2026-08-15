@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -17,6 +17,7 @@ import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { manualAccountParent, ROUTE_PARENTS } from '@/lib/routeParents';
 import {
+  addDecimal,
   divideDecimal,
   formatDecimal,
   formatDecimalFixed,
@@ -25,6 +26,7 @@ import {
 import type {
   FinancialAccount,
   FinancialAccountProductType,
+  ManualLiabilityRepayment,
   ManualInvestmentHolding,
   ManualInvestmentTransaction,
   YahooQuote,
@@ -34,6 +36,7 @@ import type {
 type EditableProductType = Exclude<FinancialAccountProductType, 'unknown'>;
 type TradeKind = ManualInvestmentTransaction['kind'];
 type CostInputMode = 'unit' | 'total';
+type AccountDraftField = 'productType' | 'name' | 'currency' | 'balance';
 
 const PRODUCT_TYPES: { value: EditableProductType; label: string }[] = [
   { value: 'deposit', label: '存款' },
@@ -64,6 +67,7 @@ const TRADE_KINDS: { value: TradeKind; label: string }[] = [
   { value: 'sell', label: '賣出' },
   { value: 'fee', label: '費用' },
 ];
+const LIABILITY_TYPES = new Set<FinancialAccountProductType>(['loan', 'mortgage', 'credit_line']);
 const today = () => {
   const date = new Date();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -129,6 +133,9 @@ export default function ManualAccountScreen() {
   const [currency, setCurrency] = useState('TWD');
   const [balance, setBalance] = useState('0');
   const [error, setError] = useState<string | null>(null);
+  const hydratedAccountIdRef = useRef<string | null>(null);
+  const expectedBalanceRef = useRef<string | null>(null);
+  const dirtyFieldsRef = useRef(new Set<AccountDraftField>());
   const normalizedCurrency = currency.trim().toUpperCase();
   const accountCurrencyOptions = useMemo(
     () => normalizedCurrency && !ACCOUNT_CURRENCIES.some((option) => option.value === normalizedCurrency)
@@ -149,12 +156,21 @@ export default function ManualAccountScreen() {
 
   useEffect(() => {
     if (!account) return;
-    // Async query hydrates user-editable state once; derived values would overwrite edits.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (account.product_type !== 'unknown') setProductType(account.product_type);
-    setName(account.name);
-    setCurrency(account.currency);
-    setBalance((account.manual_balance ?? account.balance ?? '0').replace(/^-/, ''));
+    const firstHydration = hydratedAccountIdRef.current !== account.id;
+    if (firstHydration) {
+      hydratedAccountIdRef.current = account.id;
+      dirtyFieldsRef.current.clear();
+    }
+    // Preserve unsaved drafts while repayment refreshes update clean server-backed fields.
+    if ((firstHydration || !dirtyFieldsRef.current.has('productType')) && account.product_type !== 'unknown') {
+      setProductType(account.product_type);
+    }
+    if (firstHydration || !dirtyFieldsRef.current.has('name')) setName(account.name);
+    if (firstHydration || !dirtyFieldsRef.current.has('currency')) setCurrency(account.currency);
+    if (firstHydration || !dirtyFieldsRef.current.has('balance')) {
+      expectedBalanceRef.current = account.balance;
+      setBalance((account.manual_balance ?? account.balance ?? '0').replace(/^-/, ''));
+    }
   }, [account]);
 
   const saveAccount = useMutation<FinancialAccount, ApiError>({
@@ -168,11 +184,14 @@ export default function ManualAccountScreen() {
           currency: currency.trim().toUpperCase(),
           balance: balance.trim(),
           manual_balance: balance.trim(),
+          ...(isNew || !account ? {} : { expected_balance: expectedBalanceRef.current }),
           included_in_net_worth: account?.included_in_net_worth ?? true,
         },
       },
     ),
-    onSuccess: async () => {
+    onSuccess: async (savedAccount) => {
+      expectedBalanceRef.current = savedAccount.balance;
+      dirtyFieldsRef.current.clear();
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['financial-accounts'] }),
         queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
@@ -198,7 +217,11 @@ export default function ManualAccountScreen() {
   });
 
   function confirmDeleteAccount() {
-    const message = '此帳戶的持股與交易明細也會刪除，無法復原。';
+    const message = account && LIABILITY_TYPES.has(account.product_type)
+      ? '此帳戶的還款紀錄也會刪除，且無法復原。'
+      : account?.product_type === 'investment'
+        ? '此帳戶的持股與交易明細也會刪除，且無法復原。'
+        : '刪除後無法復原。';
     if (Platform.OS === 'web') {
       if (window.confirm(message)) deleteAccount.mutate();
       return;
@@ -254,7 +277,10 @@ export default function ManualAccountScreen() {
             {PRODUCT_TYPES.map((option) => (
               <Pressable
                 key={option.value}
-                onPress={() => setProductType(option.value)}
+                onPress={() => {
+                  dirtyFieldsRef.current.add('productType');
+                  setProductType(option.value);
+                }}
                 accessibilityRole="radio"
                 accessibilityState={{ selected: productType === option.value }}
                 accessibilityLabel={`帳戶類型：${option.label}`}
@@ -268,18 +294,27 @@ export default function ManualAccountScreen() {
               </Pressable>
             ))}
           </View>
-          <Field label="名稱" value={name} onChangeText={setName} placeholder="例如：永豐證券、緊急預備金" testID="manual-name" />
+          <Field label="名稱" value={name} onChangeText={(value) => {
+            dirtyFieldsRef.current.add('name');
+            setName(value);
+          }} placeholder="例如：永豐證券、緊急預備金" testID="manual-name" />
           <View className="flex-row gap-3">
             <View className="w-44 mb-4">
               <Dropdown
                 label="幣別"
                 value={normalizedCurrency}
-                onChange={setCurrency}
+                onChange={(value) => {
+                  dirtyFieldsRef.current.add('currency');
+                  setCurrency(value);
+                }}
                 options={accountCurrencyOptions}
                 testID="manual-currency"
               />
             </View>
-            <View className="flex-1"><Field label={productType === 'investment' ? '目前總值' : '目前餘額'} value={balance} onChangeText={setBalance} keyboardType="decimal-pad" testID="manual-balance" /></View>
+            <View className="flex-1"><Field label={productType === 'investment' ? '目前總值' : '目前餘額'} value={balance} onChangeText={(value) => {
+              dirtyFieldsRef.current.add('balance');
+              setBalance(value);
+            }} keyboardType="decimal-pad" testID="manual-balance" /></View>
           </View>
 
           {(error || saveAccount.isError || deleteAccount.isError) && (
@@ -311,6 +346,10 @@ export default function ManualAccountScreen() {
               params: { account_id: accountId, transaction_id: String(transactionId) },
             })}
           />
+        )}
+
+        {!isNew && account && LIABILITY_TYPES.has(account.product_type) && accountId && (
+          <RepaymentJournal accountId={accountId} currency={account.currency} />
         )}
 
         {!isNew && (
@@ -712,5 +751,200 @@ export function InvestmentJournal({
       </View>
       )}
     </>
+  );
+}
+
+function repaymentTotal(row: ManualLiabilityRepayment): string | null {
+  const subtotal = addDecimal(row.principal, row.interest);
+  return subtotal == null ? null : addDecimal(subtotal, row.fee);
+}
+
+export function RepaymentJournal({ accountId, currency }: { accountId: string; currency: string }) {
+  const queryClient = useQueryClient();
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [occurredOn, setOccurredOn] = useState(today());
+  const [principal, setPrincipal] = useState('');
+  const [interest, setInterest] = useState('0');
+  const [fee, setFee] = useState('0');
+  const [note, setNote] = useState('');
+
+  const repaymentsQ = useQuery<ManualLiabilityRepayment[], ApiError>({
+    queryKey: ['financial-accounts', accountId, 'repayments'],
+    queryFn: () => api(`/financial-accounts/${accountId}/repayments`),
+  });
+
+  function closeForm() {
+    setShowForm(false);
+    setEditingId(null);
+    setOccurredOn(today());
+    setPrincipal('');
+    setInterest('0');
+    setFee('0');
+    setNote('');
+  }
+
+  function editRepayment(row: ManualLiabilityRepayment) {
+    setEditingId(row.id);
+    setOccurredOn(row.occurred_on);
+    setPrincipal(row.principal);
+    setInterest(row.interest);
+    setFee(row.fee);
+    setNote(row.note ?? '');
+    setShowForm(true);
+  }
+
+  async function refreshRepayments() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['financial-accounts', accountId, 'repayments'] }),
+      queryClient.invalidateQueries({ queryKey: ['financial-accounts', 'manual'] }),
+      queryClient.invalidateQueries({ queryKey: ['portfolio', 'summary'] }),
+    ]);
+  }
+
+  const saveRepayment = useMutation<ManualLiabilityRepayment, ApiError>({
+    mutationFn: () => api(
+      editingId == null
+        ? `/financial-accounts/${accountId}/repayments`
+        : `/financial-accounts/${accountId}/repayments/${editingId}`,
+      {
+        method: editingId == null ? 'POST' : 'PATCH',
+        body: {
+          occurred_on: occurredOn,
+          principal: principal.trim(),
+          interest: interest.trim() || '0',
+          fee: fee.trim() || '0',
+          note: note.trim() || null,
+        },
+      },
+    ),
+    onSuccess: async () => {
+      await refreshRepayments();
+      closeForm();
+    },
+  });
+
+  const deleteRepayment = useMutation<void, ApiError, number>({
+    mutationFn: (id) => api(`/financial-accounts/${accountId}/repayments/${id}`, { method: 'DELETE' }),
+    onSuccess: refreshRepayments,
+  });
+
+  function confirmDeleteRepayment(id: number) {
+    const message = '刪除後會把本金加回目前餘額，且無法復原。';
+    if (Platform.OS === 'web') {
+      if (window.confirm(message)) deleteRepayment.mutate(id);
+      return;
+    }
+    Alert.alert('刪除還款紀錄？', message, [
+      { text: '取消', style: 'cancel' },
+      { text: '刪除', style: 'destructive', onPress: () => deleteRepayment.mutate(id) },
+    ]);
+  }
+
+  const saveRepaymentDisabled = saveRepayment.isPending || !principal.trim();
+
+  return (
+    <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">
+      <View className="flex-row items-center justify-between gap-3 mb-3">
+        <View className="flex-1">
+          <Text className="text-ink-900 dark:text-ink-50 text-h2">還款紀錄</Text>
+          <Text className="text-ink-500 dark:text-ink-400 text-micro mt-1">
+            本金會扣減目前餘額；利息與費用只保留在紀錄中。
+          </Text>
+        </View>
+        {!showForm && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="新增還款紀錄"
+            onPress={() => setShowForm(true)}
+            className="bg-brand-600 active:bg-brand-700 rounded-xl px-3 py-2"
+            testID="add-manual-repayment"
+          >
+            <Text className="text-white text-small font-semibold">＋ 新增還款</Text>
+          </Pressable>
+        )}
+      </View>
+
+      {showForm && (
+        <View className="border border-ink-200 dark:border-ink-700 rounded-xl p-4 mb-4">
+          <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-3">
+            {editingId == null ? '新增還款' : '編輯還款'}
+          </Text>
+          <Field label="日期（YYYY-MM-DD）" value={occurredOn} onChangeText={setOccurredOn} />
+          <Field label="償還本金" value={principal} onChangeText={setPrincipal} keyboardType="decimal-pad" />
+          <View className="flex-row gap-3">
+            <View className="flex-1"><Field label="利息" value={interest} onChangeText={setInterest} keyboardType="decimal-pad" /></View>
+            <View className="flex-1"><Field label="費用" value={fee} onChangeText={setFee} keyboardType="decimal-pad" /></View>
+          </View>
+          <Field label="備註（選填）" value={note} onChangeText={setNote} />
+          {saveRepayment.isError && (
+            <Text className="text-red-600 text-small mb-3">{formatApiError(saveRepayment.error)}</Text>
+          )}
+          <View className="flex-row gap-3">
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="取消還款編輯"
+              onPress={closeForm}
+              className="flex-1 border border-ink-300 dark:border-ink-700 rounded-xl py-3 items-center"
+            >
+              <Text className="text-ink-700 dark:text-ink-300 text-h3">取消</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={editingId == null ? '儲存還款紀錄' : '儲存還款變更'}
+              onPress={() => saveRepayment.mutate()}
+              disabled={saveRepaymentDisabled}
+              accessibilityState={{ disabled: saveRepaymentDisabled }}
+              className="flex-1 bg-brand-600 active:bg-brand-700 rounded-xl py-3 items-center"
+              testID="save-manual-repayment"
+            >
+              {saveRepayment.isPending
+                ? <ActivityIndicator color="#fff" />
+                : <Text className="text-white text-h3">儲存</Text>}
+            </Pressable>
+          </View>
+        </View>
+      )}
+
+      {repaymentsQ.isLoading ? <ActivityIndicator /> : repaymentsQ.isError ? (
+        <Pressable accessibilityRole="button" accessibilityLabel="重試載入還款紀錄" onPress={() => repaymentsQ.refetch()}>
+          <Text className="text-red-600 text-small">載入失敗，點此重試</Text>
+        </Pressable>
+      ) : (repaymentsQ.data ?? []).length === 0 ? (
+        <Text className="text-ink-500 dark:text-ink-400 text-small">尚無還款紀錄</Text>
+      ) : (repaymentsQ.data ?? []).map((row) => {
+        const total = repaymentTotal(row);
+        return (
+          <View key={row.id} className="py-3 border-b border-ink-100 dark:border-ink-800">
+            <View className="flex-row justify-between gap-3">
+              <View className="flex-1">
+                <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">
+                  本金 {currency} {formatDecimalFixed(row.principal, 2) ?? row.principal}
+                </Text>
+                <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
+                  {row.occurred_on} · 利息 {formatDecimalFixed(row.interest, 2) ?? row.interest}
+                  {' · '}費用 {formatDecimalFixed(row.fee, 2) ?? row.fee}
+                </Text>
+                {row.note && <Text className="text-ink-600 dark:text-ink-300 text-small mt-1">{row.note}</Text>}
+              </View>
+              <Text className="text-ink-700 dark:text-ink-300 text-small">
+                {currency} {total == null ? '—' : (formatDecimalFixed(total, 2) ?? total)}
+              </Text>
+            </View>
+            <View className="flex-row justify-end gap-3 mt-2">
+              <Pressable accessibilityRole="button" accessibilityLabel={`編輯 ${row.occurred_on} 還款`} onPress={() => editRepayment(row)}>
+                <Text className="text-brand-600 text-small">編輯</Text>
+              </Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel={`刪除 ${row.occurred_on} 還款`} onPress={() => confirmDeleteRepayment(row.id)} disabled={deleteRepayment.isPending} accessibilityState={{ disabled: deleteRepayment.isPending }}>
+                <Text className="text-red-600 text-small">刪除</Text>
+              </Pressable>
+            </View>
+          </View>
+        );
+      })}
+      {deleteRepayment.isError && (
+        <Text className="text-red-600 text-small mt-3">{formatApiError(deleteRepayment.error)}</Text>
+      )}
+    </View>
   );
 }

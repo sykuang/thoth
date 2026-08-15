@@ -19,6 +19,8 @@ const dashboard = source('src/app/(tabs)/dashboard.tsx');
 const transactions = source('src/app/(tabs)/transactions.tsx');
 const accounts = source('src/app/(tabs)/cards/index.tsx');
 const settings = source('src/app/(tabs)/settings/index.tsx');
+const manualAccount = source('src/app/(tabs)/cards/manual/[account_id].tsx');
+const apiTypes = source('src/types/api.ts');
 const transactionDetail = source('src/components/transactions/TxnDetailModal.tsx');
 const brokerageTransaction = source('src/components/transactions/BrokerageTxnRow.tsx');
 const brokerageAccounts = source('src/components/SnapTradeSections.tsx');
@@ -79,6 +81,19 @@ includes(dashboard, 'showKpiCard &&', 'dashboard must not reserve an empty KPI c
 includes(login, '敏感資料加密保存', 'login value copy must stay user-facing');
 includes(settings, '管理主分類、子分類與自訂標籤', 'settings copy must stay user-facing');
 includes(transactionDetail, "formatSignedCurrency(txn.balance, 'TWD')", 'account balances must preserve their sign');
+includes(apiTypes, 'export type ManualLiabilityRepayment', 'manual liability repayment API type is missing');
+includes(manualAccount, 'RepaymentJournal', 'manual liability accounts must render a repayment journal');
+includes(manualAccount, 'LIABILITY_TYPES.has(account.product_type)', 'repayment journal must stay liability-only');
+includes(manualAccount, 'add-manual-repayment', 'manual liability repayment create action is missing');
+includes(manualAccount, 'save-manual-repayment', 'manual liability repayment save action is missing');
+includes(manualAccount, '/repayments', 'manual liability repayment UI must use the repayment API');
+includes(manualAccount, 'expected_balance: expectedBalanceRef.current', 'manual account PATCH must use the draft-bound balance CAS token');
+includes(manualAccount, "dirtyFieldsRef.current.has('productType')", 'repayment refresh must preserve dirty account types');
+includes(manualAccount, "dirtyFieldsRef.current.has('name')", 'repayment refresh must preserve dirty account names');
+includes(manualAccount, "dirtyFieldsRef.current.has('currency')", 'repayment refresh must preserve dirty account currencies');
+includes(manualAccount, "dirtyFieldsRef.current.has('balance')", 'repayment refresh must preserve dirty account balances');
+includes(manualAccount, 'accessibilityState={{ disabled: saveRepaymentDisabled }}', 'repayment save must expose disabled accessibility state');
+includes(manualAccount, '還款紀錄也會刪除', 'liability account deletion must disclose repayment history deletion');
 
 for (const [name, text] of [
   ['dashboard', dashboard],

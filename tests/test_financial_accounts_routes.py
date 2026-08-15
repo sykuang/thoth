@@ -115,6 +115,20 @@ def test_fresh_manual_investment_schema_has_only_total_cost(client):
     assert "unit_price" not in columns
 
 
+def test_fresh_manual_liability_repayment_schema(client):
+    from backend.server import db
+
+    with db.get_conn() as conn:
+        columns = db._columns(conn, "manual_liability_repayments")
+
+    assert {
+        "account_id", "occurred_on", "principal", "interest", "fee", "note",
+    }.issubset(columns)
+    with db.get_conn() as conn:
+        account_columns = db._columns(conn, "manual_financial_accounts")
+    assert "repayment_revision" in account_columns
+
+
 def test_drop_column_tolerates_another_sqlite_process_winning_race(monkeypatch):
     from backend.server import db
 
@@ -139,6 +153,43 @@ def test_drop_column_tolerates_another_sqlite_process_winning_race(monkeypatch):
             "manual_investment_transactions",
             "unit_price",
         )
+
+
+def test_add_column_tolerates_sqlite_schema_races(monkeypatch):
+    from backend.server import db
+
+    class DuplicateConnection:
+        def execute(self, _sql):
+            raise db.sqlite3.OperationalError("duplicate column name: repayment_revision")
+
+    observed_columns = iter([set(), {"repayment_revision"}])
+    monkeypatch.setattr(db, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db, "_columns", lambda _conn, _table: next(observed_columns))
+    db._add_column_if_missing(
+        DuplicateConnection(),
+        "manual_financial_accounts",
+        "repayment_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+    class LockedOnceConnection:
+        calls = 0
+
+        def execute(self, _sql):
+            self.calls += 1
+            if self.calls == 1:
+                raise db.sqlite3.OperationalError("database is locked")
+
+    conn = LockedOnceConnection()
+    monkeypatch.setattr(db, "_columns", lambda _conn, _table: set())
+    monkeypatch.setattr(db.time, "sleep", lambda _delay: None)
+    db._add_column_if_missing(
+        conn,
+        "manual_financial_accounts",
+        "repayment_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    assert conn.calls == 2
 
 
 def test_manual_financial_account_crud_and_liability_normalization(client):
@@ -254,6 +305,11 @@ def test_manual_financial_account_rejects_invalid_values(client):
         "/financial-accounts",
         headers=headers,
         json=_payload(currency="US D"),
+    ).status_code == 422
+    assert client.post(
+        "/financial-accounts",
+        headers=headers,
+        json={**_payload(), "unexpected": True},
     ).status_code == 422
 
 
@@ -602,6 +658,347 @@ def test_manual_investment_transactions_are_tenant_isolated_and_investment_only(
         f"/financial-accounts/{account['id']}/transactions",
         headers=_auth(other),
     ).status_code == 404
+
+
+def test_manual_liability_repayment_crud_updates_balance(client):
+    token = _register(client, "manual-repayment@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+
+    created = client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={
+            "occurred_on": "2026-08-15",
+            "principal": "250.00",
+            "interest": "10.00",
+            "fee": "2.00",
+            "note": "August payment",
+        },
+    )
+    assert created.status_code == 201, created.text
+    repayment = created.json()
+    assert repayment["account_id"] == account["id"]
+    assert repayment["principal"] == "250.00"
+    assert repayment["interest"] == "10.00"
+    assert repayment["fee"] == "2.00"
+    assert client.get(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+    ).json() == [repayment]
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["balance"] == "-750.00"
+    assert client.get("/portfolio/summary", headers=headers).json()["manual_liabilities_twd"] == 750
+
+    updated = client.patch(
+        f"/financial-accounts/{account['id']}/repayments/{repayment['id']}",
+        headers=headers,
+        json={
+            "occurred_on": "2026-08-15",
+            "principal": "300.00",
+            "interest": "12.00",
+            "fee": "0",
+            "note": None,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["principal"] == "300.00"
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["balance"] == "-700.00"
+
+    deleted = client.delete(
+        f"/financial-accounts/{account['id']}/repayments/{repayment['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["balance"] == "-1000.00"
+    assert client.get(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+    ).json() == []
+
+
+def test_manual_liability_with_repayments_cannot_be_changed_to_asset(client):
+    token = _register(client, "manual-repayment-type@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+    assert client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "100"},
+    ).status_code == 201
+
+    changed = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json=_payload(product_type="deposit", name="Wrong Type", balance="900"),
+    )
+    assert changed.status_code == 422, changed.text
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["product_type"] == "loan"
+
+
+def test_legacy_liability_patch_cannot_overwrite_repayment_balance(client):
+    token = _register(client, "manual-repayment-stale-legacy@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+    assert client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "100"},
+    ).status_code == 201
+
+    stale_patch = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json=_payload(product_type="loan", name="Stale Rename", balance="1000"),
+    )
+    assert stale_patch.status_code == 422, stale_patch.text
+    assert "balance changed" in stale_patch.text
+    row = client.get("/financial-accounts?source=manual", headers=headers).json()[0]
+    assert row["name"] == "Personal Loan"
+    assert row["balance"] == "-900"
+
+
+def test_legacy_liability_patch_stays_compatible_before_first_repayment(client):
+    token = _register(client, "manual-repayment-legacy-compatible@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+
+    updated = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json=_payload(product_type="loan", name="Legacy Rename", balance="1000"),
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["name"] == "Legacy Rename"
+    assert updated.json()["balance"] == "-1000"
+
+
+def test_liability_patch_uses_expected_balance_cas(client):
+    token = _register(client, "manual-repayment-balance-cas@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+    assert client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "100"},
+    ).status_code == 201
+
+    current_patch = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json={
+            **_payload(product_type="loan", name="Current Rename", balance="900"),
+            "expected_balance": "-900",
+        },
+    )
+    assert current_patch.status_code == 200, current_patch.text
+    assert current_patch.json()["name"] == "Current Rename"
+    assert current_patch.json()["balance"] == "-900"
+
+    assert client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-16", "principal": "100"},
+    ).status_code == 201
+    stale_patch = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json={
+            **_payload(product_type="loan", name="Stale Rename", balance="900"),
+            "expected_balance": "-900",
+        },
+    )
+    assert stale_patch.status_code == 422, stale_patch.text
+    assert "balance changed" in stale_patch.text
+    row = client.get("/financial-accounts?source=manual", headers=headers).json()[0]
+    assert row["name"] == "Current Rename"
+    assert row["balance"] == "-800"
+
+
+def test_liability_patch_cas_survives_last_repayment_delete(client):
+    token = _register(client, "manual-repayment-delete-cas@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="1000"),
+    ).json()
+    repayment = client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "100"},
+    ).json()
+    assert client.delete(
+        f"/financial-accounts/{account['id']}/repayments/{repayment['id']}",
+        headers=headers,
+    ).status_code == 204
+
+    stale_patch = client.patch(
+        f"/financial-accounts/{account['id']}",
+        headers=headers,
+        json={
+            **_payload(product_type="loan", name="Stale Rename", balance="900"),
+            "expected_balance": "-900",
+        },
+    )
+    assert stale_patch.status_code == 422, stale_patch.text
+    assert "balance changed" in stale_patch.text
+    row = client.get("/financial-accounts?source=manual", headers=headers).json()[0]
+    assert row["name"] == "Personal Loan"
+    assert row["balance"] == "-1000"
+
+
+def test_manual_repayment_rejects_overpayment_and_non_liability(client):
+    token = _register(client, "manual-repayment-invalid@palace.example")
+    headers = _auth(token)
+    loan = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", name="Personal Loan", balance="100"),
+    ).json()
+    deposit = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="deposit", name="Cash", balance="100"),
+    ).json()
+
+    payload = {"occurred_on": "2026-08-15", "principal": "100.01"}
+    assert client.post(
+        f"/financial-accounts/{loan['id']}/repayments",
+        headers=headers,
+        json=payload,
+    ).status_code == 422
+    repayment = client.post(
+        f"/financial-accounts/{loan['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-14", "principal": "10"},
+    ).json()
+    assert client.post(
+        f"/financial-accounts/{deposit['id']}/repayments",
+        headers=headers,
+        json=payload,
+    ).status_code == 422
+    assert client.patch(
+        f"/financial-accounts/{deposit['id']}/repayments/{repayment['id']}",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "5"},
+    ).status_code == 422
+    assert client.delete(
+        f"/financial-accounts/{deposit['id']}/repayments/{repayment['id']}",
+        headers=headers,
+    ).status_code == 422
+    rows = client.get("/financial-accounts?source=manual", headers=headers).json()
+    assert next(row for row in rows if row["id"] == loan["id"])["balance"] == "-90"
+
+
+def test_manual_repayment_update_overpayment_rolls_back_row_and_balance(client):
+    token = _register(client, "manual-repayment-update-rollback@palace.example")
+    headers = _auth(token)
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", balance="100"),
+    ).json()
+    repayment = client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "60"},
+    ).json()
+
+    rejected = client.patch(
+        f"/financial-accounts/{account['id']}/repayments/{repayment['id']}",
+        headers=headers,
+        json={"occurred_on": "2026-08-15", "principal": "110"},
+    )
+    assert rejected.status_code == 422, rejected.text
+    rows = client.get(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+    ).json()
+    assert rows[0]["principal"] == "60"
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["balance"] == "-40"
+
+
+def test_manual_repayments_are_tenant_isolated(client):
+    owner = _register(client, "manual-repayment-owner@palace.example")
+    other = _register(client, "manual-repayment-other@palace.example")
+    account = client.post(
+        "/financial-accounts",
+        headers=_auth(owner),
+        json=_payload(product_type="loan", balance="100"),
+    ).json()
+    repayment = client.post(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=_auth(owner),
+        json={"occurred_on": "2026-08-15", "principal": "10"},
+    ).json()
+
+    assert client.get(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=_auth(other),
+    ).status_code == 404
+    assert client.delete(
+        f"/financial-accounts/{account['id']}/repayments/{repayment['id']}",
+        headers=_auth(other),
+    ).status_code == 404
+
+
+def test_manual_repayment_concurrency_cannot_overpay_balance(client):
+    token = _register(client, "manual-repayment-race@palace.example")
+    headers = _auth(token)
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    account = client.post(
+        "/financial-accounts",
+        headers=headers,
+        json=_payload(product_type="loan", balance="100"),
+    ).json()
+
+    from backend.server.financial_accounts import (
+        InvalidManualAccount,
+        create_liability_repayment,
+    )
+
+    def repay_once() -> bool:
+        try:
+            create_liability_repayment(
+                user_id,
+                account["id"],
+                occurred_on="2026-08-15",
+                principal="75",
+                interest="0",
+                fee="0",
+                note=None,
+            )
+            return True
+        except InvalidManualAccount:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(lambda _: repay_once(), range(2))) == [False, True]
+    assert client.get("/financial-accounts?source=manual", headers=headers).json()[0]["balance"] == "-25"
+    assert len(client.get(
+        f"/financial-accounts/{account['id']}/repayments",
+        headers=headers,
+    ).json()) == 1
 
 
 def test_manual_investment_concurrent_sells_cannot_create_negative_holdings(client):

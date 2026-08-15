@@ -392,6 +392,7 @@ CREATE TABLE IF NOT EXISTS manual_financial_accounts (
     name                  TEXT NOT NULL,
     currency              TEXT NOT NULL,
     balance               TEXT NOT NULL,
+    repayment_revision    INTEGER NOT NULL DEFAULT 0,
     included_in_net_worth INTEGER NOT NULL DEFAULT 1,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL
@@ -417,6 +418,23 @@ CREATE TABLE IF NOT EXISTS manual_investment_transactions (
 );
 CREATE INDEX IF NOT EXISTS ix_manual_investment_txns_account_date
     ON manual_investment_transactions(user_id, account_id, occurred_on DESC, id DESC);
+
+-- Manual liability repayment journal. Principal reduces the outstanding
+-- account balance; interest and fees remain historical payment details.
+CREATE TABLE IF NOT EXISTS manual_liability_repayments (
+    id           {_PK_TYPE},
+    user_id      INTEGER NOT NULL,
+    account_id   INTEGER NOT NULL REFERENCES manual_financial_accounts(id) ON DELETE CASCADE,
+    occurred_on  TEXT NOT NULL,
+    principal    TEXT NOT NULL,
+    interest     TEXT NOT NULL,
+    fee          TEXT NOT NULL,
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_manual_liability_repayments_account_date
+    ON manual_liability_repayments(user_id, account_id, occurred_on DESC, id DESC);
 
 -- 2026-06-23 (L13 使用者指示): 自動同步排程 — 每個 user 一個 daily schedule.
 --   * user_id PK = 1 user 1 schedule (1:N to bank_accounts at fire-time)
@@ -572,6 +590,39 @@ def _drop_column_if_present(conn: Any, table: str, column: str) -> None:
             raise
 
 
+def _add_column_if_missing(
+    conn: Any,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    allowed = {
+        (
+            "manual_financial_accounts",
+            "repayment_revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+    }
+    if (table, column, definition) not in allowed:
+        raise ValueError("unsupported schema column")
+    if column in _columns(conn, table):
+        return
+    sql = f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
+    if DB_BACKEND == "postgres":
+        conn.execute(sql.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ", 1))
+        return
+    for attempt in range(4):
+        try:
+            conn.execute(sql)
+            return
+        except sqlite3.OperationalError as exc:
+            if column in _columns(conn, table):
+                return
+            if "locked" not in str(exc).lower() or attempt == 3:
+                raise
+            time.sleep(0.05 * (2 ** attempt))
+
+
 def _ensure_schema(conn: Any) -> None:
     """執行 schema DDL (IF NOT EXISTS, 重複安全) + L5-1 migration。
 
@@ -604,6 +655,12 @@ def _ensure_schema(conn: Any) -> None:
 
     for obsolete_column in ("institution_name", "account_ref", "as_of"):
         _drop_column_if_present(conn, "manual_financial_accounts", obsolete_column)
+    _add_column_if_missing(
+        conn,
+        "manual_financial_accounts",
+        "repayment_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     _drop_column_if_present(conn, "manual_investment_transactions", "unit_price")
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上
