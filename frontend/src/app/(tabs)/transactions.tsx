@@ -50,6 +50,7 @@ import {
   aggregateBySubcategory,
   computePeriodStats,
   filterCategoryViewItems,
+  matchesCardDrilldown,
   transactionSectionTitle,
   txnCashflowAmount,
 } from '@/lib/txnFilter';
@@ -226,7 +227,7 @@ export default function TransactionsScreen() {
     let items = datasetQ.data?.transactions ?? [];
     if (selectedBanks.length > 0) items = items.filter((t) => selectedBanks.includes(t.bank));
     if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);
-    if (effectiveCardNo) items = items.filter((t) => t.card_no === effectiveCardNo);
+    if (effectiveCardNo) items = items.filter((t) => matchesCardDrilldown(t, effectiveCardNo));
     items = items.filter((t) => {
       const d = transactionDateForBasis(t, cardDateBasis);
       return d >= since && d <= until;

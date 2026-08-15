@@ -105,7 +105,7 @@ def test_route_params_are_visible_frontend_filters_only():
     assert "let items = datasetQ.data?.transactions ?? [];" in raw_block
     assert "items = items.filter((t) => selectedBanks.includes(t.bank))" in raw_block
     assert "items = items.filter((t) => t.account_no === effectiveAccountNo)" in raw_block
-    assert "items = items.filter((t) => t.card_no === effectiveCardNo)" in raw_block
+    assert "items = items.filter((t) => matchesCardDrilldown(t, effectiveCardNo))" in raw_block
     assert "t.kind ===" not in raw_block
     assert "setActiveAccountNo('');" in toggle_block
     assert "setActiveCardNo('');" in toggle_block

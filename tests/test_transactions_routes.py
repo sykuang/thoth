@@ -392,6 +392,46 @@ def test_transactions_card_date_basis_post_filters_and_sorts_by_post_date(client
     assert by_desc["cross-month-pending"]["post_date"] == "2026-07-04"
 
 
+def test_card_drilldown_keeps_bank_level_installment_on_post_date(client, data_root):
+    """Card scope keeps unattributed card rows without leaking deposits or sibling cards."""
+    token = _register(client, email="bank-level-installment@p.com")
+    client.post("/accounts", json={"bank": "ubot", "label": "x"}, headers=_auth(token))
+    _seed_bank_db(
+        data_root,
+        "ubot",
+        twd=[{
+            "account_no": "A", "datetime": "2026-06-11T10:00:00",
+            "desc": "deposit-row", "expend": 1, "income": 0, "balance": 0,
+        }],
+        billed=[
+            {
+                "card_no": "", "date": "2026-05-05", "post_date": "2026-06-11",
+                "desc": "installment-01/12", "amount": 45756,
+            },
+            {
+                "card_no": "CARD-1", "date": "2026-06-10", "post_date": "2026-06-11",
+                "desc": "selected-card", "amount": 29,
+            },
+            {
+                "card_no": "CARD-2", "date": "2026-06-10", "post_date": "2026-06-11",
+                "desc": "sibling-card", "amount": 39,
+            },
+        ],
+    )
+
+    response = client.get(
+        "/transactions?bank=ubot&card_no=CARD-1&since=2026-06-01&until=2026-06-30&card_date_basis=post",
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert {item["description"] for item in items} == {"installment-01/12", "selected-card"}
+    installment = next(item for item in items if item["description"] == "installment-01/12")
+    assert installment["date"] == "2026-06-11"
+    assert installment["card_no"] == ""
+
+
 def test_transactions_stats_card_date_basis_post_buckets_by_post_date(client, data_root):
     """Stats date buckets also follow card_date_basis for card rows."""
     token = _register(client, email="date-basis-stats@p.com")

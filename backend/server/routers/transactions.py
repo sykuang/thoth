@@ -854,7 +854,11 @@ def _collect_transactions(
     if account_no:
         items = [t for t in items if t.get("account_no") == account_no]
     if card_no:
-        items = [t for t in items if t.get("card_no") == card_no]
+        items = [
+            t for t in items
+            if t.get("card_no") == card_no
+            or (t.get("kind") in {"billed", "pending"} and not t.get("card_no"))
+        ]
     if q:
         ql = q.lower()
         items = [t for t in items if t["description"] and ql in t["description"].lower()]

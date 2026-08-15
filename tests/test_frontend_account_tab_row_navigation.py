@@ -52,7 +52,7 @@ def test_transactions_tab_accepts_exact_account_and_card_query_filter():
     assert "params.account_no" in txns
     assert "params.card_no" in txns
     assert "t.account_no === effectiveAccountNo" in txns
-    assert "t.card_no === effectiveCardNo" in txns
+    assert "matchesCardDrilldown(t, effectiveCardNo)" in txns
 
 
 def test_account_tab_drilldown_pushes_reset_nonce_even_for_same_row_repeat_taps():

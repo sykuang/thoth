@@ -1,5 +1,9 @@
 import type { Transaction } from '@/types/api';
-import { filterCategoryViewItems, transactionSectionTitle } from './txnFilter';
+import {
+  filterCategoryViewItems,
+  matchesCardDrilldown,
+  transactionSectionTitle,
+} from './txnFilter';
 
 function deepEqual(actual: unknown, expected: unknown, message: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -54,6 +58,22 @@ deepEqual(
   [transactionSectionTitle('income'), transactionSectionTitle('expense'), transactionSectionTitle('all')],
   ['收入明細', '支出明細', '收支明細'],
   '區段標題必須反映收入/支出 scope',
+);
+
+deepEqual(
+  [
+    { kind: 'billed', card_no: 'CARD-1' },
+    { kind: 'billed', card_no: '' },
+    { kind: 'pending', card_no: null },
+    { kind: 'billed', card_no: 'CARD-2' },
+    { kind: 'twd', card_no: null },
+  ].filter((item) => matchesCardDrilldown(item as Transaction, 'CARD-1')),
+  [
+    { kind: 'billed', card_no: 'CARD-1' },
+    { kind: 'billed', card_no: '' },
+    { kind: 'pending', card_no: null },
+  ],
+  '單卡 drilldown 必須保留銀行無法歸卡的整戶信用卡交易，但不得帶入其他卡或存款交易',
 );
 
 console.log('transaction category view filter tests passed');

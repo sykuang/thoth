@@ -37,6 +37,12 @@ export type TxnFilters = {
 
 export type TxnCashflowDirection = 'income' | 'expense' | 'zero';
 
+/** Keep provider-level card rows visible without attributing them to one card. */
+export function matchesCardDrilldown(t: Transaction, cardNo: string): boolean {
+  return t.card_no === cardNo
+    || ((t.kind === 'billed' || t.kind === 'pending') && !t.card_no);
+}
+
 /**
  * Transaction cash-flow direction used consistently by list filters, cards,
  * and category aggregates. This intentionally mirrors currency.ts/renderAmount:
