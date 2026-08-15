@@ -1551,10 +1551,6 @@ function CardRow({
     card.bill_status,
   );
 
-  const primaryAmount = card.used_credit !== null && card.used_credit !== undefined
-    ? card.used_credit
-    : card.credit_limit;
-
   // Phase 8.2 C: 顯示 fallback overwrite || raw；row 右側保留獨立編輯 affordance。
   const rawName = card.name ?? '(未命名)';
   const overwriteName = (card.nickname_overwrite ?? '').trim();
@@ -1653,7 +1649,7 @@ function CardRow({
         })}
         testID={`card-detail-${card.card_no}`}
       >
-        {/* 行 1: 卡名 (左) + 已用額度/信用額度 (右) */}
+        {/* 行 1: 卡名 (左) + 本期待繳帳單 (右) */}
         <View className="flex-row items-baseline justify-between">
           <View className="flex-row items-center gap-1 flex-1 min-w-0">
             <Text
@@ -1667,13 +1663,13 @@ function CardRow({
             className={`text-h3 font-semibold font-mono ml-2 ${
               excluded
                 ? 'text-ink-400 dark:text-ink-500 line-through'
-                : card.used_credit !== null && card.used_credit !== undefined && card.used_credit > 0
+                : billDue > 0
                   ? 'text-red-600 dark:text-red-400'
                   : 'text-emerald-600 dark:text-emerald-400'
             }`}
             numberOfLines={1}
           >
-            {primaryAmount == null ? '—' : formatCurrency(primaryAmount, 'TWD')}
+            {formatCurrency(billDue, 'TWD')}
           </Text>
         </View>
         {/* 行 2: 末四碼 (左) + 到期日/狀態 (右) */}

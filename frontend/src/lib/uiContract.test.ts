@@ -66,6 +66,8 @@ includes(accounts, 'contentContainerStyle={{ paddingBottom: 32 }}', 'accounts li
 excludes(accounts, 'formatSignedCurrency', 'account-tab amounts must use color rather than signs');
 includes(accounts, "'text-red-600 dark:text-red-400'", 'account-tab liabilities must use the red amount tone');
 includes(accounts, "'text-emerald-600 dark:text-emerald-400'", 'account-tab assets must use the green amount tone');
+includes(accounts, "formatCurrency(billDue, 'TWD')", 'credit-card rows must show the amount due beside the due-date label');
+excludes(accounts, 'const primaryAmount = card.used_credit', 'credit-card rows must not present aggregate credit usage as the bill due');
 includes(brokerageAccounts, 'formatAbsoluteDecimalCurrency', 'brokerage account totals must use color rather than signs');
 excludes(accounts, 'borderLeftWidth: 4', 'normal bank groups must not use warning-style side stripes');
 excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transactions must not use status-style side stripes');
