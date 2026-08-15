@@ -21,38 +21,76 @@ def _scsb_page_error(text: str) -> bool:
     ))
 
 
-def _scsb_parse_card_rows(text: str, scope: str) -> list:
-    """SCSB Credit Card 表格 row 解析。
-
-    Real-Time Transaction Records 格式：
-      Transaction Date / Transaction Time / Card Type / Last 4 / Merchant Name / Amount / ...
-
-    使用者目前無 transaction 所以僅 header 在 — 但留 parser 給未來用。
-    """
+def _scsb_parse_card_rows(text: str, scope: str) -> tuple[list, bool]:
+    """Parse SCSB card rows and report whether every data-looking row parsed."""
     rows = []
-    if not text:
-        return rows
-    # 找出 header 後的 data block
-    if "Transaction Date" not in text:
-        return rows
+    if not text or "Transaction Date" not in text:
+        return rows, False
     after_header = text.split("Transaction Date", 1)[1]
-    # 用 regex 找：日期 \d{4}/\d{2}/\d{2} ... 然後抓金額 NT$ 或純數字
-    for m in re.finditer(
+    lines = after_header.splitlines()
+    header_cells = (["Transaction Date"] + [
+        cell.strip() for cell in (lines[0].lstrip("\t").split("\t") if lines else [])
+    ])
+    card_index = next((
+        i for i, cell in enumerate(header_cells)
+        if "last 4" in cell.lower() or "card no" in cell.lower()
+    ), None)
+    desc_index = next((
+        i for i, cell in enumerate(header_cells) if "merchant" in cell.lower()
+    ), None)
+    amount_index = next((
+        i for i, cell in enumerate(header_cells) if "amount" in cell.lower()
+    ), None)
+    if card_index is not None and desc_index is not None and amount_index is not None:
+        candidate_rows = malformed_rows = 0
+        for line in lines[1:]:
+            cells = [cell.strip() for cell in line.split("\t")]
+            if not cells or not re.fullmatch(r"\d{4}/\d{2}/\d{2}", cells[0]):
+                continue
+            candidate_rows += 1
+            if len(cells) <= max(card_index, desc_index, amount_index):
+                malformed_rows += 1
+                continue
+            card_value = cells[card_index]
+            amount_value = cells[amount_index]
+            if (
+                not re.fullmatch(r"(?:\*{4})?\d{4}", card_value)
+                or not re.fullmatch(r"(?:NT\$\s*)?-?[\d,]+(?:\.\d+)?", amount_value)
+            ):
+                malformed_rows += 1
+                continue
+            desc = cells[desc_index]
+            amt = _num(amount_value.replace("NT$", "").replace(",", "").strip())
+            rows.append({
+                "card_no": f"****{card_value[-4:]}",
+                "scope": scope,
+                "date": cells[0].replace("/", "-"),
+                "desc": desc,
+                "amount": amt,
+                "currency": "TWD",
+                "txn_type": classify.classify_by_desc_and_sign(desc, amt),
+            })
+        if candidate_rows:
+            return rows, malformed_rows == 0 and len(rows) == candidate_rows
+
+    for match in re.finditer(
         r"(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2}(?::\d{2})?)?\s*([A-Za-z\s]{0,30})?\s*(\d{4})\s+([^\t\n]{1,60})\s+(NT\$\s*[\d,]+|[\d,]+\.\d+)",
         after_header,
     ):
-        desc = (m.group(5) or "").strip()
-        amt = _num((m.group(6) or "").replace("NT$", "").replace(",", "").strip())
+        desc = (match.group(5) or "").strip()
+        amt = _num((match.group(6) or "").replace("NT$", "").replace(",", "").strip())
         rows.append({
-            "card_no": m.group(4),  # last 4 only
+            "card_no": f"****{match.group(4)}",
             "scope": scope,
-            "date": m.group(1).replace("/", "-"),
+            "date": match.group(1).replace("/", "-"),
             "desc": desc,
             "amount": amt,
             "currency": "TWD",
             "txn_type": classify.classify_by_desc_and_sign(desc, amt),
         })
-    return rows
+    candidate_rows = len(re.findall(r"(?m)^\s*\d{4}/\d{2}/\d{2}\b", after_header))
+    return rows, candidate_rows > 0 and len(rows) == candidate_rows
+
 
 def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
     """SCSB collect() 結構 → store 表增量。
@@ -200,8 +238,8 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 unb_refreshed = True
             else:
                 # 嘗試解析（未來若使用者有刷卡才會走到這）
-                unb_rows = _scsb_parse_card_rows(unb_text, scope="unbilled")
-                if unb_rows:
+                unb_rows, unb_complete = _scsb_parse_card_rows(unb_text, scope="unbilled")
+                if unb_rows and unb_complete:
                     card_unbilled = store.refresh_card_pending(
                         "unbilled", unb_rows, rules=rules, fetch_ok=True,
                         commit=False)
@@ -227,8 +265,8 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "url": cur.get("url"),
                 "snippet": cur_text[cur_text.find("Real-Time Transaction Records"):][:600] if "Real-Time" in cur_text else cur_text[:600],
             }, today, commit=False)
-            cur_rows = _scsb_parse_card_rows(cur_text, scope="current")
-            if cur_rows:
+            cur_rows, cur_complete = _scsb_parse_card_rows(cur_text, scope="current")
+            if cur_rows and cur_complete:
                 card_current = store.refresh_card_pending(
                     "current", cur_rows, rules=rules, fetch_ok=True)
                 cur_refreshed = True

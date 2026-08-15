@@ -548,6 +548,10 @@ class DbsCrawler(BankCrawler):
             out["twd_account_drilldown_error"] = str(e)
             _log(f"[dbs][twd] drilldown probe failed: {e}")
 
+        # 2026-08-15 實頁驗證：overview 卡片 tile 不是 drilldown；點 CardWrapper 不改 URL、
+        # 不發任何 API，頂部「繳卡費」也只有帳單摘要。DBS Internet Banking 未提供可證明
+        # 的逐筆信用卡來源，故此處不得合成明細或日期。
+
         # 信用卡卡費：使用者實測指出登入後點頂部「繳卡費」才看得到最近一期帳單金額。
         # 這頁是發起繳卡費流程，不是歷史繳款紀錄；只用來補 bill_due/payment_due。
         try:

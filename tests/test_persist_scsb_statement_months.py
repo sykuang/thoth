@@ -171,9 +171,9 @@ def test_scsb_real_credit_card_masked_extracted_from_unbilled(store):
     # 模擬 unbilled 有交易、卡號 ****7016
     text_with_real_unbilled = """Unbilled Transaction Details
 Data Time：2026/06/14 00:26:16
-Transaction Date\tCard Last 4\tMerchant\tAmount
-2026/06/10\t****7016\tStarbucks\t150
-2026/06/11\t****7016\t7-11\t89
+Transaction Date\tCard Last 4\tMerchant\tAmount\tAuth Code
+2026/06/10\t****7016\tStarbucks\t150\t999999
+2026/06/11\t****7016\t7-11\t89\t888888
 """
     data = {
         "accounts": [],
@@ -182,6 +182,7 @@ Transaction Date\tCard Last 4\tMerchant\tAmount
                 "unbilled": {
                     "url": "https://scsb/unbilled",
                     "text": text_with_real_unbilled,
+                    "nav": {"ok": True},
                 },
                 "statement": {
                     "url": "https://scsb/statement",
@@ -196,5 +197,36 @@ Transaction Date\tCard Last 4\tMerchant\tAmount
     # 確認身分證 masked 沒被當卡號（regression guard）
     assert not any(c.startswith("A") for c in card_nos), \
         f"身分證 masked 不該當卡號: {card_nos}"
-    # 注意：unbilled parser 抽不抽到 ****7016 取決於 _scsb_parse_card_rows 實作；
-    # 此 test 的主旨是驗證 statement 不再產生幽靈卡，這部分必為真。
+    assert card_nos == ["****7016"]
+    pending = list(store.conn.execute(
+        "SELECT card_no, consume_date, post_date, description, amount "
+        "FROM card_pending_txns ORDER BY consume_date"
+    ))
+    assert [tuple(row) for row in pending] == [
+        ("****7016", "2026-06-10", None, "Starbucks", 150),
+        ("****7016", "2026-06-11", None, "7-11", 89),
+    ]
+
+
+def test_scsb_partial_parse_preserves_existing_scope(store):
+    old_rows = [
+        {"card_no": "****7016", "date": "2026-06-01", "desc": "舊一", "amount": 10},
+        {"card_no": "****7016", "date": "2026-06-02", "desc": "舊二", "amount": 20},
+    ]
+    store.refresh_card_pending("current", old_rows, fetch_ok=True)
+    text = """Real-Time Transaction Records
+Transaction Date\tCard Last 4\tMerchant\tAmount
+2026/06/10\t****7016\t合法交易\t150
+2026/06/11\t****7016\t解析失敗\tN/A
+"""
+    persist_scsb({
+        "accounts": [],
+        "card_inquiry": {"leaves": {"current": {
+            "url": "https://scsb/current", "text": text, "nav": {"ok": True},
+        }}},
+    }, store)
+
+    rows = store.conn.execute(
+        "SELECT description, amount FROM card_pending_txns WHERE scope='current' ORDER BY amount"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [("舊一", 10), ("舊二", 20)]

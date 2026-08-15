@@ -239,7 +239,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             for t in txns:
                 if not isinstance(t, dict):
                     continue
-                date = t.get("transactionDate") or t.get("postingDate") or t.get("txnDate")
+                consume_date = t.get("transactionDate") or t.get("txnDate")
+                post_date = t.get("postingDate")
                 desc = t.get("merchantName") or t.get("description") or t.get("merchantDesc")
                 twd_amount = t.get("localAmount") or t.get("twdAmount") or t.get("amount") or 0
                 fx_currency = t.get("currency") or t.get("originalCurrency") or "TWD"
@@ -256,7 +257,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
                     fx_float = None
                 billed_payload.append({
                     "card_no": f"****{card_last4}" if card_last4 else None,
-                    "date": date,
+                    "date": consume_date,
+                    "post_date": post_date,
                     "desc": desc or "",
                     "amount": twd_int,
                     "currency": "TWD",

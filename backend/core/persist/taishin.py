@@ -260,7 +260,7 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
                 card_no_suffix = b.get("card_no_suffix") or ""
                 card_no = f"****{card_no_suffix}" if card_no_suffix else None
                 consume_date = _norm_date(b.get("txn_date"))
-                post_date = _norm_date(b.get("post_date")) or consume_date
+                post_date = _norm_date(b.get("post_date"))
                 desc = b.get("desc")
                 amt = b.get("amount")
                 billed_payload.append({

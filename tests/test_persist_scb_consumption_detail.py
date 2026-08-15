@@ -82,6 +82,7 @@ def test_scb_consumption_detail_with_twd_only(store):
                         "transactionList": [
                             {
                                 "transactionDate": "2025/12/10",
+                                "postingDate": "2025/12/12",
                                 "merchantName": "全聯福利中心",
                                 "amount": 850,
                                 "currency": "TWD",
@@ -101,11 +102,14 @@ def test_scb_consumption_detail_with_twd_only(store):
 
     assert delta["card_billed_new"] == 1
     rows = list(store.conn.execute(
-        "SELECT card_no, description, amount, currency, consume_currency, consume_amount FROM card_billed_txns"
+        "SELECT card_no, consume_date, post_date, description, amount, currency, "
+        "consume_currency, consume_amount FROM card_billed_txns"
     ))
     assert len(rows) == 1
-    card_no, desc, amt, cur, cc, ca = rows[0]
+    card_no, consume_date, post_date, desc, amt, cur, cc, ca = rows[0]
     assert card_no == "****7052"
+    assert consume_date == "2025/12/10"
+    assert post_date == "2025/12/12"
     assert desc == "全聯福利中心"
     assert amt == 850
     assert cur == "TWD"

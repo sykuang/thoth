@@ -77,5 +77,9 @@ const postBasisTimeline = mergeTransactionTimeline(
 if (postBasisTimeline[0].source !== 'bank' || postBasisTimeline[0].transaction.id !== 9) {
   throw new Error('post-date timeline ordering regressed');
 }
+const emptyPostCard = { ...crossMonthCard, post_date: '   ' };
+if (transactionDateForBasis(emptyPostCard, 'post') !== '2026-07-31') {
+  throw new Error('empty post-date must fall back to consumption date');
+}
 
 console.log('transaction timeline checks passed');

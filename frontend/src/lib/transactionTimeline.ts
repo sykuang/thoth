@@ -36,9 +36,11 @@ export function transactionDateForBasis(
 ): string {
   if (transaction.kind === 'billed' || transaction.kind === 'pending') {
     if (basis === 'post') {
-      return transaction.post_date ?? transaction.consume_date ?? transaction.date ?? '';
+      return transaction.post_date?.trim() || transaction.consume_date?.trim()
+        || transaction.date?.trim() || '';
     }
-    return transaction.consume_date ?? transaction.date ?? transaction.post_date ?? '';
+    return transaction.consume_date?.trim() || transaction.date?.trim()
+      || transaction.post_date?.trim() || '';
   }
   return transaction.date ?? '';
 }

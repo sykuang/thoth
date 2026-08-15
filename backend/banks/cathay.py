@@ -710,7 +710,7 @@ class CathayCrawler(BankCrawler):
             "card_no": self.mask_card(t.get("cardNo") or t.get("mobileCardNo")),
             "date": t.get("consumeDate") or t.get("transDate"),   # 消費日
             # 入帳日：國泰用 beginValueDate(折算入帳日) / convertDate(折算日)；
-            # 爬不到留 None，store 層會 fallback 成消費日（設計規範）。
+            # 三個獨立來源欄位都沒有時保留 None，shared store 不得偽造。
             "post_date": t.get("beginValueDate") or t.get("convertDate") or t.get("postingDate"),
             "desc": t.get("transDesc"),
             "amount": t.get("amount"),                            # 台幣入帳金額

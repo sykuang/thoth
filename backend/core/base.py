@@ -314,6 +314,7 @@ class BankCollectResult:
     card_billed: Any = None
     card_billing: Any = None
     card_bills: Any = None
+    card_bill_details: Any = None
     card_detail: Any = None
     card_final_url: Any = None
     card_frame_match: Any = None
@@ -333,6 +334,7 @@ class BankCollectResult:
     card_quota_frames: Any = None
     card_quota_nav_probe: Any = None
     card_resources: Any = None
+    card_statement_transactions: Any = None
     card_statements: Any = None
     card_submenu: Any = None
     card_summary: Any = None

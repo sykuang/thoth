@@ -20,7 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.banks.ubot import _ubot_card_bill_fact
 from backend.core.persist import persist_ubot
+from backend.core.persist._common import _ubot_date
 from backend.core.store import BankStore
+
+
+@pytest.mark.parametrize("value", ["00000000", "N/A", "20260230"])
+def test_ubot_date_rejects_invalid_sentinel(value):
+    assert _ubot_date(value) is None
 
 
 @pytest.fixture

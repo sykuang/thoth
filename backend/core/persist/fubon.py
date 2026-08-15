@@ -9,7 +9,23 @@ from datetime import datetime
 
 from backend.core import classify
 from backend.core.store import BankStore
-from backend.core.persist._common import _num_to_float, _roc_to_west, _slash_date_to_iso
+from backend.core.persist._common import _num_to_float, _slash_date_to_iso
+
+
+def _fubon_date(value: str | None) -> str | None:
+    """富邦頁面日期邊界：只接受有效 ROC/Gregorian Y/M/D，非法 sentinel → None。"""
+    if not value:
+        return None
+    try:
+        parts = str(value).strip().replace("-", "/").split("/")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            return None
+        year, month, day = map(int, parts)
+        if year < 1000:
+            year += 1911
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_fubon_deposit_accounts(deposit_text: str) -> list[dict]:
@@ -377,7 +393,7 @@ def _parse_fubon_credit_card(data: dict) -> dict:
         if m:
             billing_summary["bill_month_roc"] = m.group(1)
             billing_summary["statement_date_roc"] = m.group(4)
-            billing_summary["statement_date"] = _roc_to_west(m.group(4))
+            billing_summary["statement_date"] = _fubon_date(m.group(4))
             if not billing_summary.get("bill_date"):
                 billing_summary["bill_date"] = billing_summary["statement_date"]
 
@@ -402,9 +418,9 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             r"(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]+?)\s*\t\s*(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*(-?[\d,]+(?:\.\d+)?)",
             billed_text,
         ):
-            consume_date = _roc_to_west(tm.group(1))
+            consume_date = _fubon_date(tm.group(1))
             desc = tm.group(2).strip()
-            post_date = _roc_to_west(tm.group(3))
+            post_date = _fubon_date(tm.group(3))
             fx_part = tm.group(5).strip()
             amount_str = tm.group(6).replace(",", "")
             # 跳過聚合行（desc 含「前期應繳/本期應繳/最低應繳」）
@@ -434,8 +450,9 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             r"(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]+?)\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*(-?[\d,]+(?:\.\d+)?)",
             pending_text,
         ):
-            consume_date = _roc_to_west(tm.group(1))
+            consume_date = _fubon_date(tm.group(1))
             desc = tm.group(2).strip()
+            post_date = _fubon_date(tm.group(3).strip())
             amount_str = tm.group(6).replace(",", "")
             try:
                 amount = float(amount_str)
@@ -445,6 +462,7 @@ def _parse_fubon_credit_card(data: dict) -> dict:
                 continue
             pending_txns.append({
                 "date": consume_date,
+                "post_date": post_date,
                 "desc": desc,
                 "amount": amount,
                 "currency": "TWD",
@@ -483,7 +501,7 @@ def _parse_fubon_credit_card(data: dict) -> dict:
                 "adjustment": int(m.group(5).replace(",", "")),
                 "balance": int(m.group(6).replace(",", "")),
                 "expiring": int(m.group(7).replace(",", "")),
-                "expiry_date": _roc_to_west(m.group(8)),
+                "expiry_date": _fubon_date(m.group(8)),
             }
     out["points"] = points
 
@@ -618,6 +636,7 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         pending_payload.append({
             "card_no": default_card_no,
             "date": p.get("date"),
+            "post_date": p.get("post_date"),
             "desc": desc,
             "amount": amt,
             "currency": p.get("currency") or "TWD",

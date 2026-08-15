@@ -166,6 +166,46 @@ def test_fubon_persist_classifies_payment_txn(fubon_data, fubon_store):
         )
 
 
+def test_fubon_pending_preserves_posting_date_column(fubon_data, fubon_store):
+    """未出帳表第三欄是入帳日期；parser 不得抓到後丟掉。"""
+    fubon_data["pending_click_ok"] = True
+    fubon_data["pending_page_url"] = "https://ebank.example/cccqu004/home"
+    fubon_data["pending_page_text"] = (
+        "消費日期\t消費說明\t入帳日期\t外幣折算日/幣別\t外幣金額/消費地\t臺幣金額\n"
+        "115/05/05\t測試商店\t115/05/06\t　\t　\t100\n"
+    )
+
+    persist_fubon(fubon_data, fubon_store)
+
+    row = fubon_store.conn.execute(
+        "SELECT consume_date, post_date, description FROM card_pending_txns"
+    ).fetchone()
+    assert dict(row) == {
+        "consume_date": "2026-05-05",
+        "post_date": "2026-05-06",
+        "description": "測試商店",
+    }
+
+
+@pytest.mark.parametrize("sentinel", ["---", "N/A", "000/00/00"])
+def test_fubon_pending_parser_rejects_invalid_posting_date(
+    sentinel, fubon_data, fubon_store,
+):
+    fubon_data["pending_click_ok"] = True
+    fubon_data["pending_page_url"] = "https://ebank.example/cccqu004/home"
+    fubon_data["pending_page_text"] = (
+        "消費日期\t消費說明\t入帳日期\t外幣折算日/幣別\t外幣金額/消費地\t臺幣金額\n"
+        f"115/05/05\t測試商店\t{sentinel}\t　\t　\t100\n"
+    )
+
+    persist_fubon(fubon_data, fubon_store)
+
+    row = fubon_store.conn.execute(
+        "SELECT consume_date, post_date FROM card_pending_txns"
+    ).fetchone()
+    assert tuple(row) == ("2026-05-05", None)
+
+
 def test_fubon_persist_writes_four_daily_metrics(fubon_data, fubon_store):
     """E: persist_fubon 應寫 4 個 daily_metric: card_billing_summary / card_limits / card_points / endpoints."""
     persist_fubon(fubon_data, fubon_store)

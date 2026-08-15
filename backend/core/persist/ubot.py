@@ -140,7 +140,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "bill_date": bill_date,
                 "currency": "TWD",                              # 入帳幣別（台幣）
                 "date": _ubot_date(t.get("effectDate")),       # 消費日
-                "post_date": _ubot_date(t.get("postDate")),     # 入帳日（爬不到 store 層 fallback=消費日）
+                "post_date": _ubot_date(t.get("postDate")),     # 入帳日（缺值保留 NULL）
                 "desc": desc,
                 "amount": amt,
                 "consume_country": None,

@@ -97,7 +97,7 @@ def test_cathay_filters_only_when_both_dates_null(store):
                 "consume_currency": "",
                 "consume_amount": 0,
             },
-            # 只 post_date NULL — 不 filter (store fallback 會補)
+            # 只 post_date NULL — 不 filter；store 必須原樣保留 NULL
             {
                 "card_no": "****7016",
                 "date": "2026-05-01T00:00:00",

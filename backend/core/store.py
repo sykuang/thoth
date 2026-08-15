@@ -346,8 +346,8 @@ CREATE TABLE IF NOT EXISTS twd_transactions (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_twd_dedup ON twd_transactions(dedup_key);
 
 -- 2. 信用卡已出帳逐筆明細（append-only）
--- 消費日(consume_date) 與 入帳日(post_date) 分開存；爬不到入帳日才由 persist 層
--- fallback 成與消費日相同（設計規範：兩個日期都要確實爬出）。
+-- 消費日(consume_date) 與入帳日(post_date)分開存；來源沒給入帳日就保留 NULL，
+-- 不得複製消費日冒充銀行提供的入帳日。
 -- 外幣消費：consume_currency 存每筆原始幣別（JPY/USD/EUR…），consume_amount 用 REAL
 -- 保留外幣小數（如 USD 123.45 的分），不可截斷；amount 是台幣入帳金額(整數)。
 CREATE TABLE IF NOT EXISTS card_billed_txns (
@@ -542,10 +542,8 @@ class BankStore:
         cols = {r["name"] for r in self.conn.execute(
             "PRAGMA table_info(card_billed_txns)").fetchall()}
         if "post_date" not in cols:
-            # 入帳日欄位；既有列先以消費日回填（爬不到入帳日時兩者相同的既定語意）
+            # 舊 schema 沒有來源可重建入帳日；新增 nullable 欄後保持 NULL。
             self.conn.execute("ALTER TABLE card_billed_txns ADD COLUMN post_date TEXT")
-            self.conn.execute(
-                "UPDATE card_billed_txns SET post_date = consume_date WHERE post_date IS NULL")
         # Bank memo is part of the persisted canonical description used by both UI and rules.
         # Keep raw_description for audit/dedup provenance; description is the canonical value.
         twd_cols = {r["name"] for r in self.conn.execute(
@@ -859,6 +857,30 @@ class BankStore:
         inserted_count = 0
         now = _now()
         pending_metadata = self._pending_user_metadata()
+        prepared_txns = []
+        for original in txns:
+            t = dict(original)
+            t["post_date"] = t.get("post_date") or None
+            if (
+                t.get("post_date") and not t.get("card_no") and t.get("date")
+                and t.get("amount") is not None and t.get("desc")
+            ):
+                candidates = self.conn.execute(
+                    """SELECT card_no FROM card_billed_txns
+                       WHERE user_id = ? AND post_date IS NULL
+                         AND consume_date = ? AND amount = ? AND description = ?
+                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                       ORDER BY id""",
+                    (self.user_id, t.get("date"), t.get("amount"), t.get("desc"),
+                     t.get("consume_amount"), t.get("consume_amount")),
+                ).fetchall()
+                if len(candidates) == 1:
+                    t["card_no"] = candidates[0]["card_no"]
+                elif len(candidates) > 1:
+                    # Bank-level statement row 沒有卡號且舊資料有多個候選時無法安全 join。
+                    continue
+            prepared_txns.append(t)
+        txns = prepared_txns
         # 信用卡無 running balance，重複刷卡更需 occurrence index 防誤殺。
         # dedup_key 同時納入 consume_date(消費日) 與 post_date(入帳日)：
         # 同消費日但不同入帳日（如分期、跨月折算）算不同筆，不可去重誤殺。
@@ -870,8 +892,64 @@ class BankStore:
         ]
         dedup_keys = _with_occurrence(content_keys)
         for t, key in zip(txns, dedup_keys, strict=True):
-            # 入帳日爬不到 → fallback 成與消費日相同（設計規範）
-            post_date = t.get("post_date") or t.get("date")
+            post_date = t.get("post_date") or None
+            if (
+                post_date and t.get("card_no") and t.get("date")
+                and t.get("amount") is not None and t.get("desc")
+            ):
+                blank_candidates = self.conn.execute(
+                    """SELECT id FROM card_billed_txns
+                       WHERE user_id = ? AND (card_no IS NULL OR card_no = '')
+                         AND consume_date = ? AND post_date = ?
+                         AND amount = ? AND description = ?
+                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                       ORDER BY id""",
+                    (self.user_id, t.get("date"), post_date, t.get("amount"),
+                     t.get("desc"), t.get("consume_amount"), t.get("consume_amount")),
+                ).fetchall()
+                if len(blank_candidates) > 1:
+                    continue
+                key_exists = self.conn.execute(
+                    "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                    (self.user_id, key),
+                ).fetchone()
+                if len(blank_candidates) == 1 and key_exists is None:
+                    self.conn.execute(
+                        "UPDATE card_billed_txns SET card_no = ?, dedup_key = ?, "
+                        "bill_date = COALESCE(?, bill_date) WHERE user_id = ? AND id = ?",
+                        (t.get("card_no"), key, t.get("bill_date"), self.user_id,
+                         blank_candidates[0]["id"]),
+                    )
+            if (
+                post_date and t.get("date") and t.get("amount") is not None
+                and t.get("desc")
+            ):
+                candidates = self.conn.execute(
+                    """SELECT id FROM card_billed_txns
+                       WHERE user_id = ? AND post_date IS NULL
+                         AND (card_no = ? OR (card_no IS NULL AND ? IS NULL))
+                         AND consume_date = ? AND amount = ? AND description = ?
+                         AND (consume_amount = ? OR (consume_amount IS NULL AND ? IS NULL))
+                       ORDER BY id""",
+                    (self.user_id, t.get("card_no"), t.get("card_no"), t.get("date"),
+                     t.get("amount"), t.get("desc"), t.get("consume_amount"),
+                     t.get("consume_amount")),
+                ).fetchall()
+                existing_key = self.conn.execute(
+                    "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                    (self.user_id, key),
+                ).fetchone()
+                if len(candidates) > 1:
+                    continue
+                if len(candidates) == 1 and existing_key is None:
+                    # 同一 canonical row 從「尚無入帳日」升級為銀行真值；原地更新可保留
+                    # 使用者分類／備註／拆帳，且避免新 dedup key 造成雙列。
+                    self.conn.execute(
+                        "UPDATE card_billed_txns SET post_date = ?, "
+                        "bill_date = COALESCE(?, bill_date), dedup_key = ? "
+                        "WHERE user_id = ? AND id = ?",
+                        (post_date, t.get("bill_date"), key, self.user_id, candidates[0]["id"]),
+                    )
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
             metadata_rows = None
@@ -922,13 +1000,20 @@ class BankStore:
                 inserted_count += 1
             else:
                 existing = self.conn.execute(
-                    "SELECT id, category, subcategory, txn_type, description_overwrite, "
+                    "SELECT id, post_date, category, subcategory, txn_type, description_overwrite, "
                     "tags_overwrite, auto_excluded, splits_overwrite "
                     "FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
                     (self.user_id, key),
                 ).fetchone()
                 if existing:
                     self._current_billed_ids.append(existing["id"])
+                    if post_date is None and existing["post_date"]:
+                        # 舊 store 寫入 consume_date fallback，但 dedup_key 是用來源的
+                        # post_date=None 生成；同 key 再同步即是可證明的 legacy 假值。
+                        self.conn.execute(
+                            "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
+                            (existing["id"],),
+                        )
             if (not inserted and pending_id is not None and existing and (
                     cat or sub or description_overwrite or tags_overwrite
                     or splits_overwrite or auto_ex)):
@@ -1401,7 +1486,7 @@ class BankStore:
                     is_subscription, splits_overwrite)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.user_id, scope, t.get("card_no"), t.get("date"),
-                 t.get("post_date") or t.get("date"), t.get("desc"),
+                 t.get("post_date") or None, t.get("desc"),
                  t.get("amount"), t.get("currency"),
                  t.get("consume_country"), t.get("consume_currency"),
                  t.get("consume_amount"),

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 
 
 def _num(s) -> int | None:
@@ -61,10 +62,13 @@ def _ubot_date(s: str | None) -> str | None:
     """聯邦日期：'2026/05/16' 或 '20260515' → 'YYYY-MM-DD'。"""
     if not s:
         return None
-    t = str(s).strip().replace("/", "")
-    if len(t) == 8 and t.isdigit():
-        return f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-    return s
+    text = str(s).strip().replace("/", "").replace("-", "")
+    if len(text) != 8 or not text.isdigit() or text == "00000000":
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _roc_to_west(s: str | None) -> str | None:

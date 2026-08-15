@@ -267,7 +267,8 @@ function CardDateBasisToggle() {
       testID="settings-card-date-disclosure"
     >
       <Text className="text-ink-500 dark:text-ink-400 text-small mb-3">
-        此設定會影響明細篩選、月份歸屬與統計。
+        此設定會影響明細篩選、月份歸屬與統計。銀行尚未提供入帳日時，
+        該筆會標示「消費日」並暫按消費日認列。
       </Text>
       <View
         className={`self-start flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${

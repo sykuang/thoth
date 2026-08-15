@@ -292,6 +292,7 @@ export function TxnDetailModal({
   if (!txn) return null;
 
   const render = renderAmount(txn, fxMode);
+  const postDate = txn.post_date?.trim() || null;
   const [rawDisplayDescription] = getDisplayDescription({
     ...txn,
     description_overwrite: null,
@@ -434,9 +435,16 @@ export function TxnDetailModal({
               <DetailRow label="帳戶餘額" value={formatSignedCurrency(txn.balance, 'TWD')} mono />
             )}
             {txn.consume_date && <DetailRow label="消費日" value={txn.consume_date} />}
-            {txn.post_date && <DetailRow label="入帳日" value={txn.post_date} />}
             {(txn.kind === 'billed' || txn.kind === 'pending') && (
-              <DetailRow label="認列方式" value={cardDateBasis === 'post' ? '入帳日' : '消費日'} />
+              <>
+                <DetailRow label="入帳日" value={postDate ?? '尚無入帳日'} />
+                <DetailRow
+                  label="認列方式"
+                  value={cardDateBasis === 'post' && !postDate
+                    ? '暫按消費日（尚未取得入帳日）'
+                    : cardDateBasis === 'post' ? '入帳日' : '消費日'}
+                />
+              </>
             )}
             {txn.scope && <DetailRow label="範圍" value={SCOPE_LABEL[txn.scope] ?? txn.scope} />}
             {txn.datetime && <DetailRow label="完整時間" value={txn.datetime} />}

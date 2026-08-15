@@ -612,6 +612,73 @@ class EsunCrawler(BankCrawler):
                 out["card_bills"] = self._parse_card_bills(full_text)
                 _log(f"[esun][collect] card_summary={out['card_summary']}")
                 _log(f"[esun][collect] card_bills count={len(out['card_bills'])}")
+
+                # 帳單列表只含月份／總額；逐月點橘色「明細」才有真實入帳日。
+                bill_details = []
+                for bill_index, bill in enumerate(out["card_bills"]):
+                    if bill_index:
+                        self._navigate_credit_card_bill(page, debug_dir)
+                        page.wait_for_timeout(5000)
+                    click_result = None
+                    for frame in page.frames:
+                        try:
+                            click_result = frame.evaluate(r"""(index) => {
+                                const body = document.body?.textContent || '';
+                                if (!body.includes('帳單月份') || !body.includes('應繳總金額')) return null;
+                                const visible = (el) => {
+                                    const r = el.getBoundingClientRect();
+                                    const s = getComputedStyle(el);
+                                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                                };
+                                const buttons = [...document.querySelectorAll('a,button,input[type="button"],input[type="submit"]')]
+                                    .filter((el) => ((el.textContent || el.value || '').replace(/\s+/g, '') === '明細') && visible(el));
+                                const target = buttons[index];
+                                if (!target) return {clicked: false, count: buttons.length};
+                                target.click();
+                                return {clicked: true, count: buttons.length, tag: target.tagName, id: target.id || '', name: target.name || ''};
+                            }""", bill_index)
+                            if click_result and click_result.get("clicked"):
+                                break
+                        except Exception:
+                            pass
+                    if not click_result or not click_result.get("clicked"):
+                        bill_details.append({"bill_month": bill.get("bill_month"), "click": click_result})
+                        continue
+                    page.wait_for_timeout(7000)
+                    detail = None
+                    pages = list(page.context.pages)
+                    for detail_page in reversed(pages):
+                        for frame in detail_page.frames:
+                            try:
+                                text = frame.evaluate("() => document.body.textContent.slice(0, 50000)")
+                                has_detail_headers = all(marker in text for marker in (
+                                    "交易日期", "入帳日期", "本期消費明細：", "本期合計：",
+                                ))
+                                if has_detail_headers:
+                                    detail = {
+                                        "bill_month": bill.get("bill_month"),
+                                        "url": frame.url[:200],
+                                        "text_preview": text,
+                                        "click": click_result,
+                                        "popup": detail_page != page,
+                                    }
+                                    break
+                            except Exception:
+                                pass
+                        if detail:
+                            break
+                    for popup in pages:
+                        if popup != page:
+                            with contextlib.suppress(Exception):
+                                popup.close()
+                    bill_details.append(detail or {
+                        "bill_month": bill.get("bill_month"),
+                        "click": click_result,
+                        "error": "detail page not found",
+                        "page_count": len(pages),
+                    })
+                out["card_bill_details"] = bill_details
+                _log(f"[esun][collect] card_bill_details={len(bill_details)}")
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "card.png"), full_page=True)
             _log(f"[esun][collect] card_frames={len(card_frames)} (widget mode)")
@@ -850,6 +917,13 @@ class EsunCrawler(BankCrawler):
 
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         out["_endpoint_count"] = len(out["_all_endpoints"])
+        out["card_statement_transactions"] = self._parse_card_bill_details(
+            out.get("card_bill_details") or [],
+        )
+        out["card_transactions"] = self._merge_card_transactions(
+            out.get("card_transactions") or [],
+            out["card_statement_transactions"],
+        )
         publish_card_bill_facts(out, [_esun_card_bill_fact(out)])
         _log(f"[esun][collect] 攔到 {out['_endpoint_count']} 個 API endpoint")
         return BankCollectResult(**out)
@@ -1084,6 +1158,107 @@ class EsunCrawler(BankCrawler):
                 "paid_amount": int(m.group("paid").replace(",", "") or 0),
             })
         return bills
+
+    @staticmethod
+    def _parse_card_bill_details(details: list[dict]) -> list[dict]:
+        """逐月帳單 popup：交易日、入帳日、交易項目、原幣／繳款幣別金額。"""
+        import re as _re
+
+        date_re = _re.compile(r"^(\d{1,2})/(\d{1,2})$")
+        amount_re = _re.compile(r"^([A-Z]{3})\s*(-?[\d,]+(?:\.\d+)?)$")
+        rows = []
+        for detail in details:
+            bill_month = str(detail.get("bill_month") or "")
+            if not _re.fullmatch(r"\d{4}-\d{2}", bill_month):
+                continue
+            bill_year, bill_month_number = map(int, bill_month.split("-"))
+            text = str(detail.get("text_preview") or "")
+            section = text.split("本期消費明細：", 1)[-1].split("本期合計：", 1)[0]
+            tokens = [line.strip() for line in section.splitlines() if line.strip()]
+            index = 0
+            while index + 1 < len(tokens):
+                consume_match = date_re.fullmatch(tokens[index])
+                post_match = date_re.fullmatch(tokens[index + 1])
+                if not consume_match or not post_match:
+                    index += 1
+                    continue
+                end = index + 2
+                while end < len(tokens):
+                    if end + 1 < len(tokens) and date_re.fullmatch(tokens[end]) and date_re.fullmatch(tokens[end + 1]):
+                        break
+                    end += 1
+                body = tokens[index + 2:end]
+                amounts = []
+                description = None
+                for token in body:
+                    amount_match = amount_re.fullmatch(token.replace(" ", ""))
+                    if amount_match:
+                        amounts.append((
+                            amount_match.group(1),
+                            float(amount_match.group(2).replace(",", "")),
+                        ))
+                    elif description is None:
+                        description = token
+                if description and amounts:
+                    def iso(match):
+                        month, day = map(int, match.groups())
+                        year = bill_year - 1 if month > bill_month_number + 6 else bill_year
+                        return f"{year:04d}/{month:02d}/{day:02d}"
+
+                    billed_currency, billed_amount = amounts[-1]
+                    consume_currency = consume_amount = None
+                    if len(amounts) > 1:
+                        consume_currency, consume_amount = amounts[0]
+                    rows.append({
+                        "card_no": "",
+                        "consume_date": iso(consume_match),
+                        "post_date": iso(post_match),
+                        "merchant": description,
+                        "consume_currency": consume_currency,
+                        "consume_amount": consume_amount,
+                        "billed_currency": billed_currency,
+                        "billed_amount": billed_amount,
+                        "status": "已入帳",
+                        "bill_month": bill_month,
+                    })
+                index = max(end, index + 1)
+        return rows
+
+    @staticmethod
+    def _merge_card_transactions(current: list[dict], statement: list[dict]) -> list[dict]:
+        """同日期／商戶／金額時，以有真實入帳日的帳單 row 取代消費查詢 row。"""
+        from collections import Counter
+
+        def key(row):
+            try:
+                amount = float(row.get("billed_amount"))
+            except (TypeError, ValueError):
+                amount = row.get("billed_amount")
+            return (row.get("consume_date"), row.get("merchant"), amount)
+
+        current_by_key = {}
+        for index, row in enumerate(current):
+            current_by_key.setdefault(key(row), []).append((index, row))
+        statement_counts = Counter(key(row) for row in statement)
+        matched_current = set()
+        enriched_statement = []
+        for row in statement:
+            enriched = dict(row)
+            matches = current_by_key.get(key(row), [])
+            if len(matches) == 1 and statement_counts[key(row)] == 1:
+                current_index, current_row = matches.pop(0)
+                matched_current.add(current_index)
+                for field in ("card_no", "card_last4"):
+                    if not enriched.get(field) and current_row.get(field):
+                        enriched[field] = current_row[field]
+            elif matches:
+                # 帳單 popup 沒有卡號；同日同店同額多筆時無穩定 join key，寧可保留
+                # 原 consumption rows（post_date=NULL），不可按 DOM 順序猜卡。
+                continue
+            enriched_statement.append(enriched)
+        return [
+            row for index, row in enumerate(current) if index not in matched_current
+        ] + enriched_statement
 
     @staticmethod
     def _parse_card_transactions(text: str) -> list[dict]:

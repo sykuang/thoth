@@ -89,7 +89,7 @@ def _hsbc_card_txn(t: dict) -> dict:
         "bill_date": None,          # HSBC 明細 API 未直接給帳單日（卡詳情另有）
         "currency": "TWD",          # 入帳幣別
         "date": _hsbc_date(t.get("transactionDate")),   # 消費日
-        "post_date": _hsbc_date(t.get("postedDate")),   # 入帳日（未入帳→None，store fallback）
+        "post_date": _hsbc_date(t.get("postedDate")),   # 入帳日（未入帳→None）
         "desc": desc,
         "amount": signed,           # 台幣入帳金額（還款為負）
         "consume_country": None,

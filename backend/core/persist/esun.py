@@ -399,6 +399,7 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
         row = {
             "card_no": card_no_normalized,
             "date": (t.get("consume_date") or "").replace("/", "-"),  # 2026/06/08 → 2026-06-08
+            "post_date": (t.get("post_date") or "").replace("/", "-") or None,
             "desc": desc,
             "amount": amt,  # 入帳金額（TWD/結算幣）
             "currency": billed_cur,
@@ -410,14 +411,14 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
             pending_txns.append(row)
         else:
             # 已入帳 → 帳單月份待 card_bills 對齊
-            # 2026-06-20: 玉山「信用卡消費明細查詢」列表頁的物理限制 — 該頁
-            # 只給「消費日期/商店/消費幣別+金額/繳款幣別+金額/卡號/狀態」共 6 欄，
-            # **沒有獨立的「請款日/入帳日」欄位**（頁面註腳寫「上列為商店已請款之明細」，
-            # 商店請款≈入帳即將發生，但具體入帳日要等月結帳單才有）。
-            # 不再寫 post_date = consume_date (顯示誠實) — 留 NULL 讓 store 層
-            # fallback (store.py:571 `post_date = t.get("post_date") or t.get("date")`)。
-            # 未來想抓真實入帳日需另抓「月結帳單」(信用卡帳單 > 明細) 那邊的 posting date。
-            row["bill_date"] = None
+            # 消費明細查詢頁沒有獨立入帳日；月結帳單 popup 有交易日／入帳日，
+            # collector 會用 statement row 取代同 identity 的 consumption row。
+            # 尚未進帳單、無 statement match 的 row 必須保留 post_date=NULL。
+            bill_month = t.get("bill_month")
+            row["bill_date"] = (
+                f"{bill_month}-01" if isinstance(bill_month, str) and len(bill_month) == 7
+                else None
+            )
             billed_txns.append(row)
     if billed_txns:
         n = store.upsert_card_billed(billed_txns, rules=rules)

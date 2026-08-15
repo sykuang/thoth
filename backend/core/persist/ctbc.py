@@ -78,11 +78,15 @@ def _normalize_ctbc_datetime(act_dt_tm: str) -> str | None:
     return f"{y}-{m}-{d} {hh}:{mm}:{ss}"
 
 
-def _ctbc_yyyymmdd_to_iso(s: str) -> str | None:
-    """'20260602' → '2026-06-02'。"""
-    if not s or not isinstance(s, str) or len(s) != 8 or not s.isdigit():
+def _ctbc_yyyymmdd_to_iso(value: str | None) -> str | None:
+    """CTBC 日期邊界：有效 YYYYMMDD 才進 canonical，零值/非法值 → None。"""
+    text = str(value or "").strip()
+    if len(text) != 8 or not text.isdigit() or text == "00000000":
         return None
-    return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    try:
+        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _parse_ctbc_twd_history(twd_history: list) -> list[dict]:
@@ -365,9 +369,7 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
                         mm, dd, yy = pst[:2], pst[2:4], pst[4:6]
                         post_date = f"20{yy}-{mm}-{dd}"
                     else:
-                        # 缺值時 fallback consume_date (避免 NOT NULL 違反，
-                        # 跟舊 row 顯示行為一致 — 顯示「入帳日 = 消費日」優於 null)
-                        post_date = consume_date
+                        post_date = None
                     # bill_date: 用月份開頭 1 日當代表（月份 '2026/05'）
                     bill_date = f"{month_str.replace('/', '-')}-01" if "/" in month_str else None
                     # 外幣處理
@@ -411,11 +413,9 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     for t in (qu006_detail.get("allItems") or []) if isinstance(qu006_detail, dict) else []:
         if not isinstance(t, dict):
             continue
-        pdt = (t.get("purchaseDt") or "").strip()
-        if len(pdt) == 8 and pdt.isdigit():
-            consume_date = f"{pdt[:4]}-{pdt[4:6]}-{pdt[6:8]}"
-        else:
-            # CTBC qu006 rows without purchaseDt are structural noise; skip rather than
+        consume_date = _ctbc_yyyymmdd_to_iso(t.get("purchaseDt"))
+        if consume_date is None:
+            # CTBC qu006 rows without a valid purchaseDt are structural noise; skip rather than
             # creating undated pending rows that cannot dedupe or display honestly.
             continue
         suffix_raw = (t.get("cardNoSuffixFour") or "").strip()
@@ -431,7 +431,7 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         pending_rows.append({
             "card_no": f"****{last4}",
             "date": consume_date,
-            "post_date": f"{(t.get('postingDt') or '').strip()[:4]}-{(t.get('postingDt') or '').strip()[4:6]}-{(t.get('postingDt') or '').strip()[6:8]}" if len((t.get("postingDt") or "").strip()) == 8 and (t.get("postingDt") or "").strip().isdigit() else consume_date,
+            "post_date": _ctbc_yyyymmdd_to_iso(t.get("postingDt")),
             "desc": desc,
             "amount": amt,
             "currency": "TWD",

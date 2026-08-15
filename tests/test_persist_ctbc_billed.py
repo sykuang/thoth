@@ -123,7 +123,7 @@ def test_ctbc_billed_post_date_from_postingDt_field(store):
     UI 顯示「入帳日 = 消費日」永遠一樣。修正後：
     - 健身工廠: purchaseDt=050526 → consume=2026-05-05, postingDt=050826 → post=2026-08-05
     - GetYourGuide: purchaseDt=051226 → consume=2026-05-12, postingDt=052026 → post=2026-05-20
-    - 本行扣繳: postingDt=000000 (缺值) → fallback consume_date 2026-05-05
+    - 本行扣繳: postingDt=000000 (缺值) → post_date 保留 NULL
     """
     persist_ctbc(FIXTURE_BILLED, store)
     conn = store.conn
@@ -144,10 +144,10 @@ def test_ctbc_billed_post_date_from_postingDt_field(store):
     assert gyg_post == "2026-05-20"
     assert gyg_consume != gyg_post
 
-    # 本行扣繳: postingDt='000000' fallback consume_date (避免 NOT NULL 違反)
+    # 本行扣繳: postingDt='000000' 是缺值，必須保留 NULL，不得假裝等於消費日
     debit_consume, debit_post = by_desc["本行扣繳"]
     assert debit_consume == "2026-05-05"
-    assert debit_post == "2026-05-05"  # fallback
+    assert debit_post is None
 
 
 def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
@@ -173,7 +173,7 @@ def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
                      "description": "９１ＡＰＰ＊ＩＳＰＯ＋   TAIPEI CITY  TW",
                      "purchaseAmt": 4631, "origCurCode": "901", "origCurDesc": "TWD",
                      "origCurAmt": 4631, "txCode": "40"},
-                    {"purchaseDt": "20260618", "postingDt": "20260623",
+                    {"purchaseDt": "20260618", "postingDt": "00000000",
                      "cardNoSuffixFour": "7036_0",
                      "description": "９１ＡＰＰ＊ＩＳＰＯ＋   TAIPEI CITY  TW",
                      "purchaseAmt": 5866, "origCurCode": "901", "origCurDesc": "TWD",
@@ -188,7 +188,7 @@ def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
     conn = store.conn
     rows = list(conn.execute(
         "SELECT scope, card_no, consume_date, description, amount, currency, "
-        "consume_currency, consume_amount, txn_type "
+        "consume_currency, consume_amount, txn_type, post_date "
         "FROM card_pending_txns ORDER BY amount"
     ))
     assert len(rows) == 2, f"qu006 unbilled rows should be persisted, got: {rows}"
@@ -201,6 +201,7 @@ def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
     assert [r[6] for r in rows] == [None, None]
     assert [r[7] for r in rows] == [None, None]
     assert [r[8] for r in rows] == ["spending", "spending"]
+    assert [r[9] for r in rows] == ["2026-06-23", None]
 
 
 def test_ctbc_missing_unbilled_endpoint_preserves_existing_pending_rows(store):

@@ -210,3 +210,27 @@ def test_taishin_no_real_payment_row_keeps_last_payment_null(tmp_path, monkeypat
         assert card["bill_due_amount"] == 0
     finally:
         store.close()
+
+
+def test_taishin_billed_missing_post_date_stays_null(tmp_path, monkeypatch):
+    store = _open_store(tmp_path, monkeypatch)
+    try:
+        data = _build_data(
+            summary={"remaining": 0},
+            billed_txns=[{
+                "txn_date": "2026/06/29",
+                "post_date": None,
+                "desc": "測試消費",
+                "amount": 80.0,
+                "currency": "新臺幣",
+                "card_no_suffix": "7018",
+            }],
+        )
+        persist_taishin(data, store)
+        row = store.conn.execute(
+            "SELECT consume_date, post_date FROM card_billed_txns"
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("2026-06-29", None)
+    finally:
+        store.close()
