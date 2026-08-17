@@ -59,7 +59,7 @@ def _log(*a):
 
 
 class ScbLoginError(RuntimeError):
-    """SCB login 送出後失敗——立刻中止，絕不自動重打。"""
+    """SCB login 送出後失敗；僅明確 CAPT* 錯誤可限重試一次。"""
 
 
 class ScbCrawler(BankCrawler):
