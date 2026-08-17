@@ -29,7 +29,7 @@
     Step 4: page.evaluate 驗 length 不對就 abort 不送 login
     Step 5: click 登入鈕 (type=submit b-bg-green-d)
 
-  ⚠️ 鐵律 max_attempts=1 — 失敗 raise ScbLoginError，絕不重打
+  ⚠️ 鐵律：預設只送一次；僅銀行明確回 CAPT* 驗證碼錯誤時換圖限重送一次
 
   Collect 流程（已完成）:
     - collect() 點信用卡 menu, 抓 sharedCards + crditAcctList E2EE 帳單明細
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import re
 import sys
 from pathlib import Path
 
@@ -156,8 +157,8 @@ class ScbCrawler(BankCrawler):
                 _log(f"[scb][cap] OCR 例外: {e}")
         return None
 
-    def login(self, page) -> bool:
-        """渣打 SCB 登入 — 鐵律 max_attempts=1。
+    def login(self, page, *, _captcha_retry_used: bool = False) -> bool:
+        """渣打 SCB 登入；只有明確 CAPT* 錯誤可換圖限重送一次。
 
         2026-06-12 v2 session 復用：先試 goto dashboard URL，
         若 session 還在就跳過 login（省一次 login，避免 SCB rate limit）。
@@ -387,6 +388,8 @@ class ScbCrawler(BankCrawler):
                 if (m) return m[0];
                 const m2 = bodyText.match(/E\d{3,4}[:：][^\n]{0,80}/);
                 if (m2) return m2[0];
+                const m3 = bodyText.match(/CAPT\d+[:：]?[^\n]{0,80}/i);
+                if (m3) return m3[0];
                 return '';
             }""") or ""
             # 判斷是不是 server-busy（HIBERR_000010 系統忙線）
@@ -394,6 +397,11 @@ class ScbCrawler(BankCrawler):
                 is_server_busy = True
         except Exception:
             pass
+
+        captcha_invalid = bool(re.search(r"\bCAPT\d+\b", err_msg, re.IGNORECASE))
+        if captcha_invalid and not _captcha_retry_used:
+            _log(f"[scb][login] bank error=captcha_invalid ({err_msg[:80]})，換新圖限重試一次")
+            return self.login(page, _captcha_retry_used=True)
 
         from backend.banks._login_debug import snapshot as _login_snapshot
         snap = _login_snapshot(page)
