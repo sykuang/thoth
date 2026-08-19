@@ -20,7 +20,7 @@
               #m1_VVYJVIJLIE  → 使用者代碼 (maxlen=10，實況 7 碼 XXX1234)
               #m1_ACXMQTRIBF  → 密碼 (maxlen=16)
               #m1_userCaptcha → 6 碼純數字 captcha
-    Step 5: captcha = OCR(#m1_captchaImage src 從 /B2C/captchaImage?timestamp=...)
+    Step 5: captcha = OCR(#m1_captchaImage locator screenshot bytes)
             實測 3/3 OCR 命中（v3_captcha_t1=418862 等）
     Step 6: click #btnLogin2 (txnFrame 內，<a id="btnLogin2">登入</a>)
 
@@ -29,17 +29,23 @@
 """
 from __future__ import annotations
 
-import base64
 import contextlib
 import re
 import sys
 from pathlib import Path
+from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import TaipeiFubonCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://ebank.taipeifubon.com.tw/B2C/common/Index.faces"
 PRE_LOGIN_HINT = "PreLogin.faces"
@@ -89,6 +95,8 @@ def _fubon_card_bill_fact(amount_text: str):
 
 
 class FubonCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="fubon")
         self.creds = TaipeiFubonCreds.load()
@@ -97,308 +105,303 @@ class FubonCrawler(BankCrawler):
         return "taipeifubon.com"
 
     def _find_login_frame(self, page):
-        """找 txnFrame (src 含 PreLogin.faces)。"""
-        for f in page.frames:
-            if PRE_LOGIN_HINT in (f.url or ""):
-                return f
-            if f.name == "txnFrame":
-                return f
-        return None
+        matches = {
+            id(frame): frame
+            for frame in page.frames
+            if frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or "")
+        }
+        return next(iter(matches.values())) if len(matches) == 1 else None
 
     def _find_header_frame(self, page):
-        """找 frame1 (ContextFrame.faces, 含右上登入鈕)。"""
-        for f in page.frames:
-            if f.name == "frame1":
-                return f
-            if "ContextFrame" in (f.url or ""):
-                return f
-        return None
+        matches = {
+            id(frame): frame
+            for frame in page.frames
+            if frame.name == "frame1" or "ContextFrame" in (frame.url or "")
+        }
+        return next(iter(matches.values())) if len(matches) == 1 else None
 
     def _logged_in(self, page) -> bool:
-        """W (2026-06-17): positive signal 4 條件 AND（frameset 版，對齊 SCSB 鐵律）
-
-        Fubon B2C 是 frameset，txnFrame 為主畫面 frame。
-
-        1) urlOk: ebank.fubon.com 網域內
-        2) noLoginForm: PreLogin.faces frame 已消失
-        3) lenOk: 所有 frame innerText 合計 >= 500
-        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
-
-        任一 fail → 視為未登入。
-        """
+        """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            url = (page.url or "").lower()
-            if "fubon" not in url:
+            if urlparse(page.url or "").hostname != "ebank.taipeifubon.com.tw":
                 return False
-
-            # noLoginForm: 任何 frame 還含 PreLogin.faces → 未登入
-            for f in page.frames:
-                if PRE_LOGIN_HINT in (f.url or ""):
-                    return False
-
-            # lenOk + kw（main page + 所有 frame）
-            texts = []
-            for f in [page, *list(page.frames)]:
-                try:
-                    txt = f.evaluate("() => document.body && document.body.innerText || ''")
-                    if txt:
-                        texts.append(txt)
-                except Exception:
-                    pass
-            joined = "\n".join(texts)
-            if len(joined) < 500:
+            login_frames = {
+                id(frame)
+                for frame in page.frames
+                if frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or "")
+            }
+            header_frames = {
+                id(frame)
+                for frame in page.frames
+                if frame.name == "frame1" or "ContextFrame" in (frame.url or "")
+            }
+            if len(login_frames) > 1 or len(header_frames) > 1:
                 return False
-
-            KW = (
-                "帳戶總覽", "我的帳戶", "資產總額", "存款", "轉帳", "信用卡",
-                "登出", "個人設定", "台幣", "外幣", "基金", "投資", "貸款",
-                "繳費", "安全", "信託", "理財",
+            if any(PRE_LOGIN_HINT in (frame.url or "") for frame in page.frames):
+                return False
+            scopes = [
+                page,
+                *(frame for frame in page.frames if frame is not page.main_frame),
+            ]
+            body_parts = []
+            controls_selector = (
+                "input[type='password'], #m1_userCaptcha, #btnLogin2, "
+                "#header_form\\:header_login"
             )
-            kw = sum(1 for k in KW if k in joined)
-            return kw >= 2
+            for scope in scopes:
+                controls = scope.locator(controls_selector)
+                if any(
+                    controls.nth(index).is_visible()
+                    for index in range(controls.count())
+                ):
+                    return False
+                bodies = scope.locator("body")
+                body_parts.extend(
+                    bodies.nth(index).inner_text()
+                    for index in range(bodies.count())
+                )
+            body = "\n".join(body_parts)
+            return (
+                len(body) >= 500
+                and "登出" in body
+                and any(item in body for item in ("帳戶總覽", "我的帳戶", "資產總額"))
+            )
         except Exception:
             return False
-
-    def _ocr_captcha(self, frame, max_attempts=5):
-        """從 #m1_captchaImage 抓 base64 → OCR 6 碼純數字（送出前安全重試）。"""
-        for n in range(1, max_attempts + 1):
-            try:
-                cap_b64 = frame.evaluate("""() => {
-                    const img = document.getElementById('m1_captchaImage');
-                    if (!img) return null;
-                    if (img.naturalWidth < 10) return null;
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.naturalWidth;
-                    canvas.height = img.naturalHeight;
-                    canvas.getContext('2d').drawImage(img, 0, 0);
-                    return canvas.toDataURL('image/png').split(',')[1];
-                }""")
-                if not cap_b64:
-                    _log(f"[fubon][cap] 第 {n} 次抓 captcha base64 失敗")
-                    continue
-                raw = base64.b64decode(cap_b64)
-                text = ocr_bytes(raw, expected_len=6, alnum_only=True)
-                if text and len(text) == 6 and text.isdigit():
-                    _log(f"[fubon][cap] 第 {n} 次 OCR 成功: {text}")
-                    return text
-                _log(f"[fubon][cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {text!r}），換圖")
-                # 換圖：找「重新產生」連結
-                try:
-                    frame.evaluate("""() => {
-                        for (const el of document.querySelectorAll('a, button, span')) {
-                            const t = (el.textContent || '').trim();
-                            if (t === '重新產生' || t.includes('重新')) {
-                                el.click(); return true;
-                            }
-                        }
-                        // 退而求其次：reload captcha img src
-                        const img = document.getElementById('m1_captchaImage');
-                        if (img) img.src = '/B2C/captchaImage?timestamp=' + Date.now();
-                        return false;
-                    }""")
-                    frame.evaluate("() => new Promise(r => setTimeout(r, 1500))")
-                except Exception as e:
-                    _log(f"[fubon][cap] 換圖失敗: {e}")
-            except Exception as e:
-                _log(f"[fubon][cap] OCR 失敗: {e}")
-        return None
 
     def login(self, page) -> bool:
-        """富邦 B2C 登入 — 鐵律 max_attempts=1。"""
-        page.wait_for_timeout(12000)  # 等 frameset 全載
-        _log(f"[fubon][login] 起始 url={page.url}")
+        return self._shared_login(page)
 
-        # session 復用偵測
-        if self._logged_in(page):
-            _log("[fubon][login] ✓ session 仍有效（無 PreLogin frame），跳過 login")
-            return True
-
-        # ─── Step 1: 點 frame1 的右上「登入」按鈕（開 modal）───
-        header_frame = self._find_header_frame(page)
-        if header_frame is None:
-            _log("[fubon][login] 找不到 frame1（含右上登入鈕）")
-            _log(f"  frames: {[(f.name, (f.url or '')[:80]) for f in page.frames]}")
-            return False
-
+    def prepare_login_page(self, page) -> None:
         try:
-            res = header_frame.evaluate(f"""() => {{
-                const el = document.getElementById('{HEADER_LOGIN_BTN_ID}');
-                if (!el) return {{ok: false, why: 'not-found'}};
-                const r = el.getBoundingClientRect();
-                const opts = {{bubbles: true, cancelable: true, view: window,
-                              clientX: r.x + r.width/2, clientY: r.y + r.height/2}};
-                ['mouseenter', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(ev => {{
-                    el.dispatchEvent(new MouseEvent(ev, opts));
-                }});
-                el.click();
-                return {{ok: true}};
-            }}""")
-            if not res.get("ok"):
-                _log(f"[fubon][login] 點右上「登入」失敗: {res}")
-                return False
-            _log("[fubon][login] ✓ 已點右上「登入」（開 modal）")
-        except Exception as e:
-            _log(f"[fubon][login] 點右上「登入」例外: {e}")
-            return False
+            page.wait_for_timeout(12000)
+            if self._logged_in(page):
+                return
+            header_frame = self._find_header_frame(page)
+            if header_frame is None:
+                raise FubonLoginError("找不到唯一的登入頁首；未送出登入")
+            headers = header_frame.locator("#header_form\\:header_login")
+            if headers.count() != 1:
+                raise FubonLoginError("找不到唯一且可操作的頁首登入按鈕；未送出登入")
+            header = headers.nth(0)
+            if (
+                not header.is_visible()
+                or not header.is_enabled()
+                or " ".join(header.inner_text().split()) != "登入"
+            ):
+                raise FubonLoginError("找不到唯一且可操作的頁首登入按鈕；未送出登入")
+            header.click(timeout=8000)
+            page.wait_for_timeout(5000)
 
-        page.wait_for_timeout(5000)  # 等 modal 開
-
-        # ─── Step 2: 找 txnFrame（PreLogin form 載體）───
-        login_frame = self._find_login_frame(page)
-        if login_frame is None:
-            _log("[fubon][login] 找不到 txnFrame")
-            _log(f"  frames: {[(f.name, (f.url or '')[:80]) for f in page.frames]}")
-            return False
-        _log(f"[fubon][login] PreLogin frame: {login_frame.url[:100]}")
-
-        # ─── Step 3: 切到「一般登入」分頁 ───
-        try:
-            tab_clicked = login_frame.evaluate("""() => {
-                for (const a of document.querySelectorAll('a, span, div')) {
-                    const t = (a.textContent || '').trim();
-                    if (t !== '一般登入') continue;
-                    if (a.offsetParent === null) continue;
-                    if (a.tagName === 'DIV' && a.querySelector('a')) continue;
-                    a.click();
-                    return {ok: true, tag: a.tagName, id: a.id};
-                }
-                return {ok: false};
-            }""")
-            _log(f"[fubon][login] 「一般登入」tab click: {tab_clicked}")
+            login_frame = self._find_login_frame(page)
+            if login_frame is None:
+                raise FubonLoginError("找不到唯一的一般登入頁面；未送出登入")
+            actions = login_frame.locator("a, button")
+            eligible = []
+            for index in range(actions.count()):
+                action = actions.nth(index)
+                if (
+                    action.is_visible()
+                    and action.is_enabled()
+                    and " ".join(action.inner_text().split()) == GENERAL_LOGIN_TAB
+                ):
+                    eligible.append(action)
+            if len(eligible) != 1:
+                raise FubonLoginError("找不到唯一且可操作的一般登入分頁；未送出登入")
+            eligible[0].click(timeout=8000)
             page.wait_for_timeout(2000)
-        except Exception as e:
-            _log(f"[fubon][login] 切「一般登入」分頁失敗: {e}")
-
-        # ─── Step 4: 填 3 欄帳密 ───
-        # 富邦 JSF 每次 page load 重新生成混淆 id (例如 m1_LJCHUYIFKV → m1_DTUZHFJAFO)
-        # 不能 hardcode id，改用「visible input 出現順序」定位：
-        #   [0] type=password maxlen=10  → 身分證
-        #   [1] type=password maxlen=10  → 使用者代碼
-        #   [2] type=password maxlen=16  → 密碼
-        #   [3] type=text     maxlen=6   → captcha (這個 id 是固定的 m1_userCaptcha)
-        #
-        # W (2026-06-17): 為什麼用 page.evaluate 而非 page.fill?
-        #   富邦 login 不給 password 欄位穩定 id (動態生成), 必須 runtime 掃所有
-        #   type=password input + 按 y 座標排序才能對應 [0]=身分證 [1]=user_code [2]=password.
-        #   page.fill('#xxx') 用不上, 只能 evaluate 內 querySelectorAll 找.
-        #   也必須手動 dispatch input/change/blur 3 events — 富邦 React form
-        #   不會聽 nativeSetter 設值, 一定要事件 trigger validation 才生效.
-        #   captcha 欄位則回到 page.fill (id 固定, 走標準路徑).
-        try:
-            fill_result = login_frame.evaluate("""(creds) => {
-                // 收集所有 visible password input (skip hidden)
-                const pws = [];
-                for (const el of document.querySelectorAll('input[type=password]')) {
-                    if (el.offsetParent === null) continue;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 1) continue;
-                    pws.push({el: el, id: el.id, name: el.name, maxlen: el.maxLength, y: r.y});
-                }
-                // 依 y 座標排序（top-to-bottom）
-                pws.sort((a, b) => a.y - b.y);
-
-                if (pws.length < 3) {
-                    return {ok: false, why: `only ${pws.length} visible password inputs`, found: pws.map(p => p.id)};
-                }
-
-                const setVal = (el, val) => {
-                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    nativeSetter.call(el, val);
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('blur', {bubbles: true}));
-                };
-
-                setVal(pws[0].el, creds.national_id);
-                setVal(pws[1].el, creds.user_code);
-                setVal(pws[2].el, creds.password);
-
-                return {
-                    ok: true,
-                    national_id_field: pws[0].id,
-                    user_code_field:   pws[1].id,
-                    password_field:    pws[2].id,
-                };
-            }""", {
-                "national_id": self.creds.national_id,
-                "user_code": self.creds.user_code,
-                "password": self.creds.password,
-            })
-            _log(f"[fubon][login] fill 3 欄結果: {fill_result}")
-
-            if not fill_result.get("ok"):
-                _log("[fubon][login] ❌ 填欄位失敗 → 中止（不送 login）")
-                from backend.core.store import _data_root
-                debug_dir = _data_root() / "fubon_collect"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(debug_dir / "fill_FAILED.png"), full_page=True)
-                return False
-        except Exception as e:
-            _log(f"[fubon][login] 填欄位例外: {e}")
-            return False
-
-        # ─── Step 5: OCR captcha (送出前安全重試 5 次) ───
-        captcha = self._ocr_captcha(login_frame, max_attempts=5)
-        if not captcha:
-            _log("[fubon][login] OCR 5 次都失敗，放棄（未送 login）")
-            return False
-        try:
-            login_frame.fill(f"#{FIELD_M1_CAPTCHA}", captcha)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            _log(f"[fubon][login] 填 captcha 失敗: {e}")
-            return False
-
-        # ─── Step 6: 送出（max_attempts=1 鐵律）───
-        _log(f"[fubon][login] 送出 login (captcha={captcha})")
-        try:
-            login_frame.click(f"#{LOGIN_BTN_ID}", timeout=8000)
-        except Exception as e:
-            _log(f"[fubon][login] click 登入鈕失敗: {e}")
-            return False
-
-        page.wait_for_timeout(10000)
-
-        if self._logged_in(page):
-            _log(f"[fubon][login] ✅ 登入成功 -> {page.url}")
-            return True
-
-        # 失敗 → dump 截圖 + 錯訊
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "fubon_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            page.screenshot(path=str(debug_dir / "login_FAILED.png"), full_page=True)
-            _log(f"[fubon][login] 失敗截圖: {debug_dir}/login_FAILED.png")
+        except FubonLoginError:
+            raise
         except Exception:
-            pass
+            raise FubonLoginError("登入頁面準備狀態不明；未送出登入") from None
 
-        errs = []
-        try:
-            frame = self._find_login_frame(page) or page.main_frame
-            errs = frame.evaluate(
-                "(() => [...document.querySelectorAll('div,span,p,td')]"
-                ".filter(e=>e.offsetParent!==null)"
-                ".map(e=>(e.textContent||'').trim())"
-                ".filter(t=>t && t.length<100 && /錯誤|不正確|失敗|鎖|無效|請|invalid|error/i.test(t))"
-                ".slice(0,8))()",
-            )
-        except Exception:
-            pass
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        msg = (
-            f"富邦登入失敗。請檢查帳號、密碼是否正確。"
-            f"\n  url={page.url}"
-            f"\n  錯誤訊息: {errs}"
-            f"\n  可能原因：(a) 驗證碼辨識錯誤 (b) 帳號或密碼錯誤 (c) 帳號已被鎖定"
-            f"\n{snap}"
-            # Internal policy: max_attempts=1, MUST NOT auto-retry. See wiki
-            # concepts/taiwan-bank-login-retry-account-lockout-lesson.
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post = (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE)
+        otp = re.compile(
+            r"^[\s\S]{0,400}(?:(?<![A-Za-z])OTP(?![A-Za-z])|一次性密碼|簡訊驗證碼|裝置驗證|信任此裝置)[\s\S]{0,400}$",
+            re.IGNORECASE,
         )
-        _log(f"[fubon][login] ❌ {msg}")
-        raise FubonLoginError(msg)
+        password = re.compile(
+            r"^[\s\S]{0,120}(?:(?:必須|強制|請立即|請先)(?:變更|修改|更新|重設)(?:您的?)?密碼|"
+            r"密碼(?:已到期|已過期|必須修改|需要修改|需修改|強制變更))[\s\S]{0,120}$"
+        )
+        error = re.compile(
+            r"^\s*(?:密碼不正確|帳號.{0,20}鎖定|登入失敗|驗證碼不正確|invalid credentials|account locked)[。.!！\s]*$",
+            re.IGNORECASE,
+        )
+        rules = []
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"fubon-otp-required-{suffix}", bank="fubon", phases=all_phases,
+                kind=CheckpointKind.OTP_REQUIRED, container_selector=selector,
+                required_body_pattern=otp,
+            ))
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"fubon-password-change-required-{suffix}", bank="fubon", phases=all_phases,
+                kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED, container_selector=selector,
+                required_body_pattern=password,
+            ))
+        for suffix, selector in (("error", ".error"), ("alert", ".alert"), ("role-alert", "[role='alert']")):
+            rules.append(LoginCheckpointRule(
+                name=f"fubon-explicit-login-error-{suffix}", bank="fubon", phases=post,
+                kind=CheckpointKind.EXPLICIT_LOGIN_ERROR, container_selector=selector,
+                required_body_pattern=error,
+            ))
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"fubon-unknown-{suffix}", bank="fubon", phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector=selector,
+            ))
+        rules.append(LoginCheckpointRule(
+            name="fubon-login-form-still-visible", bank="fubon", phases=post,
+            kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector="#m1_userCaptcha",
+        ))
+        return tuple(rules)
+
+    def _ocr_captcha(self, frame, max_attempts=5):
+        attempts = min(max(max_attempts, 0), 5)
+        for attempt in range(attempts):
+            try:
+                images = frame.locator("#m1_captchaImage")
+                if images.count() != 1:
+                    return None
+                image = images.nth(0)
+                if not image.is_visible():
+                    return None
+                raw = image.screenshot()
+                text = ocr_bytes(raw, expected_len=6, alnum_only=True)
+            except Exception:
+                return None
+            if text and len(text) == 6 and text.isdigit():
+                return text
+            if attempt == attempts - 1:
+                break
+            try:
+                candidates = frame.locator("a, button")
+                eligible = []
+                for index in range(candidates.count()):
+                    action = candidates.nth(index)
+                    if (
+                        action.is_visible()
+                        and action.is_enabled()
+                        and " ".join(action.inner_text().split()) == "重新產生"
+                    ):
+                        eligible.append(action)
+                if len(eligible) != 1:
+                    return None
+                eligible[0].click()
+                frame.wait_for_timeout(1500)
+            except Exception:
+                return None
+        return None
+
+    def submit_credentials_once(self, page) -> None:
+        try:
+            frame = self._find_login_frame(page)
+            if frame is None:
+                raise FubonLoginError("找不到唯一的登入頁面；未送出登入")
+            candidates = frame.locator("input[type='password']")
+            visible = []
+            for index in range(candidates.count()):
+                field = candidates.nth(index)
+                if not field.is_visible():
+                    continue
+                if not field.is_enabled():
+                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+                visible.append(field)
+            if len(visible) != 3:
+                raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+
+            ordered = []
+            for field in visible:
+                box = field.bounding_box()
+                if not box:
+                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+                ordered.append((box["y"], field.get_attribute("maxlength"), field))
+            ordered.sort(key=lambda item: item[0])
+            if (
+                len({item[0] for item in ordered}) != 3
+                or [item[1] for item in ordered] != ["10", "10", "16"]
+            ):
+                raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+
+            fields = [item[2] for item in ordered]
+            values = (self.creds.national_id, self.creds.user_code, self.creds.password)
+            for field, value in zip(fields, values, strict=True):
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
+                if len(field.input_value()) != len(value):
+                    raise FubonLoginError("登入欄位輸入長度不符；未送出登入")
+
+            captchas = frame.locator("#m1_userCaptcha")
+            if captchas.count() != 1:
+                raise FubonLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            captcha_field = captchas.nth(0)
+            if (
+                not captcha_field.is_visible()
+                or not captcha_field.is_enabled()
+                or captcha_field.get_attribute("maxlength") != "6"
+            ):
+                raise FubonLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            captcha = self._ocr_captcha(frame, max_attempts=5)
+            if not captcha or len(captcha) != 6 or not captcha.isdigit():
+                raise FubonLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+            captcha_field.click()
+            captcha_field.click(click_count=3)
+            page.keyboard.press("Backspace")
+            page.keyboard.type(captcha, delay=80)
+            if len(captcha_field.input_value()) != 6:
+                raise FubonLoginError("驗證碼欄位輸入長度不符；未送出登入")
+
+            submits = frame.locator("#btnLogin2")
+            if submits.count() != 1:
+                raise FubonLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            submit = submits.nth(0)
+            if (
+                not submit.is_visible()
+                or not submit.is_enabled()
+                or " ".join(submit.inner_text().split()) != "登入"
+            ):
+                raise FubonLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        except FubonLoginError:
+            raise
+        except Exception:
+            raise FubonLoginError("登入欄位無法安全填寫；未送出登入") from None
+
+        try:
+            submit.click(timeout=8000)
+        except Exception:
+            raise FubonLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(3000)
+            for _ in range(10):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                scopes = [
+                    page,
+                    *(child for child in page.frames if child is not page.main_frame),
+                ]
+                for scope in scopes:
+                    for selector in (
+                        ".modal.show", "[role='dialog']", ".error", ".alert", "[role='alert']",
+                    ):
+                        checkpoints = scope.locator(selector)
+                        if any(
+                            checkpoints.nth(index).is_visible()
+                            for index in range(checkpoints.count())
+                        ):
+                            return
+        except Exception:
+            raise FubonLoginError("登入後狀態無法安全確認；禁止自動重試") from None
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """富邦 collect：信用卡 menu 在 txnFrame (CGEQU001_Home) carousel 全渲染。
