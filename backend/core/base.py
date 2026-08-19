@@ -29,6 +29,7 @@ from backend.core.login_checkpoints import (
     LoginCheckpointRule,
     evaluate_login_checkpoint,
     reduce_login_checkpoint,
+    validate_login_checkpoint_outcome,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -625,21 +626,7 @@ class BankCrawler(ABC):
                 is_authenticated=self.is_authenticated,
             )
             active_rules_by_name = {rule.name: rule for rule in active_rules}
-            if outcome.kind in {
-                CheckpointKind.AUTHENTICATED,
-                CheckpointKind.READY_FOR_CREDENTIALS,
-            }:
-                valid_outcome = outcome.rule_name is None
-            elif outcome.kind is CheckpointKind.UNKNOWN_BLOCKER:
-                valid_outcome = (
-                    outcome.rule_name is None
-                    or outcome.rule_name in active_rules_by_name
-                )
-            else:
-                outcome_rule = active_rules_by_name.get(outcome.rule_name or "")
-                valid_outcome = outcome_rule is not None and outcome_rule.kind is outcome.kind
-            if not valid_outcome:
-                outcome = CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+            outcome = validate_login_checkpoint_outcome(outcome, active_rules)
             next_phase, next_budget = reduce_login_checkpoint(phase, budget, outcome)
 
             if (

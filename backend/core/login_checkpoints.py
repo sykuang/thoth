@@ -148,6 +148,24 @@ class CheckpointOutcome:
     interaction: str | None = None
 
 
+def validate_login_checkpoint_outcome(
+    outcome: CheckpointOutcome,
+    active_rules: tuple[LoginCheckpointRule, ...],
+) -> CheckpointOutcome:
+    rules_by_name = {rule.name: rule for rule in active_rules}
+    if outcome.kind in {
+        CheckpointKind.AUTHENTICATED,
+        CheckpointKind.READY_FOR_CREDENTIALS,
+    }:
+        valid = outcome.rule_name is None
+    elif outcome.kind is CheckpointKind.UNKNOWN_BLOCKER:
+        valid = outcome.rule_name is None or outcome.rule_name in rules_by_name
+    else:
+        rule = rules_by_name.get(outcome.rule_name or "")
+        valid = rule is not None and rule.kind is outcome.kind
+    return outcome if valid else CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+
+
 def _action_selected(action: Any) -> bool:
     if any(action.get_attribute(name) is not None for name in ("checked", "selected")):
         return True

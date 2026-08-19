@@ -8,9 +8,69 @@ from backend.core.login_checkpoints import (
     CheckpointPhase,
     LoginBudget,
     LoginCheckpointBlocked,
+    LoginCheckpointRule,
     LoginInteractionRequired,
     reduce_login_checkpoint,
+    validate_login_checkpoint_outcome,
 )
+
+
+def _checkpoint_rule(name: str, kind: CheckpointKind) -> LoginCheckpointRule:
+    return LoginCheckpointRule(
+        name=name,
+        bank="test-bank",
+        phases=tuple(CheckpointPhase),
+        kind=kind,
+        container_selector=f"#{name}",
+        action_texts=("Continue",) if kind is CheckpointKind.DUPLICATE_SESSION else (),
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name="otp"),
+        CheckpointOutcome(CheckpointKind.OTP_REQUIRED, rule_name="otp"),
+        CheckpointOutcome(CheckpointKind.DUPLICATE_SESSION, rule_name="duplicate"),
+    ],
+)
+def test_login_checkpoint_outcome_provenance_accepts_valid_outcomes(
+    outcome: CheckpointOutcome,
+) -> None:
+    rules = (
+        _checkpoint_rule("otp", CheckpointKind.OTP_REQUIRED),
+        _checkpoint_rule("duplicate", CheckpointKind.DUPLICATE_SESSION),
+    )
+
+    assert validate_login_checkpoint_outcome(outcome, rules) is outcome
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        CheckpointOutcome(CheckpointKind.AUTHENTICATED, rule_name="otp"),
+        CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS, rule_name="otp"),
+        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name="foreign"),
+        CheckpointOutcome(CheckpointKind.OTP_REQUIRED),
+        CheckpointOutcome(CheckpointKind.OTP_REQUIRED, rule_name="foreign"),
+        CheckpointOutcome(CheckpointKind.DUPLICATE_SESSION, rule_name="otp"),
+    ],
+)
+def test_login_checkpoint_outcome_provenance_replaces_invalid_outcomes(
+    outcome: CheckpointOutcome,
+) -> None:
+    rules = (
+        _checkpoint_rule("otp", CheckpointKind.OTP_REQUIRED),
+        _checkpoint_rule("duplicate", CheckpointKind.DUPLICATE_SESSION),
+    )
+
+    validated = validate_login_checkpoint_outcome(outcome, rules)
+
+    assert validated == CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    assert validated is not outcome
 
 
 def test_unknown_state_never_requests_resubmit():

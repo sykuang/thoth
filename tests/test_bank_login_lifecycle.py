@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from importlib import import_module
+import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -16,6 +19,28 @@ from backend.core.login_checkpoints import (
 
 
 BANK_MODULES = sorted((Path(__file__).parents[1] / "backend/banks").glob("*.py"))
+
+
+def _module_uses_shared_login_checkpoints(module: ModuleType) -> bool:
+    return any(
+        inspect.isclass(candidate)
+        and candidate is not BankCrawler
+        and candidate.__module__ == module.__name__
+        and issubclass(candidate, BankCrawler)
+        and candidate.USES_SHARED_LOGIN_CHECKPOINTS is True
+        for candidate in vars(module).values()
+    )
+
+
+def _opted_in_bank_modules() -> set[str]:
+    return {
+        path.stem
+        for path in BANK_MODULES
+        if path.stem != "__init__"
+        and _module_uses_shared_login_checkpoints(
+            import_module(f"backend.banks.{path.stem}")
+        )
+    }
 
 
 @dataclass
@@ -234,14 +259,30 @@ def test_legacy_login_path_is_unchanged(monkeypatch, tmp_path):
     assert crawler.events == ["attach-dialog", "login", "collect", "logout"]
 
 
-def test_current_bank_adapters_remain_on_legacy_login_path():
-    opted_in = [
-        path.name
-        for path in BANK_MODULES
-        if "USES_SHARED_LOGIN_CHECKPOINTS = True" in path.read_text()
-    ]
+def test_shared_login_checkpoint_opt_in_inventory():
+    assert _opted_in_bank_modules() == {"rakuten"}
 
-    assert opted_in == []
+
+@pytest.mark.parametrize(
+    "annotations",
+    [{}, {"USES_SHARED_LOGIN_CHECKPOINTS": ClassVar[bool]}],
+)
+def test_shared_login_checkpoint_inventory_detects_flag_spelling(
+    annotations: dict[str, object],
+) -> None:
+    module = ModuleType(f"test_bank_{len(annotations)}")
+    crawler = type(
+        "FixtureCrawler",
+        (BankCrawler,),
+        {
+            "__module__": module.__name__,
+            "__annotations__": annotations,
+            "USES_SHARED_LOGIN_CHECKPOINTS": True,
+        },
+    )
+    setattr(module, "FixtureCrawler", crawler)
+
+    assert _module_uses_shared_login_checkpoints(module)
 
 
 @pytest.mark.parametrize(
