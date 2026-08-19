@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, ClassVar, NotRequired, Required, TypedDict
+from urllib.parse import urlparse
 
 from scrapling.fetchers import StealthyFetcher
 
@@ -27,7 +28,9 @@ from backend.core.login_checkpoints import (
     CheckpointPhase,
     DEFAULT_ACTION_SELECTOR,
     LoginBudget,
+    LoginCheckpointBlocked,
     LoginCheckpointRule,
+    LoginInteractionRequired,
     evaluate_login_checkpoint,
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
@@ -481,6 +484,79 @@ class BankCollectResult:
         return out
 
 
+class _OriginGuardProxy:
+    """Fail closed around every browser object operation during collection."""
+
+    __slots__ = ("_target", "_guard", "_cache")
+
+    def __init__(self, target, guard, cache=None):
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_guard", guard)
+        object.__setattr__(self, "_cache", cache if cache is not None else {})
+        self._cache[id(target)] = self
+
+    def _wrap(self, value):
+        if value is None or isinstance(value, (str, bytes, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [self._wrap(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._wrap(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._wrap(item) for key, item in value.items()}
+        cached = self._cache.get(id(value))
+        return cached if cached is not None else type(self)(value, self._guard, self._cache)
+
+    @staticmethod
+    def _unwrap(value):
+        return value._target if isinstance(value, _OriginGuardProxy) else value
+
+    def __getattr__(self, name):
+        self._guard()
+        value = getattr(self._target, name)
+        self._guard()
+        if not callable(value):
+            return self._wrap(value)
+
+        def guarded(*args, **kwargs):
+            self._guard()
+            result = value(
+                *(self._unwrap(arg) for arg in args),
+                **{key: self._unwrap(item) for key, item in kwargs.items()},
+            )
+            self._guard()
+            return self._wrap(result)
+
+        return guarded
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        self._guard()
+        setattr(self._target, name, self._unwrap(value))
+        self._guard()
+
+    def __enter__(self):
+        self._guard()
+        result = self._target.__enter__()
+        self._guard()
+        return self._wrap(result)
+
+    def __exit__(self, *args):
+        self._guard()
+        result = self._target.__exit__(*args)
+        self._guard()
+        return result
+
+    def __bool__(self):
+        self._guard()
+        return bool(self._target)
+
+    def __repr__(self):
+        return "<origin-guarded browser object>"
+
+
 @dataclass
 class BankCrawler(ABC):
     """銀行爬蟲基類。"""
@@ -501,6 +577,7 @@ class BankCrawler(ABC):
     # 子類可 override：例 HSBC 首次登入有裝置綁定 OTP，可拉到 600 秒減少 OTP 觸發。
     SESSION_MAX_AGE_SECONDS: int = 180
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = False
+    CREDENTIAL_HOSTS: ClassVar[frozenset[str]] = frozenset()
     _shared_dialog_blocked: bool = False
 
     def __post_init__(self):
@@ -583,7 +660,19 @@ class BankCrawler(ABC):
         return ()
 
     def _shared_login(self, page) -> bool:
+        if not self._credential_origin_allowed(page):
+            reduce_login_checkpoint(
+                CheckpointPhase.PRE_SUBMIT,
+                LoginBudget(),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            )
         self.prepare_login_page(page)
+        if not self._credential_origin_allowed(page):
+            reduce_login_checkpoint(
+                CheckpointPhase.PRE_SUBMIT,
+                LoginBudget(),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            )
         rules = self.login_checkpoint_rules()
         if len({rule.name for rule in rules}) != len(rules):
             reduce_login_checkpoint(
@@ -607,6 +696,12 @@ class BankCrawler(ABC):
 
         for _ in range(max_steps):
             if getattr(self, "_shared_dialog_blocked", False):
+                reduce_login_checkpoint(
+                    phase,
+                    budget,
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
+            if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(
                     phase,
                     budget,
@@ -654,6 +749,12 @@ class BankCrawler(ABC):
                 rules=active_rules,
                 is_authenticated=self.is_authenticated,
             )
+            if not self._credential_origin_allowed(page):
+                reduce_login_checkpoint(
+                    phase,
+                    budget,
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
             active_rules_by_name = {rule.name: rule for rule in active_rules}
             outcome = validate_login_checkpoint_outcome(outcome, active_rules)
             if getattr(self, "_shared_dialog_blocked", False):
@@ -672,6 +773,12 @@ class BankCrawler(ABC):
             if next_budget.credential_submissions == budget.credential_submissions + 1:
                 if next_budget.captcha_resubmits == budget.captcha_resubmits + 1:
                     self.prepare_captcha_resubmit(page)
+                if not self._credential_origin_allowed(page):
+                    reduce_login_checkpoint(
+                        phase,
+                        budget,
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    )
                 self.submit_credentials_once(page)
             if next_budget.reloads == budget.reloads + 1:
                 page.reload()
@@ -689,6 +796,46 @@ class BankCrawler(ABC):
             CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
         )
         return False  # pragma: no cover - reducer always raises
+
+    def _credential_origin_allowed(self, page) -> bool:
+        try:
+            return self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _exact_https_origin_allowed(url: str, hosts: frozenset[str]) -> bool:
+        try:
+            current = urlparse(url or "")
+            return (
+                current.scheme.lower() == "https"
+                and (current.hostname or "").lower() in hosts
+                and current.port in (None, 443)
+                and current.username is None
+                and current.password is None
+            )
+        except Exception:
+            return False
+
+    def _frame_origin_allowed(self, page, frame) -> bool:
+        current = frame
+        main_frame = getattr(page, "main_frame", None)
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if main_frame is not None and current is main_frame:
+                return self._credential_origin_allowed(page)
+            try:
+                parsed = urlparse(current.url or "")
+            except Exception:
+                return False
+            if parsed.scheme == "about" and parsed.path in {"blank", "srcdoc"}:
+                current = getattr(current, "parent_frame", None)
+                continue
+            return self._exact_https_origin_allowed(
+                current.url, self.CREDENTIAL_HOSTS
+            )
+        return False
 
     @abstractmethod
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
@@ -759,41 +906,46 @@ class BankCrawler(ABC):
         def page_action(page):
             collector.attach(page)
             self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
-            # 所有銀行都掛 dialog handler——銀行常用 JS alert/confirm 做風險提醒
-            # （重複登入確認、查詢前必填、敏感操作確認），headless 沒人按會卡死整個流程
-            if self.USES_SHARED_LOGIN_CHECKPOINTS:
-                self._shared_dialog_blocked = False
-                self.attach_shared_dialog_handler(page)
-            else:
-                self.attach_dialog_handler(page)
+            self._shared_dialog_blocked = False
+            self.attach_shared_dialog_handler(page)
             logged_in = False
             try:
                 try:
-                    ok = (
-                        self._shared_login(page)
-                        if self.USES_SHARED_LOGIN_CHECKPOINTS
-                        else self.login(page)
-                    )
+                    ok = self._shared_login(page)
                 except Exception as e:
                     # login 子類可能 raise（例：ScsbLoginError、TaishinLoginError）
                     # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
                     # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
                     import sys as _sys
-                    import traceback as _tb
-                    msg = f"{type(e).__name__}: {e}"
-                    print(f"[{self.name}][login] raise → {msg}", file=_sys.stderr)
-                    print(_tb.format_exc(), file=_sys.stderr)
+                    if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
+                        msg = f"{type(e).__name__}: {e}"
+                    else:
+                        msg = f"{type(e).__name__}: login failed"
+                    print(
+                        f"[{self.name}][login] raise → {type(e).__name__}: details withheld",
+                        file=_sys.stderr,
+                    )
                     result["error"] = msg
-                    result["final_url"] = page.url
                     return page
 
                 if not ok:
                     result["error"] = "login_failed"
-                    result["final_url"] = page.url
                     return page
                 logged_in = True
                 try:
-                    collect_result = self.collect(page, collector)
+                    def ensure_collect_origin() -> None:
+                        if not self._credential_origin_allowed(page):
+                            reduce_login_checkpoint(
+                                CheckpointPhase.POST_SUBMIT_SETTLE,
+                                LoginBudget(credential_submissions=1),
+                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                            )
+
+                    ensure_collect_origin()
+                    collect_result = self.collect(
+                        _OriginGuardProxy(page, ensure_collect_origin), collector
+                    )
+                    ensure_collect_origin()
                     if not isinstance(collect_result, BankCollectResult):
                         raise TypeError(
                             f"{self.__class__.__name__}.collect() must return "
@@ -814,10 +966,9 @@ class BankCrawler(ABC):
                     print(f"[{self.name}][collect] raise → {msg}", file=_sys.stderr)
                     print(_tb.format_exc(), file=_sys.stderr)
                     result["error"] = msg
-                    result["final_url"] = page.url
             finally:
-                # 鐵律：登入成功就必須嘗試登出，失敗也吞掉（best-effort）
-                if logged_in:
+                # 已登入且仍在owned origin才best-effort logout；foreign origin零互動。
+                if logged_in and self._credential_origin_allowed(page):
                     try:
                         self.logout(page)
                     except Exception as e:
@@ -864,33 +1015,6 @@ class BankCrawler(ABC):
                 with contextlib.suppress(Exception): c()
         return result
 
-    def attach_dialog_handler(self, page) -> None:
-        """框架預設：所有銀行 page 自動掛 JS dialog handler。
-
-        為何強制：銀行常用 JS alert/confirm 做風險提醒（重複登入、session 過期、
-        查詢前必填、敏感操作確認），headless 沒人按就會卡死、被誤判為流程失敗。
-        詳見 wiki/concepts/taiwan-bank-captcha-ddddocr-automation.md 手法 7。
-
-        策略（safe defaults）：
-        - alert  → log message 後 accept（看銀行親口錯誤原因，極好 debug 線索）
-        - confirm → accept（強制踢舊 session / 確認操作；ok_text 可用 dialog.accept(prompt_text)）
-        - prompt → accept 不填值（讓銀行用預設）
-        - beforeunload → dismiss（不離頁）
-
-        子類可 override：例如某銀行的 confirm 想 dismiss（不踢別處 session），就改寫此方法。
-        """
-        def _on_dialog(d):
-            msg = (d.message or "")[:120]
-            try:
-                if d.type == "beforeunload":
-                    print(f"[{self.name}][dialog] beforeunload -> dismiss", file=__import__("sys").stderr)
-                    d.dismiss()
-                else:
-                    print(f"[{self.name}][dialog] {d.type} msg={msg!r} -> accept", file=__import__("sys").stderr)
-                    d.accept()
-            except Exception as e:
-                print(f"[{self.name}][dialog] handle 失敗: {e}", file=__import__("sys").stderr)
-        page.on("dialog", _on_dialog)
 
     def attach_shared_dialog_handler(self, page) -> None:
         """Dismiss opaque JS dialogs and let the typed lifecycle fail closed."""
@@ -900,119 +1024,6 @@ class BankCrawler(ABC):
                 dialog.dismiss()
 
         page.on("dialog", _on_dialog)
-
-    # ─────────────────────────────────────────────────────────
-    # 通用「重複登入」HTML modal 處理（所有銀行共用）
-    # ─────────────────────────────────────────────────────────
-    # 預設關鍵字：銀行 modal 文字含這些 → 視為「重複登入提示」
-    DUP_LOGIN_KEYWORDS = (
-        "重複登入", "重覆登入", "您已登入", "已從其他",
-        "已從別處", "同時登入", "強制登入", "踢出原連線",
-        "其他位置將會自動登出", "您的帳號目前已在",
-        "上次未正常登出", "未正常登出",  # 台新 pattern
-    )
-    # 預設主按鈕優先順序（找第一個匹配的可見按鈕點下）
-    DUP_LOGIN_KICK_BTN_TEXTS = (
-        "確定登入", "強制登入", "繼續登入", "踢出", "我要登入",
-        "重新登入", "繼續使用", "重新登錄",  # 台新 pattern
-        "確定", "確認", "同意", "Yes", "OK",
-    )
-    # 黑名單：絕不點這些（防誤觸）
-    DUP_LOGIN_AVOID_BTN_TEXTS = ("取消", "Cancel", "否", "No", "返回", "離開")
-
-    def should_kick_other_session(self) -> bool:
-        """子類 override：True=遇「重複登入」直接踢，False=報錯停止。
-
-        預設行為：所有銀行都應主動踢，預設 True。
-        """
-        return True
-
-    def handle_dup_login_modal(self, page) -> bool:
-        """掃所有 frame 找「重複登入」modal，自動點主按鈕踢掉舊 session。
-
-        回傳：True=偵測到且處理完畢；False=沒看到 modal（或沒點到按鈕）。
-
-        為何放 base：「所有銀行都要做」是設計規範。各家銀行的 modal 文字大同小異，
-        基類用關鍵字 + 文字優先表掃所有 frame，子類可 override 關鍵字/按鈕表客製。
-        """
-        import sys as _sys
-        kw = "|".join(re.escape(k) for k in self.DUP_LOGIN_KEYWORDS)
-        kick_texts = list(self.DUP_LOGIN_KICK_BTN_TEXTS)
-        avoid_texts = list(self.DUP_LOGIN_AVOID_BTN_TEXTS)
-
-        for f in page.frames:
-            try:
-                # 第一階段：偵測 frame 是否含關鍵字
-                has_modal = f.evaluate(f"""
-                    () => {{
-                      const re = new RegExp({json.dumps(kw)});
-                      const all = document.querySelectorAll('div,span,td,p,h1,h2,h3,h4');
-                      for (const e of all) {{
-                        const t = (e.textContent || '').trim();
-                        if (t.length > 0 && t.length < 300 && re.test(t)) return true;
-                      }}
-                      return false;
-                    }}
-                """)
-                if not has_modal:
-                    continue
-
-                print(f"[{self.name}][dup-login] 偵測到「重複登入」訊號 in {f.url[:80]}", file=_sys.stderr)
-
-                if not self.should_kick_other_session():
-                    print(f"[{self.name}][dup-login] should_kick_other_session=False → 不處理", file=_sys.stderr)
-                    return True  # 偵測到但不處理（子類自己決定後續）
-
-                # 第二階段：找符合順序表的按鈕並點
-                # 範圍：button/a/input + role=button + div/span（某些銀行 popup 按鈕是 div）
-                kick_json = json.dumps(kick_texts)
-                avoid_json = json.dumps(avoid_texts)
-                clicked = f.evaluate(f"""
-                    () => {{
-                      const kickList = {kick_json};
-                      const avoidSet = new Set({avoid_json});
-                      const cand = document.querySelectorAll(
-                        'button, a, input[type=button], input[type=submit], ' +
-                        '[role=button], div, span'
-                      );
-                      // 蒐集所有可見按鈕
-                      const visible = [];
-                      for (const b of cand) {{
-                        // 跳過 nested container：如果有子節點是 button/a，留給子節點
-                        if (b.tagName === 'DIV' || b.tagName === 'SPAN') {{
-                          if (b.querySelector('button, a, [role=button]')) continue;
-                        }}
-                        const t = (b.textContent || b.value || '').trim();
-                        if (!t || t.length > 20) continue;
-                        if (avoidSet.has(t)) continue;
-                        const rect = b.getBoundingClientRect();
-                        if (rect.width <= 0 || rect.height <= 0) continue;
-                        const cs = window.getComputedStyle(b);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        visible.push({{ el: b, text: t, tag: b.tagName }});
-                      }}
-                      // 依優先順序找匹配
-                      for (const want of kickList) {{
-                        for (const v of visible) {{
-                          if (v.text === want || v.text.includes(want)) {{
-                            v.el.click();
-                            return v.text + ' (' + v.tag + ')';
-                          }}
-                        }}
-                      }}
-                      return null;
-                    }}
-                """)
-                if clicked:
-                    print(f"[{self.name}][dup-login] ✓ 已點「{clicked}」踢掉舊 session", file=_sys.stderr)
-                    page.wait_for_timeout(5000)  # 等銀行 server 處理
-                    return True
-                print(f"[{self.name}][dup-login] ⚠️ 找到 modal 但沒找到可點的「踢」按鈕", file=_sys.stderr)
-                return False
-            except Exception as e:
-                print(f"[{self.name}][dup-login] frame {f.url[:60]} 掃描失敗: {e}", file=_sys.stderr)
-                continue
-        return False
 
     def _host_filter(self) -> str:
         return ""

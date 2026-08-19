@@ -169,6 +169,19 @@ def test_login_adapter_and_prepare_delegate_once(monkeypatch) -> None:
     logged_in.assert_called_once_with(page)
 
 
+def test_authenticated_origin_requires_exact_bank_host_and_ebank_prefix() -> None:
+    crawler = object.__new__(RakutenCrawler)
+    page = Mock()
+    page.evaluate.return_value = True
+
+    page.url = "https://www.rakuten-bank.com.tw/ebank/home"
+    assert crawler._logged_in(page) is True
+    page.url = "https://evilrakuten-bank.com.tw/ebank/home"
+    assert crawler._logged_in(page) is False
+    page.url = "https://www.rakuten-bank.com.tw/public/ebank/home"
+    assert crawler._logged_in(page) is False
+
+
 def test_rakuten_rules_with_real_patchright_evaluator() -> None:
     from patchright.sync_api import sync_playwright
 
@@ -634,6 +647,7 @@ def test_goto_twd_retries_once_after_known_late_action(
     )
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
+    crawler._credential_origin_allowed = lambda _page: True
     evaluator = Mock(
         return_value=CheckpointOutcome(kind, rule_name=rule_name, action_label="known-action")
     )
@@ -673,6 +687,7 @@ def test_goto_twd_invalid_late_outcome_provenance_blocks_without_retry(
     page.get_by_role.return_value = nav
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
+    crawler._credential_origin_allowed = lambda _page: True
     evaluator = Mock(
         return_value=CheckpointOutcome(
             CheckpointKind.DUPLICATE_SESSION,
@@ -712,6 +727,7 @@ def test_goto_twd_terminal_checkpoint_does_not_retry_or_leak_body(
     page.get_by_role.return_value = nav
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
+    crawler._credential_origin_allowed = lambda _page: True
     evaluator = Mock(return_value=outcome)
     monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
 
@@ -732,6 +748,7 @@ def test_goto_twd_authenticated_outcome_rethrows_original_click_error(monkeypatc
     page.get_by_role.return_value = nav
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
+    crawler._credential_origin_allowed = lambda _page: True
     evaluator = Mock(return_value=CheckpointOutcome(CheckpointKind.AUTHENTICATED))
     monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
 

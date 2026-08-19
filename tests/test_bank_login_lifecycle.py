@@ -49,9 +49,13 @@ def _opted_in_bank_modules() -> set[str]:
 @dataclass
 class _StagedCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS = True
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
     events: list[str] = field(default_factory=list)
     submissions: int = 0
     rules: tuple[LoginCheckpointRule, ...] | None = None
+
+    def _credential_origin_allowed(self, page) -> bool:
+        return True
 
     def login(self, page) -> bool:
         raise AssertionError("legacy login must not run")
@@ -278,49 +282,38 @@ def test_page_action_attaches_collector_before_dialog_and_prepare(monkeypatch, t
     ]
 
 
-@dataclass
-class _LegacyCrawler(BankCrawler):
-    events: list[str] = field(default_factory=list)
-
-    def login(self, page) -> bool:
-        self.events.append("login")
-        return True
-
-    def prepare_login_page(self, page) -> None:
-        raise AssertionError("staged prepare must not run")
-
-    def is_authenticated(self, page) -> bool:
-        raise AssertionError("staged auth must not run")
-
-    def submit_credentials_once(self, page) -> None:
-        raise AssertionError("staged submit must not run")
-
-    def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
-        self.events.append("collect")
-        return BankCollectResult(card_bill_facts_ok=False)
-
-    def attach_dialog_handler(self, page) -> None:
-        self.events.append("attach-dialog")
-
-    def logout(self, page) -> bool:
-        self.events.append("logout")
-        return True
+def test_base_run_has_no_legacy_login_or_dialog_path() -> None:
+    run_source = inspect.getsource(BankCrawler.run)
+    assert "USES_SHARED_LOGIN_CHECKPOINTS" not in run_source
+    assert "attach_dialog_handler" not in run_source
+    assert "self.login(page)" not in run_source
+    assert "self._shared_login(page)" in run_source
+    assert "attach_dialog_handler" not in BankCrawler.__dict__
+    assert "handle_dup_login_modal" not in BankCrawler.__dict__
+    assert "should_kick_other_session" not in BankCrawler.__dict__
 
 
-def test_legacy_login_path_is_unchanged(monkeypatch, tmp_path):
-    crawler = _LegacyCrawler(name="legacy")
+def test_run_redacts_untyped_login_exception_text(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
 
+    def fail(_page):
+        raise RuntimeError("PRIVATE-LOGIN-DOM-987654")
+
+    monkeypatch.setattr(crawler, "prepare_login_page", fail)
     result, _ = _run(
         monkeypatch,
         tmp_path,
         crawler,
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("shared evaluator must not run")
+        lambda *_args, **_kwargs: CheckpointOutcome(
+            CheckpointKind.READY_FOR_CREDENTIALS
         ),
     )
 
-    assert result["data"] == {"card_bill_facts_ok": False}
-    assert crawler.events == ["attach-dialog", "login", "collect", "logout"]
+    assert result["error"] == "RuntimeError: login failed"
+    assert "PRIVATE" not in result["error"]
+    assert "PRIVATE" not in capsys.readouterr().err
 
 
 def test_shared_login_checkpoint_opt_in_inventory():
@@ -339,6 +332,114 @@ def test_shared_login_checkpoint_opt_in_inventory():
         "taishin",
         "ubot",
     }
+
+
+def test_production_credential_origins_are_exact_https() -> None:
+    crawlers = []
+    for path in BANK_MODULES:
+        if path.stem == "__init__":
+            continue
+        module = import_module(f"backend.banks.{path.stem}")
+        crawlers.extend(
+            candidate
+            for candidate in vars(module).values()
+            if inspect.isclass(candidate)
+            and candidate is not BankCrawler
+            and candidate.__module__ == module.__name__
+            and issubclass(candidate, BankCrawler)
+            and candidate.USES_SHARED_LOGIN_CHECKPOINTS is True
+        )
+
+    assert len(crawlers) == 13
+    for crawler_type in crawlers:
+        crawler = object.__new__(crawler_type)
+        assert crawler.CREDENTIAL_HOSTS
+        for host in crawler.CREDENTIAL_HOSTS:
+            assert BankCrawler._credential_origin_allowed(
+                crawler, SimpleNamespace(url=f"https://{host}/")
+            )
+            assert BankCrawler._credential_origin_allowed(
+                crawler, SimpleNamespace(url=f"https://{host}:443/")
+            )
+            for unsafe in (
+                f"http://{host}/",
+                f"https://{host}.evil.example/",
+                f"https://user@{host}/",
+                f"https://{host}:444/",
+            ):
+                assert not BankCrawler._credential_origin_allowed(
+                    crawler, SimpleNamespace(url=unsafe)
+                )
+
+
+def test_origin_change_after_pre_checkpoint_blocks_before_credentials(monkeypatch) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._credential_origin_allowed = BankCrawler._credential_origin_allowed.__get__(crawler)
+    page = SimpleNamespace(url="https://example.com/", frames=[])
+
+    def evaluate(*_args, **_kwargs):
+        page.url = "https://evil.example/"
+        return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+
+    monkeypatch.setattr("backend.core.base.evaluate_login_checkpoint", evaluate)
+    with pytest.raises(LoginCheckpointBlocked) as error:
+        crawler._shared_login(page)
+
+    assert error.value.outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+    assert crawler.submissions == 0
+
+
+def test_post_submit_origin_change_blocks_authentication_and_collection(
+    monkeypatch, tmp_path
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._credential_origin_allowed = BankCrawler._credential_origin_allowed.__get__(crawler)
+    evaluations = 0
+
+    def evaluate(page, **_kwargs):
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 1:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+        page.url = "http://example.com/dashboard"
+        return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
+
+    result, _ = _run(monkeypatch, tmp_path, crawler, evaluate)
+
+    assert crawler.submissions == 1
+    assert "collect" not in crawler.events
+    assert "kind=unknown_blocker" in result["error"]
+
+
+def test_collect_origin_drift_discards_data_and_skips_logout(
+    monkeypatch, tmp_path
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._credential_origin_allowed = BankCrawler._credential_origin_allowed.__get__(crawler)
+
+    def collect(page, _collector):
+        page.url = "http://example.com/dashboard?PRIVATE-URL-MARKER"
+        crawler.events.append("collect-origin-drift")
+        return BankCollectResult(card_bill_facts_ok=False)
+
+    monkeypatch.setattr(crawler, "collect", collect)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    assert crawler.submissions == 1
+    assert "collect-origin-drift" not in crawler.events
+    assert "data" not in result
+    assert "kind=unknown_blocker" in result["error"]
+    assert "PRIVATE-URL-MARKER" not in repr(result)
+    assert "logout" not in crawler.events
 
 
 @pytest.mark.parametrize(
@@ -989,6 +1090,7 @@ def test_login_loop_has_a_fixed_safe_bound(monkeypatch, tmp_path):
 @dataclass
 class _MissingStagedMethodsCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS = True
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
     events: list[str] = field(default_factory=list)
 
     def login(self, page) -> bool:
@@ -1019,7 +1121,7 @@ def test_missing_opt_in_method_is_safe_and_never_falls_back(monkeypatch, tmp_pat
 
     assert crawler.events == ["attach-dialog"]
     assert result["error"].startswith("NotImplementedError:")
-    assert result["final_url"] == "https://example.com/app"
+    assert "final_url" not in result
 
 
 def test_rules_keep_order_and_twelve_action_budget_is_enforced(monkeypatch, tmp_path):

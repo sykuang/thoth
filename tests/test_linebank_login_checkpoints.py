@@ -20,6 +20,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> LinebankCrawler:
     crawler = object.__new__(LinebankCrawler)
     crawler.name = "linebank"
+    crawler._credential_origin_allowed = lambda _page: True
     return crawler
 
 
@@ -40,7 +41,9 @@ def test_linebank_shared_login_api_and_ordered_rules() -> None:
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
     ]
-    assert all(rule.bank == "linebank" and rule.phases == post for rule in rules)
+    assert all(rule.bank == "linebank" for rule in rules)
+    assert rules[0].phases == rules[2].phases == tuple(CheckpointPhase)
+    assert rules[1].phases == rules[3].phases == post
     assert [rule.container_selector for rule in rules] == [
         ".modal.show",
         ".modal.show",
@@ -245,7 +248,9 @@ def test_real_dom_rules_are_scoped_terminal_first_and_fail_closed() -> None:
         assert outcome.rule_name == "linebank-login-form-still-visible"
 
         page.set_content('<div class="modal show">登入<button>確定</button></div>')
-        assert _evaluate(page, CheckpointPhase.PRE_SUBMIT).kind is CheckpointKind.READY_FOR_CREDENTIALS
+        outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
+        assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert outcome.rule_name == "linebank-unknown-modal"
 
         page.set_content(
             '<div class="modal show" hidden>登入<button>確定</button></div>'
@@ -595,3 +600,18 @@ def test_authentication_inspection_does_not_log_private_metadata(capsys) -> None
     assert _crawler()._logged_in(page) is False
     captured = capsys.readouterr()
     assert "PRIVATE-PATH" not in captured.err
+
+
+def test_authentication_requires_exact_linebank_host() -> None:
+    page = Mock()
+    page.evaluate.return_value = True
+    crawler = _crawler()
+
+    page.url = "https://accessibility.linebank.com.tw/overview"
+    assert crawler._logged_in(page) is True
+    page.url = "https://accessibility.linebank.com.tw.evil.example/overview"
+    assert crawler._logged_in(page) is False
+    page.url = "http://accessibility.linebank.com.tw/overview"
+    assert crawler._logged_in(page) is False
+    page.url = "https://accessibility.linebank.com.tw:444/overview"
+    assert crawler._logged_in(page) is False

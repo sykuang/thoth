@@ -41,6 +41,7 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -65,6 +66,7 @@ class LinebankLoginError(RuntimeError):
 
 class LinebankCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"accessibility.linebank.com.tw"})
 
     def __init__(self):
         super().__init__(name="linebank")
@@ -82,11 +84,17 @@ class LinebankCrawler(BankCrawler):
         4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
         """
         try:
-            url = (page.url or "").lower()
-            if "linebank.com.tw" not in url:
+            current = urlparse(page.url or "")
+            if (
+                current.scheme.lower() != "https"
+                or (current.hostname or "").lower() != "accessibility.linebank.com.tw"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
+            ):
                 return False
             # 精準 path 判斷：/login 結尾才當登入頁（/overview 等不算）
-            path_tail = url.rstrip("/").split("/")[-1].split("?")[0]
+            path_tail = (current.path or "").rstrip("/").split("/")[-1].lower()
             if path_tail == "login":
                 return False
 
@@ -125,12 +133,13 @@ class LinebankCrawler(BankCrawler):
         return self._logged_in(page)
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
         post = (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE)
         return (
             LoginCheckpointRule(
                 name="linebank-otp-required",
                 bank="linebank",
-                phases=post,
+                phases=all_phases,
                 kind=CheckpointKind.OTP_REQUIRED,
                 container_selector=".modal.show",
                 required_body_pattern=re.compile(
@@ -151,7 +160,7 @@ class LinebankCrawler(BankCrawler):
             LoginCheckpointRule(
                 name="linebank-unknown-modal",
                 bank="linebank",
-                phases=post,
+                phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
                 container_selector=".modal.show",
             ),

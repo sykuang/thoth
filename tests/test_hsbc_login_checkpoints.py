@@ -24,6 +24,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> HsbcCrawler:
     crawler = object.__new__(HsbcCrawler)
     crawler.name = "hsbc"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = cast("object", SimpleNamespace(
         user_id="USER-PRIVATE", password="PASSWORD-PRIVATE"
     ))
@@ -141,6 +142,8 @@ def test_auth_exact_host_hash_identity_controls_public_menu_and_exception(caplog
         assert crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/dashboard"))
         assert crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#cards"))
         assert not crawler._logged_in(_page_proxy(real, "https://evil.hsbc.com.tw/#/dashboard"))
+        assert not crawler._logged_in(_page_proxy(real, "http://card.hsbc.com.tw/#/dashboard"))
+        assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw:444/#/dashboard"))
         assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/login"))
         assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/login/device"))
 
@@ -513,6 +516,43 @@ def test_real_delayed_error_with_mounted_fields_submits_final_once_and_never_col
         assert page.locator("body").get_attribute("data-challenge") == "1"
         assert page.locator("body").get_attribute("data-final") == "1"
         collect.assert_not_called()
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
+def test_first_stage_dom_modal_blocks_final_submit(monkeypatch) -> None:
+    manager, browser = _launch_browser()
+    try:
+        page = browser.new_page()
+        page.set_content("""
+            <input id="userId"><button data-testid="continueButton">繼續</button>
+            <input id="password" hidden><input id="captchaInput" hidden>
+            <button type="submit" id="final" hidden>繼續</button>
+            <div class="modal show" id="blocker" hidden>PRIVATE-DOM-BLOCKER</div>
+            <script>
+              document.body.dataset.challenge='0'; document.body.dataset.final='0';
+              document.querySelector('[data-testid=continueButton]').onclick = event => {
+                event.preventDefault(); document.body.dataset.challenge++;
+                userId.hidden=true; event.target.hidden=true;
+                password.hidden=false; captchaInput.hidden=false; final.hidden=false;
+                blocker.hidden=false;
+              };
+              final.onclick = event => {
+                event.preventDefault(); document.body.dataset.final++;
+              };
+            </script>
+        """)
+        crawler = _crawler()
+        monkeypatch.setattr(crawler, "_solve_captcha", Mock(return_value="ab12C"))
+        real_wait = page.wait_for_timeout
+        monkeypatch.setattr(page, "wait_for_timeout", lambda _milliseconds: real_wait(1))
+
+        with pytest.raises(HsbcLoginError, match="未分類提示"):
+            crawler.submit_credentials_once(page)
+
+        assert page.locator("body").get_attribute("data-challenge") == "1"
+        assert page.locator("body").get_attribute("data-final") == "0"
     finally:
         browser.close()
         manager.__exit__(None, None, None)

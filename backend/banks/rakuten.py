@@ -157,6 +157,7 @@ class RakutenLoginError(RuntimeError):
 
 class RakutenCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"www.rakuten-bank.com.tw"})
     FETCH_REAL_CHROME = True  # Imperva/Incapsula 會擋 bundled Chromium。
     VISIBLE_CONFIRM_SELECTOR = (
         "modal-confirm .modal.show:visible, modal-projection .modal.show:visible"
@@ -178,8 +179,13 @@ class RakutenCrawler(BankCrawler):
 
     def _logged_in(self, page) -> bool:
         try:
-            url = (page.url or "").lower()
-            if "rakuten-bank.com.tw/ebank" not in url or LOGIN_PATH_HINT in url:
+            current = urlparse(page.url or "")
+            path = (current.path or "").lower()
+            if (
+                (current.hostname or "").lower() != "www.rakuten-bank.com.tw"
+                or not path.startswith("/ebank/")
+                or LOGIN_PATH_HINT in path
+            ):
                 return False
             return bool(page.evaluate("""() => {
                 const visible = e => !!e && !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);

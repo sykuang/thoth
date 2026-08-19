@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import html
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
-from urllib.parse import quote
+
 
 import pytest
 
@@ -38,6 +39,7 @@ LOGIN_FIELD_SELECTOR = ", ".join(
 def _crawler() -> EsunCrawler:
     crawler = object.__new__(EsunCrawler)
     crawler.name = "esun"
+    crawler._credential_origin_allowed = lambda _page: True
     return crawler
 
 
@@ -243,8 +245,8 @@ def test_real_unknown_hidden_pre_ready_and_visible_form_rules_fail_closed() -> N
         manager.__exit__(None, None, None)
 
 
-def _iframe_src(body: str) -> str:
-    return f"data:text/html;charset=utf-8,{quote(body)}#{IFRAME_HINT}"
+def _iframe_srcdoc(body: str) -> str:
+    return html.escape(body, quote=True)
 
 
 def _proxy(real_page):
@@ -262,7 +264,7 @@ def test_real_auth_accepts_persistent_frame_only_with_eight_dashboard_keywords()
     try:
         page = browser.new_page()
         dashboard = "訊息中心 個人資訊 登出 帳戶總覽 歡迎使用 存款 轉帳 信用卡 " + "x" * 600
-        page.set_content(f'<iframe src="{_iframe_src(dashboard)}"></iframe>')
+        page.set_content(f'<iframe name="iframe1" srcdoc="{_iframe_srcdoc(dashboard)}"></iframe>')
         page.wait_for_timeout(100)
 
         crawler = _crawler()
@@ -270,17 +272,43 @@ def test_real_auth_accepts_persistent_frame_only_with_eight_dashboard_keywords()
 
         public_menu = "存款 轉帳 信用卡 台幣 外幣 基金 投資 貸款 " + "x" * 600
         hidden_login = public_menu + f'<input id="{FIELD_PASSWORD}" hidden>'
-        page.set_content(f'<iframe src="{_iframe_src(hidden_login)}"></iframe>')
+        page.set_content(f'<iframe name="iframe1" srcdoc="{_iframe_srcdoc(hidden_login)}"></iframe>')
         page.wait_for_timeout(100)
         assert crawler._logged_in(_proxy(page)) is False
 
         with_form = dashboard + f'<input id="{FIELD_PASSWORD}">'
-        page.set_content(f'<iframe src="{_iframe_src(with_form)}"></iframe>')
+        page.set_content(f'<iframe name="iframe1" srcdoc="{_iframe_srcdoc(with_form)}"></iframe>')
         page.wait_for_timeout(100)
         assert crawler._logged_in(_proxy(page)) is False
     finally:
         browser.close()
         manager.__exit__(None, None, None)
+
+
+def test_login_frame_rejects_foreign_origin_even_with_matching_path() -> None:
+    crawler = _crawler()
+    foreign = Mock()
+    foreign.name = "iframe1"
+    foreign.url = "https://evil.example/fco/fco08001/FCO08001_Home.faces"
+
+    assert crawler._find_login_frame(SimpleNamespace(
+        frames=[foreign], url="https://ebank.esunbank.com.tw/fco/"
+    )) is None
+
+
+def test_login_frame_rejects_srcdoc_inherited_from_foreign_parent() -> None:
+    crawler = _crawler()
+    main = Mock(url="https://ebank.esunbank.com.tw/fco/")
+    foreign = Mock(url="https://evil.example/embedded", parent_frame=main)
+    child = Mock(url="about:srcdoc", parent_frame=foreign)
+    child.name = "iframe1"
+    page = SimpleNamespace(
+        url="https://ebank.esunbank.com.tw/fco/",
+        main_frame=main,
+        frames=[main, foreign, child],
+    )
+
+    assert crawler._find_login_frame(page) is None
 
 
 def test_real_auth_accepts_no_frame_with_two_keywords_and_rejects_ambiguity() -> None:
@@ -295,8 +323,11 @@ def test_real_auth_accepts_no_frame_with_two_keywords_and_rejects_ambiguity() ->
         assert crawler._logged_in(_proxy(page)) is False
 
         dashboard = "訊息中心 個人資訊 登出 帳戶總覽 歡迎使用 存款 轉帳 信用卡 " + "x" * 600
-        src = _iframe_src(dashboard)
-        page.set_content(f'<iframe src="{src}"></iframe><iframe src="{src}"></iframe>')
+        srcdoc = _iframe_srcdoc(dashboard)
+        page.set_content(
+            f'<iframe name="iframe1" srcdoc="{srcdoc}"></iframe>'
+            f'<iframe name="iframe1" srcdoc="{srcdoc}"></iframe>'
+        )
         page.wait_for_timeout(100)
         assert crawler._logged_in(_proxy(page)) is False
     finally:
@@ -335,6 +366,7 @@ def test_auth_is_one_shot_fieldless_and_exception_safe(capsys) -> None:
 
 def _submit_fixture():
     page = Mock()
+    page.url = "https://ebank.esunbank.com.tw/fco/"
     frame = Mock(url=f"https://ebank.esunbank.com.tw/fco/{IFRAME_HINT}")
     page.frames = [frame]
     page.main_frame = Mock()
@@ -386,15 +418,23 @@ def test_submit_requires_unique_frame_fields_lengths_and_action_then_clicks_once
 
     crawler.submit_credentials_once(page)
 
-    for field, value in zip(fields.values(), crawler.creds.__dict__.values(), strict=True):
+    for field in fields.values():
         assert field.method_calls == [
             call.count(),
             call.nth(0),
             call.is_visible(),
             call.is_enabled(),
-            call.fill(value),
+            call.click(),
+            call.click(click_count=3),
             call.input_value(),
         ]
+    assert page.keyboard.press.call_args_list == [call("Backspace")] * 3
+    assert page.keyboard.type.call_args_list == [
+        call("ID-PRIVATE", delay=80),
+        call("USER-PRIVATE", delay=80),
+        call("PASSWORD-PRIVATE", delay=80),
+    ]
+    page.fill.assert_not_called()
     assert page.wait_for_timeout.call_args_list == [
         call(200),
         call(200),
@@ -423,7 +463,7 @@ def test_submit_frame_inspection_error_is_fieldless_and_zero_click(caplog) -> No
 
 @pytest.mark.parametrize(
     "failure",
-    ("no-frame", "ambiguous-frame", "duplicate", "hidden", "disabled", "length", "fill", "input"),
+    ("no-frame", "ambiguous-frame", "duplicate", "hidden", "disabled", "length", "keyboard", "input"),
 )
 def test_submit_frame_and_field_failures_are_fieldless_and_zero_click(
     failure: str,
@@ -443,8 +483,8 @@ def test_submit_frame_and_field_failures_are_fieldless_and_zero_click(
         fields[_sel(FIELD_PASSWORD)].is_enabled.return_value = False
     elif failure == "length":
         fields[_sel(FIELD_PASSWORD)].input_value.return_value = "short"
-    elif failure == "fill":
-        fields[_sel(FIELD_USER_CODE)].fill.side_effect = RuntimeError(secret)
+    elif failure == "keyboard":
+        fields[_sel(FIELD_USER_CODE)].click.side_effect = RuntimeError(secret)
     else:
         fields[_sel(FIELD_USER_CODE)].input_value.side_effect = RuntimeError(secret)
 
@@ -595,7 +635,7 @@ def test_real_submit_stops_at_multiple_modals_without_actions(monkeypatch) -> No
             }};
           </script>
         """
-        page.set_content(f'<iframe src="{_iframe_src(frame_html)}"></iframe>')
+        page.set_content(f'<iframe name="iframe1" srcdoc="{_iframe_srcdoc(frame_html)}"></iframe>')
         page.wait_for_timeout(100)
         crawler = _crawler()
         crawler.creds = SimpleNamespace(
@@ -607,9 +647,9 @@ def test_real_submit_stops_at_multiple_modals_without_actions(monkeypatch) -> No
         original_wait = page.wait_for_timeout
         monkeypatch.setattr(page, "wait_for_timeout", lambda _milliseconds: original_wait(1))
 
-        crawler.submit_credentials_once(page)
+        crawler.submit_credentials_once(_proxy(page))
 
-        frame = crawler._find_login_frame(page)
+        frame = crawler._find_login_frame(_proxy(page))
         assert frame.locator("body").get_attribute("data-submit") == "1"
         assert frame.locator("body").get_attribute("data-modal") == "0"
         assert frame.locator(".modal.show").count() == 1

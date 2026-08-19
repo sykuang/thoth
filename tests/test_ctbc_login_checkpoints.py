@@ -20,6 +20,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> CtbcCrawler:
     crawler = object.__new__(CtbcCrawler)
     crawler.name = "ctbc"
+    crawler._credential_origin_allowed = lambda _page: True
     return crawler
 
 
@@ -33,11 +34,13 @@ def test_ctbc_shared_login_api_and_ordered_rules() -> None:
         "ctbc-otp-required",
         "ctbc-duplicate-session",
         "ctbc-unknown-modal",
+        "ctbc-unknown-dialog",
     ]
     assert [rule.kind for rule in rules] == [
         CheckpointKind.DISMISSIBLE_NOTICE,
         CheckpointKind.OTP_REQUIRED,
         CheckpointKind.DUPLICATE_SESSION,
+        CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
     ]
     assert [rule.phases for rule in rules] == [
@@ -45,9 +48,12 @@ def test_ctbc_shared_login_api_and_ordered_rules() -> None:
         (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
         (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
         tuple(CheckpointPhase),
+        tuple(CheckpointPhase),
     ]
     assert all(rule.bank == "ctbc" for rule in rules)
-    assert all(rule.container_selector == ".modal.show" for rule in rules)
+    assert [rule.container_selector for rule in rules] == [
+        ".modal.show", ".modal.show", ".modal.show", ".modal.show", "[role='dialog']"
+    ]
     assert rules[0].action_selector == "a.btn_close"
     assert rules[0].action_texts == ()
     assert rules[0].max_actions == 1
@@ -264,6 +270,18 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
 
 def _submit_fixture():
     page = Mock()
+    values = {
+        'input[formcontrolname="custIxd"]': "ID-PRIVATE",
+        'input[formcontrolname="userIxd"]': "USER-PRIVATE",
+        'input[formcontrolname="pxd"]': "PASSWORD-PRIVATE",
+    }
+    fields = {selector: Mock() for selector in values}
+    for selector, field in fields.items():
+        field.count.return_value = 1
+        field.nth.return_value = field
+        field.is_visible.return_value = True
+        field.is_enabled.return_value = True
+        field.input_value.return_value = values[selector]
     candidates = Mock()
     button = Mock()
     modals = Mock()
@@ -277,9 +295,11 @@ def _submit_fixture():
     modals.nth.return_value = modal
     modal.is_visible.return_value = True
     page.locator.side_effect = lambda selector: {
+        **fields,
         "a.btn_submit": candidates,
         ".modal.show": modals,
     }[selector]
+    page.test_fields = fields
 
     crawler = _crawler()
     crawler.creds = SimpleNamespace(
@@ -291,7 +311,7 @@ def _submit_fixture():
     return crawler, page, candidates, button, modals
 
 
-def test_submit_fills_once_clicks_once_and_preserves_timing() -> None:
+def test_submit_uses_true_keyboard_clicks_once_and_preserves_timing() -> None:
     crawler, page, _candidates, button, _modals = _submit_fixture()
 
     crawler.submit_credentials_once(page)
@@ -299,10 +319,16 @@ def test_submit_fills_once_clicks_once_and_preserves_timing() -> None:
     page.wait_for_selector.assert_called_once_with(
         'input[formcontrolname="custIxd"]', state="visible", timeout=15000
     )
-    assert page.fill.call_args_list == [
-        call('input[formcontrolname="custIxd"]', "ID-PRIVATE"),
-        call('input[formcontrolname="userIxd"]', "USER-PRIVATE"),
-        call('input[formcontrolname="pxd"]', "PASSWORD-PRIVATE"),
+    for field in page.test_fields.values():
+        assert field.method_calls == [
+            call.count(), call.nth(0), call.is_visible(), call.is_enabled(),
+            call.click(), call.click(click_count=3), call.input_value(),
+        ]
+    assert page.keyboard.press.call_args_list == [call("Backspace")] * 3
+    assert page.keyboard.type.call_args_list == [
+        call("ID-PRIVATE", delay=80),
+        call("USER-PRIVATE", delay=80),
+        call("PASSWORD-PRIVATE", delay=80),
     ]
     assert page.wait_for_timeout.call_args_list == [
         call(300),
@@ -312,6 +338,7 @@ def test_submit_fills_once_clicks_once_and_preserves_timing() -> None:
         call(1000),
     ]
     button.click.assert_called_once_with(timeout=8000)
+    page.fill.assert_not_called()
     page.click.assert_not_called()
 
 
@@ -371,14 +398,14 @@ def test_submit_click_exception_is_fieldless_unknown_status_and_exactly_one_atte
     page.click.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["wait", "fill"])
+@pytest.mark.parametrize("failure", ["wait", "keyboard"])
 def test_field_failure_is_fieldless_and_zero_click(failure: str, caplog) -> None:
     crawler, page, _candidates, button, _modals = _submit_fixture()
     secret = "PRIVATE-FIELD-DOM-987654"
     if failure == "wait":
         page.wait_for_selector.side_effect = RuntimeError(secret)
     else:
-        page.fill.side_effect = RuntimeError(secret)
+        page.test_fields['input[formcontrolname="userIxd"]'].click.side_effect = RuntimeError(secret)
 
     with pytest.raises(CtbcLoginError, match="欄位無法安全填寫.*未送出登入") as error:
         crawler.submit_credentials_once(page)
@@ -390,7 +417,6 @@ def test_field_failure_is_fieldless_and_zero_click(failure: str, caplog) -> None
     assert "PASSWORD-PRIVATE" not in rendered
     assert secret not in caplog.text
     button.click.assert_not_called()
-    page.locator.assert_not_called()
 
 
 def test_structural_wait_handles_multiple_visible_modals_without_action_or_resubmit() -> None:
@@ -564,3 +590,19 @@ def test_unknown_modal_blocks_shared_login_without_submission(monkeypatch) -> No
     finally:
         browser.close()
         manager.__exit__(None, None, None)
+
+
+def test_authentication_requires_exact_https_ctbc_origin() -> None:
+    page = Mock()
+    page.evaluate.return_value = {"ok": True}
+    crawler = _crawler()
+
+    page.url = "https://www.ctbcbank.com/twrbc/twrbc-home"
+    assert crawler._logged_in(page) is True
+    for unsafe in (
+        "http://www.ctbcbank.com/twrbc/twrbc-home",
+        "https://www.ctbcbank.com.evil.example/twrbc/twrbc-home",
+        "data:text/html,twrbc-home",
+    ):
+        page.url = unsafe
+        assert crawler._logged_in(page) is False

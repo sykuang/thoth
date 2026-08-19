@@ -5,9 +5,9 @@
 
 登入入口：官網 https://www.ubot.com.tw/home 內嵌登入 modal（舊 mybank 已搬家）。
 流程：點右上「網銀登入」開 modal → 確認「個人用戶登入」分頁
-      → fill #sid/#nickname/#password → OCR 圖形驗證碼(#CAPTCHA, 6碼) → 點「登入」。
+      → 真鍵盤輸入 #sid/#nickname/#password → OCR 圖形驗證碼(#CAPTCHA, 6碼) → 點「登入」。
 驗證碼：img[alt='CAPTCHA'] base64 jpeg 170x50，ddddocr 直接 OCR，錯則點「重新產生」換圖。
-無虛擬鍵盤（密碼欄旁鍵盤圖示為選用防側錄，標準 .fill() 即可）。
+密碼欄旁虛擬鍵盤為選用；自動化仍使用真鍵盤輸入並驗證長度。
 
 設計規範：dump 真值不猜測 → 登入後 collect 先 dump endpoint，摸清明細 API 再補 parse。
 預設行為：headless browser → 預設 headless=True。
@@ -18,6 +18,7 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -188,6 +189,7 @@ def _ubot_card_bill_fact(out: dict):
 
 class UbotCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"www.ubot.com.tw"})
 
     def __init__(self):
         super().__init__(name="ubot")
@@ -203,6 +205,8 @@ class UbotCrawler(BankCrawler):
         詳見 wiki/concepts/bank-crawler-login-positive-signal-rule.md
         """
         try:
+            if (urlparse(page.url or "").hostname or "").lower() != "www.ubot.com.tw":
+                return False
             r = page.evaluate(JS_LOGGED_IN_POSITIVE)
         except Exception:
             return False
@@ -259,11 +263,12 @@ class UbotCrawler(BankCrawler):
         return self._logged_in(page)
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
         return (
             LoginCheckpointRule(
                 name="ubot-password-change-required",
                 bank="ubot",
-                phases=_POST_PHASES,
+                phases=all_phases,
                 kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
                 container_selector=".modal.show",
                 required_body_pattern=_REQUIRED_PASSWORD_PATTERN,
@@ -271,7 +276,7 @@ class UbotCrawler(BankCrawler):
             LoginCheckpointRule(
                 name="ubot-otp-required",
                 bank="ubot",
-                phases=_POST_PHASES,
+                phases=all_phases,
                 kind=CheckpointKind.OTP_REQUIRED,
                 container_selector=".modal.show",
                 required_body_pattern=_OTP_PATTERN,
@@ -295,7 +300,7 @@ class UbotCrawler(BankCrawler):
             LoginCheckpointRule(
                 name="ubot-unknown-modal",
                 bank="ubot",
-                phases=_POST_PHASES,
+                phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
                 container_selector=".modal.show",
             ),
@@ -316,8 +321,19 @@ class UbotCrawler(BankCrawler):
                 (SEL_NICK, self.creds.user_code, 150),
                 (SEL_PWD, self.creds.password, 200),
             ):
-                page.fill(selector, value)
+                candidates = page.locator(selector)
+                if candidates.count() != 1:
+                    raise UbotLoginError("登入欄位無法安全填寫；未送出登入")
+                field = candidates.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise UbotLoginError("登入欄位無法安全填寫；未送出登入")
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
                 page.wait_for_timeout(wait)
+                if len(field.input_value()) != len(value):
+                    raise UbotLoginError("登入欄位輸入長度不符；未送出登入")
         except Exception:
             raise UbotLoginError("登入欄位無法安全填寫；未送出登入") from None
 
@@ -325,8 +341,19 @@ class UbotCrawler(BankCrawler):
         if not captcha:
             raise UbotLoginError("圖形驗證碼 OCR 失敗；未送出登入")
         try:
-            page.fill(SEL_CAPTCHA, captcha)
+            candidates = page.locator(SEL_CAPTCHA)
+            if candidates.count() != 1:
+                raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            field = candidates.nth(0)
+            if not field.is_visible() or not field.is_enabled():
+                raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            field.click()
+            field.click(click_count=3)
+            page.keyboard.press("Backspace")
+            page.keyboard.type(captcha, delay=80)
             page.wait_for_timeout(200)
+            if len(field.input_value()) != len(captcha):
+                raise UbotLoginError("驗證碼欄位輸入長度不符；未送出登入")
         except Exception:
             raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
 
@@ -348,7 +375,7 @@ class UbotCrawler(BankCrawler):
 
         _log("[login] 送出 login attempt=1")
         try:
-            button.click()
+            button.click(timeout=8000)
         except Exception:
             raise UbotLoginError("登入送出狀態不明；禁止自動重試") from None
 

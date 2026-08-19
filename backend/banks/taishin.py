@@ -19,6 +19,7 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -93,6 +94,7 @@ def _taishin_card_bill_fact(parsed: dict):
 
 class TaishinCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"my.taishinbank.com.tw"})
 
     def __init__(self):
         super().__init__(name="taishin")
@@ -102,15 +104,23 @@ class TaishinCrawler(BankCrawler):
         return "taishinbank.com"
 
     def _find_login_frame(self, page):
-        matches = [frame for frame in page.frames if IFRAME_HINT in (frame.url or "")]
+        matches = [frame for frame in page.frames if self._is_login_frame_url(frame.url)]
         return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _is_login_frame_url(url: str | None) -> bool:
+        current = urlparse(url or "")
+        return (
+            (current.hostname or "").lower() == "my.taishinbank.com.tw"
+            and IFRAME_HINT in (current.path or "").lower()
+        )
 
     def _logged_in(self, page) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            if "taishinbank.com" not in (page.url or "").lower():
+            if (urlparse(page.url or "").hostname or "").lower() != "my.taishinbank.com.tw":
                 return False
-            if any(IFRAME_HINT in (frame.url or "") for frame in page.frames):
+            if any(self._is_login_frame_url(frame.url) for frame in page.frames):
                 return False
             scopes = [
                 page,
@@ -628,6 +638,7 @@ class TaishinCrawler(BankCrawler):
                         base64.b64decode(cap_b64, validate=True),
                         expected_len=6,
                         alnum_only=True,
+                        min_confidence=0.98,
                     )
                     if cap_b64
                     else None
@@ -670,7 +681,12 @@ class TaishinCrawler(BankCrawler):
                 if candidates.count() != 1:
                     raise TaishinLoginError("登入欄位無法安全填寫；未送出登入")
                 field = candidates.nth(0)
-                field.fill(value)
+                if not field.is_visible() or not field.is_enabled():
+                    raise TaishinLoginError("登入欄位無法安全填寫；未送出登入")
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
                 page.wait_for_timeout(200)
                 if len(field.input_value()) != len(value):
                     raise TaishinLoginError("登入欄位輸入長度不符；未送出登入")
@@ -687,7 +703,12 @@ class TaishinCrawler(BankCrawler):
             if candidates.count() != 1:
                 raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
             field = candidates.nth(0)
-            field.fill(captcha)
+            if not field.is_visible() or not field.is_enabled():
+                raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            field.click()
+            field.click(click_count=3)
+            page.keyboard.press("Backspace")
+            page.keyboard.type(captcha, delay=80)
             page.wait_for_timeout(300)
             if len(field.input_value()) != 6:
                 raise TaishinLoginError("驗證碼欄位輸入長度不符；未送出登入")

@@ -81,6 +81,7 @@ def _esun_card_bill_fact(out: dict):
 
 class EsunCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"ebank.esunbank.com.tw"})
 
     def __init__(self):
         super().__init__(name="esun")
@@ -90,17 +91,38 @@ class EsunCrawler(BankCrawler):
         return "esunbank.com"
 
     def _find_login_frame(self, page):
-        matches = [frame for frame in page.frames if IFRAME_HINT in (frame.url or "")]
+        matches = [
+            frame for frame in page.frames
+            if self._is_login_frame(page, frame)
+        ]
         return matches[0] if len(matches) == 1 else None
+
+    def _is_login_frame(self, page, frame) -> bool:
+        current = urlparse(frame.url or "")
+        return self._frame_origin_allowed(page, frame) and (
+            frame.name == "iframe1" or IFRAME_HINT in (current.path or "")
+        )
 
     def _logged_in(self, page) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            hostname = (urlparse(page.url or "").hostname or "").lower()
-            if hostname != "ebank.esunbank.com.tw":
+            current = urlparse(page.url or "")
+            if (
+                current.scheme.lower() != "https"
+                or (current.hostname or "").lower() != "ebank.esunbank.com.tw"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
+            ):
+                return False
+            if any(
+                (frame.name == "iframe1" or IFRAME_HINT in (frame.url or ""))
+                and not self._is_login_frame(page, frame)
+                for frame in page.frames
+            ):
                 return False
             login_frames = [
-                frame for frame in page.frames if IFRAME_HINT in (frame.url or "")
+                frame for frame in page.frames if self._is_login_frame(page, frame)
             ]
             if len(login_frames) > 1:
                 return False
@@ -246,7 +268,10 @@ class EsunCrawler(BankCrawler):
                 field = candidates.nth(0)
                 if not field.is_visible() or not field.is_enabled():
                     raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
-                field.fill(value)
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
                 page.wait_for_timeout(wait)
                 if len(field.input_value()) != len(value):
                     raise EsunLoginError("登入欄位輸入長度不符；未送出登入")

@@ -22,6 +22,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> TaishinCrawler:
     crawler = object.__new__(TaishinCrawler)
     crawler.name = "taishin"
+    crawler._credential_origin_allowed = lambda _page: True
     return crawler
 
 
@@ -475,7 +476,7 @@ def test_login_prepare_and_authentication_are_thin_one_shot_adapters(monkeypatch
     authenticated.assert_called_once_with(page)
 
 
-def test_logged_in_is_one_shot_and_requires_two_dashboard_keywords() -> None:
+def test_logged_in_is_one_shot_and_requires_exact_host_and_two_dashboard_keywords() -> None:
     page = Mock()
     page.url = "https://my.taishinbank.com.tw/TIBNetBank/home"
     page.frames = []
@@ -483,9 +484,15 @@ def test_logged_in_is_one_shot_and_requires_two_dashboard_keywords() -> None:
     page.locator.return_value.count.return_value = 0
     page.evaluate.return_value = "帳戶總覽 我的資產 " + "x" * 500
 
-    assert _crawler()._logged_in(page) is True
+    crawler = _crawler()
+    assert crawler._logged_in(page) is True
     page.wait_for_timeout.assert_not_called()
     page.evaluate.assert_called_once()
+
+    page.url = "https://evil-taishinbank.com/TIBNetBank/home"
+    assert crawler._logged_in(page) is False
+    page.frames = [Mock(url="https://evil-taishinbank.com/svc/rwd/index.html")]
+    assert crawler._find_login_frame(page) is None
 
 
 def test_multiple_matching_login_frames_fail_closed_in_shared_lifecycle(
@@ -537,6 +544,8 @@ def _submit_fixture():
     for selector, locator in fields.items():
         locator.count.return_value = 1
         locator.nth.return_value = locator
+        locator.is_visible.return_value = True
+        locator.is_enabled.return_value = True
         locator.input_value.return_value = values[selector]
 
     buttons = Mock()
@@ -567,19 +576,23 @@ def test_submit_verifies_field_cardinality_and_lengths_then_clicks_once() -> Non
 
     crawler.submit_credentials_once(page)
 
-    expected = {
-        "input[placeholder='身分證字號']": "ID-PRIVATE",
-        "input[placeholder='使用者代號']": "USER-PRIVATE",
-        "input[placeholder='使用者密碼']": "PASSWORD-PRIVATE",
-        "input[placeholder='驗證碼']": "654321",
-    }
-    for selector, locator in fields.items():
+    for locator in fields.values():
         assert locator.method_calls == [
             call.count(),
             call.nth(0),
-            call.fill(expected[selector]),
+            call.is_visible(),
+            call.is_enabled(),
+            call.click(),
+            call.click(click_count=3),
             call.input_value(),
         ]
+    assert page.keyboard.press.call_args_list == [call("Backspace")] * 4
+    assert page.keyboard.type.call_args_list == [
+        call("ID-PRIVATE", delay=80),
+        call("USER-PRIVATE", delay=80),
+        call("PASSWORD-PRIVATE", delay=80),
+        call("654321", delay=80),
+    ]
     assert page.wait_for_timeout.call_args_list == [
         call(200),
         call(200),
@@ -737,6 +750,7 @@ def test_ocr_captures_five_times_and_refreshes_at_most_four(monkeypatch, capsys)
     assert crawler._ocr_captcha(frame, max_attempts=5) is None
 
     assert frame.evaluate.call_count == ocr.call_count == 5
+    assert all(item.kwargs["min_confidence"] == 0.98 for item in ocr.call_args_list)
     assert actions[0].click.call_count == 4
     assert frame.wait_for_timeout.call_args_list == [call(1500)] * 4
     assert "PRIVATE-OCR-MARKER" not in capsys.readouterr().err

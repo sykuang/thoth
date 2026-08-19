@@ -25,6 +25,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> ScsbCrawler:
     crawler = object.__new__(ScsbCrawler)
     crawler.name = "scsb"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = SimpleNamespace(
         national_id="A123456789",
         user_code="USER-PRIVATE",
@@ -380,7 +381,8 @@ def test_ocr_reads_css_background_five_times_refreshes_four_and_never_leaks(monk
     refresh.is_enabled.return_value = True
     refresh.inner_text.return_value = "重新產生"
     page.locator.side_effect = lambda selector: images if selector == ".ved_img" else refreshes
-    monkeypatch.setattr(scsb_module, "ocr_bytes", lambda *_args, **_kwargs: None)
+    ocr = Mock(return_value=None)
+    monkeypatch.setattr(scsb_module, "ocr_bytes", ocr)
 
     assert crawler._ocr_captcha(page, max_attempts=99) is None
     assert image.evaluate.call_args_list == [
@@ -388,6 +390,7 @@ def test_ocr_reads_css_background_five_times_refreshes_four_and_never_leaks(monk
     ] * 5
     assert refresh.click.call_count == 4
     assert page.wait_for_timeout.call_args_list == [call(1500)] * 4
+    assert all(item.kwargs["min_confidence"] == 0.98 for item in ocr.call_args_list)
     assert "PRIVATE-CAPTCHA" not in caplog.text
 
 

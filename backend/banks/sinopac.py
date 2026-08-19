@@ -88,6 +88,7 @@ def _sinopac_card_bill_fact(out: dict):
 
 class SinopacCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"mma.sinopac.com"})
     CAPTCHA_INVALID = "captcha_invalid"
     CREDENTIALS_INVALID = "credentials_invalid"
     LOGIN_FAILED = "login_failed"

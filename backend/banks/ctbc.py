@@ -18,6 +18,7 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -156,6 +157,7 @@ def _build_qu002_011_post_body(account_id: str, month_type: str, template_body: 
 
 class CtbcCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"www.ctbcbank.com"})
 
     def __init__(self):
         super().__init__(name="ctbc")
@@ -166,6 +168,15 @@ class CtbcCrawler(BankCrawler):
 
     def _logged_in(self, page) -> bool:
         try:
+            current = urlparse(page.url or "")
+            if (
+                current.scheme.lower() != "https"
+                or (current.hostname or "").lower() != "www.ctbcbank.com"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
+            ):
+                return False
             r = page.evaluate(JS_LOGGED_IN_POSITIVE)
         except Exception:
             return False
@@ -224,6 +235,13 @@ class CtbcCrawler(BankCrawler):
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
                 container_selector=".modal.show",
             ),
+            LoginCheckpointRule(
+                name="ctbc-unknown-dialog",
+                bank="ctbc",
+                phases=tuple(CheckpointPhase),
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
         )
 
     def submit_credentials_once(self, page) -> None:
@@ -234,8 +252,19 @@ class CtbcCrawler(BankCrawler):
                 (SEL_USER, self.creds.user_code),
                 (SEL_PWD, self.creds.password),
             ):
-                page.fill(selector, value)
+                fields = page.locator(selector)
+                if fields.count() != 1:
+                    raise CtbcLoginError("登入欄位無法安全填寫；未送出登入")
+                field = fields.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise CtbcLoginError("登入欄位無法安全填寫；未送出登入")
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
                 page.wait_for_timeout(300)
+                if len(field.input_value()) != len(value):
+                    raise CtbcLoginError("登入欄位輸入長度不符；未送出登入")
         except Exception:
             raise CtbcLoginError("登入欄位無法安全填寫；未送出登入") from None
 

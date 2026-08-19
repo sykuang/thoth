@@ -20,6 +20,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> UbotCrawler:
     crawler = object.__new__(UbotCrawler)
     crawler.name = "ubot"
+    crawler._credential_origin_allowed = lambda _page: True
     return crawler
 
 
@@ -43,7 +44,9 @@ def test_ubot_shared_login_api_and_ordered_rules() -> None:
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
     ]
-    assert all(rule.bank == "ubot" and rule.phases == post for rule in rules)
+    assert all(rule.bank == "ubot" for rule in rules)
+    assert rules[0].phases == rules[1].phases == rules[3].phases == tuple(CheckpointPhase)
+    assert rules[2].phases == rules[4].phases == post
     assert [rule.container_selector for rule in rules] == [
         ".modal.show",
         ".modal.show",
@@ -249,7 +252,8 @@ def test_real_dom_rules_are_terminal_first_scoped_and_fail_closed() -> None:
 
         page.set_content('<div class="modal show"><input id="sid"><button>登入</button></div>')
         outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
-        assert outcome.kind is CheckpointKind.READY_FOR_CREDENTIALS
+        assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert outcome.rule_name == "ubot-unknown-modal"
     finally:
         browser.close()
         manager.__exit__(None, None, None)
@@ -421,6 +425,19 @@ def test_prepare_wait_exception_is_fieldless(
 
 def _submit_fixture():
     page = Mock()
+    values = {
+        "#sid": "ID-PRIVATE",
+        "#nickname": "USER-PRIVATE",
+        "#password": "PASSWORD-PRIVATE",
+        "#CAPTCHA": "654321",
+    }
+    fields = {selector: Mock() for selector in values}
+    for selector, field in fields.items():
+        field.count.return_value = 1
+        field.nth.return_value = field
+        field.is_visible.return_value = True
+        field.is_enabled.return_value = True
+        field.input_value.return_value = values[selector]
     login_candidates = Mock()
     button = Mock()
     modals = Mock()
@@ -435,9 +452,11 @@ def _submit_fixture():
     modals.nth.return_value = modal
     modal.is_visible.return_value = True
     page.locator.side_effect = lambda selector: {
+        **fields,
         "button.ubot-primary-green": login_candidates,
         ".modal.show": modals,
     }[selector]
+    page.test_fields = fields
 
     crawler = _crawler()
     crawler.creds = SimpleNamespace(
@@ -450,17 +469,28 @@ def _submit_fixture():
     return crawler, page, login_candidates, button, modals
 
 
-def test_submit_fills_once_uses_one_native_click_and_preserves_timing(capsys) -> None:
+def test_submit_uses_true_keyboard_one_native_click_and_preserves_timing(capsys) -> None:
     crawler, page, _candidates, button, _modals = _submit_fixture()
 
     crawler.submit_credentials_once(page)
 
     page.wait_for_selector.assert_called_once_with("#sid", state="visible", timeout=10000)
-    assert page.fill.call_args_list == [
-        call("#sid", "ID-PRIVATE"),
-        call("#nickname", "USER-PRIVATE"),
-        call("#password", "PASSWORD-PRIVATE"),
-        call("#CAPTCHA", "654321"),
+    for field in page.test_fields.values():
+        assert field.method_calls == [
+            call.count(),
+            call.nth(0),
+            call.is_visible(),
+            call.is_enabled(),
+            call.click(),
+            call.click(click_count=3),
+            call.input_value(),
+        ]
+    assert page.keyboard.press.call_args_list == [call("Backspace")] * 4
+    assert page.keyboard.type.call_args_list == [
+        call("ID-PRIVATE", delay=80),
+        call("USER-PRIVATE", delay=80),
+        call("PASSWORD-PRIVATE", delay=80),
+        call("654321", delay=80),
     ]
     assert page.wait_for_timeout.call_args_list == [
         call(150),
@@ -470,7 +500,8 @@ def test_submit_fills_once_uses_one_native_click_and_preserves_timing(capsys) ->
         call(6000),
         call(1000),
     ]
-    button.click.assert_called_once_with()
+    button.click.assert_called_once_with(timeout=8000)
+    page.fill.assert_not_called()
     page.click.assert_not_called()
     page.evaluate.assert_not_called()
     assert "654321" not in capsys.readouterr().err
@@ -509,7 +540,7 @@ def test_submit_action_preconditions_fail_before_click(
     page.evaluate.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["wait", "fill"])
+@pytest.mark.parametrize("failure", ["wait", "keyboard"])
 def test_submit_field_failure_is_fieldless_and_zero_click(
     failure: str,
     caplog,
@@ -519,7 +550,7 @@ def test_submit_field_failure_is_fieldless_and_zero_click(
     if failure == "wait":
         page.wait_for_selector.side_effect = RuntimeError(secret)
     else:
-        page.fill.side_effect = RuntimeError(secret)
+        page.test_fields["#nickname"].click.side_effect = RuntimeError(secret)
 
     with pytest.raises(UbotLoginError, match="未送出登入") as error:
         crawler.submit_credentials_once(page)
@@ -530,7 +561,7 @@ def test_submit_field_failure_is_fieldless_and_zero_click(
     assert "PASSWORD-PRIVATE" not in str(error.value)
     assert secret not in caplog.text
     button.click.assert_not_called()
-    page.locator.assert_not_called()
+    _candidates.count.assert_not_called()
 
 
 def test_submit_ocr_failure_sends_zero() -> None:
@@ -541,7 +572,7 @@ def test_submit_ocr_failure_sends_zero() -> None:
         crawler.submit_credentials_once(page)
 
     button.click.assert_not_called()
-    page.locator.assert_not_called()
+    _candidates.count.assert_not_called()
 
 
 def test_submit_click_exception_is_fieldless_unknown_status_and_one_attempt(caplog) -> None:
@@ -555,7 +586,7 @@ def test_submit_click_exception_is_fieldless_unknown_status_and_one_attempt(capl
     assert error.value.__cause__ is None
     assert secret not in str(error.value)
     assert secret not in caplog.text
-    button.click.assert_called_once_with()
+    button.click.assert_called_once_with(timeout=8000)
 
 
 def _refresh_fixture(count: int = 1):
@@ -636,7 +667,7 @@ def test_post_submit_wait_exception_is_fieldless_after_one_click(
     crawler.submit_credentials_once(page)
 
     assert secret not in caplog.text
-    button.click.assert_called_once_with()
+    button.click.assert_called_once_with(timeout=8000)
     page.click.assert_not_called()
 
 
@@ -648,7 +679,7 @@ def test_post_submit_inspection_exception_is_fieldless_after_one_click(caplog) -
     crawler.submit_credentials_once(page)
 
     assert secret not in caplog.text
-    button.click.assert_called_once_with()
+    button.click.assert_called_once_with(timeout=8000)
     page.click.assert_not_called()
 
 
@@ -660,7 +691,7 @@ def test_post_submit_authentication_exception_is_fieldless_after_one_click(caplo
     crawler.submit_credentials_once(page)
 
     assert secret not in caplog.text
-    button.click.assert_called_once_with()
+    button.click.assert_called_once_with(timeout=8000)
     page.click.assert_not_called()
 
 
@@ -718,8 +749,8 @@ def test_password_expiry_route_remains_authenticated_and_prepare_does_not_reopen
 ) -> None:
     manager, browser = _launch_browser()
     try:
-        page = browser.new_page()
-        page.set_content(
+        real_page = browser.new_page()
+        real_page.set_content(
             """
             <button>網銀登入</button>
             <main>您離上次變更密碼已超過6個月，建議變更密碼 <a>登出 logout</a></main>
@@ -730,9 +761,17 @@ def test_password_expiry_route_remains_authenticated_and_prepare_does_not_reopen
             </script>
             """
         )
+
+        class PageProxy:
+            url = "https://www.ubot.com.tw/ibank/#/I1201001"
+
+            def __getattr__(self, name):
+                return getattr(real_page, name)
+
+        page = PageProxy()
         crawler = _crawler()
         assert crawler._logged_in(page) is True
-        monkeypatch.setattr(page, "wait_for_timeout", lambda _milliseconds: None)
+        monkeypatch.setattr(real_page, "wait_for_timeout", lambda _milliseconds: None)
 
         crawler.prepare_login_page(page)
 
@@ -758,6 +797,7 @@ def test_login_and_authentication_are_thin_adapters(monkeypatch) -> None:
 
 def test_authentication_does_not_log_url_or_body_metadata(capsys) -> None:
     page = Mock()
+    page.url = "https://www.ubot.com.tw/ibank/home"
     page.evaluate.return_value = {
         "ok": False,
         "url": "https://bank.invalid/PRIVATE-PATH",
@@ -769,3 +809,14 @@ def test_authentication_does_not_log_url_or_body_metadata(capsys) -> None:
     captured = capsys.readouterr()
     assert "PRIVATE-PATH" not in captured.err
     assert "987654" not in captured.err
+
+
+def test_authentication_requires_exact_ubot_host() -> None:
+    page = Mock()
+    page.evaluate.return_value = {"ok": True}
+    crawler = _crawler()
+
+    page.url = "https://www.ubot.com.tw/ibank/home"
+    assert crawler._logged_in(page) is True
+    page.url = "https://evil-ubot.com.tw/ibank/home"
+    assert crawler._logged_in(page) is False

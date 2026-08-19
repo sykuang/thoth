@@ -21,7 +21,7 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
     rules = crawler.login_checkpoint_rules()
 
     assert CathayCrawler.USES_SHARED_LOGIN_CHECKPOINTS is True
-    assert len(rules) == 1
+    assert len(rules) == 3
     rule = rules[0]
     assert (
         rule.name,
@@ -41,6 +41,9 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
         12,
     )
     assert not hasattr(CathayCrawler, "_dismiss_announcements")
+    assert [item.name for item in rules[1:]] == [
+        "cathay-unknown-modal", "cathay-unknown-dialog"
+    ]
 
     source = inspect.getsource(CathayCrawler)
     assert "NormalDataCheck" not in source
@@ -71,7 +74,7 @@ def test_cathay_rule_advances_only_the_scoped_announcement() -> None:
             page.set_content(
                 """
                 <button id="outside">確定</button>
-                <div id="security-modal"><button>確定</button></div>
+                <div id="security-modal" role="dialog"><button>確定</button></div>
                 <div id="divSystemLoginMsgList" class="show"><button>下一</button></div>
                 <script>
                   document.body.dataset.outsideClicks = '0';
@@ -106,7 +109,7 @@ def test_cathay_rule_advances_only_the_scoped_announcement() -> None:
             assert second.action_label == "我知道了"
             assert page.locator("body").get_attribute("data-announcement-clicks") == "2"
 
-            assert _evaluate(page).kind is CheckpointKind.READY_FOR_CREDENTIALS
+            assert _evaluate(page).kind is CheckpointKind.UNKNOWN_BLOCKER
             assert page.locator("body").get_attribute("data-outside-clicks") == "0"
             assert page.locator("body").get_attribute("data-security-clicks") == "0"
             assert page.locator("#security-modal").is_visible()
@@ -192,6 +195,7 @@ def test_shared_login_blocks_visible_thirteenth_announcement_before_submit(
             _set_announcement_pages(page, 13)
             crawler = object.__new__(CathayCrawler)
             crawler.name = "cathay"
+            crawler._credential_origin_allowed = lambda _page: True
             submissions = 0
 
             def submit(_page) -> None:
@@ -226,6 +230,7 @@ def test_shared_login_submits_after_twelfth_announcement_hides(monkeypatch) -> N
             _set_announcement_pages(page, 12)
             crawler = object.__new__(CathayCrawler)
             crawler.name = "cathay"
+            crawler._credential_origin_allowed = lambda _page: True
             submissions = 0
 
             def submit(_page) -> None:
@@ -254,6 +259,18 @@ def _submit_fixture(
     click_error: Exception | None = None,
 ):
     page = Mock()
+    values = {
+        "#CustID": "CUST-PRIVATE",
+        "#UserIdKeyin": "USER-PRIVATE",
+        "#PasswordKeyin": "PASSWORD-PRIVATE",
+    }
+    fields = {selector: Mock() for selector in values}
+    for selector, field in fields.items():
+        field.count.return_value = 1
+        field.nth.return_value = field
+        field.is_visible.return_value = True
+        field.is_enabled.return_value = True
+        field.input_value.return_value = values[selector]
     candidates = Mock()
     button = Mock()
     candidates.count.return_value = count
@@ -262,7 +279,10 @@ def _submit_fixture(
     button.is_enabled.return_value = enabled
     button.get_attribute.return_value = classes
     button.click.side_effect = click_error
-    page.locator.return_value = candidates
+    page.locator.side_effect = lambda selector: (
+        candidates if selector == "button.js-login" else fields[selector]
+    )
+    page.test_fields = fields
 
     crawler = object.__new__(CathayCrawler)
     crawler.creds = SimpleNamespace(
@@ -273,7 +293,7 @@ def _submit_fixture(
     return crawler, page, button
 
 
-def test_submit_fills_once_and_clicks_once_with_original_timing() -> None:
+def test_submit_uses_true_keyboard_and_clicks_once_with_original_timing() -> None:
     crawler, page, button = _submit_fixture()
 
     crawler.submit_credentials_once(page)
@@ -281,10 +301,16 @@ def test_submit_fills_once_and_clicks_once_with_original_timing() -> None:
     page.wait_for_selector.assert_called_once_with(
         "#CustID", state="visible", timeout=12000
     )
-    assert page.fill.call_args_list == [
-        (("#CustID", "CUST-PRIVATE"),),
-        (("#UserIdKeyin", "USER-PRIVATE"),),
-        (("#PasswordKeyin", "PASSWORD-PRIVATE"),),
+    for field in page.test_fields.values():
+        assert field.method_calls == [
+            call.count(), call.nth(0), call.is_visible(), call.is_enabled(),
+            call.click(), call.click(click_count=3), call.input_value(),
+        ]
+    assert page.keyboard.press.call_args_list == [call("Backspace")] * 3
+    assert page.keyboard.type.call_args_list == [
+        call("CUST-PRIVATE", delay=80),
+        call("USER-PRIVATE", delay=80),
+        call("PASSWORD-PRIVATE", delay=80),
     ]
     assert page.wait_for_timeout.call_args_list == [
         ((200,),),
@@ -292,8 +318,9 @@ def test_submit_fills_once_and_clicks_once_with_original_timing() -> None:
         ((200,),),
         ((9000,),),
     ]
-    page.locator.assert_called_once_with("button.js-login")
+    assert call("button.js-login") in page.locator.call_args_list
     button.click.assert_called_once_with(timeout=8000)
+    page.fill.assert_not_called()
     page.click.assert_not_called()
     page.evaluate.assert_not_called()
 
@@ -348,7 +375,12 @@ def test_submit_click_timeout_after_dispatch_is_sanitized_without_second_click(
 def test_submit_button_inspection_error_is_sanitized_before_click(caplog) -> None:
     secret = "PRIVATE-BUTTON-DOM-987654"
     crawler, page, button = _submit_fixture()
-    page.locator.return_value.count.side_effect = RuntimeError(secret)
+    def locate(selector):
+        if selector == "button.js-login":
+            raise RuntimeError(secret)
+        return page.test_fields[selector]
+
+    page.locator.side_effect = locate
 
     with pytest.raises(CathayLoginError, match="無法安全確認.*未送出登入") as error:
         crawler.submit_credentials_once(page)
@@ -358,7 +390,7 @@ def test_submit_button_inspection_error_is_sanitized_before_click(caplog) -> Non
     assert secret not in caplog.text
 
 
-@pytest.mark.parametrize("failure", ["wait", "fill"])
+@pytest.mark.parametrize("failure", ["wait", "keyboard"])
 def test_field_failure_sends_zero_without_disclosing_secrets(
     failure: str, caplog
 ) -> None:
@@ -367,7 +399,7 @@ def test_field_failure_sends_zero_without_disclosing_secrets(
     if failure == "wait":
         page.wait_for_selector.side_effect = RuntimeError(secret)
     else:
-        page.fill.side_effect = RuntimeError(secret)
+        page.test_fields["#UserIdKeyin"].click.side_effect = RuntimeError(secret)
 
     with pytest.raises(CathayLoginError) as error:
         crawler.submit_credentials_once(page)
@@ -378,7 +410,6 @@ def test_field_failure_sends_zero_without_disclosing_secrets(
     assert "PASSWORD-PRIVATE" not in str(error.value)
     assert secret not in caplog.text
     button.click.assert_not_called()
-    page.locator.assert_not_called()
     page.evaluate.assert_not_called()
 
 
@@ -397,3 +428,19 @@ def test_login_prepare_and_authentication_are_thin_adapters(monkeypatch) -> None
     assert page.mock_calls == [call.wait_for_timeout(2500)]
     assert crawler.is_authenticated(page)
     logged_in.assert_called_once_with(page)
+
+
+def test_authentication_requires_exact_https_cathay_origin() -> None:
+    page = Mock()
+    page.evaluate.return_value = {"ok": True}
+    crawler = object.__new__(CathayCrawler)
+
+    page.url = "https://www.cathaybk.com.tw/OnlineBanking/home"
+    assert crawler._logged_in(page) is True
+    for unsafe in (
+        "http://www.cathaybk.com.tw/OnlineBanking/home",
+        "https://www.cathaybk.com.tw.evil.example/OnlineBanking/home",
+        "data:text/html,/OnlineBanking/home",
+    ):
+        page.url = unsafe
+        assert crawler._logged_in(page) is False

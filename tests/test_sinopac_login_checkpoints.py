@@ -23,6 +23,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> SinopacCrawler:
     crawler = object.__new__(SinopacCrawler)
     crawler.name = "sinopac"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = SimpleNamespace(
         national_id="B123456789",
         user_code="USER-PRIVATE",

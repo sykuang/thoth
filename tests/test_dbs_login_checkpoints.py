@@ -22,6 +22,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> DbsCrawler:
     crawler = object.__new__(DbsCrawler)
     crawler.name = "dbs"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = SimpleNamespace(
         username="USER-PRIVATE",
         password="PASSWORD-PRIVATE",
@@ -277,6 +278,33 @@ def test_auth_is_one_shot_exception_safe_and_fieldless(caplog) -> None:
     page.wait_for_timeout.assert_not_called()
     page.evaluate.assert_not_called()
     assert "PRIVATE" not in caplog.text
+
+
+def test_authentication_rejects_non_https_dbs_origin() -> None:
+    page = Mock()
+    page.url = "http://internet-banking.dbs.com.tw/digitw/home"
+    page.frames = []
+    page.main_frame = Mock()
+
+    assert _crawler()._logged_in(page) is False
+    page.locator.assert_not_called()
+
+
+def test_authentication_rejects_identity_from_foreign_child_frame() -> None:
+    main = Mock()
+    main.url = "https://internet-banking.dbs.com.tw/digitw/home"
+    foreign = Mock()
+    foreign.url = "https://evil.example/embedded"
+    page = SimpleNamespace(
+        url=main.url,
+        main_frame=main,
+        frames=[main, foreign],
+        locator=main.locator,
+    )
+
+    assert _crawler()._logged_in(page) is False
+    main.locator.assert_not_called()
+    foreign.locator.assert_not_called()
 
 
 def _empty_locator() -> Mock:

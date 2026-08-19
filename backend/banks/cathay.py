@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -170,6 +171,7 @@ def _cathay_card_bill_fact(out: dict):
 
 class CathayCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"www.cathaybk.com.tw"})
 
     def __init__(self):
         super().__init__(name="cathay")
@@ -186,20 +188,20 @@ class CathayCrawler(BankCrawler):
         fallback goto 失敗時誤判為已登入。詳見 SCSB 鐵律 wiki。
         """
         try:
+            current = urlparse(page.url or "")
+            if (
+                current.scheme.lower() != "https"
+                or (current.hostname or "").lower() != "www.cathaybk.com.tw"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
+            ):
+                return False
             r = page.evaluate(JS_LOGGED_IN_POSITIVE)
         except Exception:
             return False
         if isinstance(r, dict):
-            ok = bool(r.get("ok"))
-            if not ok:
-                _log(
-                    f"[login] _logged_in=False  "
-                    f"urlOk={r.get('urlOk')} lenOk={r.get('lenOk')} "
-                    f"kwOk={r.get('kwOk')} noLoginForm={r.get('noLoginForm')} "
-                    f"txt_len={r.get('txt_len')} hit={r.get('hit')} "
-                    f"url={r.get('url','')[:120]}",
-                )
-            return ok
+            return bool(r.get("ok"))
         return bool(r)
 
     def login(self, page) -> bool:
@@ -222,6 +224,20 @@ class CathayCrawler(BankCrawler):
                 action_texts=("下一", "我知道了", "關閉", "確定"),
                 max_actions=12,
             ),
+            LoginCheckpointRule(
+                name="cathay-unknown-modal",
+                bank="cathay",
+                phases=tuple(CheckpointPhase),
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="cathay-unknown-dialog",
+                bank="cathay",
+                phases=tuple(CheckpointPhase),
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
         )
 
     def submit_credentials_once(self, page) -> None:
@@ -232,8 +248,19 @@ class CathayCrawler(BankCrawler):
                 (SEL_USERID, self.creds.user_id),
                 (SEL_PWD, self.creds.password),
             ):
-                page.fill(selector, value)
+                fields = page.locator(selector)
+                if fields.count() != 1:
+                    raise CathayLoginError("登入欄位無法安全填寫；未送出登入")
+                field = fields.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise CathayLoginError("登入欄位無法安全填寫；未送出登入")
+                field.click()
+                field.click(click_count=3)
+                page.keyboard.press("Backspace")
+                page.keyboard.type(value, delay=80)
                 page.wait_for_timeout(200)
+                if len(field.input_value()) != len(value):
+                    raise CathayLoginError("登入欄位輸入長度不符；未送出登入")
         except Exception:
             raise CathayLoginError("登入欄位無法安全填寫；未送出登入") from None
         _click_login_once(page)

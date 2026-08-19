@@ -71,6 +71,7 @@ class ScbLoginError(RuntimeError):
 
 class ScbCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"ebank.standardchartered.com.tw"})
 
     def __init__(self):
         super().__init__(name="scb")

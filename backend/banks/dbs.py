@@ -86,6 +86,7 @@ def _dbs_card_bill_fact(out: dict):
 
 class DbsCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"internet-banking.dbs.com.tw"})
 
     def __init__(self):
         super().__init__(name="dbs")
@@ -98,8 +99,18 @@ class DbsCrawler(BankCrawler):
         try:
             parsed = urlsplit(page.url or "")
             if (
-                parsed.hostname != "internet-banking.dbs.com.tw"
+                parsed.scheme.lower() != "https"
+                or parsed.hostname != "internet-banking.dbs.com.tw"
+                or parsed.port not in (None, 443)
+                or parsed.username is not None
+                or parsed.password is not None
                 or LOGIN_PATH_HINT in parsed.path.lower()
+            ):
+                return False
+            if any(
+                frame is not page.main_frame
+                and not self._frame_origin_allowed(page, frame)
+                for frame in page.frames
             ):
                 return False
             scopes = [

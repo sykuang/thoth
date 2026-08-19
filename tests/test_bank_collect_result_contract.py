@@ -243,6 +243,11 @@ def test_credit_card_collectors_publish_canonical_card_bill_contract():
 
 @dataclass
 class _GoodCrawler(BankCrawler):
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
+
+    def _shared_login(self, page) -> bool:
+        return True
+
     def login(self, page) -> bool:
         return True
 
@@ -259,6 +264,11 @@ class _GoodCrawler(BankCrawler):
 
 @dataclass
 class _BadCrawler(BankCrawler):
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
+
+    def _shared_login(self, page) -> bool:
+        return True
+
     def login(self, page) -> bool:
         return True
 
@@ -271,6 +281,11 @@ class _BadCrawler(BankCrawler):
 
 @dataclass
 class _MissingBillContractCrawler(BankCrawler):
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
+
+    def _shared_login(self, page) -> bool:
+        return True
+
     def login(self, page) -> bool:
         return True
 
@@ -283,6 +298,11 @@ class _MissingBillContractCrawler(BankCrawler):
 
 @dataclass
 class _BadDateCrawler(BankCrawler):
+    CREDENTIAL_HOSTS = frozenset({"example.com"})
+
+    def _shared_login(self, page) -> bool:
+        return True
+
     def login(self, page) -> bool:
         return True
 

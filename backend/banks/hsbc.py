@@ -80,6 +80,7 @@ def _hsbc_card_bill_facts(out: dict):
 
 class HsbcCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"card.hsbc.com.tw"})
 
     def __init__(self):
         super().__init__(name="hsbc")
@@ -104,7 +105,11 @@ class HsbcCrawler(BankCrawler):
         try:
             current = urlparse(page.url or "")
             if (
-                (current.hostname or "").lower() != "card.hsbc.com.tw"
+                current.scheme.lower() != "https"
+                or (current.hostname or "").lower() != "card.hsbc.com.tw"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
                 or (current.fragment or "").lower().startswith("/login")
             ):
                 return False
@@ -339,6 +344,8 @@ class HsbcCrawler(BankCrawler):
                     raise HsbcLoginError("帳號階段狀態不明；未送出登入") from None
                 if getattr(self, "_shared_dialog_blocked", False):
                     raise HsbcLoginError("帳號階段出現未分類提示；未送出登入")
+                if self._response_visible(page):
+                    raise HsbcLoginError("帳號階段出現未分類提示；未送出登入")
 
             password = self._visible_enabled(page, SEL_PWD)
             self._keyboard_fill(page, password, self.creds.password)
@@ -351,6 +358,8 @@ class HsbcCrawler(BankCrawler):
                 page, "button[type='submit']", "繼續", candidate_only=True
             )
             if getattr(self, "_shared_dialog_blocked", False):
+                raise HsbcLoginError("登入前出現未分類提示；未送出登入")
+            if self._response_visible(page):
                 raise HsbcLoginError("登入前出現未分類提示；未送出登入")
         except HsbcLoginError:
             raise

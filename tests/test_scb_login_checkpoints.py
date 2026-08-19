@@ -23,6 +23,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> ScbCrawler:
     crawler = object.__new__(ScbCrawler)
     crawler.name = "scb"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = SimpleNamespace(
         national_id="ID-PRIVATE",
         username="USER-PRIVATE",

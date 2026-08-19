@@ -34,7 +34,6 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -96,6 +95,7 @@ def _fubon_card_bill_fact(amount_text: str):
 
 class FubonCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"ebank.taipeifubon.com.tw"})
 
     def __init__(self):
         super().__init__(name="fubon")
@@ -104,11 +104,15 @@ class FubonCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "taipeifubon.com"
 
+    def _is_owned_frame(self, page, frame) -> bool:
+        return self._frame_origin_allowed(page, frame)
+
     def _find_login_frame(self, page):
         matches = {
             id(frame): frame
             for frame in page.frames
-            if frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or "")
+            if self._is_owned_frame(page, frame)
+            and (frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or ""))
         }
         return next(iter(matches.values())) if len(matches) == 1 else None
 
@@ -116,24 +120,35 @@ class FubonCrawler(BankCrawler):
         matches = {
             id(frame): frame
             for frame in page.frames
-            if frame.name == "frame1" or "ContextFrame" in (frame.url or "")
+            if self._is_owned_frame(page, frame)
+            and (frame.name == "frame1" or "ContextFrame" in (frame.url or ""))
         }
         return next(iter(matches.values())) if len(matches) == 1 else None
 
     def _logged_in(self, page) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            if urlparse(page.url or "").hostname != "ebank.taipeifubon.com.tw":
+            if not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS):
+                return False
+            if any(
+                not self._is_owned_frame(page, frame)
+                for frame in page.frames
+                if frame.name in {"txnFrame", "frame1"}
+                or PRE_LOGIN_HINT in (frame.url or "")
+                or "ContextFrame" in (frame.url or "")
+            ):
                 return False
             login_frames = {
                 id(frame)
                 for frame in page.frames
-                if frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or "")
+                if self._is_owned_frame(page, frame)
+                and (frame.name == "txnFrame" or PRE_LOGIN_HINT in (frame.url or ""))
             }
             header_frames = {
                 id(frame)
                 for frame in page.frames
-                if frame.name == "frame1" or "ContextFrame" in (frame.url or "")
+                if self._is_owned_frame(page, frame)
+                and (frame.name == "frame1" or "ContextFrame" in (frame.url or ""))
             }
             if len(login_frames) > 1 or len(header_frames) > 1:
                 return False
@@ -230,7 +245,7 @@ class FubonCrawler(BankCrawler):
             r"密碼(?:已到期|已過期|必須修改|需要修改|需修改|強制變更))[\s\S]{0,120}$"
         )
         error = re.compile(
-            r"^\s*(?:密碼不正確|帳號.{0,20}鎖定|登入失敗|驗證碼不正確|invalid credentials|account locked)[。.!！\s]*$",
+            r"^\s*(?:密碼不正確|帳號(?:因多次錯誤)?(?:已遭|已被|已)鎖定|登入失敗|驗證碼不正確|invalid credentials|account locked)[。.!！\s]*$",
             re.IGNORECASE,
         )
         rules = []
@@ -274,7 +289,12 @@ class FubonCrawler(BankCrawler):
                 if not image.is_visible():
                     return None
                 raw = image.screenshot()
-                text = ocr_bytes(raw, expected_len=6, alnum_only=True)
+                text = ocr_bytes(
+                    raw,
+                    expected_len=6,
+                    alnum_only=True,
+                    min_confidence=0.98,
+                )
             except Exception:
                 return None
             if text and len(text) == 6 and text.isdigit():
@@ -305,32 +325,23 @@ class FubonCrawler(BankCrawler):
             frame = self._find_login_frame(page)
             if frame is None:
                 raise FubonLoginError("找不到唯一的登入頁面；未送出登入")
-            candidates = frame.locator("input[type='password']")
-            visible = []
-            for index in range(candidates.count()):
-                field = candidates.nth(index)
-                if not field.is_visible():
-                    continue
-                if not field.is_enabled():
-                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-                visible.append(field)
-            if len(visible) != 3:
-                raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-
-            ordered = []
-            for field in visible:
-                box = field.bounding_box()
-                if not box:
-                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-                ordered.append((box["y"], field.get_attribute("maxlength"), field))
-            ordered.sort(key=lambda item: item[0])
-            if (
-                len({item[0] for item in ordered}) != 3
-                or [item[1] for item in ordered] != ["10", "10", "16"]
+            fields = []
+            for field_id, maxlength in (
+                (FIELD_M1_NATIONAL_ID, "10"),
+                (FIELD_M1_USER_CODE, "10"),
+                (FIELD_M1_PASSWORD, "16"),
             ):
-                raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-
-            fields = [item[2] for item in ordered]
+                candidates = frame.locator(f"#{field_id}")
+                if candidates.count() != 1:
+                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+                field = candidates.nth(0)
+                if (
+                    not field.is_visible()
+                    or not field.is_enabled()
+                    or field.get_attribute("maxlength") != maxlength
+                ):
+                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+                fields.append(field)
             values = (self.creds.national_id, self.creds.user_code, self.creds.password)
             for field, value in zip(fields, values, strict=True):
                 field.click()

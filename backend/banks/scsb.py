@@ -81,6 +81,7 @@ class ScsbLoginError(RuntimeError):
 
 class ScsbCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    CREDENTIAL_HOSTS = frozenset({"ibank.scsb.com.tw", "ebank.scsb.com.tw"})
 
     def __init__(self):
         super().__init__(name="scsb")
@@ -279,7 +280,12 @@ class ScsbCrawler(BankCrawler):
                 if match is None:
                     raise ValueError
                 raw = base64.b64decode(match.group("payload"), validate=True)
-                text = ocr_bytes(raw, expected_len=5, alnum_only=True)
+                text = ocr_bytes(
+                    raw,
+                    expected_len=5,
+                    alnum_only=True,
+                    min_confidence=0.98,
+                )
                 if isinstance(text, str) and len(text) == 5 and text.isdigit():
                     return text
             except Exception:

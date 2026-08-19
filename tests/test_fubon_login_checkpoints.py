@@ -22,6 +22,7 @@ from backend.core.login_checkpoints import (
 def _crawler() -> FubonCrawler:
     crawler = object.__new__(FubonCrawler)
     crawler.name = "fubon"
+    crawler._credential_origin_allowed = lambda _page: True
     crawler.creds = SimpleNamespace(
         national_id="A123456789",
         user_code="USER123456",
@@ -119,7 +120,7 @@ def test_shared_api_and_terminal_first_rule_contract() -> None:
         (2, "密碼已到期，請立即變更密碼", "密碼不正確"),
         (2, "密碼已過期，請立即變更密碼", "密碼不正確，圖形驗證碼已過期"),
         (4, "密碼不正確。", "密碼規則說明"),
-        (4, "帳號因多次錯誤已被鎖定！", "帳號" + "x" * 21 + "鎖定"),
+        (4, "帳號因多次錯誤已被鎖定！", "帳號未鎖定"),
         (4, "登入失敗", "若登入失敗請確認網路"),
         (4, "驗證碼不正確。", "圖形驗證碼說明"),
         (4, "Invalid credentials!", "invalid credentials help"),
@@ -211,6 +212,34 @@ def test_frame_helpers_dedupe_and_fail_closed_on_ambiguity() -> None:
     page.frames[-1].name = "other"
     assert crawler._find_header_frame(page) is None
 
+    foreign = Mock()
+    foreign.name = "txnFrame"
+    foreign.url = "https://evil.example/B2C/PreLogin.faces"
+    page.frames = [foreign]
+    assert crawler._find_login_frame(page) is None
+
+
+def test_frame_helpers_reject_srcdoc_inherited_from_foreign_parent() -> None:
+    crawler = _crawler()
+    main = Mock(url="https://ebank.taipeifubon.com.tw/B2C/home")
+    foreign = Mock(url="https://evil.example/embedded", parent_frame=main)
+    child = Mock(url="about:srcdoc", parent_frame=foreign)
+    child.name = "txnFrame"
+    page = SimpleNamespace(
+        url="https://ebank.taipeifubon.com.tw/B2C/home",
+        main_frame=main,
+        frames=[main, foreign, child],
+    )
+
+    assert crawler._find_login_frame(page) is None
+    for unsafe in (
+        "http://ebank.taipeifubon.com.tw/B2C/PreLogin.faces",
+        "https://ebank.taipeifubon.com.tw:444/B2C/PreLogin.faces",
+    ):
+        child.url = unsafe
+        child.parent_frame = main
+        assert crawler._find_login_frame(page) is None
+
 
 def test_real_prepare_clicks_only_exact_header_and_anchor_once(monkeypatch) -> None:
     manager, browser = _launch_browser()
@@ -280,6 +309,8 @@ def test_auth_requires_exact_host_no_prelogin_or_visible_controls_and_dashboard_
         assert crawler._logged_in(_PageProxy(real, "https://ebank.taipeifubon.com.tw/B2C/home"))
         assert not crawler._logged_in(_PageProxy(real, "https://evil.example/?next=ebank.taipeifubon.com.tw"))
         assert not crawler._logged_in(_PageProxy(real, "https://ebank.taipeifubon.com.tw.evil.example/B2C/home"))
+        assert not crawler._logged_in(_PageProxy(real, "http://ebank.taipeifubon.com.tw/B2C/home"))
+        assert not crawler._logged_in(_PageProxy(real, "https://ebank.taipeifubon.com.tw:444/B2C/home"))
 
         real.set_content("<main>登出 存款 轉帳 信用卡 投資 " + "x" * 600 + "</main>")
         assert not crawler._logged_in(_PageProxy(real, "https://ebank.taipeifubon.com.tw/B2C/home"))
@@ -367,6 +398,8 @@ def _submit_fixture():
         field.get_attribute.side_effect = lambda attr, maximum=maxlength: maximum if attr == "maxlength" else None
         field.bounding_box.return_value = {"x": 0, "y": y, "width": 100, "height": 20}
         field.input_value.return_value = value
+        field.count.return_value = 1
+        field.nth.return_value = field
         fields.append(field)
     passwords.nth.side_effect = fields.__getitem__
 
@@ -389,6 +422,9 @@ def _submit_fixture():
     empty.count.return_value = 0
     frame.locator.side_effect = lambda selector: {
         "input[type='password']": passwords,
+        f"#{fubon_module.FIELD_M1_NATIONAL_ID}": fields[1],
+        f"#{fubon_module.FIELD_M1_USER_CODE}": fields[2],
+        f"#{fubon_module.FIELD_M1_PASSWORD}": fields[0],
         "#m1_userCaptcha": captcha,
         "#btnLogin2": submit,
         ".modal.show": empty,
@@ -404,8 +440,8 @@ def _submit_fixture():
     return crawler, page, frame, fields, passwords, captcha, submit
 
 
-def test_submit_uses_y_order_maxlength_true_keyboard_and_one_native_click() -> None:
-    crawler, page, _frame, fields, _passwords, captcha, submit = _submit_fixture()
+def test_submit_uses_exact_ids_true_keyboard_and_ignores_password_decoys() -> None:
+    crawler, page, frame, fields, _passwords, captcha, submit = _submit_fixture()
     crawler.submit_credentials_once(page)
 
     ordered = [fields[1], fields[2], fields[0], captcha]
@@ -419,34 +455,30 @@ def test_submit_uses_y_order_maxlength_true_keyboard_and_one_native_click() -> N
         call("PASSWORD-PRIVATE", delay=80),
         call("654321", delay=80),
     ]
-    crawler._ocr_captcha.assert_called_once_with(_frame, max_attempts=5)
+    crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=5)
     submit.click.assert_called_once_with(timeout=8000)
+    assert call("input[type='password']") not in frame.locator.call_args_list
     page.evaluate.assert_not_called()
     page.fill.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "failure",
-    ("frame", "count", "extra", "hidden", "disabled", "maxlen", "same-y", "length", "captcha", "submit"),
+    ("frame", "count", "hidden", "disabled", "maxlen", "length", "captcha", "submit"),
 )
 def test_submit_pre_click_failures_are_private_and_zero_submit(failure: str, caplog) -> None:
-    crawler, page, _frame, fields, passwords, captcha, submit = _submit_fixture()
+    crawler, page, frame, fields, _passwords, captcha, submit = _submit_fixture()
     secret = f"PRIVATE-FUBON-{failure}-987654"
     if failure == "frame":
-        page.frames.append(Mock(name="extra", url="https://x/PreLogin.faces"))
-        page.frames[-1].name = "other"
-    elif failure in ("count", "extra"):
-        passwords.count.return_value = 2 if failure == "count" else 4
-        if failure == "extra":
-            fields.append(Mock(is_visible=Mock(return_value=True), is_enabled=Mock(return_value=True)))
+        frame.url = "https://evil.example/B2C/PreLogin.faces"
+    elif failure == "count":
+        fields[1].count.return_value = 2
     elif failure == "hidden":
         fields[1].is_visible.return_value = False
     elif failure == "disabled":
         fields[1].is_enabled.return_value = False
     elif failure == "maxlen":
         fields[2].get_attribute.side_effect = lambda attr: "11" if attr == "maxlength" else None
-    elif failure == "same-y":
-        fields[2].bounding_box.return_value = {"x": 0, "y": 10, "width": 100, "height": 20}
     elif failure == "length":
         fields[0].input_value.return_value = "short"
     elif failure == "captcha":
@@ -497,7 +529,15 @@ def test_ocr_screenshots_five_times_refreshes_four_and_never_leaks(monkeypatch, 
 
     assert crawler._ocr_captcha(frame, max_attempts=5) is None
     assert image.screenshot.call_count == ocr.call_count == 5
-    assert all(item == call(b"PRIVATE-IMAGE-BYTES", expected_len=6, alnum_only=True) for item in ocr.call_args_list)
+    assert all(
+        item == call(
+            b"PRIVATE-IMAGE-BYTES",
+            expected_len=6,
+            alnum_only=True,
+            min_confidence=0.98,
+        )
+        for item in ocr.call_args_list
+    )
     assert action.click.call_count == 4
     assert frame.wait_for_timeout.call_args_list == [call(1500)] * 4
     assert "PRIVATE" not in caplog.text + capsys.readouterr().err
@@ -536,9 +576,9 @@ def test_delayed_explicit_error_with_mounted_fields_blocks_after_one_submit(
         page.set_content(
             f"""
             <style>input {{ display:block; margin:10px }}</style>
-            <input type="password" maxlength="10">
-            <input type="password" maxlength="10">
-            <input type="password" maxlength="16">
+            <input id="{fubon_module.FIELD_M1_NATIONAL_ID}" type="password" maxlength="10">
+            <input id="{fubon_module.FIELD_M1_USER_CODE}" type="password" maxlength="10">
+            <input id="{fubon_module.FIELD_M1_PASSWORD}" type="password" maxlength="16">
             <input id="m1_userCaptcha" maxlength="6">
             <a id="btnLogin2">登入</a>
             <div class="error" hidden>{message}</div>
