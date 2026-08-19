@@ -14,14 +14,20 @@ session 持久化（user_data_dir）→ 首次綁定裝置後免 OTP（實測首
 from __future__ import annotations
 import contextlib
 import json
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
-from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import CtbcCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 
 # W (2026-06-17): ctbc 也統一 raise CtbcLoginError, 跟其他 11 家一致.
@@ -38,48 +44,24 @@ SEL_PWD = 'input[formcontrolname="pxd"]'       # 網銀密碼
 SEL_SUBMIT = "a.btn_submit"
 
 
-def _close_entry_announcement(page) -> bool:
-    """關閉入口頁可見的公告 modal，並確認登入表單已顯示。"""
-    clicked = page.evaluate(
-        """
-        () => {
-          const visible = (e) => {
-            if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) {
-              return false;
-            }
-            const style = getComputedStyle(e);
-            return style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const modal = [...document.querySelectorAll('.modal')]
-            .find(e => visible(e) && /重要公告/.test(e.innerText || ''));
-          const close = modal && [...modal.querySelectorAll('a.btn_close')].find(visible);
-          if (!close) return false;
-          close.click();
-          return true;
-        }
-        """,
-    )
-    if not clicked:
-        return False
-    page.wait_for_timeout(500)
-    try:
-        page.wait_for_selector(SEL_ID, state="visible", timeout=5000)
-    except Exception:
-        return False
-    return True
-
-
 def _submit_login_once(page) -> None:
-    """送出登入一次；任何 click 例外都 fail closed，禁止 fallback 再點。"""
-    page.click(SEL_SUBMIT, timeout=8000)
-
-
-# 「確認訊息」彈窗的「確認登入」按鈕（前次未正常登出時跳出）
-JS_CONFIRM_LOGIN = (
-    "(() => { const b=[...document.querySelectorAll('button,a,[role=button]')]"
-    ".find(x=>x.offsetParent!==null && /確認登入|確定|確認/.test((x.textContent||'').trim())"
-    "  && (x.textContent||'').trim().length<8); if(b){ b.click(); return true;} return false; })()"
-)
+    """Click the uniquely safe login action once, never retrying unknown dispatch."""
+    try:
+        candidates = page.locator(SEL_SUBMIT)
+        if candidates.count() != 1:
+            raise CtbcLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        button = candidates.first
+        classes = (button.get_attribute("class") or "").split()
+        if not button.is_visible() or not button.is_enabled() or "disabled" in classes:
+            raise CtbcLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+    except CtbcLoginError:
+        raise
+    except Exception:
+        raise CtbcLoginError("無法安全確認登入按鈕；未送出登入") from None
+    try:
+        button.click(timeout=8000)
+    except Exception:
+        raise CtbcLoginError("登入送出狀態不明；禁止自動重試") from None
 
 # W (2026-06-17): positive signal 4 條件 AND，對齊 SCSB 鐵律
 # 1) urlOk: twrbc-home / qu000 (login-after path)
@@ -173,6 +155,8 @@ def _build_qu002_011_post_body(account_id: str, month_type: str, template_body: 
 
 
 class CtbcCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="ctbc")
         self.creds = CtbcCreds.load()
@@ -186,129 +170,87 @@ class CtbcCrawler(BankCrawler):
         except Exception:
             return False
         if isinstance(r, dict):
-            ok = bool(r.get("ok"))
-            if not ok:
-                _log(
-                    f"[login] _logged_in=False  "
-                    f"urlOk={r.get('urlOk')} lenOk={r.get('lenOk')} "
-                    f"kwOk={r.get('kwOk')} noLoginForm={r.get('noLoginForm')} "
-                    f"txt_len={r.get('txt_len')} hit={r.get('hit')} "
-                    f"url={r.get('url','')[:120]}",
-                )
-            return ok
+            return bool(r.get("ok"))
         return bool(r)
-
-    def _enter_overview_if_interstitial(self, page) -> bool:
-        """CTBC ot001 有時不是登入表單，而是「您已經登入了」中繼頁。
-
-        這代表 server-side session 還在但 SPA 沒進 twrbc-home；必須點「我的總覽」
-        進 home，否則 login() 等表單會誤判 login_failed。
-        """
-        try:
-            clicked = page.evaluate(
-                """
-                () => {
-                  const body = document.body?.innerText || document.body?.textContent || '';
-                  if (!/您已經登入了|我的總覽/.test(body)) return null;
-                  const visible = (e) => {
-                    if (!e) return false;
-                    const r = e.getBoundingClientRect();
-                    const cs = getComputedStyle(e);
-                    return !!(r.width || r.height || e.getClientRects().length)
-                      && cs.display !== 'none' && cs.visibility !== 'hidden';
-                  };
-                  const a = [...document.querySelectorAll('a,button,[role=button]')]
-                    .find(x => visible(x) && (x.textContent || '').trim() === '我的總覽');
-                  if (a) { a.click(); return true; }
-                  return false;
-                }
-                """,
-            )
-            if clicked:
-                _log("[login] 偵測到『您已經登入了』中繼頁，點『我的總覽』進 home")
-                page.wait_for_timeout(6000)
-                return self._logged_in(page)
-        except Exception as e:
-            _log(f"[login] 中繼頁處理失敗: {e}")
-        return False
 
     # ---------- 登入 ----------
     def login(self, page) -> bool:
-        """CTBC 登入——鐵律 max_attempts=1，失敗 raise CtbcLoginError。
+        return self._shared_login(page)
 
-        ⚠️ 一旦點下 SEL_SUBMIT，失敗就 raise CtbcLoginError 中止，**絕不重打**——
-        重打多次 CTBC 直接鎖帳號。session 復用 / interstitial fallback 仍 return True。
-
-        Return:
-          True:  session 復用 / 過 interstitial / 登入成功
-        Raise:
-          CtbcLoginError: 登入表單沒出現 + 不在內銀區，或送出後 ~20s 仍未進內銀區
-        """
+    def prepare_login_page(self, page) -> None:
         page.wait_for_timeout(3500)
-        if _close_entry_announcement(page):
-            _log("[login] 已關閉入口重要公告，登入表單已顯示")
-        if self._enter_overview_if_interstitial(page) or self._logged_in(page):
-            _log(f"[login] ✅ session 還在，免登入 -> {page.url}")
-            return True
 
-        # 等登入表單
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        post_phases = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
+        )
+        return (
+            LoginCheckpointRule(
+                name="ctbc-entry-announcement",
+                bank="ctbc",
+                phases=(CheckpointPhase.PRE_SUBMIT,),
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector=".modal.show",
+                action_selector="a.btn_close",
+                required_body_pattern=re.compile(r"^\s*重要公告(?:\s|$)"),
+            ),
+            LoginCheckpointRule(
+                name="ctbc-otp-required",
+                bank="ctbc",
+                phases=post_phases,
+                kind=CheckpointKind.OTP_REQUIRED,
+                container_selector=".modal.show",
+                required_body_pattern=re.compile(
+                    r"^[\s\S]*(?:簡訊驗證|一次性密碼|動態密碼|OTP\s+驗證|認證碼)[\s\S]*$"
+                ),
+            ),
+            LoginCheckpointRule(
+                name="ctbc-duplicate-session",
+                bank="ctbc",
+                phases=post_phases,
+                kind=CheckpointKind.DUPLICATE_SESSION,
+                container_selector=".modal.show",
+                action_texts=("確認登入",),
+                required_body_pattern=re.compile(r"^\s*確認訊息[\s\S]*確認登入\s*$"),
+            ),
+            LoginCheckpointRule(
+                name="ctbc-unknown-modal",
+                bank="ctbc",
+                phases=tuple(CheckpointPhase),
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+        )
+
+    def submit_credentials_once(self, page) -> None:
         try:
             page.wait_for_selector(SEL_ID, state="visible", timeout=15000)
+            for selector, value in (
+                (SEL_ID, self.creds.national_id),
+                (SEL_USER, self.creds.user_code),
+                (SEL_PWD, self.creds.password),
+            ):
+                page.fill(selector, value)
+                page.wait_for_timeout(300)
         except Exception:
-            if self._logged_in(page):
-                return True
-            raise CtbcLoginError(
-                f"登入表單 SEL_ID={SEL_ID} 未出現；也不在內銀區；url={page.url}\n"
-                f"{_login_snapshot(page)}",
-            ) from None
+            raise CtbcLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        page.fill(SEL_ID, self.creds.national_id)
-        page.wait_for_timeout(300)
-        page.fill(SEL_USER, self.creds.user_code)
-        page.wait_for_timeout(300)
-        page.fill(SEL_PWD, self.creds.password)
-        page.wait_for_timeout(300)
         _submit_login_once(page)
-        _log("[login] 已送出，等登入結果…")
-        page.wait_for_timeout(5000)
-
-        # 處理「確認訊息」彈窗（前次未正常登出 → 點確認登入）
-        # 真相（2026-06-16 root cause）：
-        #   - 彈窗只在「server-side ghost session 殘留」時出現，正常 fresh session 沒彈窗
-        #   - 上一版 bug: 找不到彈窗就 break + 死等 20s _logged_in → 卡死
-        #   - 彈窗出現時機不固定（5~20s），需持續 retry 找
-        # 解法：每 2s 重 evaluate 一次，最多 8 次（共 ~16s）。找到就點、點完就 break；
-        #   找不到也不 break，繼續輪詢——可能是 fresh session 正常登入中。
-        # 真正的根治在 base.run() 的 logout() — 讓 ghost session 不再產生。
-        for attempt in range(8):
-            if self._logged_in(page):
-                break
-            if page.evaluate(JS_CONFIRM_LOGIN):
-                _log(f"[login] 點了『確認訊息』彈窗 (attempt={attempt+1})")
-                page.wait_for_timeout(6000)
-                break  # 彈窗只有一次，點完就交給下面 _logged_in loop 確認
-            page.wait_for_timeout(2000)
-
-        # 等登入完成（最多 ~20 秒；2026-06-18 revert from 60s — 加 timeout 不是 root cause
-        # 真正的雲端失敗證據改寫進 error_msg 由 _login_debug.snapshot() 撈，看 sync_jobs 表）
-        for _ in range(20):
-            page.wait_for_timeout(1000)
-            if self._logged_in(page):
-                _log(f"[login] ✅ 成功 -> {page.url}")
-                return True
-            # OTP 偵測
-            try:
-                body = page.css_first("body").text or ""
-                if any(m in body for m in ["簡訊驗證", "一次性密碼", "動態密碼", "OTP 驗證", "認證碼"]):
-                    _log("[login] ⚠️ 撞 OTP，需使用者手動（headful 視窗輸入）")
-            except Exception:
-                pass
-
-        _log(f"[login] 失敗，url={page.url}")
-        raise CtbcLoginError(
-            f"登入送出後 ~20s 仍未進內銀區；可能帳密錯或撞 OTP；url={page.url}\n"
-            f"{_login_snapshot(page)}",
-        )
+        try:
+            page.wait_for_timeout(5000)
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                modals = page.locator(".modal.show")
+                if any(modals.nth(index).is_visible() for index in range(modals.count())):
+                    return
+        except Exception:
+            return
 
     # ---------- 抓取 ----------
     def logout(self, page) -> bool:
