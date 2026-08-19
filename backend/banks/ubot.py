@@ -14,8 +14,10 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -27,6 +29,11 @@ from backend.core.card_bills import (
 )
 from backend.core.creds import UbotCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://www.ubot.com.tw/home"
 
@@ -35,50 +42,6 @@ SEL_NICK = "#nickname"     # 使用者代號 (password)
 SEL_PWD = "#password"      # 網路密碼 (password, maxlen=12)
 SEL_CAPTCHA = "#CAPTCHA"   # 圖形驗證碼 (tel)
 SEL_CAPTCHA_IMG = "img[alt='CAPTCHA']"  # base64 jpeg 170x50
-
-# 開 modal：右上「網銀登入」按鈕（短文字，避開誤點）
-JS_OPEN_MODAL = (
-    "(() => { const b=[...document.querySelectorAll('button,a')]"
-    ".find(e=>e.offsetParent!==null && /網銀登入/.test((e.textContent||'').trim())"
-    "  && (e.textContent||'').trim().length<8);"
-    " if(b){ b.click(); return true;} return false; })()"
-)
-# 確保「個人用戶登入」分頁被選中
-JS_PERSONAL_TAB = (
-    "(() => { const t=[...document.querySelectorAll('a,button,div,li,span')]"
-    ".find(e=>e.offsetParent!==null && (e.textContent||'').trim()==='個人用戶登入');"
-    " if(t){ t.click(); return true;} return false; })()"
-)
-# 點 modal 內的「登入」綠按鈕（class 含 ubot-primary-green，避開右上導覽列「網銀登入」）
-JS_CLICK_LOGIN = (
-    "(() => { const btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent!==null);"
-    " let b=btns.find(x=>/^登入$/.test((x.textContent||'').trim())"
-    "   && /green/.test(x.className||''));"
-    " if(!b) b=btns.find(x=>/^登入$/.test((x.textContent||'').trim()) && !x.closest('header,nav'));"
-    " if(b){ b.click(); return true;} return false; })()"
-)
-# 點「重新產生」換驗證碼（藍字可點的 div，class 含 text-ubot-primary-blue / cursor）
-JS_REGEN = (
-    "(() => { const els=[...document.querySelectorAll('div,a,span,button,i')]"
-    ".filter(x=>x.offsetParent!==null && (x.textContent||'').trim()==='重新產生');"
-    " let el=els.find(x=>/blue|cursor|pointer|text-ubot/.test(x.className||''));"
-    " if(!el) el=els[els.length-1];"
-    " if(el){ el.click(); return true;} return false; })()"
-)
-# 登入後是否仍停在登入框（#sid 可見 = 還沒成功）
-# 偵測登入 form 還在不在（debug 用；正常邏輯改用 JS_LOGGED_IN_POSITIVE 4 條件 AND）
-JS_STILL_LOGIN = (
-    "(() => { const s=document.querySelector('#sid');"
-    " return !!(s && s.offsetParent!==null); })()"
-)
-# 抓登入框附近的錯誤/提示訊息（驗證碼錯、密碼錯等）
-JS_ERR_MSG = (
-    "(() => { const txt=[...document.querySelectorAll('div,span,p,label')]"
-    ".filter(e=>e.offsetParent!==null)"
-    ".map(e=>(e.textContent||'').trim())"
-    ".filter(t=>t && t.length<40 && /錯誤|不正確|失敗|重新|鎖|無效|請輸入正確|驗證碼/.test(t));"
-    " return [...new Set(txt)].slice(0,6); })()"
-)
 
 # W (2026-06-17): positive signal — 對齊 SCSB 鐵律, 取代「#sid 不在 = 已登入」
 # negative-only 訊號。內銀區頁面本來就沒 #sid（外網 modal 才有），單看它不在
@@ -134,6 +97,55 @@ def _log(*a):
     print(*a, file=sys.stderr)
 
 
+_POST_PHASES = (
+    CheckpointPhase.POST_SUBMIT,
+    CheckpointPhase.POST_SUBMIT_SETTLE,
+)
+_REQUIRED_PASSWORD_PATTERN = re.compile(
+    r"^[\s\S]*(?:密碼已過期|必須變更密碼|required[\s\S]{0,80}\bchang(?:e|ing)\b)[\s\S]*$",
+    re.IGNORECASE,
+)
+_OTP_PATTERN = re.compile(
+    r"^[\s\S]*(?:\bOTP\b|(?:簡訊|一次性|動態)驗證碼|device\s+verification)[\s\S]*$",
+    re.IGNORECASE,
+)
+_OPTIONAL_PASSWORD_PATTERN = re.compile(
+    r"^(?![\s\S]*(?:密碼已過期|必須變更密碼|required[\s\S]{0,80}\bchang(?:e|ing)\b))"
+    r"[\s\S]*(?:建議[\s\S]{0,80}變更密碼|"
+    r"變更密碼[\s\S]{0,80}超過\s*(?:6|六)\s*個月|"
+    r"超過\s*(?:6|六)\s*個月[\s\S]{0,80}(?:變更)?密碼|"
+    r"recommend(?:ed)?[\s\S]{0,80}\bchang(?:e|ing)\b[\s\S]{0,40}password|"
+    r"password[\s\S]{0,80}over\s+(?:6|six)\s+months|"
+    r"over\s+(?:6|six)\s+months[\s\S]{0,80}password)[\s\S]*$",
+    re.IGNORECASE,
+)
+
+
+def _unique_visible_enabled_exact(page, selector: str, label: str):
+    try:
+        candidates = page.locator(selector)
+        matches = []
+        for index in range(candidates.count()):
+            candidate = candidates.nth(index)
+            if (
+                candidate.is_visible()
+                and candidate.is_enabled()
+                and " ".join(candidate.inner_text().split()) == label
+            ):
+                matches.append(candidate)
+        return matches[0] if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _any_visible(page, selector: str) -> bool:
+    candidates = page.locator(selector)
+    return any(
+        candidates.nth(index).is_visible()
+        for index in range(candidates.count())
+    )
+
+
 class UbotLoginError(RuntimeError):
     """聯邦 UBOT login 送出後失敗——立刻中止，絕不自動重打（防鎖帳號）。"""
 
@@ -175,6 +187,8 @@ def _ubot_card_bill_fact(out: dict):
 
 
 class UbotCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="ubot")
         self.creds = UbotCreds.load()
@@ -193,130 +207,195 @@ class UbotCrawler(BankCrawler):
         except Exception:
             return False
         if isinstance(r, dict):
-            ok = bool(r.get("ok"))
-            if not ok:
-                _log(
-                    f"[login] _logged_in=False  "
-                    f"urlOk={r.get('urlOk')} lenOk={r.get('lenOk')} "
-                    f"kwOk={r.get('kwOk')} noLoginForm={r.get('noLoginForm')} "
-                    f"pwNag={r.get('passwordExpiryNag')} "
-                    f"txt_len={r.get('txt_len')} hit={r.get('hit')} "
-                    f"url={r.get('url','')[:120]}",
-                )
-            elif r.get("passwordExpiryNag"):
-                # 登入成功但停在密碼到期提醒頁 — 使用者指示繼續同步不改密碼
-                _log(
-                    f"[login] ✅ 已登入 (停在密碼到期 nag, 將由 collect 繞過) "
-                    f"url={r.get('url','')[:120]}",
-                )
-            return ok
+            return bool(r.get("ok"))
         return bool(r)
 
     # ---------- 登入 ----------
     def login(self, page) -> bool:
-        """UBOT 登入——鐵律 max_attempts=1，失敗 raise UbotLoginError。
+        return self._shared_login(page)
 
-        OCR 階段（送出前）可換圖重試最多 5 次（安全）。
-        一旦點下登入鈕，失敗就 raise UbotLoginError 中止，**絕不重打**——
-        聯邦 3 次錯密碼鎖帳號，以前的 `for attempt in range(1, 6)` 是踩雷 candidate。
-        """
-        page.wait_for_timeout(8000)
-        _log(f"[login] 起始 url={page.url}")
+    def prepare_login_page(self, page) -> None:
+        try:
+            page.wait_for_timeout(8000)
+        except Exception:
+            return
+        if self._logged_in(page):
+            return
 
-        # 開登入 modal
-        opened = page.evaluate(JS_OPEN_MODAL)
-        _log(f"[login] 開 modal: {opened}")
-        page.wait_for_timeout(2500)
-        # 確認在「個人用戶登入」分頁
-        page.evaluate(JS_PERSONAL_TAB)
-        page.wait_for_timeout(800)
+        opener = _unique_visible_enabled_exact(page, "button, a", "網銀登入")
+        if opener is not None:
+            try:
+                opener.click()
+            except Exception:
+                return
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:
+            return
 
+        try:
+            sid_visible = _any_visible(page, SEL_SID)
+        except Exception:
+            return
+        if sid_visible:
+            return
+
+        tab = _unique_visible_enabled_exact(
+            page,
+            "a, button, [role=tab]",
+            "個人用戶登入",
+        )
+        if tab is not None:
+            try:
+                tab.click()
+            except Exception:
+                return
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            return
+
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        return (
+            LoginCheckpointRule(
+                name="ubot-password-change-required",
+                bank="ubot",
+                phases=_POST_PHASES,
+                kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                container_selector=".modal.show",
+                required_body_pattern=_REQUIRED_PASSWORD_PATTERN,
+            ),
+            LoginCheckpointRule(
+                name="ubot-otp-required",
+                bank="ubot",
+                phases=_POST_PHASES,
+                kind=CheckpointKind.OTP_REQUIRED,
+                container_selector=".modal.show",
+                required_body_pattern=_OTP_PATTERN,
+            ),
+            LoginCheckpointRule(
+                name="ubot-password-change-optional",
+                bank="ubot",
+                phases=_POST_PHASES,
+                kind=CheckpointKind.PASSWORD_CHANGE_OPTIONAL,
+                container_selector=".modal.show",
+                action_texts=(
+                    "以後再說",
+                    "暫不變更",
+                    "不變更",
+                    "下次再說",
+                    "Later",
+                    "Skip",
+                ),
+                required_body_pattern=_OPTIONAL_PASSWORD_PATTERN,
+            ),
+            LoginCheckpointRule(
+                name="ubot-unknown-modal",
+                bank="ubot",
+                phases=_POST_PHASES,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="ubot-login-form-still-visible",
+                bank="ubot",
+                phases=_POST_PHASES,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=SEL_SID,
+            ),
+        )
+
+    def submit_credentials_once(self, page) -> None:
         try:
             page.wait_for_selector(SEL_SID, state="visible", timeout=10000)
-        except Exception as e:
-            msg = f"UBOT 登入框 #sid 未出現 (url={page.url}): {e}"
-            _log(f"[login] ❌ {msg}")
-            raise UbotLoginError(msg) from e
+            for selector, value, wait in (
+                (SEL_SID, self.creds.national_id, 150),
+                (SEL_NICK, self.creds.user_code, 150),
+                (SEL_PWD, self.creds.password, 200),
+            ):
+                page.fill(selector, value)
+                page.wait_for_timeout(wait)
+        except Exception:
+            raise UbotLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        # 填三欄
-        try:
-            page.fill(SEL_SID, self.creds.national_id)
-            page.wait_for_timeout(150)
-            page.fill(SEL_NICK, self.creds.user_code)
-            page.wait_for_timeout(150)
-            page.fill(SEL_PWD, self.creds.password)
-            page.wait_for_timeout(200)
-        except Exception as e:
-            msg = f"UBOT 填欄位失敗: {e}"
-            _log(f"[login] ❌ {msg}")
-            raise UbotLoginError(msg) from e
-
-        # OCR 驗證碼（送出前安全重試：長度錯就換圖最多 5 次）
         captcha = self._ocr_with_regen(page, max_attempts=5)
         if not captcha:
-            msg = "OCR 5 次都讀不出 6 碼數字驗證碼，放棄（未送 login，無鎖帳號風險）"
-            _log(f"[login] ❌ {msg}")
-            raise UbotLoginError(msg)
+            raise UbotLoginError("圖形驗證碼 OCR 失敗；未送出登入")
         try:
             page.fill(SEL_CAPTCHA, captcha)
             page.wait_for_timeout(200)
-        except Exception as e:
-            msg = f"UBOT 填驗證碼失敗: {e}"
-            _log(f"[login] ❌ {msg}")
-            raise UbotLoginError(msg) from e
-
-        # 🚨 max_attempts=1：送 login 只此一次
-        _log(f"[login] 送出 login (captcha={captcha})")
-        clicked = page.evaluate(JS_CLICK_LOGIN)
-        if not clicked:
-            msg = "UBOT 找不到登入按鈕（form 渲染異常）"
-            _log(f"[login] ❌ {msg}")
-            raise UbotLoginError(msg)
-        page.wait_for_timeout(6000)
-
-        if self._logged_in(page):
-            _log(f"[login] ✅ 登入成功 -> {page.url}")
-            return True
-
-        # 還在登入框 → 立刻停手、dump 錯誤訊息
-        try:
-            errs = page.evaluate(JS_ERR_MSG)
         except Exception:
-            errs = []
-        # Internal policy: max_attempts=1, MUST NOT auto-retry.
-        # 聯邦銀行錯誤 3 次即停用網銀,所以絕不在 code 端重打。
-        # See wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        msg = (
-            f"聯邦登入失敗。請檢查帳號、密碼是否正確。"
-            f"\n  url={page.url}\n  錯誤訊息: {errs}\n"
-            f"  可能原因：(a) 驗證碼辨識錯誤 (機率小) (b) 帳號或密碼錯誤"
-            f" (c) 帳號已被停用 (聯邦錯誤 3 次即停用網銀)。"
-            f"\n{snap}"
+            raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
+
+        button = _unique_visible_enabled_exact(
+            page,
+            "button.ubot-primary-green",
+            "登入",
         )
-        _log(f"[login] ❌ {msg}")
-        raise UbotLoginError(msg)
+        if button is None:
+            raise UbotLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        try:
+            classes = (button.get_attribute("class") or "").split()
+            if "disabled" in classes:
+                raise UbotLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        except UbotLoginError:
+            raise
+        except Exception:
+            raise UbotLoginError("無法安全確認登入按鈕；未送出登入") from None
+
+        _log("[login] 送出 login attempt=1")
+        try:
+            button.click()
+        except Exception:
+            raise UbotLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(6000)
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page) or _any_visible(page, ".modal.show"):
+                    return
+        except Exception:
+            return
 
     def _ocr_with_regen(self, page, max_attempts=5):
         """OCR 聯邦 6 碼純數字驗證碼，失敗換圖重試（送出前安全重試）。"""
-        for n in range(1, max_attempts + 1):
-            wait_captcha_stable(page, SEL_CAPTCHA_IMG, tmp_path=self.captcha_tmp)
-            captcha = solve_captcha(
-                page, SEL_CAPTCHA_IMG, expected_len=6, alnum_only=True,
-                digits_only=True, min_confidence=0.85,
-                tmp_path=self.captcha_tmp,
-            )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                wait_captcha_stable(page, SEL_CAPTCHA_IMG, tmp_path=self.captcha_tmp)
+                captcha = solve_captcha(
+                    page,
+                    SEL_CAPTCHA_IMG,
+                    expected_len=6,
+                    alnum_only=True,
+                    digits_only=True,
+                    min_confidence=0.85,
+                    tmp_path=self.captcha_tmp,
+                )
+            except Exception:
+                _log(f"[cap] OCR attempt={attempt} status=error")
+                return None
             if captcha and len(captcha) == 6 and captcha.isdigit():
-                _log(f"[cap] 第 {n} 次 OCR 成功: {captcha}")
+                _log(f"[cap] OCR attempt={attempt} status=success")
                 return captcha
-            _log(f"[cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {captcha!r}），換圖")
-            if n < max_attempts:
-                try:
-                    page.evaluate(JS_REGEN)
-                    page.wait_for_timeout(2000)
-                except Exception as e:
-                    _log(f"[cap] 換圖失敗: {e}")
+            _log(f"[cap] OCR attempt={attempt} status=invalid")
+            if attempt == max_attempts:
+                break
+            refresh = _unique_visible_enabled_exact(
+                page,
+                "div,a,span,button,i",
+                "重新產生",
+            )
+            if refresh is None:
+                return None
+            try:
+                refresh.click()
+                page.wait_for_timeout(2000)
+            except Exception:
+                return None
         return None
 
     # ---------- 抓取 ----------
@@ -327,9 +406,6 @@ class UbotCrawler(BankCrawler):
         互動式：餘額/卡彙總進頁自動打；逐筆明細要選帳戶/期別 + 按查詢才觸發。
         """
         out: dict = {}
-        page.wait_for_timeout(2500)
-        self._close_popups(page)
-        page.wait_for_timeout(1000)
 
         # 1) 帳戶總覽（A0101001）：自動打 IBKA010001~4
         self._goto(page, "/A0101001", wait=6500)
@@ -365,15 +441,6 @@ class UbotCrawler(BankCrawler):
     def _goto(self, page, route: str, wait: int = 6000):
         page.evaluate(f"location.hash='#{route}'")
         page.wait_for_timeout(wait)
-
-    def _close_popups(self, page):
-        # 2026-06-18: 加密碼到期 nag 常見按鈕字眼 (以後再說/暫不變更/不變更/下次再說/Later/Skip)
-        page.evaluate(
-            "(() => { for(let i=0;i<6;i++){"
-            "  const b=[...document.querySelectorAll('button,a,div')].find(e=>e.offsetParent!==null"
-            "    && /^(Confirm|OK|確認|我知道了|關閉|稍後|下次|略過|確定|不再顯示|同意|以後再說|暫不變更|不變更|下次再說|Later|Skip|Cancel|取消)$/i.test((e.textContent||'').trim()));"
-            "  if(b) b.click(); else break; } })()",
-        )
 
     @staticmethod
     def _latest_body(collector: ResponseCollector, endpoint: str):
