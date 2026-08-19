@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from importlib import import_module
 import inspect
 from pathlib import Path
+import re
 from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 
@@ -14,6 +15,7 @@ from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
     CheckpointPhase,
+    DEFAULT_ACTION_SELECTOR,
     LoginCheckpointRule,
 )
 
@@ -260,7 +262,7 @@ def test_legacy_login_path_is_unchanged(monkeypatch, tmp_path):
 
 
 def test_shared_login_checkpoint_opt_in_inventory():
-    assert _opted_in_bank_modules() == {"rakuten"}
+    assert _opted_in_bank_modules() == {"cathay", "rakuten"}
 
 
 @pytest.mark.parametrize(
@@ -377,27 +379,60 @@ def test_post_submit_recovery_never_resubmits(monkeypatch, tmp_path):
     assert "logout" not in crawler.events
 
 
-def test_duplicate_session_rule_is_excluded_after_action_budget(monkeypatch, tmp_path):
-    rule = _rule("duplicate", CheckpointKind.DUPLICATE_SESSION)
+def test_exhausted_clickable_rule_becomes_classifier_only_shadow(monkeypatch, tmp_path):
+    body_pattern = re.compile(r"^known blocker$")
+    rule = LoginCheckpointRule(
+        name="duplicate",
+        bank="staged",
+        phases=tuple(CheckpointPhase),
+        kind=CheckpointKind.DUPLICATE_SESSION,
+        container_selector="#duplicate",
+        action_selector="#continue",
+        action_texts=("Continue",),
+        required_body_pattern=body_pattern,
+    )
     crawler = _StagedCrawler(name="staged", rules=(rule,))
-    rules_seen: list[tuple[str, ...]] = []
+    rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
 
     def evaluate(page, *, bank, phase, rules, is_authenticated):
-        rules_seen.append(tuple(item.name for item in rules))
+        rules_seen.append(rules)
         if len(rules_seen) == 1:
             return CheckpointOutcome(
                 CheckpointKind.DUPLICATE_SESSION,
                 rule_name="duplicate",
             )
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        if len(rules_seen) == 2:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+        return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
 
     result, _ = _run(monkeypatch, tmp_path, crawler, evaluate)
 
-    assert rules_seen == [("duplicate",), ()]
-    assert crawler.submissions == 0
-    assert "LoginCheckpointBlocked" in result["error"]
-    assert "collect" not in crawler.events
-    assert "logout" not in crawler.events
+    shadow = rules_seen[1][0]
+    assert rules_seen[0] == (rule,)
+    assert all(seen == (shadow,) for seen in rules_seen[1:])
+    assert (
+        shadow.name,
+        shadow.bank,
+        shadow.phases,
+        shadow.kind,
+        shadow.container_selector,
+        shadow.required_body_pattern,
+        shadow.action_selector,
+        shadow.action_texts,
+        shadow.max_actions,
+    ) == (
+        rule.name,
+        rule.bank,
+        rule.phases,
+        CheckpointKind.UNKNOWN_BLOCKER,
+        rule.container_selector,
+        body_pattern,
+        DEFAULT_ACTION_SELECTOR,
+        (),
+        1,
+    )
+    assert crawler.submissions == 1
+    assert result["data"] == {"card_bill_facts_ok": False}
 
 
 def test_protocol_resubmit_allows_exactly_one_second_submission(monkeypatch, tmp_path):
@@ -412,18 +447,32 @@ def test_protocol_resubmit_allows_exactly_one_second_submission(monkeypatch, tmp
         CheckpointKind.PROTOCOL_RESUBMIT,
         rule_name="protocol",
     )
+    rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
+    pending = iter(
+        (
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            request,
+            request,
+        )
+    )
+
+    def evaluate(page, *, bank, phase, rules, is_authenticated):
+        rules_seen.append(rules)
+        return next(pending)
 
     result, _ = _run(
         monkeypatch,
         tmp_path,
         crawler,
-        _outcomes(
-            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
-            request,
-            request,
-        ),
+        evaluate,
     )
 
+    assert rules_seen[0] == ()
+    assert rules_seen[1] == (rule,)
+    assert len(rules_seen[2]) == 1
+    assert rules_seen[2][0].name == rule.name
+    assert rules_seen[2][0].kind is CheckpointKind.UNKNOWN_BLOCKER
+    assert rules_seen[2][0].action_texts == ()
     assert crawler.submissions == 2
     assert "credential_submissions=2" in result["error"]
     assert "protocol_resubmits=1" in result["error"]
@@ -856,24 +905,34 @@ def test_rules_keep_order_and_twelve_action_budget_is_enforced(monkeypatch, tmp_
         name="staged",
         rules=(action_rule, classifier_rule),
     )
-    rules_seen: list[tuple[str, ...]] = []
+    rules_seen: list[tuple[tuple[str, CheckpointKind], ...]] = []
 
     def evaluate(page, *, bank, phase, rules, is_authenticated):
         assert bank == "staged"
         assert all(rule.bank == bank for rule in rules)
-        names = tuple(rule.name for rule in rules)
-        rules_seen.append(names)
+        rules_seen.append(tuple((rule.name, rule.kind) for rule in rules))
         if len(rules_seen) <= 12:
             return CheckpointOutcome(
                 CheckpointKind.DUPLICATE_SESSION,
                 rule_name="announcement",
             )
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        return CheckpointOutcome(
+            CheckpointKind.UNKNOWN_BLOCKER,
+            rule_name="announcement",
+        )
 
     result, _ = _run(monkeypatch, tmp_path, crawler, evaluate)
 
-    assert rules_seen[:12] == [("announcement", "otp")] * 12
-    assert rules_seen[12] == ("otp",)
+    assert rules_seen[:12] == [
+        (
+            ("announcement", CheckpointKind.DUPLICATE_SESSION),
+            ("otp", CheckpointKind.OTP_REQUIRED),
+        )
+    ] * 12
+    assert rules_seen[12] == (
+        ("announcement", CheckpointKind.UNKNOWN_BLOCKER),
+        ("otp", CheckpointKind.OTP_REQUIRED),
+    )
     assert crawler.submissions == 0
     assert "LoginCheckpointBlocked" in result["error"]
 
@@ -903,7 +962,8 @@ def test_twelve_actions_still_leave_room_for_successful_login(monkeypatch, tmp_p
                 CheckpointKind.DUPLICATE_SESSION,
                 rule_name="announcement",
             )
-        assert names == ("otp",)
+        assert names == ("announcement", "otp")
+        assert rules[0].kind is CheckpointKind.UNKNOWN_BLOCKER
         if len(calls) == 13:
             assert phase is CheckpointPhase.PRE_SUBMIT
             return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)

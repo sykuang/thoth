@@ -14,7 +14,7 @@ import json
 import math
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, ClassVar, NotRequired, Required, TypedDict
@@ -25,6 +25,7 @@ from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
     CheckpointPhase,
+    DEFAULT_ACTION_SELECTOR,
     LoginBudget,
     LoginCheckpointRule,
     evaluate_login_checkpoint,
@@ -602,8 +603,8 @@ class BankCrawler(ABC):
 
         for _ in range(max_steps):
             active_rules = tuple(
-                rule for rule in rules
-                if phase in rule.phases and (
+                rule
+                if (
                     not rule.is_clickable
                     or (
                         action_counts[rule.name] < rule.max_actions
@@ -617,6 +618,15 @@ class BankCrawler(ABC):
                         )
                     )
                 )
+                else replace(
+                    rule,
+                    kind=CheckpointKind.UNKNOWN_BLOCKER,
+                    action_selector=DEFAULT_ACTION_SELECTOR,
+                    action_texts=(),
+                    max_actions=1,
+                )
+                for rule in rules
+                if phase in rule.phases
             )
             outcome = evaluate_login_checkpoint(
                 page,

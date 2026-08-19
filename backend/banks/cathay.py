@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -19,6 +20,11 @@ from backend.core.card_bills import (
 )
 from backend.core.card_status import cathay_bill_status
 from backend.core.creds import CathayCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 SEL_CUSTID = "#CustID"
 SEL_USERID = "#UserIdKeyin"
@@ -83,6 +89,25 @@ class CathayLoginError(RuntimeError):
     """Cathay 登入失敗（絕對失敗，重打也沒用，會鎖帳號）。"""
 
 
+def _click_login_once(page) -> None:
+    try:
+        candidates = page.locator(SEL_LOGIN_BTN)
+        if candidates.count() != 1:
+            raise CathayLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        button = candidates.first
+        classes = (button.get_attribute("class") or "").split()
+        if not button.is_visible() or not button.is_enabled() or "disabled" in classes:
+            raise CathayLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+    except CathayLoginError:
+        raise
+    except Exception:
+        raise CathayLoginError("無法安全確認登入按鈕；未送出登入") from None
+    try:
+        button.click(timeout=8000)
+    except Exception:
+        raise CathayLoginError("登入送出狀態不明；禁止自動重試") from None
+
+
 def _cathay_card_bill_fact(out: dict):
     credit_card = out.get("credit_card") or {}
     latest = credit_card.get("latest_bill") or {}
@@ -144,6 +169,8 @@ def _cathay_card_bill_fact(out: dict):
 
 
 class CathayCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="cathay")
         self.creds = CathayCreds.load()
@@ -175,80 +202,42 @@ class CathayCrawler(BankCrawler):
             return ok
         return bool(r)
 
-    # ---------- 公告彈窗 ----------
-    def _dismiss_announcements(self, page):
-        for _ in range(12):
-            visible = page.evaluate(
-                "(() => { const m=document.querySelector('#divSystemLoginMsgList');"
-                "return m && getComputedStyle(m).display!=='none' && m.classList.contains('show'); })()",
-            )
-            if not visible:
-                break
-            page.evaluate(
-                "(() => { const m=document.querySelector('#divSystemLoginMsgList'); if(!m) return;"
-                "const b=[...m.querySelectorAll('button,a')].find(x=>/我知道了|關閉|確定|下一/.test(x.textContent)&&x.offsetParent!==null);"
-                "if(b) b.click(); })()",
-            )
-            page.wait_for_timeout(600)
-        page.evaluate(
-            "(() => { document.querySelectorAll('.modal.show').forEach(m=>{m.classList.remove('show');m.style.display='none';});"
-            "document.querySelectorAll('.modal-backdrop').forEach(b=>b.remove());"
-            "document.body.classList.remove('modal-open'); })()",
-        )
-        page.wait_for_timeout(400)
-
-    # ---------- 登入 ----------
     def login(self, page) -> bool:
-        """國泰世華登入——鐵律 max_attempts=1，失敗 raise CathayLoginError。
+        return self._shared_login(page)
 
-        ⚠️ 一旦點下 SEL_LOGIN_BTN，失敗就 raise CathayLoginError 中止，**絕不重打**——
-        重打多次會直接被銀行鎖帳號。session 仍存活的 fallback path 仍 return True。
-
-        Return:
-          True:  session 復用 (已登入) 或登入成功
-        Raise:
-          CathayLoginError: 登入流程任何明確失敗 (URL 仍在 login page、找不到關鍵 selector)
-        """
+    def prepare_login_page(self, page) -> None:
         page.wait_for_timeout(2500)
+
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        return (
+            LoginCheckpointRule(
+                name="cathay-login-announcement",
+                bank="cathay",
+                phases=(CheckpointPhase.PRE_SUBMIT,),
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector="#divSystemLoginMsgList.show",
+                action_texts=("下一", "我知道了", "關閉", "確定"),
+                max_actions=12,
+            ),
+        )
+
+    def submit_credentials_once(self, page) -> None:
         try:
             page.wait_for_selector(SEL_CUSTID, state="visible", timeout=12000)
+            for selector, value in (
+                (SEL_CUSTID, self.creds.cust_id),
+                (SEL_USERID, self.creds.user_id),
+                (SEL_PWD, self.creds.password),
+            ):
+                page.fill(selector, value)
+                page.wait_for_timeout(200)
         except Exception:
-            # session 復用路徑: URL 已在內銀區 → positive signal 雙重 check 才認
-            # （W 2026-06-17: 改用 _logged_in() 而非只看 URL，避免 fallback 誤判）
-            if self._logged_in(page):
-                _log(f"[login] session 還在，免登入 (positive signal 通過): {page.url}")
-                return True
-            # SEL_CUSTID 找不到, 也不通過 positive signal → 異常頁面
-            from backend.banks._login_debug import snapshot as _login_snapshot
-            snap = _login_snapshot(page)
-            raise CathayLoginError(
-                f"找不到登入欄位 SEL_CUSTID={SEL_CUSTID}; positive signal 也不通過; url={page.url}"
-                f"\n{snap}",
-            ) from None
-        self._dismiss_announcements(page)
-        page.fill(SEL_CUSTID, self.creds.cust_id)
-        page.wait_for_timeout(200)
-        page.fill(SEL_USERID, self.creds.user_id)
-        page.wait_for_timeout(200)
-        page.fill(SEL_PWD, self.creds.password)
-        page.wait_for_timeout(200)
-        try:
-            page.click(SEL_LOGIN_BTN, timeout=8000)
-        except Exception:
-            page.evaluate("typeof NormalDataCheck==='function' && NormalDataCheck()")
+            raise CathayLoginError("登入欄位無法安全填寫；未送出登入") from None
+        _click_login_once(page)
         page.wait_for_timeout(9000)
-        # W 2026-06-17: 改 positive signal — URL 只判 OnlineBanking 不夠，必須過
-        # innerText/keyword/no-form 四關 AND 才認登入成功。
-        ok = self._logged_in(page)
-        _log(f"[login] {'成功' if ok else '失敗'} -> {page.url}")
-        if not ok:
-            from backend.banks._login_debug import snapshot as _login_snapshot
-            snap = _login_snapshot(page)
-            raise CathayLoginError(
-                f"登入後 positive signal 未通過; 帳密或驗證碼錯誤; url={page.url}"
-                f"\n{snap}",
-            )
-        return True
 
     # ---------- 互動觸發：台幣交易明細 ----------
     def _trigger_twd_txn_query(self, page):
