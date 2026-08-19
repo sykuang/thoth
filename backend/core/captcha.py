@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import sys
@@ -73,11 +74,7 @@ def solve_captcha(
     min_confidence > 0 時，啟用 ddddocr probability，信心低於門檻回 None（觸發換圖重試）。
     digits_only=True 時，OCR 結果非純數字直接判失敗（聯邦驗證碼=純數字 6 碼）。
 
-    ⚠️ C-3 修法 (2026-06-17): tmp_path 不再 fallback 到 `/tmp/captcha_tmp.png`。
-       原本 12 家共用 `/tmp` 單一檔，sync_runner 並行同一進程兩家銀行時會 race
-       condition 互覆寫 → captcha 被誤認成別家銀行的圖。
-       Caller (BankCrawler 子類) 須傳 `self.captcha_tmp` (= session_dir/captcha.png)。
-       沒給就 raise，強迫使用者修正——比靜默誤判好。
+    tmp_path 保留為相容參數與 caller isolation guard；圖片只在記憶體處理，不落盤。
     """
     if tmp_path is None:
         raise ValueError(
@@ -89,9 +86,9 @@ def solve_captcha(
         if not el or not el.is_visible():
             _log(f"[captcha] selector {img_selector!r} 不可見")
             return None
-        tmp = tmp_path
-        el.screenshot(path=str(tmp))
-        data = Path(tmp).read_bytes()
+        data = el.screenshot()
+        if not isinstance(data, bytes):
+            return None
         conf = None
         if min_confidence > 0:
             try:
@@ -101,8 +98,8 @@ def solve_captcha(
                     conf = rp.get("confidence")
                 else:
                     raw = rp
-            except Exception as e:
-                _log(f"[captcha] probability inference 失敗，confidence gate fail closed: {e}")
+            except Exception:
+                _log("[captcha] probability inference 失敗，confidence gate fail closed")
                 return None
         else:
             raw = _ocr_classification(data)
@@ -110,9 +107,8 @@ def solve_captcha(
         text = str(raw).strip()
         if alnum_only:
             text = re.sub(r"[^0-9a-zA-Z]", "", text)
-        _log(f"[captcha] OCR -> {text!r} (raw={raw!r} conf={conf})")
         if digits_only and not text.isdigit():
-            _log(f"[captcha] 非純數字 {text!r}，判失敗重試")
+            _log("[captcha] OCR 非純數字，判失敗重試")
             return None
         if expected_len and len(text) != expected_len:
             _log(f"[captcha] 長度 {len(text)} != 預期 {expected_len}，可能誤判")
@@ -125,8 +121,8 @@ def solve_captcha(
                 _log(f"[captcha] 信心 {conf:.3f} < {min_confidence}，捨棄換圖")
                 return None
         return text or None
-    except Exception as e:
-        _log(f"[captcha] OCR 失敗: {e}")
+    except Exception:
+        _log("[captcha] OCR 失敗")
         return None
 
 
@@ -152,8 +148,8 @@ def ocr_bytes(
                     conf = rp.get("confidence")
                 else:
                     raw = rp
-            except Exception as e:
-                _log(f"[captcha] probability inference 失敗，confidence gate fail closed: {e}")
+            except Exception:
+                _log("[captcha] probability inference 失敗，confidence gate fail closed")
                 return None
         else:
             raw = _ocr_classification(data)
@@ -161,7 +157,6 @@ def ocr_bytes(
         text = str(raw).strip()
         if alnum_only:
             text = re.sub(r"[^0-9a-zA-Z]", "", text)
-        _log(f"[captcha] ocr_bytes -> {text!r} (raw={raw!r} conf={conf})")
         if digits_only and not text.isdigit():
             return None
         if expected_len and len(text) != expected_len:
@@ -169,8 +164,8 @@ def ocr_bytes(
         if min_confidence > 0 and (conf is None or conf < min_confidence):
             return None
         return text or None
-    except Exception as e:
-        _log(f"[captcha] ocr_bytes 失敗: {e}")
+    except Exception:
+        _log("[captcha] ocr_bytes 失敗")
         return None
 
 
@@ -184,23 +179,22 @@ def wait_captcha_stable(
 ) -> bool:
     """等驗證碼圖渲染穩定（連續兩次 screenshot 位元組相同），避免抓到換圖中途的舊/空圖。
 
-    ⚠️ C-3 修法 (2026-06-17): tmp_path 不再 fallback 到 `/tmp/captcha_stable.png`。
-       12 家共用 /tmp race condition 已禁用，caller 必須傳 per-bank 路徑。
+    tmp_path 保留為相容參數與 caller isolation guard；hash 與圖片只留在記憶體。
     """
     if tmp_path is None:
         raise ValueError(
             "wait_captcha_stable() 需要 tmp_path 參數 (per-bank session_dir/captcha.png)。"
             " /tmp 共用 race condition 已禁用——詳見 C-3 修法註解。",
         )
-    import hashlib
     last = None
     for _ in range(tries):
         el = page.query_selector(img_selector)
         if el and el.is_visible():
             try:
-                tmp = tmp_path
-                el.screenshot(path=str(tmp))
-                h = hashlib.md5(tmp.read_bytes()).hexdigest()
+                raw = el.screenshot()
+                if not isinstance(raw, bytes):
+                    raise TypeError
+                h = hashlib.sha256(raw).digest()
                 if h == last:
                     return True
                 last = h
