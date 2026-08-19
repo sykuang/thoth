@@ -65,6 +65,9 @@ class _StagedCrawler(BankCrawler):
         self.submissions += 1
         self.events.append(f"submit-credentials:{self.submissions}")
 
+    def prepare_captcha_resubmit(self, page) -> None:
+        self.events.append("prepare-captcha-resubmit")
+
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         if self.rules is not None:
             return self.rules
@@ -268,6 +271,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
         "esun",
         "linebank",
         "rakuten",
+        "scb",
         "taishin",
         "ubot",
     }
@@ -620,6 +624,10 @@ def test_captcha_retry_allows_exactly_one_bank_coded_second_submission(
     )
 
     assert crawler.submissions == 2
+    assert crawler.events.count("prepare-captcha-resubmit") == 1
+    assert crawler.events.index("prepare-captcha-resubmit") < crawler.events.index(
+        "submit-credentials:2"
+    )
     assert "credential_submissions=2" in result["error"]
     assert "captcha_resubmits=1" in result["error"]
     assert "collect" not in crawler.events

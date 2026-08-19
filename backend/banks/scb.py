@@ -43,12 +43,19 @@ import contextlib
 import re
 import sys
 from pathlib import Path
+from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScbCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://ebank.standardchartered.com.tw/scb/public/login?lang=tw"
 LOGIN_PATH_HINT = "/scb/public/login"
@@ -59,10 +66,12 @@ def _log(*a):
 
 
 class ScbLoginError(RuntimeError):
-    """SCB login 送出後失敗；僅明確 CAPT* 錯誤可限重試一次。"""
+    """SCB login 無法安全準備、送出，或送出狀態不明。"""
 
 
 class ScbCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="scb")
         self.creds = ScbCreds.load()
@@ -71,51 +80,276 @@ class ScbCrawler(BankCrawler):
         return "standardchartered.com.tw"
 
     def _logged_in(self, page) -> bool:
-        """W (2026-06-17): positive signal 4 條件 AND（純 SPA 動態欄位，對齊 SCSB 鐵律）
-
-        1) urlOk: standardchartered.com.tw 域內 + 不在 /scb/public/login
-        2) noLoginForm: __reCaptcha + 4 visible password/text input 都不在
-           （SCB 欄位 name 每 reload 變，只能靠 __reCaptcha 這個固定 name + visible input 數量）
-        3) lenOk: body innerText >= 500
-        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
-        """
+        """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            url = (page.url or "").lower()
-            if "standardchartered.com.tw" not in url or LOGIN_PATH_HINT in url:
+            parsed = urlparse(page.url or "")
+            if (
+                (parsed.hostname or "").lower() != "ebank.standardchartered.com.tw"
+                or LOGIN_PATH_HINT in parsed.path.lower()
+            ):
                 return False
-
-            ok = page.evaluate("""
-                () => {
-                  const visible = (e) => {
-                    if (!e) return false;
-                    const r = e.getBoundingClientRect();
-                    const cs = getComputedStyle(e);
-                    return !!(r.width || r.height || e.getClientRects().length)
-                      && cs.display !== 'none' && cs.visibility !== 'hidden';
-                  };
-                  // 登入頁有 __reCaptcha (固定 name) + 多個 type=password input
-                  const captchaInput = document.querySelector('[name="__reCaptcha"]');
-                  const visiblePwdCount = [...document.querySelectorAll('input[type="password"]')]
-                    .filter(visible).length;
-                  const noLoginForm = !visible(captchaInput) && visiblePwdCount === 0;
-                  const body = document.body && document.body.innerText || '';
-                  const lenOk = body.length >= 500;
-                  const KW = ['登出','Logout','理財總覽','帳戶綜覽','親愛的客戶',
-                              '存款','轉帳','信用卡','台幣','外幣','基金','投資',
-                              '貸款','繳費','個人設定','安全','SCB','Standard Chartered'];
-                  const kw = KW.filter(k => body.includes(k)).length;
-                  return noLoginForm && lenOk && kw >= 2;
-                }
-            """)
-            return bool(ok)
+            scopes = [
+                page,
+                *(frame for frame in page.frames if frame is not page.main_frame),
+            ]
+            for scope in scopes:
+                controls = scope.locator(
+                    "[name='__reCaptcha'], input[type='password']"
+                )
+                if any(
+                    controls.nth(index).is_visible()
+                    for index in range(controls.count())
+                ):
+                    return False
+            body = "\n".join(
+                scope.evaluate("() => document.body && document.body.innerText || ''")
+                or ""
+                for scope in scopes
+            )
         except Exception:
             return False
+        return (
+            len(body) >= 500
+            and ("登出" in body or "Logout" in body)
+            and ("理財總覽" in body or "帳戶綜覽" in body)
+        )
+
+    def login(self, page) -> bool:
+        return self._shared_login(page)
+
+    def prepare_login_page(self, page) -> None:
+        try:
+            page.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000)
+            page.wait_for_timeout(5000)
+        except Exception:
+            pass
+        if self._logged_in(page):
+            return
+        try:
+            current = urlparse(page.url or "")
+            if (
+                (current.hostname or "").lower()
+                != "ebank.standardchartered.com.tw"
+                or LOGIN_PATH_HINT not in current.path.lower()
+            ):
+                page.goto(BASE, timeout=15000)
+            page.wait_for_timeout(8000)
+        except Exception:
+            raise ScbLoginError("無法安全準備登入頁面；未送出登入") from None
+
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post_settle = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
+        )
+        otp_body = re.compile(
+            r"^[\s\S]*(?:OTP|一次性密碼|簡訊驗證碼|裝置驗證|信任此裝置|新裝置登入)[\s\S]*$",
+            re.IGNORECASE,
+        )
+        password_body = re.compile(
+            r"^[\s\S]*(?:(?:立即|必須|請先|需要|需)\s*(?:修改|變更|重設)\s*"
+            r"(?:您的?)?\s*密碼|密碼\s*(?:已)?(?:到期|過期)|"
+            r"密碼\s*強制\s*(?:修改|變更|重設)|"
+            r"強制\s*(?:修改|變更|重設)\s*(?:您的?)?\s*密碼)[\s\S]*$"
+        )
+        captcha_body = re.compile(
+            r"^[\s\S]*(?<![A-Za-z0-9_])CAPT\d+(?![A-Za-z0-9_])[\s\S]*$",
+            re.IGNORECASE,
+        )
+        error_body = re.compile(
+            r"^[\s\S]*(?:HIBERR_\d+|(?<![A-Za-z0-9_])E\d{3,4}(?!\d)|"
+            r"帳號不存在|密碼不正確|帳號[^\r\n]{0,40}鎖定|登入失敗)[\s\S]*$",
+            re.IGNORECASE,
+        )
+        duplicate_body = re.compile(
+            r"^\s*(?:您可能先前未正常登出(?:\s*或\s*已經在別台裝置登入)?|"
+            r"已經在別台裝置登入)(?:[\s.…，,。]*其他裝置將會被登出)?"
+            r"[\s.…，,。]*確定登入\s*$"
+        )
+        modal_scopes = (("modal", ".modal.show"), ("dialog", "[role='dialog']"))
+        simple_scopes = (("error", ".error"), ("alert", ".alert"), ("role-alert", "[role='alert']"))
+        return (
+            *(
+                LoginCheckpointRule(
+                    name=f"scb-otp-required-{suffix}",
+                    bank="scb",
+                    phases=all_phases,
+                    kind=CheckpointKind.OTP_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=otp_body,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scb-password-change-required-{suffix}",
+                    bank="scb",
+                    phases=all_phases,
+                    kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=password_body,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scb-explicit-login-error-{suffix}",
+                    bank="scb",
+                    phases=post_settle,
+                    kind=CheckpointKind.EXPLICIT_LOGIN_ERROR,
+                    container_selector=selector,
+                    required_body_pattern=error_body,
+                )
+                for suffix, selector in simple_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scb-captcha-retry-{suffix}",
+                    bank="scb",
+                    phases=(CheckpointPhase.POST_SUBMIT,),
+                    kind=CheckpointKind.CAPTCHA_RETRY,
+                    container_selector=selector,
+                    required_body_pattern=captcha_body,
+                )
+                for suffix, selector in simple_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scb-duplicate-session-{suffix}",
+                    bank="scb",
+                    phases=post_settle,
+                    kind=CheckpointKind.DUPLICATE_SESSION,
+                    container_selector=selector,
+                    action_texts=("確定登入",),
+                    required_body_pattern=duplicate_body,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            LoginCheckpointRule(
+                name="scb-unknown-modal",
+                bank="scb",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="scb-unknown-dialog",
+                bank="scb",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
+            LoginCheckpointRule(
+                name="scb-login-form-still-visible",
+                bank="scb",
+                phases=post_settle,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[name='__reCaptcha']",
+            ),
+        )
+
+    @staticmethod
+    def _page_scopes(page):
+        return [
+            page,
+            *(frame for frame in page.frames if frame is not page.main_frame),
+        ]
+
+    @classmethod
+    def _click_unique_refresh(cls, page) -> bool:
+        matches = []
+        for scope in cls._page_scopes(page):
+            actions = scope.locator("button, a")
+            for index in range(actions.count()):
+                action = actions.nth(index)
+                if (
+                    action.is_visible()
+                    and action.is_enabled()
+                    and " ".join(action.inner_text().split()) == "重新產生"
+                ):
+                    matches.append(action)
+        if len(matches) != 1:
+            return False
+        matches[0].click()
+        page.wait_for_timeout(1500)
+        return True
+
+    @staticmethod
+    def _keyboard_fill(page, field, value: str) -> None:
+        field.click()
+        page.wait_for_timeout(150)
+        field.click(click_count=3)
+        page.wait_for_timeout(100)
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(100)
+        page.keyboard.type(value, delay=80)
+        page.wait_for_timeout(300)
+        if len(field.input_value()) != len(value):
+            raise ScbLoginError("登入欄位輸入長度不符；未送出登入")
+
+    def prepare_captcha_resubmit(self, page) -> None:
+        try:
+            if not self._click_unique_refresh(page):
+                raise ScbLoginError("無法安全更新驗證碼；未送出登入")
+            for _ in range(10):
+                stale_error = False
+                for scope in self._page_scopes(page):
+                    for selector in (".error", ".alert", "[role='alert']"):
+                        alerts = scope.locator(selector)
+                        for index in range(alerts.count()):
+                            alert = alerts.nth(index)
+                            if alert.is_visible() and re.search(
+                                r"(?<![A-Za-z0-9_])CAPT\d+(?![A-Za-z0-9_])",
+                                " ".join(alert.inner_text().split()),
+                                re.IGNORECASE,
+                            ):
+                                stale_error = True
+                if not stale_error:
+                    return
+                page.wait_for_timeout(300)
+        except ScbLoginError:
+            raise
+        except Exception:
+            raise ScbLoginError("無法安全更新驗證碼；未送出登入") from None
+        raise ScbLoginError("驗證碼錯誤狀態未清除；未送出登入")
+
+    @classmethod
+    def _visible_alert_state(cls, page) -> tuple[bool, bool, bool]:
+        captcha = explicit = other = False
+        for scope in cls._page_scopes(page):
+            for selector in (".error", ".alert", "[role='alert']"):
+                alerts = scope.locator(selector)
+                for index in range(alerts.count()):
+                    alert = alerts.nth(index)
+                    if not alert.is_visible():
+                        continue
+                    text = " ".join(alert.inner_text().split())
+                    if re.search(
+                        r"(?:HIBERR_\d+|(?<![A-Za-z0-9_])E\d{3,4}(?!\d)|"
+                        r"帳號不存在|密碼不正確|帳號[^\r\n]{0,40}鎖定|登入失敗)",
+                        text,
+                        re.IGNORECASE,
+                    ):
+                        explicit = True
+                    elif re.search(
+                        r"(?<![A-Za-z0-9_])CAPT\d+(?![A-Za-z0-9_])",
+                        text,
+                        re.IGNORECASE,
+                    ):
+                        captcha = True
+                    else:
+                        other = True
+        return captcha, explicit, other
 
     def _ocr_captcha(self, page, max_attempts=5):
         """從 captcha img 抽 base64 → OCR 6 碼純數字（送出前安全重試）。"""
-        for n in range(1, max_attempts + 1):
+        attempts = min(max(max_attempts, 1), 5)
+        for n in range(1, attempts + 1):
             try:
-                # 抽 captcha img 的 src（data:image base64）
                 cap_src = page.evaluate("""() => {
                     for (const img of document.querySelectorAll('img')) {
                         if (img.offsetParent === null) continue;
@@ -128,291 +362,125 @@ class ScbCrawler(BankCrawler):
                     }
                     return null;
                 }""")
-                if not cap_src or not cap_src.startswith("data:image"):
-                    _log(f"[scb][cap] 第 {n} 次抓 captcha src 失敗: {(cap_src or '')[:80]}")
-                    continue
-                b64 = cap_src.split(",", 1)[1]
-                raw = base64.b64decode(b64)
+                if not isinstance(cap_src, str) or not cap_src.startswith("data:image") or "," not in cap_src:
+                    raise ValueError
+                raw = base64.b64decode(cap_src.split(",", 1)[1], validate=True)
                 text = ocr_bytes(raw, expected_len=6, alnum_only=True)
-                if text and len(text) == 6 and text.isdigit():
-                    _log(f"[scb][cap] 第 {n} 次 OCR 成功: {text}")
+                if isinstance(text, str) and len(text) == 6 and text.isdigit():
                     return text
-                _log(f"[scb][cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {text!r}），按「重新產生」")
-                # 換圖
+            except Exception:
+                pass
+            if n < attempts:
                 try:
-                    page.evaluate("""() => {
-                        for (const btn of document.querySelectorAll('button, a')) {
-                            const t = (btn.textContent || '').trim();
-                            if (t === '重新產生') {
-                                btn.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }""")
-                    page.wait_for_timeout(1500)
-                except Exception as e:
-                    _log(f"[scb][cap] 換圖失敗: {e}")
-            except Exception as e:
-                _log(f"[scb][cap] OCR 例外: {e}")
+                    if not self._click_unique_refresh(page):
+                        return None
+                except Exception:
+                    return None
         return None
 
-    def login(self, page, *, _captcha_retry_used: bool = False) -> bool:
-        """渣打 SCB 登入；只有明確 CAPT* 錯誤可換圖限重送一次。
-
-        2026-06-12 v2 session 復用：先試 goto dashboard URL，
-        若 session 還在就跳過 login（省一次 login，避免 SCB rate limit）。
-        """
-        # ─── Step 0: 試 session 復用 — 直接訪問 dashboard ───
+    def submit_credentials_once(self, page) -> None:
         try:
-            page.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000)
-            page.wait_for_timeout(5000)
-            if self._logged_in(page):
-                _log(f"[scb][login] ✓ session 復用成功，跳過 login → {page.url}")
-                return True
-            _log(f"[scb][login] session 失效，繼續走 login flow（url={page.url}）")
-        except Exception as e:
-            _log(f"[scb][login] session 試探失敗，走 login flow: {e}")
+            page.wait_for_selector(
+                "input[name='__reCaptcha']", state="visible", timeout=15000
+            )
+            inputs = page.locator("input")
+            layout = []
+            for index in range(inputs.count()):
+                field = inputs.nth(index)
+                if not field.is_visible():
+                    continue
+                field_type = (field.get_attribute("type") or "text").lower()
+                if field_type == "checkbox":
+                    continue
+                box = field.bounding_box()
+                if box is None:
+                    raise ScbLoginError("登入欄位無法安全確認；未送出登入")
+                layout.append(
+                    (
+                        box["y"],
+                        field_type,
+                        field.get_attribute("name") or "",
+                        field.get_attribute("maxlength"),
+                        field,
+                    )
+                )
+            layout.sort(key=lambda item: item[0])
+            if (
+                len(layout) != 4
+                or tuple(item[1] for item in layout) != ("text", "password", "password", "tel")
+                or layout[3][2] != "__reCaptcha"
+                or any(not item[4].is_visible() or not item[4].is_enabled() for item in layout)
+            ):
+                raise ScbLoginError("登入欄位無法安全確認；未送出登入")
 
-        # 若被導去 login 頁就 goto 一次正規 login URL
-        if LOGIN_PATH_HINT not in (page.url or ""):
-            with contextlib.suppress(Exception):
-                page.goto(BASE, timeout=15000)
+            for item, value in zip(
+                layout[:3],
+                (self.creds.national_id, self.creds.username, self.creds.password),
+                strict=True,
+            ):
+                self._keyboard_fill(page, item[4], value)
+            captcha = self._ocr_captcha(page, max_attempts=5)
+            if not captcha:
+                raise ScbLoginError("無法安全辨識驗證碼；未送出登入")
+            self._keyboard_fill(page, layout[3][4], captcha)
 
-        page.wait_for_timeout(8000)  # 等 SPA 渲染
-        _log(f"[scb][login] 起始 url={page.url}")
-
-        if self._logged_in(page):
-            _log("[scb][login] ✓ session 仍有效，跳過 login")
-            return True
-
-        # ─── Step 1: 等欄位出現 + 取 visible input 用 y-order 定位 ───
-        try:
-            page.wait_for_selector("input[name='__reCaptcha']", timeout=15000)
-        except Exception as e:
-            _log(f"[scb][login] ❌ 等欄位 timeout: {e}")
-            return False
-
-        # 找 4 個輸入欄（依 visible y-order，跳過 checkbox）
-        layout = page.evaluate("""() => {
-            const visible = [...document.querySelectorAll('input')]
-                .filter(i => i.offsetParent !== null)
-                .sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
-            const out = [];
-            for (const i of visible) {
-                if (i.type === 'checkbox') continue;
-                out.push({name: i.name, type: i.type, maxlen: i.maxLength});
-            }
-            return out;
-        }""") or []
-        _log(f"[scb][login] visible input 順序: {layout}")
-        if len(layout) < 4:
-            _log(f"[scb][login] ❌ 預期至少 4 個 input（id/user/pwd/captcha），實得 {len(layout)}")
-            return False
-
-        # 對應：[0]=身分證 (text), [1]=使用者名稱 (password), [2]=網銀密碼 (password), [3]=captcha (tel)
-        id_name = layout[0]["name"]
-        user_name = layout[1]["name"]
-        pwd_name = layout[2]["name"]
-        cap_name = layout[3]["name"]
-        if cap_name != "__reCaptcha":
-            _log(f"[scb][login] ⚠️ captcha name 異常: {cap_name}（預期 __reCaptcha）")
-
-        # ─── Step 2: keyboard.type 填三欄（DBS 教訓）───
-        try:
-            for name, val in [(id_name, self.creds.national_id),
-                              (user_name, self.creds.username),
-                              (pwd_name, self.creds.password)]:
-                loc = page.locator(f"input[name='{name}']")
-                loc.click()
-                page.wait_for_timeout(150)
-                loc.click(click_count=3)  # triple-click 選文字
-                page.wait_for_timeout(100)
-                page.keyboard.press("Backspace")  # 清空
-                page.wait_for_timeout(100)
-                page.keyboard.type(val, delay=80)
-                page.wait_for_timeout(300)
-        except Exception as e:
-            _log(f"[scb][login] ❌ keyboard type 失敗: {e}")
-            return False
-
-        # ─── Step 3: OCR captcha + 填入 ───
-        cap_text = self._ocr_captcha(page, max_attempts=5)
-        if not cap_text:
-            _log("[scb][login] ❌ OCR 5 次都失敗，不送 login（保護帳號）")
-            return False
-        try:
-            cap_loc = page.locator("input[name='__reCaptcha']")
-            cap_loc.click()
-            page.wait_for_timeout(150)
-            cap_loc.click(click_count=3)
-            page.wait_for_timeout(100)
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(100)
-            page.keyboard.type(cap_text, delay=80)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            _log(f"[scb][login] ❌ captcha fill 失敗: {e}")
-            return False
-
-        # ─── Step 4: 驗 length 不對就 abort ───
-        check = page.evaluate(
-            """(args) => {
-                const get = (name) => {
-                    const el = document.querySelector(`input[name='${name}']`);
-                    return el ? el.value.length : -1;
-                };
-                return {
-                    id_len: get(args.id_name),
-                    user_len: get(args.user_name),
-                    pwd_len: get(args.pwd_name),
-                    cap_len: get('__reCaptcha'),
-                };
-            }""",
-            {"id_name": id_name, "user_name": user_name, "pwd_name": pwd_name},
-        ) or {}
-        _log(f"[scb][login] fill 後: {check}")
-        targets = {
-            "id_len": len(self.creds.national_id),
-            "user_len": len(self.creds.username),
-            "pwd_len": len(self.creds.password),
-            "cap_len": 6,
-        }
-        for k, want in targets.items():
-            if check.get(k, 0) != want:
-                _log(f"[scb][login] ❌ {k}={check.get(k)} ≠ {want}，不送 login（保護帳號）")
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(_debug_dir() / "02_fill_failed.png"), full_page=True)
-                return False
-
-        # ─── Step 5: click 登入鈕 ───
-        _log(f"[scb][login] 送出 login (captcha={cap_text})")
-        clicked = page.evaluate("""() => {
-            for (const btn of document.querySelectorAll('button')) {
-                if (btn.type !== 'submit') continue;
-                const cls = (btn.className || '').toString();
-                if (cls.includes('b-bg-green-d') && (btn.textContent || '').trim() === '登入') {
-                    btn.click();
-                    return {ok: true, cls: cls.slice(0, 60)};
-                }
-            }
-            return {ok: false, error: 'login_btn_not_found'};
-        }""")
-        _log(f"[scb][login] click 登入: {clicked}")
-        if not clicked.get("ok"):
-            _log("[scb][login] ❌ 找不到登入鈕")
-            return False
-
-        # ─── Step 6: 等 redirect（poll 直到 URL 變化或 timeout）───
-        for _ in range(30):  # 最多 30 秒
-            page.wait_for_timeout(1000)
-            if LOGIN_PATH_HINT not in (page.url or ""):
-                break
-        final_url = page.url or ""
-        _log(f"[scb][login] 送出後 url={final_url}")
-
-        # ─── Step 6.5: 處理「重複登入」modal（鐵律：直接踢）───
-        # 渣打 modal: 「您可能先前未正常登出或已經在別台裝置登入...〔確定登入〕」
-        # 此 modal 出現 = 帳密已驗證通過（by-design 非密碼錯，類同 taishin/fubon dup-login）
-        # poll 最多 30s 等 modal 出現或 URL 變化
-        dup_modal: dict = {}
-        for _ in range(30):
-            if LOGIN_PATH_HINT not in (page.url or ""):
-                break  # URL 已換 = 不會有 modal 了
-            dup_modal = page.evaluate("""() => {
-                for (const el of document.querySelectorAll('div, section, dialog, [role=dialog]')) {
-                    if (el.offsetParent === null) continue;
-                    const t = (el.textContent || '').slice(0, 500);
-                    if (t.includes('未正常登出') || t.includes('已經在別台裝置') || t.includes('其他裝置將會被登出')) {
-                        return {found: true, preview: t.slice(0, 200)};
-                    }
-                }
-                return {found: false};
-            }""") or {}
-            if dup_modal.get("found"):
-                break
-            page.wait_for_timeout(1000)
-        if dup_modal.get("found"):
-            _log(f"[scb][login] 偵測到重複登入 modal: {dup_modal.get('preview', '')[:80]}")
-            _log("[scb][login] 偵測到重複登入,直接踢掉前一個 session")
-            try:
-                confirmed = page.evaluate("""() => {
-                    for (const btn of document.querySelectorAll('button, a')) {
-                        if (btn.offsetParent === null) continue;
-                        const t = (btn.textContent || '').trim();
-                        if (t === '確定登入' || t === '確定' || t === '繼續登入') {
-                            btn.click();
-                            return {ok: true, text: t};
-                        }
-                    }
-                    return {ok: false};
-                }""")
-                _log(f"[scb][login] click 〔確定登入〕: {confirmed}")
-                # poll 等 dup-modal 處理後 URL 變化
-                for _ in range(20):
-                    page.wait_for_timeout(1000)
-                    if LOGIN_PATH_HINT not in (page.url or ""):
-                        break
-                final_url = page.url or ""
-                _log(f"[scb][login] dup-modal 處理後 url={final_url}")
-            except Exception as e:
-                _log(f"[scb][login] dup-modal click 失敗: {e}")
-
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(_debug_dir() / "03_after_login.png"), full_page=True)
-
-        if self._logged_in(page):
-            _log(f"[scb][login] ✅ 登入成功 → {final_url}")
-            return True
-
-        # 失敗：找錯誤訊息（給使用者 debug 用，不重打）
-        # 2026-06-18: 套 dbs sibling lesson — keyword whitelist 過濾正常 CTA
-        err_msg = ""
-        is_server_busy = False
-        try:
-            err_msg = page.evaluate(r"""() => {
-                const ERROR_KW = /錯誤|不正確|失敗|鎖定|逾時|驗證碼|帳號不存在|重試|無效|忙線|稍後|invalid|error|fail|locked|expired|busy|HIBERR|E\d{3,4}/i;
-                const sels = ['.error', '.alert', '[class*=error]', '[class*=Error]',
-                              '[role=alert]', '[class*=alert]', '[class*=Alert]',
-                              '[class*=msg]', '[class*=Msg]'];
-                for (const sel of sels) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        if (el.offsetParent === null) continue;
-                        const t = (el.textContent || '').trim();
-                        if (t && t.length < 300 && t.length > 5 && ERROR_KW.test(t)) return t;
-                    }
-                }
-                // 找 body 含特定 keyword
-                const bodyText = (document.body.innerText || '').slice(0, 2000);
-                const m = bodyText.match(/HIBERR_\d+[^\n]{0,100}/);
-                if (m) return m[0];
-                const m2 = bodyText.match(/E\d{3,4}[:：][^\n]{0,80}/);
-                if (m2) return m2[0];
-                const m3 = bodyText.match(/CAPT\d+[:：]?[^\n]{0,80}/i);
-                if (m3) return m3[0];
-                return '';
-            }""") or ""
-            # 判斷是不是 server-busy（HIBERR_000010 系統忙線）
-            if "HIBERR" in err_msg or "系統忙線" in err_msg or "稍後再試" in err_msg:
-                is_server_busy = True
+            candidates = page.locator("button[type='submit']")
+            eligible = []
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if (
+                    candidate.is_visible()
+                    and candidate.is_enabled()
+                    and " ".join(candidate.inner_text().split()) == "登入"
+                    and "b-bg-green-d" in (candidate.get_attribute("class") or "").split()
+                ):
+                    eligible.append(candidate)
+            if len(eligible) != 1:
+                raise ScbLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            button = eligible[0]
+            stale_captcha, stale_explicit, stale_other = self._visible_alert_state(page)
+            if stale_explicit or stale_other:
+                raise ScbLoginError("登入頁已有未解決提示；未送出登入")
+        except ScbLoginError:
+            raise
         except Exception:
-            pass
+            raise ScbLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        captcha_invalid = bool(re.search(r"\bCAPT\d+\b", err_msg, re.IGNORECASE))
-        if captcha_invalid and not _captcha_retry_used:
-            _log(f"[scb][login] bank error=captcha_invalid ({err_msg[:80]})，換新圖限重試一次")
-            return self.login(page, _captcha_retry_used=True)
+        try:
+            button.click(timeout=8000)
+        except Exception:
+            raise ScbLoginError("登入送出狀態不明；禁止自動重試") from None
 
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        if is_server_busy:
-            msg = f"SCB server 忙線（非密碼錯，未累計失敗）: {err_msg}\n{snap}"
-            _log(f"[scb][login] ⚠️ {msg}")
-            _log("[scb][login] 銀行端忙線中,請稍後再試")
-        else:
-            msg = f"SCB 登入失敗（url={final_url}）: {err_msg or '未知原因'}\n{snap}"
-            _log(f"[scb][login] ❌ {msg}")
-        raise ScbLoginError(msg)
+        try:
+            for _ in range(30):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                modal_visible = False
+                for scope in self._page_scopes(page):
+                    for selector in (".modal.show", "[role='dialog']"):
+                        blockers = scope.locator(selector)
+                        if any(
+                            blockers.nth(index).is_visible()
+                            for index in range(blockers.count())
+                        ):
+                            modal_visible = True
+                captcha, explicit, other = self._visible_alert_state(page)
+                if explicit:
+                    return
+                if (stale_captcha or captcha) and (modal_visible or other):
+                    raise ScbLoginError("登入送出後出現衝突狀態；禁止自動重試")
+                if stale_captcha:
+                    if not captcha:
+                        stale_captcha = False
+                elif captcha:
+                    return
+                if modal_visible or other:
+                    return
+        except Exception:
+            raise ScbLoginError("登入送出後狀態無法安全確認；禁止自動重試") from None
+        if stale_captcha:
+            raise ScbLoginError("登入送出後沒有新的驗證碼結果；禁止自動重試")
 
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:

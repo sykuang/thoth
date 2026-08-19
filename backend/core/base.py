@@ -575,6 +575,9 @@ class BankCrawler(ABC):
     def submit_credentials_once(self, page) -> None:
         raise NotImplementedError
 
+    def prepare_captcha_resubmit(self, page) -> None:
+        """Prepare one reducer-authorized CAPTCHA resubmission, if needed."""
+
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         return ()
 
@@ -645,6 +648,8 @@ class BankCrawler(ABC):
             ):
                 action_counts[outcome.rule_name] += 1
             if next_budget.credential_submissions == budget.credential_submissions + 1:
+                if next_budget.captcha_resubmits == budget.captcha_resubmits + 1:
+                    self.prepare_captcha_resubmit(page)
                 self.submit_credentials_once(page)
             if next_budget.reloads == budget.reloads + 1:
                 page.reload()
