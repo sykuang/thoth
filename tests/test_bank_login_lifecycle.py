@@ -330,6 +330,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
         "dbs",
         "esun",
         "fubon",
+        "hsbc",
         "linebank",
         "rakuten",
         "scb",
