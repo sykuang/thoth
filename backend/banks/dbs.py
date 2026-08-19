@@ -16,10 +16,9 @@
 
   登入流程:
     Step 1: page goto /digitw/ → 自動 redirect /digitw/login → 等 8s SPA hydrate
-    Step 2: native input value setter + dispatch input/change/blur 寫 username & password
-            （React reactive binding，純 element.value=xxx 不會觸發 onChange）
-    Step 3: click #loginbutton
-    Step 4: 等 router 從 /login → /digital/... (登入成功) 或 stay /login (失敗)
+    Step 2: shared checkpoints 先分類 terminal blocker，再以 true keyboard 輸入帳密
+    Step 3: 唯一、可見且 enabled 的 #loginbutton 原生 click 一次
+    Step 4: 等登入身分或 scoped response，交回 shared evaluator 判定
 
   ⚠️ 鐵律 max_attempts=1 — 失敗 raise DbsLoginError，絕不重打（會鎖帳號）
 
@@ -36,14 +35,17 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
-from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import DbsCreds
+from backend.core.login_checkpoints import CheckpointKind, CheckpointPhase, LoginCheckpointRule
 
 BASE = "https://internet-banking.dbs.com.tw/digitw/"
 LOGIN_PATH_HINT = "/digitw/login"
@@ -83,6 +85,8 @@ def _dbs_card_bill_fact(out: dict):
 
 
 class DbsCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="dbs")
         self.creds = DbsCreds.load()
@@ -91,181 +95,167 @@ class DbsCrawler(BankCrawler):
         return "dbs.com.tw"
 
     def _logged_in(self, page) -> bool:
-        """W (2026-06-17): positive signal 4 條件 AND（純 SPA，對齊 SCSB 鐵律）
-
-        1) urlOk: dbs.com.tw 域內 + 不在 /digitw/login
-        2) noLoginForm: #username + #password + #loginbutton 都不可見
-        3) lenOk: body innerText >= 300（W 2026-06-18: 從 500 降 300, 對齊 hsbc SPA
-           門檻——cloud evidence 揭 DBS overview clean innerText 僅 341 字，500 門檻
-           造成 false negative。SPA 不像傳統 page 那樣大段文字，門檻必降。詳見
-           wiki/concepts/bank-crawler-login-positive-signal-rule.md SPA 門檻表）
-        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
-        """
         try:
-            url = (page.url or "").lower()
-            if "dbs.com.tw" not in url or LOGIN_PATH_HINT in url:
+            parsed = urlsplit(page.url or "")
+            if (
+                parsed.hostname != "internet-banking.dbs.com.tw"
+                or LOGIN_PATH_HINT in parsed.path.lower()
+            ):
                 return False
-
-            ok = page.evaluate("""
-                () => {
-                  const visible = (e) => {
-                    if (!e) return false;
-                    const r = e.getBoundingClientRect();
-                    const cs = getComputedStyle(e);
-                    return !!(r.width || r.height || e.getClientRects().length)
-                      && cs.display !== 'none' && cs.visibility !== 'hidden';
-                  };
-                  const noLoginForm = !visible(document.querySelector('#username'))
-                    && !visible(document.querySelector('#password'))
-                    && !visible(document.querySelector('#loginbutton'));
-                  const body = document.body && document.body.innerText || '';
-                  const lenOk = body.length >= 300;
-                  const KW = ['帳戶總覽','資產總覽','登出','logout','存款','轉帳','信用卡',
-                              '台幣','外幣','基金','投資','貸款','繳費','個人設定','安全'];
-                  const kw = KW.filter(k => body.toLowerCase().includes(k.toLowerCase())).length;
-                  return noLoginForm && lenOk && kw >= 2;
-                }
-            """)
-            return bool(ok)
+            scopes = [
+                page,
+                *(frame for frame in page.frames if frame is not page.main_frame),
+            ]
+            body_parts = []
+            for scope in scopes:
+                for selector in ("#username", "#password", "#loginbutton"):
+                    candidates = scope.locator(selector)
+                    if any(
+                        candidates.nth(index).is_visible()
+                        for index in range(candidates.count())
+                    ):
+                        return False
+                bodies = scope.locator("body")
+                body_parts.extend(
+                    bodies.nth(index).inner_text()
+                    for index in range(bodies.count())
+                )
+            body = "\n".join(body_parts)
+            identity = "帳戶總覽" in body or "資產總覽" in body
+            logout = "登出" in body or re.search(
+                r"(?<![A-Za-z])logout(?![A-Za-z])", body, re.IGNORECASE
+            ) is not None
+            return len(body) >= 300 and logout and identity
         except Exception:
             return False
 
     def login(self, page) -> bool:
-        """DBS digibank 登入 — 鐵律 max_attempts=1。"""
-        page.wait_for_timeout(8000)  # 等 SPA hydrate
-        _log(f"[dbs][login] 起始 url={page.url}")
+        return self._shared_login(page)
 
-        # session 復用偵測
-        if self._logged_in(page):
-            _log("[dbs][login] ✓ session 仍有效（已不在 login 頁），跳過 login")
-            return True
+    def prepare_login_page(self, page) -> None:
+        page.wait_for_timeout(8000)
 
-        # 確認在登入頁
-        if LOGIN_PATH_HINT not in (page.url or ""):
-            _log(f"[dbs][login] ⚠️ 不在 login 頁: {page.url}")
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
 
-        # ─── Step 1: 等欄位出現 ───
-        try:
-            page.wait_for_selector("#username", timeout=15000)
-            page.wait_for_selector("#password", timeout=5000)
-            page.wait_for_selector("#loginbutton", timeout=5000)
-        except Exception as e:
-            _log(f"[dbs][login] ❌ 等欄位 timeout: {e}")
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(_debug_dir() / "01_no_fields.png"), full_page=True)
-            return False
-
-        # ─── Step 2: fill 帳密（純 keyboard type，真實鍵盤模擬）───
-        # 2026-06-12 v1 教訓：native setter + dispatch → password 只收到 1 字
-        # 2026-06-12 v2 教訓：page.fill → password 也只收到 1 字（同樣被 React onChange 吞）
-        #   + Ctrl+A/Delete 清不掉 page.fill 寫入的 value，反而疊加
-        # v3：純 keyboard.type 從頭打，click → triple-click 選文字 → Backspace 清空 → type
-        try:
-            # username
-            u_loc = page.locator("#username")
-            u_loc.click()
-            page.wait_for_timeout(200)
-            # 三連點選整行文字（DBS React 接得到）
-            u_loc.click(click_count=3)
-            page.wait_for_timeout(100)
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(100)
-            page.keyboard.type(self.creds.username, delay=80)
-            page.wait_for_timeout(300)
-
-            # password
-            p_loc = page.locator("#password")
-            p_loc.click()
-            page.wait_for_timeout(200)
-            p_loc.click(click_count=3)
-            page.wait_for_timeout(100)
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(100)
-            page.keyboard.type(self.creds.password, delay=80)
-            page.wait_for_timeout(500)
-        except Exception as e:
-            _log(f"[dbs][login] ❌ keyboard type 失敗: {e}")
-            return False
-
-        check = page.evaluate("""() => {
-            const u = document.getElementById('username');
-            const p = document.getElementById('password');
-            return {
-                u_len: u ? u.value.length : -1,
-                p_len: p ? p.value.length : -1,
-            };
-        }""") or {}
-        _log(f"[dbs][login] keyboard type 後: {check}")
-
-        u_target = len(self.creds.username)
-        p_target = len(self.creds.password)
-
-        if check.get("u_len", 0) != u_target or check.get("p_len", 0) != p_target:
-            _log(f"[dbs][login] ❌ fill 長度不符 (u={check.get('u_len')}/{u_target}, p={check.get('p_len')}/{p_target})")
-            _log("[dbs][login] 為保護帳號，**不送出 login**（純 fill 失敗，未累計密碼錯）")
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(_debug_dir() / "02_fill_failed.png"), full_page=True)
-            return False
-
-        # ─── Step 3: click #loginbutton ───
-        _log("[dbs][login] 送出 login")
-        try:
-            page.evaluate("""() => {
-                const btn = document.getElementById('loginbutton');
-                if (btn) btn.click();
-            }""")
-        except Exception as e:
-            _log(f"[dbs][login] ❌ click loginbutton 失敗: {e}")
-            return False
-
-        # ─── Step 4: 等 redirect + SPA hydrate ───
-        # 2026-06-18: 改 retry loop (sub-pattern 對齊 ctbc 20s)。雲端 SPA
-        # hydrate 比本機慢，舊 `wait 10s + _logged_in` 一次定生死 → race
-        # condition 假 fail（evidence 顯示 body 已渲染完整菜單但首次判定
-        # 時還沒好，導致誤回報「登入失敗」抓到的 alerts 是 DBS 頁面正常
-        # CTA「開立定存/了解更多/申請貸款」）。改 retry：每秒判一次最多 20s。
-        page.wait_for_timeout(3000)  # 給 click→navigation 最初一段
-        for _ in range(20):
-            page.wait_for_timeout(1000)
-            if self._logged_in(page):
-                final_url = page.url or ""
-                _log(f"[dbs][login] ✅ 登入成功 → {final_url}")
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(_debug_dir() / "03_after_login.png"), full_page=True)
-                return True
-
-        final_url = page.url or ""
-        _log(f"[dbs][login] ❌ 送出後 ~20s 仍未 _logged_in, url={final_url}")
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(_debug_dir() / "03_after_login.png"), full_page=True)
-
-        # 失敗：找錯誤訊息（給用戶 debug 用, 不重打）
-        # 2026-06-18: 原本盲掃 .alert / [role=alert] / .error class 結果
-        # 把 DBS 已登入頁的正常 CTA（「開立定存」「了解更多」「申請貸款」）
-        # 也撈進來當錯誤訊息 → 誤導 user。改 keyword whitelist：只認真正
-        # 錯誤關鍵字（錯誤/密碼/失敗/鎖定/逾時/驗證/帳號不存在/重試等）。
-        err_msg = ""
-        with contextlib.suppress(Exception):
-            err_msg = page.evaluate(r"""() => {
-                const ERROR_KW = /錯誤|不正確|失敗|鎖定|逾時|驗證碼|帳號不存在|重試|無效|invalid|error|fail|locked|expired/i;
-                const sels = ['.error', '.alert', '[class*=error]', '[class*=Error]',
-                              '[role=alert]', '[class*=alert]', '[class*=Alert]'];
-                for (const sel of sels) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        if (el.offsetParent === null) continue;
-                        const t = (el.textContent || '').trim();
-                        if (t && t.length < 200 && ERROR_KW.test(t)) return t;
-                    }
-                }
-                return '';
-            }""") or ""
-
-        msg = (
-            f"DBS 登入失敗（url={final_url}）: {err_msg or '未知原因'}\n"
-            f"{_login_snapshot(page)}"
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post = (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE)
+        otp = re.compile(
+            r"^[\s\S]{0,400}(?:(?<![A-Za-z])OTP(?![A-Za-z])|一次性密碼|簡訊驗證碼|裝置驗證|信任此裝置|新裝置登入)[\s\S]{0,400}$",
+            re.IGNORECASE,
         )
-        _log(f"[dbs][login] ❌ {msg}")
-        raise DbsLoginError(msg)
+        password = re.compile(
+            r"^[\s\S]{0,200}(?:(?:必須|強制|請立即)(?:變更|修改|更新)(?:您的)?密碼|密碼已到期)[\s\S]{0,200}$"
+        )
+        error = re.compile(
+            r"^\s*(?:帳號不存在|密碼不正確|帳號.{0,20}(?:已)?(?:被)?鎖定|登入失敗|invalid credentials|account locked)[。.!！\s]*$",
+            re.IGNORECASE,
+        )
+        rules = []
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"dbs-otp-required-{suffix}", bank="dbs", phases=all_phases,
+                kind=CheckpointKind.OTP_REQUIRED, container_selector=selector,
+                required_body_pattern=otp,
+            ))
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"dbs-password-change-required-{suffix}", bank="dbs", phases=all_phases,
+                kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED, container_selector=selector,
+                required_body_pattern=password,
+            ))
+        for suffix, selector in (("error", ".error"), ("alert", ".alert"), ("role-alert", "[role='alert']")):
+            rules.append(LoginCheckpointRule(
+                name=f"dbs-explicit-login-error-{suffix}", bank="dbs", phases=post,
+                kind=CheckpointKind.EXPLICIT_LOGIN_ERROR, container_selector=selector,
+                required_body_pattern=error,
+            ))
+        for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
+            rules.append(LoginCheckpointRule(
+                name=f"dbs-unknown-{suffix}", bank="dbs", phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector=selector,
+            ))
+        rules.append(LoginCheckpointRule(
+            name="dbs-login-form-still-visible", bank="dbs", phases=post,
+            kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector="#username",
+        ))
+        return tuple(rules)
+
+    def submit_credentials_once(self, page) -> None:
+        fields = (
+            ("#username", self.creds.username, 300),
+            ("#password", self.creds.password, 500),
+        )
+        try:
+            page.wait_for_selector("#username", state="visible", timeout=15000)
+            page.wait_for_selector("#password", state="visible", timeout=5000)
+            page.wait_for_selector("#loginbutton", state="visible", timeout=5000)
+            for selector, value, final_wait in fields:
+                candidates = page.locator(selector)
+                if candidates.count() != 1:
+                    raise DbsLoginError("登入欄位無法安全填寫；未送出")
+                field = candidates.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise DbsLoginError("登入欄位無法安全填寫；未送出")
+                field.click()
+                page.wait_for_timeout(200)
+                field.click(click_count=3)
+                page.wait_for_timeout(100)
+                page.keyboard.press("Backspace")
+                page.wait_for_timeout(100)
+                page.keyboard.type(value, delay=80)
+                page.wait_for_timeout(final_wait)
+                if len(field.input_value()) != len(value):
+                    raise DbsLoginError("登入欄位輸入長度不符；未送出")
+        except DbsLoginError:
+            raise
+        except Exception:
+            raise DbsLoginError("登入欄位無法安全填寫；未送出") from None
+
+        try:
+            candidates = page.locator("#loginbutton")
+            if candidates.count() != 1:
+                raise DbsLoginError("找不到唯一且可操作的登入按鈕；未送出")
+            submit = candidates.nth(0)
+            if (
+                not submit.is_visible()
+                or not submit.is_enabled()
+                or " ".join(submit.inner_text().split()) != "登入"
+            ):
+                raise DbsLoginError("找不到唯一且可操作的登入按鈕；未送出")
+        except DbsLoginError:
+            raise
+        except Exception:
+            raise DbsLoginError("無法安全確認登入按鈕；未送出") from None
+
+        try:
+            submit.click(timeout=8000)
+        except Exception:
+            raise DbsLoginError("送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(3000)
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                scopes = [
+                    page,
+                    *(frame for frame in page.frames if frame is not page.main_frame),
+                ]
+                for scope in scopes:
+                    for selector in (
+                        ".modal.show", "[role='dialog']", ".error", ".alert", "[role='alert']",
+                    ):
+                        candidates = scope.locator(selector)
+                        if any(
+                            candidates.nth(index).is_visible()
+                            for index in range(candidates.count())
+                        ):
+                            return
+        except Exception:
+            raise DbsLoginError("狀態無法安全確認；禁止自動重試") from None
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """DBS collect 第一輪：dump 登入後 URL + page text + endpoint 地圖。

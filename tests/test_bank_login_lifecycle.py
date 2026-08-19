@@ -16,6 +16,7 @@ from backend.core.login_checkpoints import (
     CheckpointOutcome,
     CheckpointPhase,
     DEFAULT_ACTION_SELECTOR,
+    LoginCheckpointBlocked,
     LoginCheckpointRule,
 )
 
@@ -86,7 +87,7 @@ class _StagedCrawler(BankCrawler):
         self.events.append("collect")
         return BankCollectResult(card_bill_facts_ok=False)
 
-    def attach_dialog_handler(self, page) -> None:
+    def attach_shared_dialog_handler(self, page) -> None:
         self.events.append("attach-dialog")
 
     def logout(self, page) -> bool:
@@ -122,6 +123,64 @@ def _outcomes(*outcomes: CheckpointOutcome):
         return next(pending)
 
     return evaluate
+
+
+def test_shared_dialog_handler_is_opaque_dismiss_only_and_terminal() -> None:
+    crawler = _StagedCrawler(name="staged")
+    callbacks = {}
+    page = SimpleNamespace(on=lambda event, callback: callbacks.setdefault(event, callback))
+
+    class Dialog:
+        dismissed = 0
+
+        @property
+        def message(self):
+            raise AssertionError("shared dialog handler must not inspect private text")
+
+        def accept(self):
+            raise AssertionError("shared dialog handler must never accept")
+
+        def dismiss(self):
+            self.dismissed += 1
+
+    BankCrawler.attach_shared_dialog_handler(crawler, page)
+    dialog = Dialog()
+    callbacks["dialog"](dialog)
+
+    assert dialog.dismissed == 1
+    assert crawler._shared_dialog_blocked is True
+    crawler.submissions = 0
+    with pytest.raises(LoginCheckpointBlocked):
+        crawler._shared_login(SimpleNamespace())
+    assert crawler.submissions == 0
+
+
+def test_dialog_during_protocol_evaluation_blocks_before_resubmit(monkeypatch) -> None:
+    protocol = _rule(
+        "protocol",
+        CheckpointKind.PROTOCOL_RESUBMIT,
+        phases=(CheckpointPhase.POST_SUBMIT,),
+    )
+    crawler = _StagedCrawler(name="staged", rules=(protocol,))
+    crawler._shared_dialog_blocked = False
+    calls = 0
+
+    def evaluate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+        crawler._shared_dialog_blocked = True
+        return CheckpointOutcome(
+            CheckpointKind.PROTOCOL_RESUBMIT,
+            rule_name="protocol",
+        )
+
+    monkeypatch.setattr("backend.core.base.evaluate_login_checkpoint", evaluate)
+    with pytest.raises(LoginCheckpointBlocked):
+        crawler._shared_login(SimpleNamespace())
+
+    assert crawler.submissions == 1
 
 
 def _rule(
@@ -197,7 +256,7 @@ def test_page_action_attaches_collector_before_dialog_and_prepare(monkeypatch, t
         crawler.events.extend(("collector-assigned-at-dialog", "attach-dialog"))
 
     monkeypatch.setattr(ResponseCollector, "attach", attach)
-    monkeypatch.setattr(crawler, "attach_dialog_handler", attach_dialog)
+    monkeypatch.setattr(crawler, "attach_shared_dialog_handler", attach_dialog)
 
     result, _ = _run(
         monkeypatch,
@@ -268,6 +327,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
     assert _opted_in_bank_modules() == {
         "cathay",
         "ctbc",
+        "dbs",
         "esun",
         "linebank",
         "rakuten",
@@ -887,7 +947,7 @@ class _MissingStagedMethodsCrawler(BankCrawler):
         self.events.append("collect")
         return BankCollectResult(card_bill_facts_ok=False)
 
-    def attach_dialog_handler(self, page) -> None:
+    def attach_shared_dialog_handler(self, page) -> None:
         self.events.append("attach-dialog")
 
     def logout(self, page) -> bool:

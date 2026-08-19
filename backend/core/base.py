@@ -501,6 +501,7 @@ class BankCrawler(ABC):
     # 子類可 override：例 HSBC 首次登入有裝置綁定 OTP，可拉到 600 秒減少 OTP 觸發。
     SESSION_MAX_AGE_SECONDS: int = 180
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = False
+    _shared_dialog_blocked: bool = False
 
     def __post_init__(self):
         self.session_dir = DATA_ROOT / f"{self.name}_session"
@@ -605,6 +606,12 @@ class BankCrawler(ABC):
         ) + 8
 
         for _ in range(max_steps):
+            if getattr(self, "_shared_dialog_blocked", False):
+                reduce_login_checkpoint(
+                    phase,
+                    budget,
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
             active_rules = tuple(
                 rule
                 if (
@@ -640,6 +647,12 @@ class BankCrawler(ABC):
             )
             active_rules_by_name = {rule.name: rule for rule in active_rules}
             outcome = validate_login_checkpoint_outcome(outcome, active_rules)
+            if getattr(self, "_shared_dialog_blocked", False):
+                reduce_login_checkpoint(
+                    phase,
+                    budget,
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
             next_phase, next_budget = reduce_login_checkpoint(phase, budget, outcome)
 
             if (
@@ -739,7 +752,11 @@ class BankCrawler(ABC):
             self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
             # 所有銀行都掛 dialog handler——銀行常用 JS alert/confirm 做風險提醒
             # （重複登入確認、查詢前必填、敏感操作確認），headless 沒人按會卡死整個流程
-            self.attach_dialog_handler(page)
+            if self.USES_SHARED_LOGIN_CHECKPOINTS:
+                self._shared_dialog_blocked = False
+                self.attach_shared_dialog_handler(page)
+            else:
+                self.attach_dialog_handler(page)
             logged_in = False
             try:
                 try:
@@ -864,6 +881,15 @@ class BankCrawler(ABC):
                     d.accept()
             except Exception as e:
                 print(f"[{self.name}][dialog] handle 失敗: {e}", file=__import__("sys").stderr)
+        page.on("dialog", _on_dialog)
+
+    def attach_shared_dialog_handler(self, page) -> None:
+        """Dismiss opaque JS dialogs and let the typed lifecycle fail closed."""
+        def _on_dialog(dialog):
+            self._shared_dialog_blocked = True
+            with contextlib.suppress(Exception):
+                dialog.dismiss()
+
         page.on("dialog", _on_dialog)
 
     # ─────────────────────────────────────────────────────────
