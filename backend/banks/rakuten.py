@@ -153,6 +153,11 @@ class RakutenCrawler(BankCrawler):
         "登出前一個裝置，是否以此裝置登入？"
     )
     REFERRAL_PROMO_PREFIX = "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~"
+    INSURANCE_PROMO_PREFIX = "輸入專案代碼【RICB】投保即可抽大獎"
+    PROMO_DISMISSALS = (
+        (REFERRAL_PROMO_PREFIX, "稍後再看"),
+        (INSURANCE_PROMO_PREFIX, "略過了"),
+    )
     LOGOUT_BODY = "登出網路銀行 確認登出本系統？"
 
     def __init__(self) -> None:
@@ -225,28 +230,32 @@ class RakutenCrawler(BankCrawler):
             return True
         return False
 
-    def _dismiss_referral_promo(self, page) -> bool:
+    def _dismiss_known_promo(self, page) -> bool:
         modals = page.locator(self.VISIBLE_CONFIRM_SELECTOR)
-        later_pattern = re.compile(r"^\s*稍後再看\s*$")
         for index in range(modals.count()):
             modal = modals.nth(index)
             body = " ".join(modal.locator(".modal-body").inner_text().split())
-            if not body.startswith(self.REFERRAL_PROMO_PREFIX):
+            action_text = next((
+                action
+                for prefix, action in self.PROMO_DISMISSALS
+                if body.startswith(prefix)
+            ), None)
+            if action_text is None:
                 continue
-            later = modal.locator(
+            dismiss = modal.locator(
                 "a:visible, button:visible, [role=button]:visible",
-            ).filter(has_text=later_pattern)
-            if later.count() != 1 or not later.first.is_visible():
-                raise RakutenLoginError("樂天推薦活動提示缺少唯一稍後再看按鈕")
-            later.first.click()
+            ).filter(has_text=re.compile(rf"^\s*{re.escape(action_text)}\s*$"))
+            if dismiss.count() != 1 or not dismiss.first.is_visible():
+                raise RakutenLoginError("樂天活動提示缺少唯一略過按鈕")
+            dismiss.first.click()
             modal.wait_for(state="hidden", timeout=10000)
             return True
         return False
 
     def _resolve_known_blocking_modals(self, page) -> bool:
         duplicate = self._resolve_duplicate_login_modal(page)
-        referral = self._dismiss_referral_promo(page)
-        return duplicate or referral
+        promo = self._dismiss_known_promo(page)
+        return duplicate or promo
 
     @staticmethod
     def _blocking_modal_text(page) -> str | None:

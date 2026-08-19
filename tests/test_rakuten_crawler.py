@@ -179,30 +179,60 @@ def test_duplicate_like_unknown_modal_is_not_confirmed() -> None:
     assert not crawler._resolve_duplicate_login_modal(Page())
 
 
-def test_known_referral_modal_clicks_only_later_action() -> None:
+@pytest.mark.parametrize(
+    ("body_text", "action_text"),
+    [
+        (
+            "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~\n"
+            "★推薦禮：活動說明\n活動期間: 2026/7/1~2026/9/30",
+            "稍後再看",
+        ),
+        (
+            "輸入專案代碼【RICB】投保即可抽大獎\n"
+            "★滿額禮：抽Nespresso 膠囊咖啡機\n2026/08/01-2026/08/31",
+            "略過了",
+        ),
+    ],
+)
+def test_known_promo_clicks_only_allowlisted_action(body_text: str, action_text: str) -> None:
     events: list[str] = []
-    page, modals, modal, body, actions, later = (Mock() for _ in range(6))
+    page, modals, modal, body, actions, dismiss = (Mock() for _ in range(6))
     page.locator.return_value = modals
     modals.count.return_value = 1
     modals.nth.return_value = modal
-    body.inner_text.return_value = (
-        "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~\n"
-        "★推薦禮：活動說明\n活動期間: 2026/7/1~2026/9/30"
-    )
+    body.inner_text.return_value = body_text
     modal.locator.side_effect = lambda selector: body if selector == ".modal-body" else actions
     actions.filter.return_value = actions
     actions.count.return_value = 1
-    actions.first = later
-    later.is_visible.return_value = True
-    later.click.side_effect = lambda: events.append("later")
+    actions.first = dismiss
+    dismiss.is_visible.return_value = True
+    dismiss.click.side_effect = lambda: events.append("dismiss")
     modal.wait_for.side_effect = lambda **kwargs: events.append(
         f"wait:{kwargs['state']}:{kwargs['timeout']}"
     )
     crawler = object.__new__(RakutenCrawler)
 
-    assert crawler._dismiss_referral_promo(page)
-    assert events == ["later", "wait:hidden:10000"]
-    assert actions.filter.call_args.kwargs["has_text"].fullmatch("稍後再看")
+    assert crawler._dismiss_known_promo(page)
+    assert events == ["dismiss", "wait:hidden:10000"]
+    assert actions.filter.call_args.kwargs["has_text"].fullmatch(action_text)
+
+
+def test_known_modal_resolver_dismisses_insurance_campaign(monkeypatch) -> None:
+    page, modals, modal, body, actions, dismiss = (Mock() for _ in range(6))
+    page.locator.return_value = modals
+    modals.count.return_value = 1
+    modals.nth.return_value = modal
+    body.inner_text.return_value = "輸入專案代碼【RICB】投保即可抽大獎\n活動期間"
+    modal.locator.side_effect = lambda selector: body if selector == ".modal-body" else actions
+    actions.filter.return_value = actions
+    actions.count.return_value = 1
+    actions.first = dismiss
+    dismiss.is_visible.return_value = True
+    crawler = object.__new__(RakutenCrawler)
+    monkeypatch.setattr(crawler, "_resolve_duplicate_login_modal", lambda _page: False)
+
+    assert crawler._resolve_known_blocking_modals(page)
+    dismiss.click.assert_called_once_with()
 
 
 def test_hidden_static_modals_are_not_blockers() -> None:
