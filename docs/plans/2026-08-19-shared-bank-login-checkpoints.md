@@ -217,7 +217,7 @@ def evaluate_login_checkpoint(
 
 The function may execute only the rule-approved action and returns one outcome per call. The outer reducer owns loops/budgets.
 
-Rule ownership and action safety are construction-time invariants: `rule.bank` must exactly match the evaluator's bank; `AUTHENTICATED`/`READY_FOR_CREDENTIALS` cannot be declared as DOM rules; CAPTCHA retry, startup recovery, OTP, mandatory password change, explicit error, and unknown blocker are classifier-only and never click. Every container selector and custom action selector must already be canonical (no leading/trailing whitespace) and use a conservative single-compound scoped grammar: optional tag plus at least one id, class, or exact-value attribute; wildcard, root/bare tags, unions, combinators, pseudos, presence-only attributes, fuzzy attribute operators, and attribute flags are rejected. Clickable notice/duplicate/protocol-resubmit/optional-password rules require either explicit nonblank exact action texts with the fixed broad action-element selector or a scoped structural selector; bare `[role=button]` is not a textless structural action. Structural actions return no DOM-derived `action_label`, and both Playwright and Patchright timeout types enter the same bounded alternate-progress check.
+Rule ownership and action safety are construction-time invariants: `rule.bank` must exactly match the evaluator's bank and is validated before any authentication short-circuit; `AUTHENTICATED`/`READY_FOR_CREDENTIALS` cannot be declared as DOM rules; CAPTCHA retry, startup recovery, OTP, mandatory password change, explicit error, and unknown blocker are classifier-only and never click. Every container selector and custom action selector must already be canonical (no leading/trailing whitespace) and use a conservative single-compound scoped grammar: optional tag plus at least one id, class, or exact-value attribute; wildcard, root/bare tags, unions, combinators, pseudos, presence-only attributes, fuzzy attribute operators, and attribute flags are rejected. Clickable notice/duplicate/protocol-resubmit/optional-password rules require either explicit nonblank exact action texts with the fixed broad action-element selector or a scoped structural selector; bare `[role=button]` is not a textless structural action. Structural actions return no DOM-derived `action_label`, and both Playwright and Patchright timeout types enter the same bounded alternate-progress check. PRE/POST keep authentication-first evaluation after ownership validation; POST_SUBMIT_SETTLE is rules-first, then authenticates only when no settle rule matched, so a visible post-login notice cannot be skipped.
 
 **Step 3: Verify**
 
@@ -282,6 +282,8 @@ Keep the old abstract `login()` as a compatibility adapter for unmigrated banks 
 - `submit_credentials_once()` is invoked only through the centralized budget guard.
 - POST_SUBMIT outcome loop is bounded.
 - `POST_SUBMIT_SETTLE` runs before collect.
+- Active rules are phase-exact and filtered before evaluator side effects: the base validates ownership across the full declared tuple before any auth shortcut, removes phase-ineligible rules, and removes an exhausted protocol-resubmit rule even if its own `max_actions` is larger.
+- Every rule-owned outcome must name an active rule of the same kind before reduction; only UNKNOWN may safely carry the name of a differently-kind active rule to report ambiguity/no-progress.
 - Typed interaction requirements become `result["error"]` through the existing exception path.
 
 **Step 4: Verify compatibility**

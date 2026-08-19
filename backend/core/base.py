@@ -21,6 +21,16 @@ from typing import Any, ClassVar, NotRequired, Required, TypedDict
 
 from scrapling.fetchers import StealthyFetcher
 
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointOutcome,
+    CheckpointPhase,
+    LoginBudget,
+    LoginCheckpointRule,
+    evaluate_login_checkpoint,
+    reduce_login_checkpoint,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
 
@@ -488,6 +498,7 @@ class BankCrawler(ABC):
     #   3. 重 login 成本不算貴（每家 10-30s），比 stale session 抓 0 筆值得。
     # 子類可 override：例 HSBC 首次登入有裝置綁定 OTP，可拉到 600 秒減少 OTP 觸發。
     SESSION_MAX_AGE_SECONDS: int = 180
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = False
 
     def __post_init__(self):
         self.session_dir = DATA_ROOT / f"{self.name}_session"
@@ -552,6 +563,108 @@ class BankCrawler(ABC):
     @abstractmethod
     def login(self, page) -> bool:
         """填表登入，回傳是否成功。"""
+
+    def prepare_login_page(self, page) -> None:
+        raise NotImplementedError
+
+    def is_authenticated(self, page) -> bool:
+        raise NotImplementedError
+
+    def submit_credentials_once(self, page) -> None:
+        raise NotImplementedError
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        return ()
+
+    def _shared_login(self, page) -> bool:
+        self.prepare_login_page(page)
+        rules = self.login_checkpoint_rules()
+        if len({rule.name for rule in rules}) != len(rules):
+            reduce_login_checkpoint(
+                CheckpointPhase.PRE_SUBMIT,
+                LoginBudget(),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            )
+        if any(rule.bank != self.name for rule in rules):
+            reduce_login_checkpoint(
+                CheckpointPhase.PRE_SUBMIT,
+                LoginBudget(),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            )
+
+        action_counts = {rule.name: 0 for rule in rules}
+        phase = CheckpointPhase.PRE_SUBMIT
+        budget = LoginBudget()
+        max_steps = sum(
+            rule.max_actions for rule in rules if rule.is_clickable
+        ) + 8
+
+        for _ in range(max_steps):
+            active_rules = tuple(
+                rule for rule in rules
+                if phase in rule.phases and (
+                    not rule.is_clickable
+                    or (
+                        action_counts[rule.name] < rule.max_actions
+                        and (
+                            rule.kind is not CheckpointKind.PROTOCOL_RESUBMIT
+                            or (
+                                phase is CheckpointPhase.POST_SUBMIT
+                                and budget.credential_submissions == 1
+                                and budget.protocol_resubmits == 0
+                            )
+                        )
+                    )
+                )
+            )
+            outcome = evaluate_login_checkpoint(
+                page,
+                bank=self.name,
+                phase=phase,
+                rules=active_rules,
+                is_authenticated=self.is_authenticated,
+            )
+            active_rules_by_name = {rule.name: rule for rule in active_rules}
+            if outcome.kind in {
+                CheckpointKind.AUTHENTICATED,
+                CheckpointKind.READY_FOR_CREDENTIALS,
+            }:
+                valid_outcome = outcome.rule_name is None
+            elif outcome.kind is CheckpointKind.UNKNOWN_BLOCKER:
+                valid_outcome = (
+                    outcome.rule_name is None
+                    or outcome.rule_name in active_rules_by_name
+                )
+            else:
+                outcome_rule = active_rules_by_name.get(outcome.rule_name or "")
+                valid_outcome = outcome_rule is not None and outcome_rule.kind is outcome.kind
+            if not valid_outcome:
+                outcome = CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+            next_phase, next_budget = reduce_login_checkpoint(phase, budget, outcome)
+
+            if (
+                outcome.rule_name in active_rules_by_name
+                and active_rules_by_name[outcome.rule_name].is_clickable
+            ):
+                action_counts[outcome.rule_name] += 1
+            if next_budget.credential_submissions == budget.credential_submissions + 1:
+                self.submit_credentials_once(page)
+            if next_budget.reloads == budget.reloads + 1:
+                page.reload()
+                self.prepare_login_page(page)
+            if (
+                phase is CheckpointPhase.POST_SUBMIT_SETTLE
+                and outcome.kind is CheckpointKind.AUTHENTICATED
+            ):
+                return True
+            phase, budget = next_phase, next_budget
+
+        reduce_login_checkpoint(
+            phase,
+            budget,
+            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+        )
+        return False  # pragma: no cover - reducer always raises
 
     @abstractmethod
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
@@ -628,7 +741,11 @@ class BankCrawler(ABC):
             logged_in = False
             try:
                 try:
-                    ok = self.login(page)
+                    ok = (
+                        self._shared_login(page)
+                        if self.USES_SHARED_LOGIN_CHECKPOINTS
+                        else self.login(page)
+                    )
                 except Exception as e:
                     # login 子類可能 raise（例：ScsbLoginError、TaishinLoginError）
                     # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。

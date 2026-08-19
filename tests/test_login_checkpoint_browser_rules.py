@@ -80,11 +80,18 @@ class Page:
         return self.root.queries.get(selector) and Locator(self.root.queries[selector]) or Locator([])
 
 
-def test_authenticated_short_circuits_without_browser_interaction():
+def test_foreign_rule_is_rejected_before_authenticated_or_browser_inspection():
     class Page:
         @property
         def frames(self):
             raise AssertionError("browser must not be inspected")
+
+    auth_calls = 0
+
+    def authenticated(page):
+        nonlocal auth_calls
+        auth_calls += 1
+        return True
 
     foreign_rule = LoginCheckpointRule(
         name="foreign-bank-status",
@@ -98,10 +105,11 @@ def test_authenticated_short_circuits_without_browser_interaction():
         bank="test-bank",
         phase=CheckpointPhase.PRE_SUBMIT,
         rules=(foreign_rule,),
-        is_authenticated=lambda page: True,
+        is_authenticated=authenticated,
     )
 
-    assert outcome.kind is CheckpointKind.AUTHENTICATED
+    assert outcome == CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    assert auth_calls == 0
 
 
 def test_foreign_bank_rule_never_inspects_or_clicks_colliding_dom():

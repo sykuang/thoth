@@ -79,6 +79,10 @@ class LoginCheckpointRule:
     required_body_pattern: re.Pattern[str] | None = None
     max_actions: int = 1
 
+    @property
+    def is_clickable(self) -> bool:
+        return self.kind in _CLICKABLE_RULE_KINDS
+
     def __post_init__(self) -> None:
         if (
             not self.name.strip()
@@ -97,7 +101,7 @@ class LoginCheckpointRule:
         if self.kind in _CLASSIFIER_RULE_KINDS:
             if self.action_texts or self.action_selector != DEFAULT_ACTION_SELECTOR:
                 raise ValueError("classifier login checkpoint rules cannot configure actions")
-        elif self.kind in _CLICKABLE_RULE_KINDS:
+        elif self.is_clickable:
             if (
                 any(not text for text in normalized_action_texts)
                 or (self.action_selector == DEFAULT_ACTION_SELECTOR and not normalized_action_texts)
@@ -272,10 +276,13 @@ def evaluate_login_checkpoint(
     is_authenticated: Callable[[Any], bool],
 ) -> CheckpointOutcome:
     try:
-        if is_authenticated(page):
-            return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
         if any(rule.bank != bank for rule in rules):
             return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        if (
+            phase is not CheckpointPhase.POST_SUBMIT_SETTLE
+            and is_authenticated(page)
+        ):
+            return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
         scopes = [page, *(frame for frame in page.frames if frame is not page.main_frame)]
     except Exception:
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
@@ -290,6 +297,12 @@ def evaluate_login_checkpoint(
         if outcome:
             return outcome
 
+    if phase is CheckpointPhase.POST_SUBMIT_SETTLE:
+        try:
+            if is_authenticated(page):
+                return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
+        except Exception:
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
     fallback = (
         CheckpointKind.READY_FOR_CREDENTIALS
         if phase is CheckpointPhase.PRE_SUBMIT
