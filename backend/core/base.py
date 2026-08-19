@@ -615,17 +615,26 @@ class BankCrawler(ABC):
             active_rules = tuple(
                 rule
                 if (
-                    not rule.is_clickable
-                    or (
-                        action_counts[rule.name] < rule.max_actions
-                        and (
-                            rule.kind is not CheckpointKind.PROTOCOL_RESUBMIT
-                            or (
-                                phase is CheckpointPhase.POST_SUBMIT
-                                and budget.credential_submissions == 1
-                                and budget.protocol_resubmits == 0
-                            )
+                    (not rule.is_clickable or action_counts[rule.name] < rule.max_actions)
+                    and (
+                        rule.kind is not CheckpointKind.PROTOCOL_RESUBMIT
+                        or (
+                            phase is CheckpointPhase.POST_SUBMIT
+                            and budget.credential_submissions == 1
+                            and budget.protocol_resubmits == 0
                         )
+                    )
+                    and (
+                        rule.kind is not CheckpointKind.CAPTCHA_RETRY
+                        or (
+                            phase is CheckpointPhase.POST_SUBMIT
+                            and budget.credential_submissions == 1
+                            and budget.captcha_resubmits == 0
+                        )
+                    )
+                    and (
+                        rule.kind is not CheckpointKind.STARTUP_RECOVERY
+                        or budget.reloads == 0
                     )
                 )
                 else replace(

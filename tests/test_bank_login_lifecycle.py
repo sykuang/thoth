@@ -335,6 +335,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
         "rakuten",
         "scb",
         "scsb",
+        "sinopac",
         "taishin",
         "ubot",
     }
@@ -553,6 +554,54 @@ def test_protocol_resubmit_allows_exactly_one_second_submission(monkeypatch, tmp
     assert "protocol_resubmits=1" in result["error"]
     assert "collect" not in crawler.events
     assert "logout" not in crawler.events
+
+
+def test_exhausted_captcha_classifier_becomes_unknown_shadow(monkeypatch, tmp_path):
+    body_pattern = re.compile(r"^captcha invalid$")
+    rule = LoginCheckpointRule(
+        name="captcha",
+        bank="staged",
+        phases=(CheckpointPhase.POST_SUBMIT,),
+        kind=CheckpointKind.CAPTCHA_RETRY,
+        container_selector="#captcha",
+        required_body_pattern=body_pattern,
+    )
+    crawler = _StagedCrawler(name="staged", rules=(rule,))
+    rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
+
+    def evaluate(page, *, bank, phase, rules, is_authenticated):
+        rules_seen.append(rules)
+        if phase is CheckpointPhase.PRE_SUBMIT:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+        active = rules[0]
+        return CheckpointOutcome(active.kind, rule_name=active.name)
+
+    result, _ = _run(monkeypatch, tmp_path, crawler, evaluate)
+
+    shadow = rules_seen[2][0]
+    assert rules_seen[1] == (rule,)
+    assert (
+        shadow.name,
+        shadow.bank,
+        shadow.phases,
+        shadow.kind,
+        shadow.container_selector,
+        shadow.required_body_pattern,
+        shadow.action_texts,
+    ) == (
+        rule.name,
+        rule.bank,
+        rule.phases,
+        CheckpointKind.UNKNOWN_BLOCKER,
+        rule.container_selector,
+        body_pattern,
+        (),
+    )
+    assert crawler.submissions == 2
+    assert crawler.events.count("prepare-captcha-resubmit") == 1
+    assert "kind=unknown_blocker" in result["error"]
+    assert "captcha_resubmits=1" in result["error"]
+    assert "collect" not in crawler.events
 
 
 def test_real_protocol_rule_is_removed_after_one_resubmit(monkeypatch, tmp_path):

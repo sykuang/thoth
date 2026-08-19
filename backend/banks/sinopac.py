@@ -17,9 +17,11 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs
+from typing import ClassVar
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -29,91 +31,17 @@ from backend.core.card_bills import (
     make_card_bill_fact,
     publish_card_bill_facts,
 )
-from backend.core.creds import SinopacCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
+from backend.core.creds import SinopacCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
 LOAN_DETAIL_URL = "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_detail.aspx"
 SEL_CAP_IMG = "#imgCode"
-
-JS_CLOSE_COOKIE = (
-    "(() => { const b=[...document.querySelectorAll('button,a,div,span')]"
-    ".find(e=>e.offsetParent!==null && /繼續使用|我知道了|同意|接受|關閉/.test((e.textContent||'').trim())"
-    "  && (e.textContent||'').trim().length<8);"
-    " if(b){ b.click(); return (b.textContent||'').trim(); } return ''; })()"
-)
-
-# ASP.NET 欄位 id 是動態 hash，用 maxLength 區分（11=身分證、20×2=代碼/密碼、6=驗證碼）
-JS_TAG_INPUTS = r"""
-(() => {
-  const all = [...document.querySelectorAll('input')].filter(i=>i.offsetParent!==null);
-  const sid = all.find(i=>i.maxLength===11);
-  const m20 = all.filter(i=>i.maxLength===20);
-  const cap = all.find(i=>i.maxLength===6) || document.querySelector('#sino_keyword3');
-  if(sid) sid.setAttribute('data-role','sid');
-  if(m20[0]) m20[0].setAttribute('data-role','user');
-  if(m20[1]) m20[1].setAttribute('data-role','pwd');
-  if(cap) cap.setAttribute('data-role','cap');
-  return {
-    sid: !!sid, user: !!m20[0], pwd: !!m20[1], cap: !!cap,
-    sid_id: sid?sid.id:'', user_id: m20[0]?m20[0].id:'', pwd_id: m20[1]?m20[1].id:'', cap_id: cap?cap.id:'',
-  };
-})()
-"""
-
-# 點登入鈕（永豐專用 id）
-JS_CLICK_LOGIN = (
-    "(() => { const b=document.querySelector('#MMA_Login'); if(b){ b.click(); return true; }"
-    " const cand=[...document.querySelectorAll('a,button')].find(e=>e.offsetParent!==null"
-    "   && (e.textContent||'').trim()==='登入' && !e.closest('header,nav'));"
-    " if(cand){ cand.click(); return true; } return false; })()"
-)
-
-# 登入後是否仍停在登入框（看 #imgCode 還在不在）
-# NOTE (2026-06-17): _logged_in 已升級成 JS_LOGGED_IN_POSITIVE（4 條件 AND），
-# 此 JS_STILL_LOGIN 保留供 OCR retry loop 內精準偵測「驗證碼錯，留在登入框」用。
-JS_STILL_LOGIN = (
-    "(() => { const i=document.querySelector('#imgCode');"
-    " return !!(i && i.offsetParent!==null); })()"
-)
-
-# W (2026-06-17): positive signal 4 條件 AND，對齊 SCSB 鐵律
-# 1) urlOk: MyMMA / Myasset / mma_ 等登入後路徑（非 MMALogin.aspx）
-# 2) lenOk: innerText >= 500 (內銀區滿載)
-# 3) kw >= 2 (內銀區關鍵字)
-# 4) noLoginForm: #imgCode + maxLength 6 input 都不可見
-# 任一 fail → 視為未登入。
-JS_LOGGED_IN_POSITIVE = """
-() => {
-  const url = location.href.toLowerCase();
-  const urlOk = /\\/mymma\\/|\\/myasset\\/|\\/mma_|memberportal\\/main/.test(url)
-    && !/mmalogin\\.aspx/.test(url);
-  const visible = (e) => {
-    if (!e) return false;
-    const r = e.getBoundingClientRect();
-    const cs = getComputedStyle(e);
-    return !!(r.width || r.height || e.getClientRects().length)
-      && cs.display !== 'none' && cs.visibility !== 'hidden';
-  };
-  const noLoginForm = !visible(document.querySelector('#imgCode'))
-    && ![...document.querySelectorAll('input')].some(i => i.maxLength === 6 && visible(i));
-  const body = document.body?.innerText || document.body?.textContent || '';
-  const lenOk = body.length >= 500;
-  const KW = ['資產總覽','資產分析','存款','轉帳','信用卡','登出',
-              '台幣','外幣','基金','投資','貸款','繳費','個人設定','安全','MMA'];
-  const kw = KW.filter(k => body.includes(k)).length;
-  return urlOk && lenOk && kw >= 2 && noLoginForm;
-}
-"""
-
-# 抓登入框周邊錯誤訊息
-JS_ERR_MSG = (
-    "(() => { const txt=[...document.querySelectorAll('div,span,p,label,td')]"
-    ".filter(e=>e.offsetParent!==null)"
-    ".map(e=>(e.textContent||'').trim())"
-    ".filter(t=>t && t.length<60 && /錯誤|不正確|失敗|重新|鎖|無效|請輸入正確|驗證碼|密碼|身分證|代碼|嘗試/.test(t));"
-    " return [...new Set(txt)].slice(0,8); })()"
-)
 
 
 def _log(*a):
@@ -159,179 +87,359 @@ def _sinopac_card_bill_fact(out: dict):
 
 
 class SinopacCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
     CAPTCHA_INVALID = "captcha_invalid"
     CREDENTIALS_INVALID = "credentials_invalid"
     LOGIN_FAILED = "login_failed"
-    CAPTCHA_ERROR_KEYWORDS = (
-        "驗證碼失效",
-        "驗證碼錯誤",
-        "驗證碼輸入錯誤",
-        "請重新輸入驗證碼",
-    )
-    CREDENTIAL_ERROR_KEYWORDS = (
-        "使用者代碼或網路密碼錯誤",
-        "帳號或密碼錯誤",
-        "密碼不正確",
-        "密碼無效",
-        "身分證字號錯誤",
-    )
 
     def __init__(self):
         super().__init__(name="sinopac")
         self.creds = SinopacCreds.load()
-        self._last_dialog_message = ""
-        self._last_dialog_type = ""
 
     def _host_filter(self) -> str:
         return "sinopac.com"
 
+    @staticmethod
+    def _page_scopes(page):
+        return [
+            page,
+            *(frame for frame in page.frames if frame is not page.main_frame),
+        ]
+
     def _logged_in(self, page) -> bool:
         try:
-            return bool(page.evaluate(JS_LOGGED_IN_POSITIVE))
+            current = urlparse(page.url or "")
+            path = (current.path or "").lower()
+            if (
+                (current.hostname or "").lower() != "mma.sinopac.com"
+                or "mmalogin.aspx" in path
+                or not path.startswith(("/mymma/", "/myasset/", "/mma_"))
+            ):
+                return False
+            for scope in self._page_scopes(page):
+                captcha_images = scope.locator(SEL_CAP_IMG)
+                if any(
+                    captcha_images.nth(index).is_visible()
+                    for index in range(captcha_images.count())
+                ):
+                    return False
+                inputs = scope.locator("input")
+                for index in range(inputs.count()):
+                    field = inputs.nth(index)
+                    if (
+                        field.is_visible()
+                        and field.get_attribute("maxlength") in {"6", "11", "20"}
+                    ):
+                        return False
+            body = page.locator("body").inner_text()
         except Exception:
             return False
-
-    def _is_captcha_login_error(self, message: str | None) -> bool:
-        text = message or ""
-        return bool(text) and any(k in text for k in self.CAPTCHA_ERROR_KEYWORDS)
-
-    def _message_error_code(self, message: str | None) -> str:
-        text = message or ""
-        if any(k in text for k in self.CREDENTIAL_ERROR_KEYWORDS):
-            return self.CREDENTIALS_INVALID
-        if self._is_captcha_login_error(text):
-            return self.CAPTCHA_INVALID
-        return self.LOGIN_FAILED
-
-    def _login_error_code(self, dialog_message: str, errors: list[str]) -> str:
-        if dialog_message:
-            return self._message_error_code(dialog_message)
-        codes = [self._message_error_code(message) for message in errors]
-        if self.CREDENTIALS_INVALID in codes:
-            return self.CREDENTIALS_INVALID
-        if self.CAPTCHA_INVALID in codes:
-            return self.CAPTCHA_INVALID
-        return self.LOGIN_FAILED
-
-    # ---------- 登入 ----------
-    # 註：attach_dialog_handler 已升格到 base.py 預設實作（永豐踩出來的鐵律）。
-    # 永豐額外記錄最新 dialog message，讓明確 captcha error 可安全重試一次。
-    def attach_dialog_handler(self, page) -> None:
-        def _on_dialog(d):
-            msg = (d.message or "")[:200]
-            self._last_dialog_type = d.type
-            self._last_dialog_message = msg
-            try:
-                print(f"[sinopac][dialog] {d.type} msg={msg!r} -> accept", file=sys.stderr)
-                d.accept()
-            except Exception as e:
-                print(f"[sinopac][dialog] handle 失敗: {e}", file=sys.stderr)
-        page.on("dialog", _on_dialog)
+        return (
+            len(body) >= 500
+            and "登出" in body
+            and ("資產總覽" in body or "資產分析" in body or "我的帳戶" in body)
+        )
 
     def login(self, page) -> bool:
-        """銀行明確回 captcha error 時換圖重試一次，帳密或未知錯誤停手。"""
-        page.wait_for_timeout(8000)
-        _log(f"[login] 起始 url={page.url}")
+        return self._shared_login(page)
 
-        cc = page.evaluate(JS_CLOSE_COOKIE)
-        if cc:
-            _log(f"[login] 關 cookie bar: {cc!r}")
-            page.wait_for_timeout(1000)
+    def prepare_login_page(self, page) -> None:
+        try:
+            page.wait_for_timeout(8000)
+        except Exception:
+            raise SinopacLoginError(
+                self.LOGIN_FAILED,
+                "永豐登入頁面無法安全準備；未送出登入",
+            ) from None
 
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post_settle = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
+        )
+        otp = re.compile(
+            r"^[\s\S]{0,300}(?:(?<![A-Za-z])OTP(?![A-Za-z])|一次性(?:密碼|驗證碼)|"
+            r"簡訊驗證碼|動態驗證碼|裝置驗證|新裝置登入|信任此裝置)[\s\S]{0,300}$",
+            re.IGNORECASE,
+        )
+        password = re.compile(
+            r"^[\s\S]{0,200}(?:(?<!驗證)密碼\s*(?:已)?(?:到期|過期)|"
+            r"(?:立即|必須|請先|需要|需)\s*(?:修改|變更|重設)\s*(?:您的?)?\s*密碼|"
+            r"強制\s*(?:修改|變更|重設)\s*(?:您的?)?\s*密碼)[\s\S]{0,200}$"
+        )
+        credential_error = re.compile(
+            r"^\s*(?:使用者代碼或網路密碼錯誤|帳號或密碼錯誤|密碼不正確|"
+            r"密碼無效|身分證字號錯誤)\s*[。.!！?？]?\s*$"
+        )
+        captcha_error = re.compile(
+            r"^\s*(?:(?:驗證碼失效|驗證碼錯誤|驗證碼輸入錯誤|"
+            r"請重新輸入驗證碼)\s*[。.!！?？]?|"
+            r"驗證碼失效或輸入錯誤，請重新輸入。)\s*$"
+        )
+        modal_scopes = (("modal", ".modal.show"), ("dialog", "[role='dialog']"))
+        alert_scopes = (
+            ("error", ".error"),
+            ("alert", ".alert"),
+            ("role-alert", "[role='alert']"),
+        )
+        return (
+            *(
+                LoginCheckpointRule(
+                    name=f"sinopac-otp-required-{suffix}",
+                    bank="sinopac",
+                    phases=all_phases,
+                    kind=CheckpointKind.OTP_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=otp,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"sinopac-password-change-required-{suffix}",
+                    bank="sinopac",
+                    phases=all_phases,
+                    kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=password,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"sinopac-explicit-login-error-{suffix}",
+                    bank="sinopac",
+                    phases=post_settle,
+                    kind=CheckpointKind.EXPLICIT_LOGIN_ERROR,
+                    container_selector=selector,
+                    required_body_pattern=credential_error,
+                )
+                for suffix, selector in alert_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"sinopac-captcha-retry-{suffix}",
+                    bank="sinopac",
+                    phases=(CheckpointPhase.POST_SUBMIT,),
+                    kind=CheckpointKind.CAPTCHA_RETRY,
+                    container_selector=selector,
+                    required_body_pattern=captcha_error,
+                )
+                for suffix, selector in alert_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"sinopac-unknown-{suffix}",
+                    bank="sinopac",
+                    phases=all_phases,
+                    kind=CheckpointKind.UNKNOWN_BLOCKER,
+                    container_selector=selector,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            LoginCheckpointRule(
+                name="sinopac-login-form-still-visible",
+                bank="sinopac",
+                phases=post_settle,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=SEL_CAP_IMG,
+            ),
+        )
+
+    @staticmethod
+    def _captcha_image(page, *, enabled: bool = False):
+        images = page.locator(SEL_CAP_IMG)
+        visible = [
+            images.nth(index)
+            for index in range(images.count())
+            if images.nth(index).is_visible()
+            and (not enabled or images.nth(index).is_enabled())
+        ]
+        return visible[0] if len(visible) == 1 else None
+
+    @staticmethod
+    def _keyboard_fill(page, field, value: str) -> None:
+        field.click()
+        field.click(click_count=3)
+        page.keyboard.press("Backspace")
+        page.keyboard.type(value, delay=80)
+        if len(field.input_value()) != len(value):
+            raise SinopacLoginError(
+                SinopacCrawler.LOGIN_FAILED,
+                "永豐登入欄位輸入長度不符；未送出登入",
+            )
+
+    def prepare_captcha_resubmit(self, page) -> None:
+        try:
+            image = self._captcha_image(page, enabled=True)
+            if image is None:
+                raise SinopacLoginError(
+                    self.CAPTCHA_INVALID,
+                    "無法安全更新永豐驗證碼；未送出登入",
+                )
+            image.click()
+            page.wait_for_timeout(1500)
+        except SinopacLoginError:
+            raise
+        except Exception:
+            raise SinopacLoginError(
+                self.CAPTCHA_INVALID,
+                "無法安全更新永豐驗證碼；未送出登入",
+            ) from None
+
+    def _ocr_captcha(self, page, max_attempts=5):
+        attempts = min(max(max_attempts, 1), 5)
+        for attempt in range(attempts):
+            try:
+                if self._captcha_image(page) is None:
+                    return None
+                wait_captcha_stable(page, SEL_CAP_IMG, tmp_path=self.captcha_tmp)
+                text = solve_captcha(
+                    page,
+                    SEL_CAP_IMG,
+                    expected_len=6,
+                    alnum_only=True,
+                    digits_only=True,
+                    min_confidence=0.98,
+                    tmp_path=self.captcha_tmp,
+                )
+                if isinstance(text, str) and len(text) == 6 and text.isdigit():
+                    return text
+            except Exception:
+                pass
+            if attempt + 1 < attempts:
+                try:
+                    image = self._captcha_image(page, enabled=True)
+                    if image is None:
+                        return None
+                    image.click()
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    return None
+        return None
+
+    @classmethod
+    def _response_visible(cls, page) -> bool:
+        for scope in cls._page_scopes(page):
+            for selector in (
+                ".modal.show",
+                "[role='dialog']",
+                ".error",
+                ".alert",
+                "[role='alert']",
+            ):
+                matches = scope.locator(selector)
+                if any(
+                    matches.nth(index).is_visible()
+                    for index in range(matches.count())
+                ):
+                    return True
+        return False
+
+    def submit_credentials_once(self, page) -> None:
         try:
             page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=10000)
-        except Exception as e:
-            raise SinopacLoginError(
-                self.LOGIN_FAILED, f"永豐登入表單載入失敗: {e}; url={page.url}",
-            ) from e
-
-        for submit_attempt in range(1, 3):
-            tagged = page.evaluate(JS_TAG_INPUTS)
-            _log(f"[login] 標記欄位: {tagged}")
-            if not all(tagged.get(k) for k in ("sid", "user", "pwd", "cap")):
-                raise SinopacLoginError(self.LOGIN_FAILED, "永豐登入表單欄位不完整")
-
-            try:
-                page.fill("input[data-role='sid']", self.creds.national_id)
-                page.wait_for_timeout(200)
-                page.fill("input[data-role='user']", self.creds.user_code)
-                page.wait_for_timeout(200)
-                page.fill("input[data-role='pwd']", self.creds.password)
-                page.wait_for_timeout(300)
-            except Exception as e:
-                raise SinopacLoginError(self.LOGIN_FAILED, f"永豐登入欄位填寫失敗: {e}") from e
-
-            captcha = self._ocr_with_regen(page, max_attempts=5)
-            if not captcha:
+            inputs = page.locator("input")
+            groups = {6: [], 11: [], 20: []}
+            for index in range(inputs.count()):
+                field = inputs.nth(index)
+                if not field.is_visible():
+                    continue
+                maxlength = field.get_attribute("maxlength")
+                if maxlength in {"6", "11", "20"}:
+                    groups[int(maxlength)].append(field)
+            if tuple(len(groups[length]) for length in (11, 20, 6)) != (1, 2, 1):
                 raise SinopacLoginError(
-                    self.CAPTCHA_INVALID, "永豐驗證碼辨識失敗（送出前已換圖 5 次）",
+                    self.LOGIN_FAILED,
+                    "永豐登入欄位無法安全確認；未送出登入",
                 )
-            try:
-                page.fill("input[data-role='cap']", captcha)
-                page.wait_for_timeout(300)
-            except Exception as e:
-                raise SinopacLoginError(self.LOGIN_FAILED, f"永豐驗證碼欄位填寫失敗: {e}") from e
-
-            self._last_dialog_message = ""
-            _log(f"[login] 送出 login attempt={submit_attempt}/2 (captcha={captcha})")
-            if not page.evaluate(JS_CLICK_LOGIN):
-                raise SinopacLoginError(self.LOGIN_FAILED, "永豐登入按鈕不存在")
-            page.wait_for_timeout(8000)
-
-            if self._logged_in(page):
-                _log(f"[login] ✅ 登入成功 -> {page.url}")
-                return True
-
-            try:
-                errors = page.evaluate(JS_ERR_MSG)
-            except Exception:
-                errors = []
-            dialog_message = self._last_dialog_message
-            error_code = self._login_error_code(dialog_message, errors)
-            if error_code == self.CAPTCHA_INVALID and submit_attempt == 1:
-                _log("[login] bank error_code=captcha_invalid，換圖重試一次")
-                page.evaluate("(()=>{const i=document.querySelector('#imgCode'); if(i) i.click();})()")
-                page.wait_for_timeout(1500)
-                continue
-
-            from backend.banks._login_debug import snapshot as _login_snapshot
-            snap = _login_snapshot(page)
-            if error_code == self.CREDENTIALS_INVALID:
-                reason = "銀行回覆帳號或密碼錯誤；未重試。"
-            elif error_code == self.CAPTCHA_INVALID:
-                reason = "銀行第二次仍回覆驗證碼錯誤；停止重試。"
-            else:
-                reason = "銀行未提供可分類的登入錯誤；未重試。"
-            messages = [message for message in [dialog_message, *errors] if message]
-            msg = (
-                f"永豐登入失敗。\n  url={page.url}\n  錯誤訊息: {messages}\n"
-                f"  可能原因：{reason}\n{snap}"
+            ordered_twenty = []
+            for field in groups[20]:
+                box = field.bounding_box()
+                if box is None:
+                    raise SinopacLoginError(
+                        self.LOGIN_FAILED,
+                        "永豐登入欄位無法安全確認；未送出登入",
+                    )
+                ordered_twenty.append((box["y"], field))
+            ordered_twenty.sort(key=lambda item: item[0])
+            if ordered_twenty[0][0] == ordered_twenty[1][0]:
+                raise SinopacLoginError(
+                    self.LOGIN_FAILED,
+                    "永豐登入欄位無法安全確認；未送出登入",
+                )
+            fields = (
+                groups[11][0],
+                ordered_twenty[0][1],
+                ordered_twenty[1][1],
+                groups[6][0],
             )
-            _log(f"[login] ❌ error_code={error_code} {msg}")
-            raise SinopacLoginError(error_code, msg)
+            if any(not field.is_enabled() for field in fields):
+                raise SinopacLoginError(
+                    self.LOGIN_FAILED,
+                    "永豐登入欄位無法安全確認；未送出登入",
+                )
+            for field, value in zip(
+                fields[:3],
+                (self.creds.national_id, self.creds.user_code, self.creds.password),
+                strict=True,
+            ):
+                self._keyboard_fill(page, field, value)
+            captcha = self._ocr_captcha(page, max_attempts=5)
+            if captcha is None:
+                raise SinopacLoginError(
+                    self.CAPTCHA_INVALID,
+                    "永豐驗證碼辨識失敗；未送出登入",
+                )
+            self._keyboard_fill(page, fields[3], captcha)
 
-        raise AssertionError("unreachable")
+            candidates = page.locator("#MMA_Login")
+            eligible = []
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if not candidate.is_visible() or not candidate.is_enabled():
+                    continue
+                label = " ".join(
+                    ((candidate.inner_text() or candidate.get_attribute("value") or "")).split()
+                )
+                if label == "登入":
+                    eligible.append(candidate)
+            if len(eligible) != 1:
+                raise SinopacLoginError(
+                    self.LOGIN_FAILED,
+                    "找不到唯一且可操作的永豐登入按鈕；未送出登入",
+                )
+            button = eligible[0]
+        except SinopacLoginError:
+            raise
+        except Exception:
+            raise SinopacLoginError(
+                self.LOGIN_FAILED,
+                "永豐登入欄位無法安全填寫；未送出登入",
+            ) from None
 
-    def _ocr_with_regen(self, page, max_attempts=5):
-        """OCR 驗證碼，長度錯換圖重 OCR（送出前安全重試，不碰 login）。"""
-        for n in range(1, max_attempts+1):
-            wait_captcha_stable(page, SEL_CAP_IMG, tmp_path=self.captcha_tmp)
-            text = solve_captcha(
-                page, SEL_CAP_IMG, expected_len=6, alnum_only=True, digits_only=True,
-                min_confidence=0.98,
-                tmp_path=self.captcha_tmp,
-            )
-            if text and len(text) == 6 and text.isdigit():
-                _log(f"[cap] 第 {n} 次 OCR 成功: {text}")
-                return text
-            _log(f"[cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {text!r}），換圖")
-            if n < max_attempts:
-                try:
-                    page.evaluate("(()=>{const i=document.querySelector('#imgCode'); if(i) i.click();})()")
-                    page.wait_for_timeout(1500)
-                except Exception as e:
-                    _log(f"[cap] 換圖失敗: {e}")
-        return None
+        try:
+            button.click(timeout=8000)
+        except Exception:
+            raise SinopacLoginError(
+                self.LOGIN_FAILED,
+                "永豐登入送出狀態不明；禁止自動重試",
+            ) from None
+
+        try:
+            for _ in range(8):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page) or self._response_visible(page):
+                    return
+        except Exception:
+            raise SinopacLoginError(
+                self.LOGIN_FAILED,
+                "永豐登入送出後狀態無法安全確認；禁止自動重試",
+            ) from None
 
     # ---------- 抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
