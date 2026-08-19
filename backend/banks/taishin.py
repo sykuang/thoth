@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -28,6 +30,11 @@ from backend.core.card_bills import (
 )
 from backend.core.creds import TaishinCreds
 from backend.core.captcha import ocr_bytes
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://my.taishinbank.com.tw/TIBNetBank/"
 IFRAME_HINT = "svc/rwd/index.html"
@@ -85,6 +92,8 @@ def _taishin_card_bill_fact(parsed: dict):
 
 
 class TaishinCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="taishin")
         self.creds = TaishinCreds.load()
@@ -93,196 +102,173 @@ class TaishinCrawler(BankCrawler):
         return "taishinbank.com"
 
     def _find_login_frame(self, page):
-        for f in page.frames:
-            if IFRAME_HINT in (f.url or ""):
-                return f
-        return None
+        matches = [frame for frame in page.frames if IFRAME_HINT in (frame.url or "")]
+        return matches[0] if len(matches) == 1 else None
 
     def _logged_in(self, page) -> bool:
-        """W (2026-06-17): positive signal 4 條件 AND（iframe + 30s wait，對齊 SCSB 鐵律）
-
-        Taishin SPA in iframe + 登入後常有 popup，須保留 30s 等待窗口。
-
-        1) urlOk: my.taishinbank.com.tw（login-after main domain）
-        2) noLoginForm: svc/rwd/index.html login iframe 已消失
-        3) lenOk: main page + iframe innerText 合計 >= 500
-        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
-
-        任一 fail → 視為未登入。每 5s retry 一次，最多 6 輪 (30s)。
-        """
-        import re
-        keywords = ["我知道了", "系統斷信", "3個月後提醒", "前往修改", "訊息通知",
-                    "帳戶總覽", "我的資產", "台幣存款", "我的帳戶", "信用卡管理",
-                    "網銀首頁", "資產總額", "存款餘額",
-                    # 虛擬鍵盤關鍵字（使用者被要求改密碼時會出現）
-                    "大陸身份", "外國身份", "清除", "虛擬鍵盤"]
-        keyword_regex = "|".join(keywords)
-
-        url = (page.url or "").lower()
-        if "taishinbank.com" not in url:
-            return False
-
-        for wait_round in range(6):  # 6 * 5 = 30 秒
-            # noLoginForm: iframe 消失
-            try:
-                if self._find_login_frame(page) is not None:
-                    page.wait_for_timeout(5000)
-                    continue
-            except Exception:
-                page.wait_for_timeout(5000)
-                continue
-
-            # lenOk + kw
-            texts = []
-            for f in [page, *list(page.frames)]:
-                try:
-                    txt = f.evaluate("() => document.body && document.body.innerText || ''")
-                    if txt:
-                        texts.append(txt)
-                except Exception:
-                    pass
-            joined = "\n".join(texts)
-            if len(joined) >= 500:
-                kws_found = re.findall(keyword_regex, joined)
-                if len(set(kws_found)) >= 2:
-                    _log(
-                        f"[taishin][logged_in] 4 條件命中 (round {wait_round+1}, "
-                        f"len={len(joined)}, kws={set(kws_found)})",
-                    )
-                    return True
-            page.wait_for_timeout(5000)
-        return False
-
-    def _close_popups(self, page):
-        """關所有登入後 popup — 強化版 v4 (2026-06-11)。
-
-        策略改為「**強制 hide modal**」而非靠各種按鈕匹配：
-          (1) 用 JS 找所有 visible modal / dialog / overlay → 強行 `display:none` + remove
-          (2) 用 Esc key 試踢
-          (3) 最後再點一輪「我知道了/關閉」等按鈕做備援
-
-        強制 deadline 25 秒（避免 collect 卡死），整個 method 超時就 break。
-        """
-        import time as _t
-        deadline = _t.monotonic() + 25.0
-        total_closed = 0
-
-        # ── Step 1: JS 強行 hide modal ──
-        # 注意：絕不誤殺 top nav！只 hide y > 200 且占畫面 ≥30% 的 modal-class 元素
+        """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            hidden = page.evaluate("""() => {
-                const candidates = document.querySelectorAll(
-                    '.modal, [role="dialog"], [class*="modal"], [class*="popup"], [class*="dialog"], ' +
-                    '[class*="overlay"], [class*="mask"], [id*="modal"], [id*="popup"]'
-                );
-                let hidden = 0;
-                const vw = window.innerWidth;
-                const vh = window.innerHeight;
-                for (const el of candidates) {
-                    const cs = window.getComputedStyle(el);
-                    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 50 || r.height < 50) continue;
-                    // 保護 top nav 區域（y < 200 不動）
-                    if (r.y < 200 && r.height < 100) continue;
-                    // 保護畫面右上角小元件（< 30% viewport 寬高 + 在頂部）
-                    if (r.y < 200 && r.width < vw * 0.4) continue;
-                    el.style.setProperty('display', 'none', 'important');
-                    el.style.setProperty('visibility', 'hidden', 'important');
-                    hidden += 1;
-                }
-                document.body.classList.remove('modal-open');
-                document.body.style.removeProperty('overflow');
-                document.body.style.removeProperty('padding-right');
-                document.querySelectorAll('.modal-backdrop, [class*="backdrop"], [class*="overlay-mask"]').forEach(b => b.remove());
-                return hidden;
-            }""")
-            if hidden:
-                _log(f"[taishin][popup] JS 強制 hide {hidden} 個 modal/overlay")
-                total_closed += hidden
-        except Exception as e:
-            _log(f"[taishin][popup] JS hide modal 失敗: {e}")
+            if "taishinbank.com" not in (page.url or "").lower():
+                return False
+            if any(IFRAME_HINT in (frame.url or "") for frame in page.frames):
+                return False
+            scopes = [
+                page,
+                *(frame for frame in page.frames if frame is not page.main_frame),
+            ]
+            for scope in scopes:
+                login_fields = scope.locator("input[placeholder='身分證字號']")
+                if any(
+                    login_fields.nth(index).is_visible()
+                    for index in range(login_fields.count())
+                ):
+                    return False
+            body = "\n".join(
+                scope.evaluate("() => document.body && document.body.innerText || ''") or ""
+                for scope in scopes
+            )
+        except Exception:
+            return False
+        keywords = (
+            "帳戶總覽",
+            "我的資產",
+            "台幣存款",
+            "我的帳戶",
+            "信用卡管理",
+            "網銀首頁",
+            "資產總額",
+            "存款餘額",
+        )
+        return len(body) >= 500 and sum(keyword in body for keyword in keywords) >= 2
 
-        # 同樣對 iframes 做一次（保護 top nav 同樣邏輯）
-        for f in page.frames:
-            if f == page.main_frame:
-                continue
-            if _t.monotonic() > deadline:
-                _log("[taishin][popup] deadline 到，frames 略過")
-                break
-            try:
-                hidden = f.evaluate("""() => {
-                    const candidates = document.querySelectorAll(
-                        '.modal, [role="dialog"], [class*="modal"], [class*="popup"], [class*="dialog"], ' +
-                        '[class*="overlay"], [class*="mask"], [id*="modal"], [id*="popup"]'
-                    );
-                    let hidden = 0;
-                    const vw = window.innerWidth;
-                    for (const el of candidates) {
-                        const cs = window.getComputedStyle(el);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        const r = el.getBoundingClientRect();
-                        if (r.width < 50 || r.height < 50) continue;
-                        // 保護 top nav 區域
-                        if (r.y < 200 && r.height < 100) continue;
-                        if (r.y < 200 && r.width < vw * 0.4) continue;
-                        el.style.setProperty('display', 'none', 'important');
-                        hidden += 1;
-                    }
-                    return hidden;
-                }""")
-                if hidden:
-                    _log(f"[taishin][popup] frame ({f.url[:60]}) hide {hidden} 個 modal")
-                    total_closed += hidden
-            except Exception:
-                pass
+    def login(self, page) -> bool:
+        return self._shared_login(page)
 
-        # ── Step 2: Esc 試踢（很多 modal 會響應）──
-        if _t.monotonic() < deadline:
-            try:
-                for _ in range(3):
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(300)
-            except Exception:
-                pass
+    def prepare_login_page(self, page) -> None:
+        page.wait_for_timeout(10000)
 
-        # ── Step 3: 點「我知道了/關閉」備援（單次，不再 multi-round）──
-        if _t.monotonic() < deadline:
-            button_texts = ["我知道了", "關閉", "稍後", "3個月後提醒", "3個月後再提醒",
-                            "暫不", "略過", "不再顯示", "下次再說", "稍後再說", "不再提醒",
-                            "I Know", "Close", "OK", "確定"]
-            for f in [page] + [fr for fr in page.frames if fr != page.main_frame]:
-                if _t.monotonic() > deadline:
-                    break
-                kind = "page" if f == page else "frame"
-                try:
-                    clicked = f.evaluate("""(texts) => {
-                        let n = 0;
-                        const all = document.querySelectorAll('button, a, span, div, [role="button"]');
-                        for (const el of all) {
-                            const t = (el.textContent || el.innerText || '').trim();
-                            if (!texts.includes(t)) continue;
-                            if (el.offsetParent === null) continue;
-                            const r = el.getBoundingClientRect();
-                            if (r.width < 5 || r.height < 5) continue;
-                            if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
-                                if (el.querySelector('button, a, [role="button"]')) continue;
-                            }
-                            try { el.click(); n += 1; } catch (e) {}
-                        }
-                        return n;
-                    }""", button_texts)
-                    if clicked:
-                        _log(f"[taishin][popup] {kind}: 額外點掉 {clicked} 個按鈕")
-                        total_closed += clicked
-                except Exception:
-                    pass
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
 
-        if total_closed:
-            _log(f"[taishin][popup] 累計關/隱藏 {total_closed} 個 popup")
-        elapsed = 25.0 - max(0, deadline - _t.monotonic())
-        _log(f"[taishin][popup] _close_popups 耗時 {elapsed:.1f}s")
-        return total_closed
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        duplicate_body = re.compile(
+            r"^\s*(?:上次未正常登出|未正常登出)\s*"
+            r"(?:[，。:：-]\s*)?(?:請\s*)?(?:重新登入|重新登錄)\s*$"
+        )
+        all_phases = tuple(CheckpointPhase)
+        post_settle = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
+        )
+        notice_body = re.compile(
+            r"^\s*(?:(?:系統斷信|訊息通知)\s*[：:]?\s*){1,2}我知道了\s*$"
+        )
+        otp_body = re.compile(
+            r"^[\s\S]*(?:OTP|一次性密碼|簡訊驗證碼|驗證碼已傳送|"
+            r"裝置驗證|信任此裝置|新裝置登入)[\s\S]*$",
+            re.IGNORECASE,
+        )
+        mandatory_password_body = re.compile(
+            r"^[\s\S]*(?:(?:立即|必須|請先|需要|需)\s*(?:修改|變更|重設)\s*"
+            r"(?:您的?)?\s*密碼|密碼[\s\S]*(?:已到期|過期|必須修改|需要修改|"
+            r"需修改|強制變更))[\s\S]*$"
+        )
+        return (
+            *(
+                LoginCheckpointRule(
+                    name=f"taishin-otp-required-{suffix}",
+                    bank="taishin",
+                    phases=all_phases,
+                    kind=CheckpointKind.OTP_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=otp_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"taishin-mandatory-password-{suffix}",
+                    bank="taishin",
+                    phases=all_phases,
+                    kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=mandatory_password_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"taishin-pre-duplicate-{suffix}",
+                    bank="taishin",
+                    phases=(CheckpointPhase.PRE_SUBMIT,),
+                    kind=CheckpointKind.DUPLICATE_SESSION,
+                    container_selector=selector,
+                    action_texts=("重新登入", "重新登錄"),
+                    required_body_pattern=duplicate_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"taishin-post-protocol-{suffix}",
+                    bank="taishin",
+                    phases=(CheckpointPhase.POST_SUBMIT,),
+                    kind=CheckpointKind.PROTOCOL_RESUBMIT,
+                    container_selector=selector,
+                    action_texts=("重新登入", "重新登錄"),
+                    required_body_pattern=duplicate_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"taishin-post-notice-{suffix}",
+                    bank="taishin",
+                    phases=post_settle,
+                    kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                    container_selector=selector,
+                    action_texts=("我知道了",),
+                    required_body_pattern=notice_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            LoginCheckpointRule(
+                name="taishin-unknown-modal",
+                bank="taishin",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="taishin-unknown-dialog",
+                bank="taishin",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
+            LoginCheckpointRule(
+                name="taishin-login-form-still-visible",
+                bank="taishin",
+                phases=post_settle,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="input[placeholder='身分證字號']",
+            ),
+        )
 
     def _try_ancestor_clicks(self, target_frame, page, debug_dir) -> bool:
         """台新信用卡 mega menu hover 策略 v2 (2026-06-11 真實 mouse)。
@@ -615,8 +601,9 @@ class TaishinCrawler(BankCrawler):
         return out
 
     def _ocr_captcha(self, frame, max_attempts=5):
-        """從 captcha img 抓 base64 → ocr_bytes 6 碼純數字（送出前安全重試）。"""
-        for n in range(1, max_attempts + 1):
+        """Read a six-digit CAPTCHA, refreshing natively at most four times."""
+        attempts = min(max(max_attempts, 0), 5)
+        for attempt in range(attempts):
             try:
                 cap_b64 = frame.evaluate("""() => {
                     const inputs = [...document.querySelectorAll('input')];
@@ -636,205 +623,115 @@ class TaishinCrawler(BankCrawler):
                     }
                     return null;
                 }""")
-                if not cap_b64:
-                    _log(f"[taishin][cap] 第 {n} 次抓 captcha base64 失敗")
-                    continue
-                raw = base64.b64decode(cap_b64)
-                text = ocr_bytes(raw, expected_len=6, alnum_only=True)
-                if text and len(text) == 6 and text.isdigit():
-                    _log(f"[taishin][cap] 第 {n} 次 OCR 成功: {text}")
-                    return text
-                _log(f"[taishin][cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {text!r}），換圖")
-                # 換圖：點旁邊的 refresh icon（如有）
-                try:
-                    frame.evaluate("""() => {
-                        const inputs = [...document.querySelectorAll('input')];
-                        const capInput = inputs.find(i => i.placeholder === '驗證碼');
-                        let parent = capInput.parentElement;
-                        for (let i = 0; i < 5 && parent; i++) {
-                            const refresh = parent.querySelector('[class*="refresh"], [class*="reload"], i.fa-sync, .icon-refresh');
-                            if (refresh) { refresh.click(); return true; }
-                            parent = parent.parentElement;
-                        }
-                        return false;
-                    }""")
-                    frame.evaluate("() => new Promise(r => setTimeout(r, 1500))")
-                except Exception as e:
-                    _log(f"[taishin][cap] 換圖失敗: {e}")
-            except Exception as e:
-                _log(f"[taishin][cap] OCR 失敗: {e}")
+                text = (
+                    ocr_bytes(
+                        base64.b64decode(cap_b64, validate=True),
+                        expected_len=6,
+                        alnum_only=True,
+                    )
+                    if cap_b64
+                    else None
+                )
+            except Exception:
+                return None
+            if text and len(text) == 6 and text.isdigit():
+                return text
+            if attempt == attempts - 1:
+                break
+            try:
+                candidates = frame.locator(
+                    "[class*='refresh'], [class*='reload'], i.fa-sync, .icon-refresh"
+                )
+                eligible = []
+                for index in range(candidates.count()):
+                    action = candidates.nth(index)
+                    if action.is_visible() and action.is_enabled():
+                        eligible.append(action)
+                if len(eligible) != 1:
+                    return None
+                eligible[0].click()
+                frame.wait_for_timeout(1500)
+            except Exception:
+                return None
         return None
 
-    def _submit_login_once(self, page) -> tuple[bool, str]:
-        """執行單次 fill帳密 + OCR captcha + click 登入鈕 + 等 10 秒判斷結果。
-
-        回傳 (success, reason):
-          - (True, "ok")               — 登入成功進主畫面
-          - (False, "no_frame")        — 找不到登入 iframe
-          - (False, "fill_failed")     — 填欄位失敗
-          - (False, "ocr_failed")      — OCR 5 次都失敗（未送 login）
-          - (False, "submit_failed")   — click 登入鈕失敗
-          - (False, "not_logged_in")   — 送出但 _logged_in 偵測不到（可能 popup 阻擋）
-
-        實測揭示：台新「上次未正常登出」popup 後**必須**再呼叫此 helper 一次才能進主畫面,
-        是 by-design 兩階段登入流程，**不算** retry。但呼叫超過 2 次（即不止 1 次救援）
-        則視為真實 retry，違反 max_attempts=1 鐵律 → 停手。
-        """
-        frame = self._find_login_frame(page)
-        if frame is None:
-            if "my.taishinbank.com.tw" in (page.url or ""):
-                _log("[taishin][login] ✓ session 可能仍有效")
-                return True, "ok"
-            _log("[taishin][login] 找不到 login iframe")
-            return False, "no_frame"
-
-        _log(f"[taishin][login] login iframe → {frame.url[:100]}")
-
-        # 填 3 欄
-        try:
-            for label in ["national_id", "user_code", "password"]:
-                ph = FIELD_PLACEHOLDERS[label]
-                val = getattr(self.creds, label)
-                frame.fill(_ph_sel(ph), val)
-                page.wait_for_timeout(200)
-                _log(f"[taishin][login]   ✓ {label} (len {len(val)})")
-        except Exception as e:
-            _log(f"[taishin][login] 填欄位失敗: {e}")
-            return False, "fill_failed"
-
-        # OCR captcha
-        captcha = self._ocr_captcha(frame, max_attempts=5)
-        if not captcha:
-            _log("[taishin][login] OCR 5 次都失敗，放棄（未送 login）")
-            return False, "ocr_failed"
-        try:
-            frame.fill(_ph_sel(FIELD_PLACEHOLDERS["captcha"]), captcha)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            _log(f"[taishin][login] 填 captcha 失敗: {e}")
-            return False, "fill_failed"
-
-        _log(f"[taishin][login] ⚠️ 送出 login（captcha={captcha}）")
-        try:
-            frame.click(f"#{LOGIN_BTN_ID}", timeout=8000)
-        except Exception as e:
-            _log(f"[taishin][login] click 登入鈕失敗: {e}")
-            return False, "submit_failed"
-
-        page.wait_for_timeout(10000)
-
-        if self._logged_in(page):
-            return True, "ok"
-        return False, "not_logged_in"
-
-    def login(self, page) -> bool:
-        """台新登入——兩階段流程支援：
-
-        Step 1: 首次 fill+submit
-        Step 2: 若撞「上次未正常登出」popup → 點「重新登入」（清 session redirect 回登入頁）
-                → **必須**再 fill+submit 一次（此非 retry，是 by-design 兩階段路徑）
-        Step 3: 第 2 次仍失敗 → 鐵律停手（避免無限循環）
-
-        實測揭示：台新「重新登入」按鈕後**需要**再次登入才能進主畫面, 視為救援流程一部分,
-        不算 max_attempts=1 的第 2 次 submit。但 step 3 後就絕不再試。
-        """
-        page.wait_for_timeout(10000)
-        _log(f"[taishin][login] 起始 url={page.url}")
-
-        # 載入時若有殘留 popup 先清（少數 case：上次未正常關 browser）
-        try:
-            kicked = self.handle_dup_login_modal(page)
-            if kicked:
-                _log("[taishin][login] 載入時就有殘留 popup，已踢")
-                page.wait_for_timeout(4000)
-        except Exception as e:
-            _log(f"[taishin][login] 初始 dup-handler 略過: {e}")
-
-        # ====== Step 1: 首次 submit ======
-        _log("[taishin][login] === Step 1: 首次 submit ===")
-        ok, reason = self._submit_login_once(page)
-        if ok:
-            _log(f"[taishin][login] ✅ Step 1 登入成功 -> {page.url}")
-            return True
-        _log(f"[taishin][login] Step 1 結果: ok={ok} reason={reason}")
-
-        # ====== Step 2: 偵測「上次未正常登出」popup → 點「重新登入」→ 再 submit ======
-        # 實測揭示：這是台新 by-design 兩階段流程, **第 2 次 submit 不算 retry**。
-        # 但必須確認 popup 真的有出現（不是亂猜重試）。
-        if reason != "not_logged_in":
-            # Internal: OCR / fill / submit mechanical failure — DON'T recover
-            # to avoid burning a wrong-password attempt at the bank.
-            _log(f"[taishin][login] ❌ Step 1 機械故障 ({reason}) → 不救援")
-            self._dump_login_failed(page)
-            raise TaishinLoginError(
-                f"台新登入失敗 (Step 1 表單操作異常): {reason}; url={page.url}",
-            )
-
-        # 偵測 popup
-        try:
-            kicked = self.handle_dup_login_modal(page)
-        except Exception as e:
-            _log(f"[taishin][login] dup-handler 例外: {e}")
-            kicked = False
-
-        if not kicked:
-            # 沒 popup 又 not_logged_in → 可能真的密碼錯或別種 error
-            _log("[taishin][login] ❌ Step 1 失敗但無重複登入彈窗 → 疑似帳號或密碼錯誤,停手")
-            self._dump_login_failed(page)
-            raise TaishinLoginError(
-                f"Step 1 not_logged_in 且無 dup-popup; 疑似帳密錯; url={page.url}",
-            )
-
-        _log("[taishin][login] === Step 2: dup-popup 點掉「重新登入」→ 等 redirect ===")
-        page.wait_for_timeout(10000)
-
-        # redirect 後可能直接進主畫面（esun-style）或回登入頁（台新-style）
-        if self._logged_in(page):
-            _log(f"[taishin][login] ✅ Step 2 「重新登入」一鍵成功（esun-style）-> {page.url}")
-            return True
-
-        # 台新-style：回登入頁，需再 fill+submit
-        _log("[taishin][login] === Step 3: 二次 submit (by-design 兩階段) ===")
-        ok2, reason2 = self._submit_login_once(page)
-        if ok2:
-            _log(f"[taishin][login] ✅ Step 3 二次登入成功 -> {page.url}")
-            return True
-
-        _log(f"[taishin][login] ❌ Step 3 失敗 reason={reason2} → 停手,不再試第 3 次")
-        self._dump_login_failed(page)
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        # Internal policy: max_attempts=2, MUST NOT auto-retry beyond Step 3.
-        # See wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.
-        raise TaishinLoginError(
-            f"台新登入失敗 (Step 3): {reason2}; url={page.url}\n{snap}",
-        )
-
-    def _dump_login_failed(self, page):
-        """login 失敗時 dump 截圖 + frame 錯誤訊息 — 給人類核對。"""
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "taishin_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            page.screenshot(path=str(debug_dir / "login_FAILED.png"), full_page=True)
-            _log(f"[taishin][login] 失敗截圖已存: {debug_dir}/login_FAILED.png")
-        except Exception:
-            pass
-
+    def submit_credentials_once(self, page) -> None:
         try:
             frame = self._find_login_frame(page)
-            if frame:
-                err_texts = frame.evaluate("""() => {
-                    return [...document.querySelectorAll('div, span, p')]
-                        .filter(e => e.offsetParent !== null)
-                        .map(e => (e.innerText || '').trim())
-                        .filter(t => t && t.length < 200 && /錯誤|失敗|無效|不正確|請重|請聯絡|密碼|驗證碼|帳號|身分|鎖|停用/.test(t))
-                        .slice(0, 5);
-                }""")
-                if err_texts:
-                    _log(f"[taishin][login] frame 錯誤訊息: {err_texts}")
         except Exception:
-            pass
+            raise TaishinLoginError("無法安全確認登入頁面；未送出登入") from None
+        if frame is None:
+            raise TaishinLoginError("找不到登入頁面；未送出登入") from None
+
+        try:
+            for label in ("national_id", "user_code", "password"):
+                value = getattr(self.creds, label)
+                candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS[label]))
+                if candidates.count() != 1:
+                    raise TaishinLoginError("登入欄位無法安全填寫；未送出登入")
+                field = candidates.nth(0)
+                field.fill(value)
+                page.wait_for_timeout(200)
+                if len(field.input_value()) != len(value):
+                    raise TaishinLoginError("登入欄位輸入長度不符；未送出登入")
+        except TaishinLoginError:
+            raise
+        except Exception:
+            raise TaishinLoginError("登入欄位無法安全填寫；未送出登入") from None
+
+        captcha = self._ocr_captcha(frame, max_attempts=5)
+        if not captcha or len(captcha) != 6 or not captcha.isdigit():
+            raise TaishinLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+        try:
+            candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS["captcha"]))
+            if candidates.count() != 1:
+                raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            field = candidates.nth(0)
+            field.fill(captcha)
+            page.wait_for_timeout(300)
+            if len(field.input_value()) != 6:
+                raise TaishinLoginError("驗證碼欄位輸入長度不符；未送出登入")
+        except TaishinLoginError:
+            raise
+        except Exception:
+            raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
+
+        try:
+            candidates = frame.locator(f"#{LOGIN_BTN_ID}")
+            if candidates.count() != 1:
+                raise TaishinLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            button = candidates.nth(0)
+            if not button.is_visible() or not button.is_enabled():
+                raise TaishinLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        except TaishinLoginError:
+            raise
+        except Exception:
+            raise TaishinLoginError("無法安全確認登入按鈕；未送出登入") from None
+        try:
+            button.click(timeout=8000)
+        except Exception:
+            raise TaishinLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(10000)
+            for _ in range(30):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                scopes = [
+                    page,
+                    *(child for child in page.frames if child is not page.main_frame),
+                ]
+                for scope in scopes:
+                    for selector in (".modal.show", "[role='dialog']"):
+                        checkpoints = scope.locator(selector)
+                        if any(
+                            checkpoints.nth(index).is_visible()
+                            for index in range(checkpoints.count())
+                        ):
+                            return
+        except Exception:
+            return
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """台新 collect — C 策略：popup 強行 hide → 直接點 top nav「信用卡」。
@@ -852,12 +749,6 @@ class TaishinCrawler(BankCrawler):
         out["initial_url"] = page.url
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "00_initial.png"), full_page=False)
-
-        # ── Step 1: 關所有 popup（強行 hide 版）──
-        self._close_popups(page)
-        page.wait_for_timeout(2000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "01_after_close_popups.png"), full_page=False)
 
         # ── Step 2: 從所有 frames（含主 page）找 top nav「信用卡」DOM 元素並點 ──
         # 台新 SPA 整個介面在 svc/rwd iframe 內，top nav 也在裡面（不在主 page）

@@ -262,7 +262,14 @@ def test_legacy_login_path_is_unchanged(monkeypatch, tmp_path):
 
 
 def test_shared_login_checkpoint_opt_in_inventory():
-    assert _opted_in_bank_modules() == {"cathay", "ctbc", "linebank", "rakuten", "ubot"}
+    assert _opted_in_bank_modules() == {
+        "cathay",
+        "ctbc",
+        "linebank",
+        "rakuten",
+        "taishin",
+        "ubot",
+    }
 
 
 @pytest.mark.parametrize(
