@@ -334,6 +334,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
         "linebank",
         "rakuten",
         "scb",
+        "scsb",
         "taishin",
         "ubot",
     }

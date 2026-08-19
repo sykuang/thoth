@@ -23,12 +23,19 @@ import contextlib
 import re
 import sys
 from pathlib import Path
+from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScsbCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://ibank.scsb.com.tw/"
 
@@ -57,80 +64,11 @@ JS_KILL_MODAL = r"""
 })()
 """
 
-# 抽 .ved_img background-image base64
-JS_GRAB_BG = r"""
-(() => {
-  const el = document.querySelector('.ved_img');
-  if (!el) return {err: 'no .ved_img'};
-  const bg = getComputedStyle(el).backgroundImage || '';
-  const m = bg.match(/data:image\/[a-z]+;base64,([^"')]+)/i);
-  return {found: !!m, b64: m ? m[1] : '', visible: el.offsetParent !== null};
-})()
-"""
-
-# 點橘紅 Log in 鈕（不是分頁的 General Login）
-JS_CLICK_LOGIN = r"""
-(() => {
-  const cands = [...document.querySelectorAll('button,input[type=submit],input[type=button]')]
-    .filter(b=>b.offsetParent!==null);
-  let b = cands.find(x=>{
-    const t = (x.textContent || x.value || '').trim();
-    return /^Log\s*in$/i.test(t) || /^登入$/.test(t);
-  });
-  if(!b){
-    b = cands.find(x=>{
-      const cls = (x.className || '').toLowerCase();
-      return /btn-gradient|btn-login/.test(cls);
-    });
-  }
-  if(b){ b.click(); return {ok:true, txt:(b.textContent||b.value||'').trim()}; }
-  return {ok:false};
-})()
-"""
-
-# 登入後是否仍在登入頁（負向訊號：login form 的驗證碼還在）
-JS_STILL_LOGIN = r"""
-(() => {
-  const ved = document.querySelector('.ved_img');
-  return !!(ved && ved.offsetParent !== null);
-})()
-"""
-
-# 登入成功的「正向訊號」 — 必須真的看到登入後的菜單字樣，不能只靠「驗證碼不在」反推
-# SCSB 登入後左側菜單固定有 My Overview / TWD Deposit / Credit Card Services 三大主項
-JS_LOGGED_IN_POSITIVE = r"""
-(() => {
-  // 1. URL 必須在內頁 prefix（/aply/ 或 /ibhm/），不在登入 SPA 根 /ibap/...
-  const url = location.href || '';
-  const urlOk = /\/(aply|ibhm)\//.test(url) && !/\/ibap\/.*login/i.test(url);
-
-  // 2. innerText 必須夠長（< 500 字幾乎都是 loading / 空白 / 錯誤頁）
-  const txt = (document.body && document.body.innerText) || '';
-  const lenOk = txt.length >= 500;
-
-  // 3. 必須看到主菜單字樣（命中 ≥ 2 個才算）
-  const keywords = [
-    'My Overview', 'TWD Deposit', 'Credit Card', 'Foreign Currency',
-    'My Settings', 'Loan', 'Investment', 'Hello', 'Last Login',
-    '個人總覽', '台幣存款', '信用卡', '外幣存款', '貸款', '投資理財',
-  ];
-  let hit = 0;
-  for (const k of keywords) {
-    if (txt.indexOf(k) !== -1) { hit += 1; if (hit >= 2) break; }
-  }
-  const kwOk = hit >= 2;
-
-  // 4. 不能還有 captcha form
-  const ved = document.querySelector('.ved_img');
-  const noCap = !(ved && ved.offsetParent !== null);
-
-  return {
-    ok: urlOk && lenOk && kwOk && noCap,
-    urlOk, lenOk, kwOk, noCap,
-    url, txt_len: txt.length, hit
-  };
-})()
-"""
+_CAPTCHA_BACKGROUND = re.compile(
+    r"^url\((?P<quote>[\"']?)data:image/(?:png|jpe?g|gif|webp);base64,"
+    r"(?P<payload>[A-Za-z0-9+/]+={0,2})(?P=quote)\)$",
+    re.IGNORECASE,
+)
 
 
 def _log(*a):
@@ -142,6 +80,8 @@ class ScsbLoginError(RuntimeError):
 
 
 class ScsbCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="scsb")
         self.creds = ScsbCreds.load()
@@ -150,179 +90,295 @@ class ScsbCrawler(BankCrawler):
         return "scsb.com"
 
     def _logged_in(self, page) -> bool:
-        """正向訊號：URL 在內頁 + innerText >= 500 + 命中 >=2 個菜單字樣 + 無 captcha form。
-
-        以前只用 `.ved_img` 不存在當「已登入」(negative-only)，雲端 fallback
-        goto 內頁拿空白 165 字也會被誤判成功 → false-positive。
-        """
+        """Pure one-shot positive check; the shared lifecycle owns waiting."""
         try:
-            r = page.evaluate(JS_LOGGED_IN_POSITIVE)
+            current = urlparse(page.url or "")
+            path = current.path.lower()
+            if (
+                (current.hostname or "").lower() != "ebank.scsb.com.tw"
+                or not path.startswith(("/aply/", "/ibhm/"))
+            ):
+                return False
+            controls = page.locator(
+                "#userId, #idNumber, #pppd, #verified, .ved_img"
+            )
+            if any(
+                controls.nth(index).is_visible()
+                for index in range(controls.count())
+            ):
+                return False
+            body = page.locator("body").inner_text()
         except Exception:
             return False
-        if isinstance(r, dict):
-            ok = bool(r.get("ok"))
-            if not ok:
-                _log(
-                    f"[login] _logged_in=False  "
-                    f"urlOk={r.get('urlOk')} lenOk={r.get('lenOk')} "
-                    f"kwOk={r.get('kwOk')} noCap={r.get('noCap')} "
-                    f"txt_len={r.get('txt_len')} hit={r.get('hit')} "
-                    f"url={r.get('url','')[:120]}",
-                )
-            return ok
-        return bool(r)
-
-    # ---------- 登入 ----------
-    def login(self, page) -> bool:
-        """SCSB iBank 登入——鐵律 max_attempts=1，失敗 raise ScsbLoginError。
-
-        若 session 仍有效（已登入跳到內頁且通過 positive signal），直接 return True。
-        絕不再「form 不見 → goto 內頁假裝成功」（那是 false-positive 來源）。
-        """
-        page.wait_for_timeout(9000)
-        _log(f"[login] 起始 url={page.url}")
-
-        # 連關 modal 兩輪
-        page.evaluate(JS_KILL_MODAL)
-        page.wait_for_timeout(1500)
-        page.evaluate(JS_KILL_MODAL)
-        page.wait_for_timeout(1000)
-
-        # session 仍有效 → 用正向訊號（URL prefix + 菜單字樣）雙重 check
-        cur_url = page.url or ""
-        if any(p in cur_url for p in ["/ibhm/", "/aply/"]) and self._logged_in(page):
-            _log(f"[login] ✓ session 仍有效（positive signal 通過），跳過 login: {cur_url}")
-            return True
-
-        # 等 login form 出現 — Akamai cold start 可能慢，給 30s + reload retry
-        # （CTBC 也踩過同一個雷，見 wiki/concepts/bank-crawler-must-logout-rule.md）
-        form_ready = False
-        for attempt in range(2):
-            try:
-                page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
-                page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
-                form_ready = True
-                break
-            except Exception as e:
-                _log(f"[login] form 等不到 (attempt {attempt+1}/2, 30s timeout): {e}")
-                if attempt == 0:
-                    # 再給一次：reload + 12s 等
-                    try:
-                        _log("[login] reload + 等 12s 後重試")
-                        page.reload(wait_until="domcontentloaded", timeout=20000)
-                        page.wait_for_timeout(12000)
-                        page.evaluate(JS_KILL_MODAL)
-                        page.wait_for_timeout(1500)
-                    except Exception as e2:
-                        _log(f"[login] reload 失敗: {e2}")
-        if not form_ready:
-            msg = (
-                f"SCSB 網銀無法連線 (登入表單載入逾時)。"
-                f"\n  url={page.url}\n"
-                f"  可能原因：銀行網站暫時無法連線、或 SCSB 正在維護。請稍後再試。"
-                # Internal policy: do NOT fall through to the inner page on form
-                # timeout — that produces a false-positive logged-in state. See
-                # wiki/concepts/taiwan-bank-login-positive-signal-rule.
-            )
-            _log(f"[login] ❌ {msg}")
-            raise ScsbLoginError(msg)
-
-        # 填三欄
-        try:
-            page.fill(SEL_SID, self.creds.national_id)
-            page.wait_for_timeout(200)
-            page.fill(SEL_USER, self.creds.user_code)
-            page.wait_for_timeout(200)
-            page.fill(SEL_PWD, self.creds.password)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            msg = f"SCSB 填欄位失敗: {e}"
-            _log(f"[login] ❌ {msg}")
-            raise ScsbLoginError(msg) from e
-
-        # OCR 驗證碼（送出前安全重試）
-        cap = self._ocr_with_regen(page, max_attempts=5)
-        if not cap:
-            msg = "OCR 5 次都讀不出 5 碼驗證碼，放棄（未送 login，無鎖帳號風險）"
-            _log(f"[login] ❌ {msg}")
-            raise ScsbLoginError(msg)
-        try:
-            page.fill(SEL_CAP, cap)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            msg = f"填驗證碼失敗: {e}"
-            _log(f"[login] ❌ {msg}")
-            raise ScsbLoginError(msg) from e
-
-        # 🚨 max_attempts=1：送 login 只此一次
-        _log(f"[login] 送出 login (captcha={cap})")
-        result = page.evaluate(JS_CLICK_LOGIN)
-        if not result.get("ok"):
-            msg = "找不到登入鈕（form 渲染異常）"
-            _log(f"[login] ❌ {msg}")
-            raise ScsbLoginError(msg)
-        page.wait_for_timeout(12000)
-        page.evaluate(JS_KILL_MODAL)
-        page.wait_for_timeout(2000)
-
-        # 給內頁多一點時間渲染菜單（cold start）— 最多再等 3 輪
-        for n in range(3):
-            if self._logged_in(page):
-                _log(f"[login] ✅ 登入成功 -> {page.url}")
-                return True
-            _log(f"[login] 等內頁渲染 (round {n+1}/3)")
-            page.wait_for_timeout(5000)
-            page.evaluate(JS_KILL_MODAL)
-
-        # 失敗 → 立刻停手、dump 錯訊
-        try:
-            errs = page.evaluate(
-                "(() => [...document.querySelectorAll('div,span,p,td')]"
-                ".filter(e=>e.offsetParent!==null)"
-                ".map(e=>(e.textContent||'').trim())"
-                ".filter(t=>t && t.length<100 && /錯誤|不正確|失敗|停用|E\\d{4}|locked|invalid|error|fail|expired/i.test(t))"
-                ".slice(0,8))()",
-            )
-        except Exception:
-            errs = []
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        msg = (
-            f"SCSB 登入失敗。請檢查帳號、密碼是否正確。"
-            f"\n  url={page.url}\n  錯誤訊息: {errs}\n"
-            f"  可能原因：(a) 驗證碼辨識錯誤 (機率小) (b) 帳號或密碼錯誤 (c) 帳號已被鎖定。"
-            f"\n{snap}"
-            # Internal policy: max_attempts=1, MUST NOT auto-retry the login
-            # form — bank locks the account after a few wrong-password attempts.
-            # See wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.
+        identities = ("Hello", "Last Login", "登出", "Logout")
+        menus = (
+            "My Overview",
+            "TWD Deposit",
+            "Credit Card",
+            "我的總覽",
+            "台幣存款",
+            "信用卡",
         )
-        _log(f"[login] ❌ {msg}")
-        raise ScsbLoginError(msg)
+        return (
+            len(body) >= 500
+            and any(identity in body for identity in identities)
+            and sum(menu in body for menu in menus) >= 2
+        )
 
-    def _ocr_with_regen(self, page, max_attempts=5):
-        """OCR `.ved_img` background base64，長度錯點 `.chg_link` 換圖（送出前安全重試）。"""
-        for n in range(1, max_attempts+1):
-            page.wait_for_timeout(800)
-            g = page.evaluate(JS_GRAB_BG)
-            if g.get("err") or not g.get("b64"):
-                _log(f"[cap] 第 {n} 次抓 base64 失敗: {g}")
-                continue
+    def login(self, page) -> bool:
+        return self._shared_login(page)
+
+    def prepare_login_page(self, page) -> None:
+        page.wait_for_timeout(9000)
+
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
+
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
+        )
+        otp = re.compile(
+            r"^[\s\S]{0,400}(?:(?<![A-Za-z])OTP(?=$|[^A-Za-z]|I got it)|一次性密碼|"
+            r"簡訊驗證碼|裝置驗證|信任此裝置|新裝置登入|device\s+verification)"
+            r"[\s\S]{0,400}$",
+            re.IGNORECASE,
+        )
+        password = re.compile(
+            r"^[\s\S]{0,120}(?:(?:必須|強制|請立即|請先|需要|需)\s*"
+            r"(?:變更|修改|更新|重設)\s*(?:您的?)?\s*密碼|"
+            r"密碼\s*(?:已)?(?:到期|過期)|mandatory\s+password\s+change)"
+            r"[\s\S]{0,120}$",
+            re.IGNORECASE,
+        )
+        error = re.compile(
+            r"^\s*(?:E4025|(?:帳號|密碼|使用者代碼)"
+            r"(?:不正確|錯誤|已停用|已鎖定)|登入失敗|驗證碼(?:錯誤|不正確)|"
+            r"Invalid credentials|Account locked)[。.!！：:\s]*$",
+            re.IGNORECASE,
+        )
+        modal_scopes = (
+            ("modal", ".modal.show"),
+            ("dialog", "[role='dialog']"),
+            ("intro", "#intro_alert.custom-modal.show"),
+        )
+        alert_scopes = (
+            ("error", ".error"),
+            ("alert", ".alert"),
+            ("role-alert", "[role='alert']"),
+        )
+        intro = LoginCheckpointRule(
+            name="scsb-intro-notice",
+            bank="scsb",
+            phases=(CheckpointPhase.PRE_SUBMIT,),
+            kind=CheckpointKind.DISMISSIBLE_NOTICE,
+            container_selector="#intro_alert.custom-modal.show",
+            action_texts=("I got it",),
+            max_actions=1,
+        )
+        return (
+            *(
+                LoginCheckpointRule(
+                    name=f"scsb-otp-required-{suffix}",
+                    bank="scsb",
+                    phases=all_phases,
+                    kind=CheckpointKind.OTP_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=otp,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scsb-password-change-required-{suffix}",
+                    bank="scsb",
+                    phases=all_phases,
+                    kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=password,
+                )
+                for suffix, selector in modal_scopes
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"scsb-explicit-login-error-{suffix}",
+                    bank="scsb",
+                    phases=post,
+                    kind=CheckpointKind.EXPLICIT_LOGIN_ERROR,
+                    container_selector=selector,
+                    required_body_pattern=error,
+                )
+                for suffix, selector in alert_scopes
+            ),
+            intro,
+            LoginCheckpointRule(
+                name="scsb-unknown-modal",
+                bank="scsb",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="scsb-unknown-dialog",
+                bank="scsb",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
+            LoginCheckpointRule(
+                name="scsb-login-form-still-visible",
+                bank="scsb",
+                phases=post,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=SEL_CAP,
+            ),
+        )
+
+    @staticmethod
+    def _keyboard_fill(page, field, value: str) -> None:
+        field.click()
+        field.click(click_count=3)
+        page.keyboard.press("Backspace")
+        page.keyboard.type(value, delay=80)
+        if len(field.input_value()) != len(value):
+            raise ScsbLoginError("登入欄位輸入長度不符；未送出登入")
+
+    @staticmethod
+    def _click_unique_refresh(page) -> bool:
+        refreshes = page.locator(".chg_link")
+        if refreshes.count() != 1:
+            return False
+        refresh = refreshes.nth(0)
+        if not refresh.is_visible() or not refresh.is_enabled():
+            return False
+        label = " ".join(refresh.inner_text().split())
+        if label not in ("", "重新產生", "Refresh"):
+            return False
+        refresh.click()
+        page.wait_for_timeout(1500)
+        return True
+
+    def _ocr_captcha(self, page, max_attempts=5):
+        attempts = min(max(int(max_attempts), 0), 5)
+        for attempt in range(attempts):
             try:
-                raw = base64.b64decode(g["b64"])
+                images = page.locator(SEL_CAP_IMG)
+                if images.count() != 1:
+                    return None
+                image = images.nth(0)
+                if not image.is_visible():
+                    return None
+                background = image.evaluate("el => getComputedStyle(el).backgroundImage")
+                match = (
+                    _CAPTCHA_BACKGROUND.fullmatch(background)
+                    if isinstance(background, str)
+                    else None
+                )
+                if match is None:
+                    raise ValueError
+                raw = base64.b64decode(match.group("payload"), validate=True)
                 text = ocr_bytes(raw, expected_len=5, alnum_only=True)
-                if text and len(text) == 5 and text.isdigit():
-                    _log(f"[cap] 第 {n} 次 OCR 成功: {text}")
+                if isinstance(text, str) and len(text) == 5 and text.isdigit():
                     return text
-                _log(f"[cap] 第 {n}/{max_attempts} 次 OCR 失敗（讀到 {text!r}），換圖")
-            except Exception as e:
-                _log(f"[cap] OCR 失敗: {e}")
-            if n < max_attempts:
+            except Exception:
+                pass
+            if attempt < attempts - 1:
                 try:
-                    page.click(".chg_link")
-                    page.wait_for_timeout(1500)
-                except Exception as e:
-                    _log(f"[cap] 換圖失敗: {e}")
+                    if not self._click_unique_refresh(page):
+                        return None
+                except Exception:
+                    return None
         return None
+
+    @staticmethod
+    def _visible_blocker(page) -> bool:
+        for selector in (
+            ".modal.show",
+            "[role='dialog']",
+            ".error",
+            ".alert",
+            "[role='alert']",
+        ):
+            candidates = page.locator(selector)
+            if any(
+                candidates.nth(index).is_visible()
+                for index in range(candidates.count())
+            ):
+                return True
+        return False
+
+    def submit_credentials_once(self, page) -> None:
+        try:
+            page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
+            page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
+            fields = []
+            for selector in (SEL_SID, SEL_USER, SEL_PWD, SEL_CAP):
+                candidates = page.locator(selector)
+                if candidates.count() != 1:
+                    raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
+                field = candidates.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
+                fields.append(field)
+
+            for field, value in zip(
+                fields[:3],
+                (
+                    self.creds.national_id,
+                    self.creds.user_code,
+                    self.creds.password,
+                ),
+                strict=True,
+            ):
+                self._keyboard_fill(page, field, value)
+            captcha = self._ocr_captcha(page, max_attempts=5)
+            if not captcha:
+                raise ScsbLoginError("無法安全辨識驗證碼；未送出登入")
+            self._keyboard_fill(page, fields[3], captcha)
+
+            candidates = page.locator(
+                "button, input[type='submit'], input[type='button']"
+            )
+            eligible = []
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if not candidate.is_visible() or not candidate.is_enabled():
+                    continue
+                label = " ".join(
+                    (
+                        candidate.inner_text()
+                        or candidate.get_attribute("value")
+                        or ""
+                    ).split()
+                )
+                if label in ("Log in", "登入"):
+                    eligible.append(candidate)
+            if len(eligible) != 1:
+                raise ScsbLoginError(
+                    "找不到唯一且可操作的登入按鈕；未送出登入"
+                )
+            button = eligible[0]
+        except ScsbLoginError:
+            raise
+        except Exception:
+            raise ScsbLoginError("登入欄位無法安全填寫；未送出登入") from None
+
+        try:
+            button.click(timeout=8000)
+        except Exception:
+            raise ScsbLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            for wait_ms in (12000, 5000, 5000, 5000):
+                page.wait_for_timeout(wait_ms)
+                if self._logged_in(page) or self._visible_blocker(page):
+                    return
+        except Exception:
+            raise ScsbLoginError(
+                "登入送出後狀態無法安全確認；禁止自動重試"
+            ) from None
 
     # ---------- 抓取（DOM regex 路線，API 加密暫不解）----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
