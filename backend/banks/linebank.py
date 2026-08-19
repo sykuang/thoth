@@ -20,15 +20,15 @@ LINE Bank 連線商業銀行 accessibility.linebank.com.tw/login 個人網銀爬
     Step 1: page goto → 等 6s SPA hydrate（React mount + lazy chunks）
     Step 2: triple-click + Backspace + keyboard.type 寫 3 欄（DBS 教訓：
             React controlled input 對 native setter + dispatchEvent 不認，必用真鍵盤）
-    Step 3: page.evaluate 驗 length；長度不符直接 abort 不送 login（保護帳號）
+    Step 3: 各欄 locator.input_value() 驗 length；不符直接 abort 不送 login
     Step 4: click 登入鈕 → 等 redirect
-    Step 5: 偵測 OTP / 簡訊驗證碼頁（送出後若跳, raise 中止由使用者人工處理）
+    Step 5: shared scoped checkpoints 處理 OTP / 登入成功通知
 
   ⚠️ 鐵律 max_attempts=1 — 失敗 raise LinebankLoginError，絕不重打
      （LINE Bank 客戶為純位元銀行用戶, 鎖帳號代價極高）
 
   Collect 流程（已完成 2026-06-14）:
-    - dismiss 登入後「確定」modal → goto /transaction
+    - shared SETTLE dismiss 登入後「確定」modal → goto /transaction
     - 讀 <select> 帳戶清單 → 對每個帳戶 set value + click 查詢 → 攔 API
     - dump 全 api_responses（payables / transactions / informations）
     - persist_linebank() 解析存款餘額 + 交易明細 + 分期信貸推斷
@@ -37,16 +37,22 @@ LINE Bank 連線商業銀行 accessibility.linebank.com.tw/login 個人網銀爬
 from __future__ import annotations
 
 import contextlib
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import publish_card_bill_facts
 from backend.core.creds import LinebankCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://accessibility.linebank.com.tw/login"
-LOGIN_PATH_HINT = "/login"
 
 
 def _log(*a):
@@ -54,14 +60,12 @@ def _log(*a):
 
 
 class LinebankLoginError(RuntimeError):
-    """LINE Bank login 送出後失敗——立刻中止，絕不自動重打。"""
-
-
-class LinebankOtpRequired(RuntimeError):
-    """登入送出後跳 OTP / 簡訊驗證 — 第一輪不自動填，raise 中止由使用者人工處理。"""
+    """LINE Bank login 失敗——立刻中止，絕不自動重打。"""
 
 
 class LinebankCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="linebank")
         self.creds = LinebankCreds.load()
@@ -111,185 +115,122 @@ class LinebankCrawler(BankCrawler):
         except Exception:
             return False
 
-    def _detect_otp(self, page) -> str | None:
-        """偵測登入後是否跳 OTP / 簡訊驗證頁。回傳訊息或 None。"""
-        try:
-            txt = page.evaluate("() => (document.body.innerText || '').slice(0, 3000)") or ""
-            otp_kw = [
-                "簡訊驗證碼", "OTP", "一次性密碼", "驗證碼已傳送", "請輸入您收到的",
-                "裝置驗證", "信任此裝置", "新裝置登入",
-            ]
-            for kw in otp_kw:
-                if kw in txt:
-                    # 取附近 80 字當錯誤訊息
-                    idx = txt.find(kw)
-                    return txt[max(0, idx - 20):idx + 80].strip()
-            return None
-        except Exception:
-            return None
-
     def login(self, page) -> bool:
-        """LINE Bank 登入 — 鐵律 max_attempts=1。"""
-        page.wait_for_timeout(6000)  # 等 SPA hydrate
-        _log(f"[linebank][login] 起始 url={page.url}")
+        return self._shared_login(page)
 
-        # session 復用偵測
-        if self._logged_in(page):
-            _log("[linebank][login] ✓ session 仍有效（已不在 login 頁），跳過 login")
-            return True
+    def prepare_login_page(self, page) -> None:
+        page.wait_for_timeout(6000)
 
-        if LOGIN_PATH_HINT not in (page.url or ""):
-            _log(f"[linebank][login] ⚠️ 不在 login 頁: {page.url}")
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
 
-        # ─── Step 1: 等欄位出現 ───
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        post = (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE)
+        return (
+            LoginCheckpointRule(
+                name="linebank-otp-required",
+                bank="linebank",
+                phases=post,
+                kind=CheckpointKind.OTP_REQUIRED,
+                container_selector=".modal.show",
+                required_body_pattern=re.compile(
+                    r"^[\s\S]*(?:簡訊驗證碼|OTP|一次性密碼|驗證碼已傳送|"
+                    r"請輸入您收到的簡訊驗證碼|裝置驗證|信任此裝置|新裝置登入)[\s\S]*$"
+                ),
+            ),
+            LoginCheckpointRule(
+                name="linebank-login-success-notice",
+                bank="linebank",
+                phases=post,
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector=".modal.show",
+                action_texts=("確定",),
+                required_body_pattern=re.compile(r"^\s*登入\s*確定\s*$"),
+                max_actions=1,
+            ),
+            LoginCheckpointRule(
+                name="linebank-unknown-modal",
+                bank="linebank",
+                phases=post,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="linebank-login-form-still-visible",
+                bank="linebank",
+                phases=post,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="#nationalId",
+            ),
+        )
+
+    def submit_credentials_once(self, page) -> None:
+        fields = (
+            ("#nationalId", self.creds.national_id, 15000),
+            ("#userId", self.creds.user_code, 5000),
+            ("#pw", self.creds.password, 5000),
+        )
         try:
-            page.wait_for_selector("#nationalId", timeout=15000)
-            page.wait_for_selector("#userId", timeout=5000)
-            page.wait_for_selector("#pw", timeout=5000)
-        except Exception as e:
-            _log(f"[linebank][login] ❌ 等欄位 timeout: {e}")
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(_debug_dir() / "01_no_fields.png"), full_page=True)
-            return False
+            for selector, _value, timeout in fields:
+                page.wait_for_selector(selector, state="visible", timeout=timeout)
 
-        # ─── Step 2: fill 3 欄（純 keyboard type，仿 DBS 策略）───
-        # 為何不用 page.fill：React controlled input + onChange 可能吞 batch 填值
-        # 策略：triple-click 選整行 → Backspace 清 → keyboard.type 一字一字打
-        creds_map = [
-            ("#nationalId", self.creds.national_id, "national_id"),
-            ("#userId",     self.creds.user_code,   "user_code"),
-            ("#pw",         self.creds.password,    "password"),
-        ]
-        try:
-            for sel, val, _label in creds_map:
-                loc = page.locator(sel)
-                loc.click()
+            for selector, value, _timeout in fields:
+                locator = page.locator(selector)
+                if locator.count() != 1:
+                    raise LinebankLoginError("登入欄位無法安全填寫；未送出登入")
+                locator.click()
                 page.wait_for_timeout(150)
-                loc.click(click_count=3)
+                locator.click(click_count=3)
                 page.wait_for_timeout(100)
                 page.keyboard.press("Backspace")
                 page.wait_for_timeout(100)
-                page.keyboard.type(val, delay=60)
+                page.keyboard.type(value, delay=60)
                 page.wait_for_timeout(250)
-        except Exception as e:
-            _log(f"[linebank][login] ❌ keyboard type 失敗: {e}")
-            return False
+                if len(locator.input_value()) != len(value):
+                    raise LinebankLoginError("登入欄位輸入長度不符；未送出登入")
+        except LinebankLoginError:
+            raise
+        except Exception:
+            raise LinebankLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        # ─── Step 2.5: 驗 length 不符不送出 ───
-        check = page.evaluate("""() => {
-            const get = id => document.getElementById(id);
-            return {
-                n_len: (get('nationalId') || {value:''}).value.length,
-                u_len: (get('userId')     || {value:''}).value.length,
-                p_len: (get('pw')         || {value:''}).value.length,
-            };
-        }""") or {}
-        _log(f"[linebank][login] keyboard type 後: {check}")
-
-        targets = {
-            "n_len": len(self.creds.national_id),
-            "u_len": len(self.creds.user_code),
-            "p_len": len(self.creds.password),
-        }
-        if any(check.get(k, 0) != v for k, v in targets.items()):
-            _log(f"[linebank][login] ❌ fill 長度不符 (got={check}, target={targets})")
-            _log("[linebank][login] 為保護帳號，**不送出 login**（純 fill 失敗，未累計密碼錯）")
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(_debug_dir() / "02_fill_failed.png"), full_page=True)
-            return False
-
-        # ─── Step 3: click 登入鈕 ───
-        _log("[linebank][login] 送出 login")
         try:
-            # LINE Bank 登入鈕：text="登入"（無 form submit, 直接 onClick）
-            # 用 evaluate 找第一個可見 + textContent==='登入' 的 button
-            clicked = page.evaluate("""() => {
-                for (const b of document.querySelectorAll('button')) {
-                    if (b.offsetParent === null) continue;
-                    const t = (b.textContent || '').trim();
-                    if (t === '登入' || t === '登入友善網路銀行') {
-                        b.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""")
-            if not clicked:
-                _log("[linebank][login] ❌ 找不到 '登入' 按鈕")
-                return False
-        except Exception as e:
-            _log(f"[linebank][login] ❌ click 登入鈕 失敗: {e}")
-            return False
+            buttons = page.locator("button")
+            matches = []
+            for index in range(buttons.count()):
+                button = buttons.nth(index)
+                if not button.is_visible() or not button.is_enabled():
+                    continue
+                text = " ".join(button.inner_text().split())
+                aria_label = button.get_attribute("aria-label")
+                if text in {"登入", "登入友善網路銀行"} or aria_label == "登入友善網路銀行":
+                    matches.append(button)
+        except Exception:
+            raise LinebankLoginError("無法安全確認登入按鈕；未送出登入") from None
+        if len(matches) != 1:
+            raise LinebankLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
 
-        # ─── Step 4: 等 redirect ───
-        page.wait_for_timeout(10000)
-        final_url = page.url or ""
-        _log(f"[linebank][login] 送出後 url={final_url}")
-
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(_debug_dir() / "03_after_login.png"), full_page=True)
-
-        # OTP / 裝置驗證
-        otp_msg = self._detect_otp(page)
-        if otp_msg:
-            _log(f"[linebank][login] ⚠️ 偵測到 OTP 驗證: {otp_msg}")
-            raise LinebankOtpRequired(
-                f"LINE Bank 跳 OTP/裝置驗證（url={final_url}）: {otp_msg}\n"
-                "第一輪不自動填，請使用者 headless=False 手動輸入後，session 會存進 user_data_dir，"
-                "下次同機可跳過。",
-            )
-
-        if self._logged_in(page):
-            _log(f"[linebank][login] ✅ 登入成功 → {final_url}")
-            return True
-
-        # 失敗：找錯誤訊息
-        # 2026-06-18: 套 dbs sibling lesson — keyword whitelist 過濾正常 CTA
-        err_msg = ""
-        with contextlib.suppress(Exception):
-            err_msg = page.evaluate(r"""() => {
-                const ERROR_KW = /錯誤|不正確|失敗|鎖定|逾時|驗證碼|帳號不存在|重試|無效|invalid|error|fail|locked|expired/i;
-                const sels = ['.error', '.alert', '[class*=error]', '[class*=Error]',
-                              '[role=alert]', '[class*=alert]', '[class*=Alert]'];
-                for (const sel of sels) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        if (el.offsetParent === null) continue;
-                        const t = (el.textContent || '').trim();
-                        if (t && t.length < 200 && ERROR_KW.test(t)) return t;
-                    }
-                }
-                return '';
-            }""") or ""
-
-        from backend.banks._login_debug import snapshot as _login_snapshot
-        snap = _login_snapshot(page)
-        msg = f"LINE Bank 登入失敗（url={final_url}）: {err_msg or '未知原因'}\n{snap}"
-        _log(f"[linebank][login] ❌ {msg}")
-        raise LinebankLoginError(msg)
-
-    def _dismiss_post_login_modal(self, page) -> None:
-        """登入後會跳一個「登入 確定」 modal，點「確定」進入正常頁面。
-
-        不是「重複登入」modal（沒提示語），純粹是登入成功確認，因此走獨立 handler，
-        不沾染 base.handle_dup_login_modal 的 logic。
-        """
         try:
-            clicked = page.evaluate("""() => {
-                for (const b of document.querySelectorAll('button, a, [role=button]')) {
-                    if (b.offsetParent === null) continue;
-                    const t = (b.textContent || '').trim();
-                    if (t === '確定' || t === '確認') {
-                        b.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""")
-            if clicked:
-                _log("[linebank][collect] 已點掉登入後「確定」modal")
-                page.wait_for_timeout(1500)
-        except Exception as e:
-            _log(f"[linebank][collect] dismiss post-login modal 失敗（忽略）: {e}")
+            matches[0].click(timeout=8000)
+        except Exception:
+            raise LinebankLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(10000)
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                modals = page.locator(".modal.show")
+                if any(modals.nth(index).is_visible() for index in range(modals.count())):
+                    return
+                login_fields = page.locator("#nationalId")
+                if any(
+                    login_fields.nth(index).is_visible()
+                    for index in range(login_fields.count())
+                ):
+                    return
+        except Exception:
+            return
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """LINE Bank collect 第二輪：點 menu 抓帳戶 + 交易明細。
@@ -298,7 +239,6 @@ class LinebankCrawler(BankCrawler):
         /transaction（帳戶交易明細查詢）才能拿到資料。
 
         步驟：
-          0. dismiss 登入後「確定」modal
           1. dump 主首頁 home_text + nav_items（保留第一輪行為）
           2. goto /transaction → 攔截 API + screenshot
           3. 全 dump api_responses（給後續 parser 升 dedicated persist_linebank）
@@ -308,9 +248,6 @@ class LinebankCrawler(BankCrawler):
         out: dict = {}
         page.wait_for_timeout(4000)
         debug_dir = _debug_dir()
-
-        # ─── Step 0: dismiss post-login modal ───
-        self._dismiss_post_login_modal(page)
 
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "00_home.png"), full_page=True)
@@ -476,6 +413,6 @@ if __name__ == "__main__":
     crawler = LinebankCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=False)
-    except (LinebankLoginError, LinebankOtpRequired) as e:
+    except LinebankLoginError as e:
         result = {"error": str(e)}
     print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
