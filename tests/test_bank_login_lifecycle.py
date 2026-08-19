@@ -265,6 +265,7 @@ def test_shared_login_checkpoint_opt_in_inventory():
     assert _opted_in_bank_modules() == {
         "cathay",
         "ctbc",
+        "esun",
         "linebank",
         "rakuten",
         "taishin",

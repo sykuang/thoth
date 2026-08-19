@@ -16,14 +16,21 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import sys
 from pathlib import Path
+from typing import ClassVar
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
-from backend.banks._login_debug import snapshot as _login_snapshot
 from backend.core.creds import EsunCreds
+from backend.core.login_checkpoints import (
+    CheckpointKind,
+    CheckpointPhase,
+    LoginCheckpointRule,
+)
 
 BASE = "https://ebank.esunbank.com.tw"
 IFRAME_HINT = "FCO08001_Home.faces"
@@ -73,6 +80,8 @@ def _esun_card_bill_fact(out: dict):
 
 
 class EsunCrawler(BankCrawler):
+    USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+
     def __init__(self):
         super().__init__(name="esun")
         self.creds = EsunCreds.load()
@@ -81,191 +90,212 @@ class EsunCrawler(BankCrawler):
         return "esunbank.com"
 
     def _find_login_frame(self, page):
-        """找含 FCO08001 的 iframe。"""
-        for f in page.frames:
-            if IFRAME_HINT in (f.url or ""):
-                return f
-        return None
+        matches = [frame for frame in page.frames if IFRAME_HINT in (frame.url or "")]
+        return matches[0] if len(matches) == 1 else None
 
     def _logged_in(self, page) -> bool:
-        """W (2026-06-17): positive signal 4 條件 AND（iframe 版，對齊 SCSB 鐵律）
-
-        1) urlOk: main page 仍在 esunbank.com 網域
-        2) noLoginForm: FCO08001_Home iframe 已消失（login iframe gone）
-        3) lenOk: main page innerText + iframe innerText 合計 >= 500
-        4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
-
-        任一 fail → 視為未登入。失敗時 _log 所有 condition 細節（cathay pattern）。
-
-        2026-06-18 evidence-driven fix（job 79+0.1.36 retry 30 次都 noLoginForm=F）：
-        玉山登入後 main page 仍在 index.jsp，iframe FCO08001_Home 也仍掛著（只是
-        iframe 內容換成已登入 dashboard），_find_login_frame 永遠找到 → noLoginForm
-        永遠 False → 4-AND 永遠 fail。但 kwOk=True hit=13（13 個內銀關鍵字命中）+
-        lenOk=True txt_len=3454 = 登入「真的成功」的強訊號。
-        修法：加 strongLogin OR — urlOk + lenOk + hit >= 8 即視為已登入，繞過
-        noLoginForm 機械式判定。對齊 [[bank-crawler-post-login-friction-pattern]]
-        ubot passwordExpiryNag 思路（friction page 不是 login fail）。
-        """
-        url = (page.url or "").lower()
-        urlOk = "esunbank.com" in url
-        noLoginForm = self._find_login_frame(page) is None
-
-        # 收集 body 文字（main page + 所有 frame）
-        texts = []
+        """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            main_txt = page.evaluate("document.body && document.body.innerText || ''")
-            if main_txt:
-                texts.append(main_txt)
+            hostname = (urlparse(page.url or "").hostname or "").lower()
+            if hostname != "ebank.esunbank.com.tw":
+                return False
+            login_frames = [
+                frame for frame in page.frames if IFRAME_HINT in (frame.url or "")
+            ]
+            if len(login_frames) > 1:
+                return False
+            scopes = [
+                page,
+                *(frame for frame in page.frames if frame is not page.main_frame),
+            ]
+            login_fields_selector = ", ".join(
+                _sel(field)
+                for field in (FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD)
+            )
+            for scope in scopes:
+                fields = scope.locator(login_fields_selector)
+                if any(
+                    fields.nth(index).is_visible()
+                    for index in range(fields.count())
+                ):
+                    return False
+            body = "\n".join(
+                scope.evaluate("() => document.body && document.body.innerText || ''") or ""
+                for scope in scopes
+            )
         except Exception:
-            pass
-        for f in page.frames:
-            if f == page.main_frame:
-                continue
-            try:
-                ftxt = f.evaluate("document.body && document.body.innerText || ''")
-                if ftxt:
-                    texts.append(ftxt)
-            except Exception:
-                pass
-        joined = "\n".join(texts)
-        lenOk = len(joined) >= 500
+            return False
 
-        KW = (
-            "訊息中心", "個人資訊", "登出", "帳戶總覽", "歡迎使用",
-            "存款", "轉帳", "信用卡", "台幣", "外幣",
-            "基金", "投資", "貸款", "繳費", "安全",
+        keywords = (
+            "訊息中心",
+            "個人資訊",
+            "登出",
+            "帳戶總覽",
+            "歡迎使用",
+            "存款",
+            "轉帳",
+            "信用卡",
+            "台幣",
+            "外幣",
+            "基金",
+            "投資",
+            "貸款",
+            "繳費",
         )
-        hit = sum(1 for k in KW if k in joined)
-        kwOk = hit >= 2
-
-        # strongLogin: kwOk hit >= 8 = 強訊號已登入（hit=13 cloud evidence 真實案例）
-        # 不靠 noLoginForm 機械式判定，繞過 iframe url 沒變 false-negative
-        strongLogin = urlOk and lenOk and hit >= 8
-
-        ok = (urlOk and noLoginForm and lenOk and kwOk) or strongLogin
-        if not ok:
-            _log(
-                f"[esun][login] _logged_in=False  "
-                f"urlOk={urlOk} noLoginForm={noLoginForm} "
-                f"lenOk={lenOk} kwOk={kwOk} strong={strongLogin} "
-                f"txt_len={len(joined)} hit={hit} "
-                f"url={page.url[:120]}",
-            )
-        elif strongLogin and not noLoginForm:
-            _log(
-                f"[esun][login] ✅ strongLogin (hit={hit}>=8) iframe 未消但內銀字夠強 "
-                f"url={page.url[:120]}",
-            )
-        return ok
+        hits = sum(keyword in body for keyword in keywords)
+        dashboard_identity = "登出" in body and "帳戶總覽" in body
+        return len(body) >= 500 and dashboard_identity and (
+            (not login_frames and hits >= 2) or (len(login_frames) == 1 and hits >= 8)
+        )
 
     def login(self, page) -> bool:
-        """玉山 ebank 登入——鐵律 max_attempts=1，失敗 raise EsunLoginError。"""
-        page.wait_for_timeout(10000)  # 玉山 iframe load 較慢
-        _log(f"[esun][login] 起始 url={page.url}")
+        return self._shared_login(page)
 
-        # session 復用偵測：若 iframe 已不在 FCO08001 → 已登入
-        frame = self._find_login_frame(page)
-        if frame is None and "esunbank.com" in (page.url or ""):
-            _log("[esun][login] ✓ session 仍有效，跳過 login")
-            return True
-
-        if frame is None:
-            _log(f"[esun][login] 找不到 login iframe (hint={IFRAME_HINT})")
-            return False
-        _log(f"[esun][login] login iframe → {frame.url[:100]}")
-
-        # 填 3 欄
-        try:
-            frame.fill(_sel(FIELD_NATIONAL_ID), self.creds.national_id)
-            page.wait_for_timeout(200)
-            frame.fill(_sel(FIELD_USER_CODE), self.creds.user_code)
-            page.wait_for_timeout(200)
-            frame.fill(_sel(FIELD_PASSWORD), self.creds.password)
-            page.wait_for_timeout(300)
-            _log("[esun][login] 已填 3 欄（national_id/user_code/password）")
-        except Exception as e:
-            _log(f"[esun][login] 填欄位失敗: {e}")
-            return False
-
-        # 🚨 max_attempts=1
-        _log("[esun][login] 送出 login")
-        try:
-            # click 用 attr selector
-            frame.click(_sel(LOGIN_BTN_ID), timeout=8000)
-        except Exception as e:
-            _log(f"[esun][login] click 登入鈕失敗: {e}")
-            return False
-
+    def prepare_login_page(self, page) -> None:
         page.wait_for_timeout(10000)
 
-        # 🚨 通用「重複登入」HTML modal 處理（base.py 預設 should_kick_other_session=True）
-        if self.handle_dup_login_modal(page):
-            _log("[esun][login] 重複登入 modal 已處理，等銀行 server 切 session 後再判定")
-            page.wait_for_timeout(3000)
+    def is_authenticated(self, page) -> bool:
+        return self._logged_in(page)
 
-        # 2026-06-18 evidence-driven fix（job 79 確診）：
-        # cloud failure 證實 _logged_in 真因是 noLoginForm=False（iframe FCO08001 還在），
-        # urlOk/lenOk/kwOk 三條件都 ✅ 通過 — login 送出 server 端 SSO redirect 比 10s 慢。
-        # 對比 SCSB 0.1.33 fix 用 20s retry loop 才過（log 證實 14s 才 ✅）。
-        # esun 改成 retry loop 30s 上限，每秒重判，給 server SSO redirect 足夠時間。
-        # 對齊 wiki/concepts/bank-crawler-login-positive-signal-rule.md SCSB/DBS pattern。
-        for _i in range(30):
-            if self._logged_in(page):
-                _log(f"[esun][login] ✅ 登入成功 ({10 + _i}s) -> {page.url}")
-                return True
-            page.wait_for_timeout(1000)
-
-        # 沒馬上判定登入成功 → dump 細節 + 截圖，但不馬上 raise
-        # 玉山可能 (a) login 成功但 iframe url 沒換 (b) 跳到訊息中心頁 (c) 真失敗
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "esun_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            page.screenshot(path=str(debug_dir / "after_login.png"), full_page=True)
-            _log("[esun][login] 截圖 → after_login.png")
-        except Exception as e:
-            _log(f"[esun][login] 截圖失敗: {e}")
-
-        # dump 所有 frame text + main page text
-        all_text = []
-        try:
-            main_txt = (page.evaluate("document.body.innerText") or "")[:2000]
-            all_text.append(("main", page.url, main_txt))
-        except Exception:
-            pass
-        for f in page.frames:
-            if f == page.main_frame:
-                continue
-            try:
-                ftxt = (f.evaluate("document.body.innerText") or "")[:2000]
-                all_text.append(("frame", f.url, ftxt))
-            except Exception:
-                pass
-        _log(f"[esun][login] dump {len(all_text)} pages/frames")
-        for kind, url, txt in all_text:
-            _log(f"[esun][login][{kind}] url={url[:80]}")
-            _log(f"[esun][login][{kind}] text={txt[:500]}")
-
-        # 看 main page 是否含「重複登入 / 重複登錄 / OTP / 簡訊 / 認證」字串 → 不是失敗
-        main_full = " ".join(t for _, _, t in all_text)
-        if any(k in main_full for k in ("重複登入", "重複登錄", "您已登入", "已從", "OTP", "簡訊驗證", "裝置綁定", "安全認證")):
-            _log("[esun][login] ⚠️ 偵測到二階段認證/重複登入訊號，視為 login 進行中（不視為失敗，交由 collect 處理）")
-            return True
-
-        # 否則才真失敗
-        errs = []
-        with contextlib.suppress(Exception):
-            errs = [t for _, _, t in all_text if any(k in t for k in ("錯誤", "失敗", "鎖", "無效", "invalid", "error"))][:5]
-        # Internal policy: max_attempts=1, MUST NOT auto-retry.
-        # See wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.
-        msg = (
-            f"玉山登入失敗。請檢查帳號、密碼是否正確。"
-            f"\n  url={page.url}\n  錯誤訊息/全文摘要: {errs}\n"
-            f"  可能原因：(a) 帳號或密碼錯誤 (b) 跳出 OTP / 裝置綁定確認 (c) 帳號已被鎖定。\n"
-            f"{_login_snapshot(page)}"
+    def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        all_phases = tuple(CheckpointPhase)
+        post_settle = (
+            CheckpointPhase.POST_SUBMIT,
+            CheckpointPhase.POST_SUBMIT_SETTLE,
         )
-        _log(f"[esun][login] ❌ {msg}")
-        raise EsunLoginError(msg)
+        otp_body = re.compile(
+            r"^[\s\S]*(?:OTP|一次性密碼|簡訊驗證碼|裝置綁定|"
+            r"安全認證|裝置驗證|信任此裝置|新裝置登入)[\s\S]*$",
+            re.IGNORECASE,
+        )
+        password_body = re.compile(
+            r"^[\s\S]*(?:(?:立即|必須|請先|需要|需)\s*(?:修改|變更|重設)\s*"
+            r"(?:您的?)?\s*密碼|密碼\s*(?:已)?(?:到期|過期)|"
+            r"密碼\s*強制\s*(?:修改|變更|重設)|"
+            r"強制\s*(?:修改|變更|重設)\s*(?:您的?)?\s*密碼)[\s\S]*$"
+        )
+        return (
+            *(
+                LoginCheckpointRule(
+                    name=f"esun-otp-required-{suffix}",
+                    bank="esun",
+                    phases=all_phases,
+                    kind=CheckpointKind.OTP_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=otp_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            *(
+                LoginCheckpointRule(
+                    name=f"esun-password-change-required-{suffix}",
+                    bank="esun",
+                    phases=all_phases,
+                    kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+                    container_selector=selector,
+                    required_body_pattern=password_body,
+                )
+                for suffix, selector in (
+                    ("modal", ".modal.show"),
+                    ("dialog", "[role='dialog']"),
+                )
+            ),
+            LoginCheckpointRule(
+                name="esun-unknown-modal",
+                bank="esun",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".modal.show",
+            ),
+            LoginCheckpointRule(
+                name="esun-unknown-dialog",
+                bank="esun",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector="[role='dialog']",
+            ),
+            LoginCheckpointRule(
+                name="esun-login-form-still-visible",
+                bank="esun",
+                phases=post_settle,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=_sel(FIELD_NATIONAL_ID),
+            ),
+        )
+
+    def submit_credentials_once(self, page) -> None:
+        try:
+            frame = self._find_login_frame(page)
+        except Exception:
+            raise EsunLoginError("無法安全確認登入頁面；未送出登入") from None
+        if frame is None:
+            raise EsunLoginError("找不到唯一登入頁面；未送出登入") from None
+
+        try:
+            for selector, value, wait in (
+                (_sel(FIELD_NATIONAL_ID), self.creds.national_id, 200),
+                (_sel(FIELD_USER_CODE), self.creds.user_code, 200),
+                (_sel(FIELD_PASSWORD), self.creds.password, 300),
+            ):
+                candidates = frame.locator(selector)
+                if candidates.count() != 1:
+                    raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
+                field = candidates.nth(0)
+                if not field.is_visible() or not field.is_enabled():
+                    raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
+                field.fill(value)
+                page.wait_for_timeout(wait)
+                if len(field.input_value()) != len(value):
+                    raise EsunLoginError("登入欄位輸入長度不符；未送出登入")
+        except EsunLoginError:
+            raise
+        except Exception:
+            raise EsunLoginError("登入欄位無法安全填寫；未送出登入") from None
+
+        try:
+            candidates = frame.locator(_sel(LOGIN_BTN_ID))
+            if candidates.count() != 1:
+                raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            button = candidates.nth(0)
+            if not button.is_visible() or not button.is_enabled():
+                raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        except EsunLoginError:
+            raise
+        except Exception:
+            raise EsunLoginError("無法安全確認登入按鈕；未送出登入") from None
+
+        try:
+            button.click(timeout=8000)
+        except Exception:
+            raise EsunLoginError("登入送出狀態不明；禁止自動重試") from None
+
+        try:
+            page.wait_for_timeout(10000)
+            for _ in range(30):
+                page.wait_for_timeout(1000)
+                if self._logged_in(page):
+                    return
+                scopes = [
+                    page,
+                    *(child for child in page.frames if child is not page.main_frame),
+                ]
+                for scope in scopes:
+                    for selector in (
+                        ".modal.show",
+                        "[role='dialog']",
+                        _sel(FIELD_NATIONAL_ID),
+                    ):
+                        checkpoints = scope.locator(selector)
+                        if any(
+                            checkpoints.nth(index).is_visible()
+                            for index in range(checkpoints.count())
+                        ):
+                            return
+        except Exception:
+            return
 
     # ---------- 抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
