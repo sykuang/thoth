@@ -659,6 +659,10 @@ class BankCrawler(ABC):
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         return ()
 
+    def _recover_late_authentication(self, page, error: Exception) -> bool:
+        """Allow a bank-specific, non-resubmitting auth recheck after a terminal."""
+        return False
+
     def _shared_login(self, page) -> bool:
         if not self._credential_origin_allowed(page):
             reduce_login_checkpoint(
@@ -887,6 +891,32 @@ class BankCrawler(ABC):
         kw["__cleanups__"] = cleanups
         return kw
 
+    def _execute_browser_flow(
+        self,
+        login_url: str,
+        *,
+        headless: bool,
+        page_action,
+        fetch_kwargs: dict,
+    ) -> None:
+        StealthyFetcher.fetch(
+            login_url,
+            headless=headless,
+            network_idle=False,
+            load_dom=True,
+            wait=2000,
+            timeout=180000,
+            user_data_dir=str(self.session_dir),
+            page_action=page_action,
+            google_search=True,
+            # 2026-06-18 evidence: these three protections pass CTBC's
+            # PerimeterX/HUMAN BotManager; solve_cloudflare breaks this SPA path.
+            hide_canvas=True,
+            block_webrtc=True,
+            dns_over_https=True,
+            **fetch_kwargs,
+        )
+
     def run(self, login_url: str, headless: bool = False) -> dict:
         """完整流程：開瀏覽器 → 登入 → 抓取 → **登出** → 回傳資料。
 
@@ -914,20 +944,27 @@ class BankCrawler(ABC):
                 try:
                     ok = self._shared_login(page)
                 except Exception as e:
-                    # login 子類可能 raise（例：ScsbLoginError、TaishinLoginError）
-                    # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
-                    # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
-                    import sys as _sys
-                    if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
-                        msg = f"{type(e).__name__}: {e}"
+                    try:
+                        recovered = self._recover_late_authentication(page, e)
+                    except Exception:
+                        recovered = False
+                    if recovered:
+                        ok = True
                     else:
-                        msg = f"{type(e).__name__}: login failed"
-                    print(
-                        f"[{self.name}][login] raise → {type(e).__name__}: details withheld",
-                        file=_sys.stderr,
-                    )
-                    result["error"] = msg
-                    return page
+                        # login 子類可能 raise（例：ScsbLoginError、TaishinLoginError）
+                        # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
+                        # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
+                        import sys as _sys
+                        if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
+                            msg = f"{type(e).__name__}: {e}"
+                        else:
+                            msg = f"{type(e).__name__}: login failed"
+                        print(
+                            f"[{self.name}][login] raise → {type(e).__name__}: details withheld",
+                            file=_sys.stderr,
+                        )
+                        result["error"] = msg
+                        return page
 
                 if not ok:
                     result["error"] = "login_failed"
@@ -983,33 +1020,13 @@ class BankCrawler(ABC):
         cleanups = fetch_kwargs.pop("__cleanups__", [])
 
         try:
-            StealthyFetcher.fetch(
-                login_url, headless=headless, network_idle=False, load_dom=True,
-                wait=2000, timeout=180000, user_data_dir=str(self.session_dir),
-                page_action=page_action, google_search=True,
-                # ── 2026-06-18 anti-bot 加強：scrapling 預設 stealth 不足以抗
-                # PerimeterX/HUMAN BotManager（CTBC 用），裸啟動會被導向
-                # /content/dam/ctbc-ib/zh_rb/general/out_of_service.html
-                # 偽 maintenance 頁（cloud job 97 evidence: 「您目前使用的作業系統
-                # 本行暫不支援」其實是 PerimeterX 煙霧彈）。三件套覆蓋 canvas/
-                # WebRTC/DNS 三大常被指紋識別的 surface，scripts/
-                # debug_ctbc_scrapling_matrix.py 已驗證單獨任一即可過 CTBC。
-                # 12 家全受惠（其他家本來就過得了，加開關無副作用）。
-                hide_canvas=True,
-                block_webrtc=True,
-                dns_over_https=True,
-                # ── 2026-06-18 第二輪實驗失敗 revert：
-                # 加 `solve_cloudflare=True` 後 cloud ctbc 反而更慘 — 之前 page collapse
-                # 387 字（login 後 submit 失敗），加完變成 page 連 43 字、login form 完全
-                # 沒 render + JSON parse error alert（`Unexpected token '\ufeff'`）。
-                # 推測 scrapling solve_cloudflare 在沒 Cloudflare challenge 的站
-                # （如 CTBC 用 PerimeterX）會 hook 干擾 SPA loading，把好的也搞壞。
-                # 本機 log 已預警 `ERROR: No Cloudflare challenge found`。
-                # Lesson: 「再加一個 flag 試試」不是 free — 沒 cloud-evidence 證實有效
-                # 的 flag 不該疊加，反而可能 break 已 work 的部份。
-                # 留 macOS UA + sec-ch-ua-platform + navigator.platform spoof（ctbc 子類）
-                # 繼續試，本層只保留三件套。
-                **fetch_kwargs,
+            # Stealth defaults shared by all banks: no solve_cloudflare hook; keep the
+            # proven canvas/WebRTC/DNS protections and each adapter's fetch kwargs.
+            self._execute_browser_flow(
+                login_url,
+                headless=headless,
+                page_action=page_action,
+                fetch_kwargs=fetch_kwargs,
             )
         finally:
             for c in cleanups:

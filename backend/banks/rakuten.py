@@ -12,6 +12,8 @@ import time
 from typing import ClassVar
 from urllib.parse import urlparse
 
+from scrapling.fetchers import StealthySession
+
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 
 from backend.core.captcha import solve_captcha, wait_captcha_stable
@@ -20,6 +22,7 @@ from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
     LoginBudget,
+    LoginCheckpointBlocked,
     LoginCheckpointTerminal,
     LoginCheckpointRule,
     evaluate_login_checkpoint,
@@ -177,6 +180,40 @@ class RakutenCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "rakuten-bank.com.tw"
 
+    def _execute_browser_flow(
+        self,
+        login_url: str,
+        *,
+        headless: bool,
+        page_action,
+        fetch_kwargs: dict,
+    ) -> None:
+        # Rakuten's Angular login transition completes only after the shared login
+        # stack unwinds; keep the same owned page alive for the bounded recheck.
+        with StealthySession(
+            headless=headless,
+            user_data_dir=str(self.session_dir),
+            hide_canvas=True,
+            block_webrtc=True,
+            dns_over_https=True,
+            **fetch_kwargs,
+        ) as engine:
+            if engine.context is None:
+                raise RuntimeError("樂天瀏覽器 context 未建立")
+            page = engine.context.new_page()
+            page.set_default_navigation_timeout(180000)
+            page.set_default_timeout(180000)
+            if headers := fetch_kwargs.get("extra_headers"):
+                page.set_extra_http_headers(headers)
+            try:
+                page.goto(login_url, referer="https://www.google.com/")
+                page.wait_for_load_state("load")
+                page.wait_for_load_state("domcontentloaded")
+                page_action(page)
+                page.wait_for_timeout(2000)
+            finally:
+                page.close()
+
     def _logged_in(self, page) -> bool:
         try:
             current = urlparse(page.url or "")
@@ -211,6 +248,63 @@ class RakutenCrawler(BankCrawler):
 
     def is_authenticated(self, page) -> bool:
         return self._logged_in(page)
+
+    def _recover_late_authentication(self, page, error: Exception) -> bool:
+        if (
+            not isinstance(error, LoginCheckpointBlocked)
+            or error.budget != LoginBudget(credential_submissions=1)
+            or error.outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER
+            or error.outcome.rule_name is not None
+            or getattr(self, "_shared_dialog_blocked", False)
+        ):
+            return False
+        page.wait_for_timeout(5000)
+        if (
+            getattr(self, "_shared_dialog_blocked", False)
+            or not self._credential_origin_allowed(page)
+            or _any_visible(page, "input[name='otpCode']")
+            or _any_visible(page, "#ib_init_connect_error_popup")
+        ):
+            return False
+        if not _any_visible(page, ".modal.show"):
+            return self._logged_in(page)
+
+        rules = self.login_checkpoint_rules()
+        active_rules = tuple(
+            rule for rule in rules if CheckpointPhase.POST_SUBMIT_SETTLE in rule.phases
+        )
+        outcome = validate_login_checkpoint_outcome(
+            evaluate_login_checkpoint(
+                page,
+                bank=self.name,
+                phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                rules=rules,
+                is_authenticated=self.is_authenticated,
+                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+            ),
+            active_rules,
+        )
+        if outcome.kind not in {
+            CheckpointKind.DUPLICATE_SESSION,
+            CheckpointKind.DISMISSIBLE_NOTICE,
+        }:
+            return False
+        try:
+            reduce_login_checkpoint(
+                CheckpointPhase.POST_SUBMIT_SETTLE,
+                error.budget,
+                outcome,
+            )
+        except LoginCheckpointTerminal:
+            return False
+        return (
+            not getattr(self, "_shared_dialog_blocked", False)
+            and self._credential_origin_allowed(page)
+            and not _any_visible(page, "input[name='otpCode']")
+            and not _any_visible(page, ".modal.show")
+            and not _any_visible(page, "#ib_init_connect_error_popup")
+            and self._logged_in(page)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -261,7 +355,7 @@ class RakutenCrawler(BankCrawler):
                 phases=all_phases,
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
                 container_selector=".modal.show",
-                action_texts=("略過了",),
+                action_texts=("略過",),
                 required_body_pattern=prefix(self.INSURANCE_PROMO_PREFIX),
             ),
             LoginCheckpointRule(

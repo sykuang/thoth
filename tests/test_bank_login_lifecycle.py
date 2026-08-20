@@ -316,6 +316,33 @@ def test_run_redacts_untyped_login_exception_text(
     assert "PRIVATE" not in capsys.readouterr().err
 
 
+def test_run_recovery_hook_exception_fails_closed_without_leaking(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail_login(_page):
+        raise RuntimeError("ORIGINAL-LOGIN-DOM-987654")
+
+    def fail_recovery(_page, _error):
+        raise RuntimeError("PRIVATE-RECOVERY-DOM-654321")
+
+    monkeypatch.setattr(crawler, "prepare_login_page", fail_login)
+    monkeypatch.setattr(crawler, "_recover_late_authentication", fail_recovery)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        lambda *_args, **_kwargs: CheckpointOutcome(
+            CheckpointKind.READY_FOR_CREDENTIALS
+        ),
+    )
+
+    assert result["error"] == "RuntimeError: login failed"
+    assert "PRIVATE" not in result["error"]
+    assert "PRIVATE" not in capsys.readouterr().err
+
+
 def test_shared_login_checkpoint_opt_in_inventory():
     assert _opted_in_bank_modules() == {
         "cathay",

@@ -8,7 +8,9 @@ from unittest.mock import Mock, call
 import pytest
 
 import backend.banks.rakuten as rakuten_mod
+import backend.core.base as base_mod
 from backend.banks.rakuten import (
+    BASE,
     CAPTCHA_IMG,
     LOADER_SELECTOR,
     RakutenCrawler,
@@ -24,10 +26,12 @@ from backend.banks.rakuten import (
     _unique_option_index,
     _view_ready,
 )
+from backend.core.base import BankCollectResult
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
     CheckpointPhase,
+    LoginBudget,
     LoginCheckpointBlocked,
     LoginInteractionRequired,
     evaluate_login_checkpoint,
@@ -100,7 +104,7 @@ def test_shared_login_api_and_rule_inventory() -> None:
         ("是，我要登入",),
         (),
         ("稍後再看",),
-        ("略過了",),
+        ("略過",),
         (),
     ]
     assert all(rule.max_actions == 1 for rule in rules)
@@ -167,6 +171,106 @@ def test_login_adapter_and_prepare_delegate_once(monkeypatch) -> None:
     page.wait_for_timeout.assert_called_once_with(20000)
     assert crawler.is_authenticated(page)
     logged_in.assert_called_once_with(page)
+
+
+def test_run_recovers_only_late_authenticated_rakuten_terminal(monkeypatch, tmp_path) -> None:
+    page = Mock()
+    page.url = "https://www.rakuten-bank.com.tw/ebank/chm/chmqu0001/010"
+    page.locator.return_value.count.return_value = 0
+
+    class FakeContext:
+        def new_page(self):
+            return page
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            self.context = FakeContext()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    crawler = object.__new__(RakutenCrawler)
+    crawler.name = "rakuten"
+    crawler.session_dir = tmp_path
+    crawler.collector = None
+    crawler._shared_dialog_blocked = False
+    crawler._enforce_session_freshness = Mock()
+    crawler._build_fetch_kwargs = Mock(return_value={"__cleanups__": []})
+    crawler._shared_login = Mock(side_effect=LoginCheckpointBlocked(
+        LoginBudget(credential_submissions=1),
+        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+    ))
+    crawler._logged_in = Mock(return_value=True)
+    crawler.collect = Mock(return_value=BankCollectResult(
+        bank="rakuten",
+        final_url=page.url,
+        twd_txn_results=[],
+        card_bill_facts_ok=False,
+        card_bill_facts=[],
+    ))
+    crawler.logout = Mock(return_value=True)
+    monkeypatch.setattr(rakuten_mod, "StealthySession", FakeSession, raising=False)
+    monkeypatch.setattr(
+        base_mod.StealthyFetcher,
+        "fetch",
+        Mock(side_effect=AssertionError("Rakuten must keep one owned page")),
+    )
+
+    result = crawler.run(BASE, headless=True)
+
+    assert "error" not in result
+    assert "data" in result
+    assert page.wait_for_timeout.call_args_list == [call(5000), call(2000)]
+    crawler._logged_in.assert_called_once_with(page)
+    crawler.collect.assert_called_once()
+    crawler.logout.assert_called_once_with(page)
+
+
+def test_late_auth_recovery_processes_only_known_scoped_modal(monkeypatch) -> None:
+    modal_visible = True
+
+    class Locator:
+        def __init__(self, selector: str):
+            self.selector = selector
+
+        def count(self) -> int:
+            return int(self.selector == ".modal.show" and modal_visible)
+
+        def nth(self, _index: int):
+            return self
+
+        def is_visible(self) -> bool:
+            return self.selector == ".modal.show" and modal_visible
+
+    page = Mock()
+    page.locator.side_effect = Locator
+    crawler = object.__new__(RakutenCrawler)
+    crawler.name = "rakuten"
+    crawler._shared_dialog_blocked = False
+    crawler._credential_origin_allowed = Mock(return_value=True)
+    crawler._logged_in = Mock(return_value=True)
+
+    def evaluate(*_args, **_kwargs):
+        nonlocal modal_visible
+        modal_visible = False
+        return CheckpointOutcome(
+            CheckpointKind.DISMISSIBLE_NOTICE,
+            rule_name="rakuten-ricb-promo",
+            action_label="略過",
+        )
+
+    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluate)
+    error = LoginCheckpointBlocked(
+        LoginBudget(credential_submissions=1),
+        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+    )
+
+    assert crawler._recover_late_authentication(page, error)
+    assert page.wait_for_timeout.call_args_list == [call(5000)]
+    crawler._logged_in.assert_called_once_with(page)
 
 
 def test_authenticated_origin_requires_exact_bank_host_and_ebank_prefix() -> None:
@@ -254,7 +358,7 @@ def test_rakuten_rules_with_real_patchright_evaluator() -> None:
 
             for prefix, action, expected_rule in (
                 (RakutenCrawler.REFERRAL_PROMO_PREFIX, "稍後再看", "rakuten-referral-promo"),
-                (RakutenCrawler.INSURANCE_PROMO_PREFIX, "略過了", "rakuten-ricb-promo"),
+                (RakutenCrawler.INSURANCE_PROMO_PREFIX, "略過", "rakuten-ricb-promo"),
             ):
                 outcome = evaluate(
                     f"""
