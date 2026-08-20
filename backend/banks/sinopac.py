@@ -112,9 +112,13 @@ class SinopacCrawler(BankCrawler):
             current = urlparse(page.url or "")
             path = (current.path or "").lower()
             if (
-                (current.hostname or "").lower() != "mma.sinopac.com"
+                not self._exact_https_origin_allowed(
+                    page.url, frozenset({"mma.sinopac.com"})
+                )
                 or "mmalogin.aspx" in path
-                or not path.startswith(("/mymma/", "/myasset/", "/mma_"))
+                or not path.startswith(
+                    ("/mymma/", "/myasset/", "/mma_", "/mma/mymma/")
+                )
             ):
                 return False
             for scope in self._page_scopes(page):

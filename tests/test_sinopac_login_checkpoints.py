@@ -221,8 +221,16 @@ def test_auth_requires_exact_host_known_path_private_identity_and_no_login_field
         dashboard = "登出 資產總覽 " + "x" * 600
         real.set_content(f"<main>{dashboard}</main>")
 
-        for path in ("/MyMMA/home", "/Myasset/home", "/mma_assets/home"):
+        for path in (
+            "/MyMMA/home",
+            "/Myasset/home",
+            "/mma_assets/home",
+            "/mma/mymma/myasset/mma_assets_summary.aspx",
+        ):
             assert crawler._logged_in(_page_proxy(real, f"https://mma.sinopac.com{path}"))
+        assert not crawler._logged_in(
+            _page_proxy(real, "http://mma.sinopac.com/mma/mymma/myasset/mma_assets_summary.aspx")
+        )
         assert not crawler._logged_in(_page_proxy(real, "https://marketing.sinopac.com/MyMMA/home"))
         assert not crawler._logged_in(_page_proxy(real, "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"))
         assert not crawler._logged_in(_page_proxy(real, "https://mma.sinopac.com/public/home"))

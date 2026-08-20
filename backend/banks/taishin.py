@@ -107,24 +107,29 @@ class TaishinCrawler(BankCrawler):
         matches = [frame for frame in page.frames if self._is_login_frame_url(frame.url)]
         return matches[0] if len(matches) == 1 else None
 
-    @staticmethod
-    def _is_login_frame_url(url: str | None) -> bool:
+    @classmethod
+    def _is_login_frame_url(cls, url: str | None) -> bool:
         current = urlparse(url or "")
         return (
-            (current.hostname or "").lower() == "my.taishinbank.com.tw"
+            cls._exact_https_origin_allowed(url or "", cls.CREDENTIAL_HOSTS)
             and IFRAME_HINT in (current.path or "").lower()
         )
 
     def _logged_in(self, page) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
         try:
-            if (urlparse(page.url or "").hostname or "").lower() != "my.taishinbank.com.tw":
+            if not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS):
                 return False
             if any(self._is_login_frame_url(frame.url) for frame in page.frames):
                 return False
             scopes = [
                 page,
-                *(frame for frame in page.frames if frame is not page.main_frame),
+                *(
+                    frame
+                    for frame in page.frames
+                    if frame is not page.main_frame
+                    and self._frame_origin_allowed(page, frame)
+                ),
             ]
             for scope in scopes:
                 login_fields = scope.locator("input[placeholder='身分證字號']")
@@ -149,7 +154,11 @@ class TaishinCrawler(BankCrawler):
             "資產總額",
             "存款餘額",
         )
-        return len(body) >= 500 and sum(keyword in body for keyword in keywords) >= 2
+        return (
+            len(body) >= 500
+            and "登出" in body
+            and any(keyword in body for keyword in keywords)
+        )
 
     def login(self, page) -> bool:
         return self._shared_login(page)

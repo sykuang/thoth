@@ -288,8 +288,10 @@ def _submit_fixture():
     modal = Mock()
     candidates.count.return_value = 1
     candidates.first = button
+    candidates.nth.return_value = button
     button.is_visible.return_value = True
     button.is_enabled.return_value = True
+    button.inner_text.return_value = "登入"
     button.get_attribute.return_value = "btn_submit"
     modals.count.return_value = 1
     modals.nth.return_value = modal
@@ -340,6 +342,22 @@ def test_submit_uses_true_keyboard_clicks_once_and_preserves_timing() -> None:
     button.click.assert_called_once_with(timeout=8000)
     page.fill.assert_not_called()
     page.click.assert_not_called()
+
+
+def test_submit_ignores_hidden_responsive_duplicate_and_clicks_one_visible_action() -> None:
+    crawler, page, candidates, button, _modals = _submit_fixture()
+    hidden = Mock()
+    hidden.is_visible.return_value = False
+    hidden.is_enabled.return_value = True
+    hidden.inner_text.return_value = "登入"
+    hidden.get_attribute.return_value = "btn_submit"
+    candidates.count.return_value = 2
+    candidates.nth.side_effect = [hidden, button]
+
+    crawler.submit_credentials_once(page)
+
+    hidden.click.assert_not_called()
+    button.click.assert_called_once_with(timeout=8000)
 
 
 @pytest.mark.parametrize(
@@ -508,7 +526,7 @@ def test_login_prepare_and_authentication_are_thin_adapters(monkeypatch) -> None
     shared_login.assert_called_once_with(page)
 
     crawler.prepare_login_page(page)
-    assert page.mock_calls == [call.wait_for_timeout(3500)]
+    assert page.mock_calls == [call.wait_for_timeout(8000)]
     assert crawler.is_authenticated(page)
     logged_in.assert_called_once_with(page)
 

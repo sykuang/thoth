@@ -52,12 +52,9 @@ HEADER_LOGIN_BTN_ID = "header_form:header_login"  # 在 frame1，右上「登入
 GENERAL_LOGIN_TAB = "一般登入"
 LOGIN_BTN_ID = "btnLogin2"  # 一般登入 form 的登入鈕（txnFrame 內）
 
-# 一般登入 form 欄位（dry probe v2 揭示，vision 確認 label）
-FIELD_M1_NATIONAL_ID = "m1_LJCHUYIFKV"  # 身分證 (maxlen=10)
-FIELD_M1_USER_CODE   = "m1_VVYJVIJLIE"  # 使用者代碼 (maxlen=10，實況 XXX1234 = 7 碼)
-FIELD_M1_PASSWORD    = "m1_ACXMQTRIBF"  # 密碼 (maxlen=16)
 FIELD_M1_CAPTCHA     = "m1_userCaptcha"  # 6 碼純數字
 CAPTCHA_IMG_ID       = "m1_captchaImage"  # 158×30 captcha img
+_DYNAMIC_LOGIN_FIELD_ID = re.compile(r"^m1_[A-Z]{10}$")
 
 
 def _log(*a):
@@ -156,7 +153,11 @@ class FubonCrawler(BankCrawler):
                 return False
             scopes = [
                 page,
-                *(frame for frame in page.frames if frame is not page.main_frame),
+                *(
+                    frame
+                    for frame in page.frames
+                    if frame is not page.main_frame and self._is_owned_frame(page, frame)
+                ),
             ]
             body_parts = []
             controls_selector = (
@@ -179,7 +180,10 @@ class FubonCrawler(BankCrawler):
             return (
                 len(body) >= 500
                 and "登出" in body
-                and any(item in body for item in ("帳戶總覽", "我的帳戶", "資產總額"))
+                and (
+                    any(item in body for item in ("帳戶總覽", "我的帳戶", "資產總額"))
+                    or ("帳戶" in body and "資產" in body)
+                )
             )
         except Exception:
             return False
@@ -325,23 +329,34 @@ class FubonCrawler(BankCrawler):
             frame = self._find_login_frame(page)
             if frame is None:
                 raise FubonLoginError("找不到唯一的登入頁面；未送出登入")
-            fields = []
-            for field_id, maxlength in (
-                (FIELD_M1_NATIONAL_ID, "10"),
-                (FIELD_M1_USER_CODE, "10"),
-                (FIELD_M1_PASSWORD, "16"),
-            ):
-                candidates = frame.locator(f"#{field_id}")
-                if candidates.count() != 1:
-                    raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-                field = candidates.nth(0)
+            candidates = frame.locator("input[type='password']")
+            ordered = []
+            for index in range(candidates.count()):
+                field = candidates.nth(index)
+                if not field.is_visible():
+                    continue
+                field_id = field.get_attribute("id") or ""
+                field_name = field.get_attribute("name") or ""
+                maxlength = field.get_attribute("maxlength") or ""
+                box = field.bounding_box()
                 if (
-                    not field.is_visible()
-                    or not field.is_enabled()
-                    or field.get_attribute("maxlength") != maxlength
+                    not field.is_enabled()
+                    or not _DYNAMIC_LOGIN_FIELD_ID.fullmatch(field_id)
+                    or field_id != f"m1_{field_name}"
+                    or maxlength not in {"10", "16"}
+                    or not box
+                    or box["width"] <= 0
+                    or box["height"] <= 0
                 ):
                     raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
-                fields.append(field)
+                ordered.append((box["y"], maxlength, field))
+            ordered.sort(key=lambda item: item[0])
+            if (
+                [item[1] for item in ordered] != ["10", "10", "16"]
+                or len({item[0] for item in ordered}) != 3
+            ):
+                raise FubonLoginError("登入欄位無法安全填寫；未送出登入")
+            fields = [item[2] for item in ordered]
             values = (self.creds.national_id, self.creds.user_code, self.creds.password)
             for field, value in zip(fields, values, strict=True):
                 field.click()

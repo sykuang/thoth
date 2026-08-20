@@ -63,6 +63,7 @@ def test_ubot_shared_login_api_and_ordered_rules() -> None:
         "下次再說",
         "Later",
         "Skip",
+        "確認",
     )
     assert rules[2].max_actions == 1
     assert rules[3].action_texts == rules[4].action_texts == ()
@@ -189,6 +190,17 @@ def test_real_dom_rules_are_terminal_first_scoped_and_fail_closed() -> None:
         assert outcome.action_label == "Skip"
         assert page.locator("body").get_attribute("data-inside") == "1"
         assert page.locator("body").get_attribute("data-outside") == "0"
+
+        page.set_content(
+            '<div class="modal show" id="optional-confirm">'
+            '您離上次變更密碼已超過6個月，建議請定期變更密碼'
+            '<button>確認</button></div>'
+            "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>{document.body.dataset.clicks++;document.querySelector('div').hidden=true}</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT_SETTLE)
+        assert outcome.kind is CheckpointKind.PASSWORD_CHANGE_OPTIONAL
+        assert outcome.action_label == "確認"
+        assert page.locator("body").get_attribute("data-clicks") == "1"
 
         for label in ("確認", "確定", "Cancel", "取消"):
             page.set_content(
@@ -453,7 +465,7 @@ def _submit_fixture():
     modal.is_visible.return_value = True
     page.locator.side_effect = lambda selector: {
         **fields,
-        "button.ubot-primary-green": login_candidates,
+        "button": login_candidates,
         ".modal.show": modals,
     }[selector]
     page.test_fields = fields
@@ -771,6 +783,13 @@ def test_password_expiry_route_remains_authenticated_and_prepare_does_not_reopen
         page = PageProxy()
         crawler = _crawler()
         assert crawler._logged_in(page) is True
+        page.url = "http://www.ubot.com.tw/ibank/#/I1201001"
+        assert crawler._logged_in(page) is False
+        page.url = "https://www.ubot.com.tw:444/ibank/#/I1201001"
+        assert crawler._logged_in(page) is False
+        page.url = "https://user@www.ubot.com.tw/ibank/#/I1201001"
+        assert crawler._logged_in(page) is False
+        page.url = "https://www.ubot.com.tw/ibank/#/I1201001"
         monkeypatch.setattr(real_page, "wait_for_timeout", lambda _milliseconds: None)
 
         crawler.prepare_login_page(page)

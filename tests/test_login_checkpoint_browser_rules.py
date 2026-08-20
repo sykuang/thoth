@@ -1001,10 +1001,38 @@ def test_rule_matches_inside_child_frame():
         phase=CheckpointPhase.POST_SUBMIT,
         rules=(rule,),
         is_authenticated=lambda page: False,
+        is_scope_owned=lambda frame: frame is child,
     )
 
     assert outcome.kind is CheckpointKind.DUPLICATE_SESSION
     assert action.clicks == 1
+
+
+def test_rule_never_acts_inside_unowned_child_frame():
+    action = Node(text="Continue")
+    container = Node(queries={"button, a, [role=button]": [action]})
+    action.on_click = lambda _: setattr(container, "visible", False)
+    child = Page({"#child-dialog": [container]})
+    rule = LoginCheckpointRule(
+        name="test-bank-child-frame",
+        bank="test-bank",
+        phases=(CheckpointPhase.POST_SUBMIT,),
+        kind=CheckpointKind.DUPLICATE_SESSION,
+        container_selector="#child-dialog",
+        action_texts=("Continue",),
+    )
+
+    outcome = evaluate_login_checkpoint(
+        Page(frames=(child,)),
+        bank="test-bank",
+        phase=CheckpointPhase.POST_SUBMIT,
+        rules=(rule,),
+        is_authenticated=lambda page: False,
+        is_scope_owned=lambda _frame: False,
+    )
+
+    assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+    assert action.clicks == 0
 
 
 def test_bank_rule_must_explicitly_list_generic_confirmation_label():

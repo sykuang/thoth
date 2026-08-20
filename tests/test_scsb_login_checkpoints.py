@@ -72,6 +72,8 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
         CheckpointKind.DISMISSIBLE_NOTICE,
+        CheckpointKind.DISMISSIBLE_NOTICE,
+        CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
@@ -87,6 +89,8 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
         ".alert",
         "[role='alert']",
         "#intro_alert.custom-modal.show",
+        ".custom-modal.show",
+        ".custom-modal.show",
         ".modal.show",
         "[role='dialog']",
         "#verified",
@@ -102,6 +106,8 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
         post,
         post,
         (CheckpointPhase.PRE_SUBMIT,),
+        (CheckpointPhase.PRE_SUBMIT,),
+        all_phases,
         all_phases,
         all_phases,
         post,
@@ -110,12 +116,15 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
     assert intro.action_selector == DEFAULT_ACTION_SELECTOR
     assert intro.action_texts == ("I got it",)
     assert intro.max_actions == 1
+    fraud = rules[10]
+    assert fraud.action_texts == ("我知道了",)
+    assert fraud.required_body_pattern is not None
     assert all(rule.bank == "scsb" for rule in rules)
     assert all(
         rule.kind not in {CheckpointKind.CAPTCHA_RETRY, CheckpointKind.PROTOCOL_RESUBMIT}
         for rule in rules
     )
-    assert all(rule.action_texts == () for rule in (*rules[:9], *rules[10:]))
+    assert all(rule.action_texts == () for rule in (*rules[:9], *rules[11:]))
 
 
 @pytest.mark.parametrize(
@@ -163,6 +172,24 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         assert page.locator("body").get_attribute("data-inside") == "1"
         assert page.locator("body").get_attribute("data-outside") == "0"
 
+        page.set_content(
+            '<div class="custom-modal show">親愛的客戶，請留意詐騙訊息<button>我知道了</button></div>'
+            "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>{document.body.dataset.clicks++;document.querySelector('div').hidden=true}</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
+        assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
+        assert outcome.rule_name == "scsb-fraud-notice"
+        assert page.locator("body").get_attribute("data-clicks") == "1"
+
+        page.set_content(
+            '<div class="custom-modal show">親愛的客戶，一般通知<button>我知道了</button></div>'
+            "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>document.body.dataset.clicks++</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
+        assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert outcome.rule_name == "scsb-unknown-custom-modal"
+        assert page.locator("body").get_attribute("data-clicks") == "0"
+
         for body, kind in (
             ("請輸入 OTP", CheckpointKind.OTP_REQUIRED),
             ("您必須變更密碼", CheckpointKind.PASSWORD_CHANGE_REQUIRED),
@@ -198,6 +225,29 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         manager.__exit__(None, None, None)
 
 
+def test_unknown_custom_modal_blocks_outer_lifecycle_before_submit(monkeypatch) -> None:
+    manager, browser = _launch_browser()
+    try:
+        page = browser.new_page()
+        page.set_content(
+            '<div class="custom-modal show">一般通知<button>我知道了</button></div>'
+            '<input id="userId"><input id="idNumber"><input id="pppd"><input id="verified">'
+        )
+        crawler = _crawler()
+        submit = Mock()
+        monkeypatch.setattr(crawler, "prepare_login_page", lambda _page: None)
+        monkeypatch.setattr(crawler, "is_authenticated", lambda _page: False)
+        monkeypatch.setattr(crawler, "submit_credentials_once", submit)
+
+        with pytest.raises(base_module.LoginCheckpointBlocked):
+            crawler._shared_login(page)
+
+        submit.assert_not_called()
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
 class _PageProxy:
     def __init__(self, page, url: str):
         self._page = page
@@ -216,6 +266,9 @@ def test_auth_requires_exact_private_url_identity_and_fixed_menu_pair() -> None:
         crawler = _crawler()
         assert crawler._logged_in(_PageProxy(real, "https://ebank.scsb.com.tw/aply/home"))
         assert crawler._logged_in(_PageProxy(real, "https://ebank.scsb.com.tw/ibhm/home"))
+        assert not crawler._logged_in(_PageProxy(real, "http://ebank.scsb.com.tw/aply/home"))
+        assert not crawler._logged_in(_PageProxy(real, "https://ebank.scsb.com.tw:444/aply/home"))
+        assert not crawler._logged_in(_PageProxy(real, "https://user@ebank.scsb.com.tw/aply/home"))
         assert not crawler._logged_in(_PageProxy(real, "https://ibank.scsb.com.tw/aply/home"))
         assert not crawler._logged_in(_PageProxy(real, "https://ebank.scsb.com.tw/public/home"))
         assert not crawler._logged_in(_PageProxy(real, "https://ebank.scsb.com.tw/public/aply/home"))

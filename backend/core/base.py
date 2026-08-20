@@ -748,6 +748,7 @@ class BankCrawler(ABC):
                 phase=phase,
                 rules=active_rules,
                 is_authenticated=self.is_authenticated,
+                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
             )
             if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(

@@ -292,6 +292,7 @@ def evaluate_login_checkpoint(
     phase: CheckpointPhase,
     rules: tuple[LoginCheckpointRule, ...],
     is_authenticated: Callable[[Any], bool],
+    is_scope_owned: Callable[[Any], bool] | None = None,
 ) -> CheckpointOutcome:
     try:
         if any(rule.bank != bank for rule in rules):
@@ -301,7 +302,13 @@ def evaluate_login_checkpoint(
             and is_authenticated(page)
         ):
             return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
-        scopes = [page, *(frame for frame in page.frames if frame is not page.main_frame)]
+        scopes = [page]
+        if is_scope_owned is not None:
+            scopes.extend(
+                frame
+                for frame in page.frames
+                if frame is not page.main_frame and is_scope_owned(frame)
+            )
     except Exception:
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
 

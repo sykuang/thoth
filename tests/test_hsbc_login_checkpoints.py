@@ -82,6 +82,7 @@ def test_shared_api_and_terminal_first_rule_contract(monkeypatch) -> None:
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
+        CheckpointKind.DISMISSIBLE_NOTICE,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
@@ -89,7 +90,9 @@ def test_shared_api_and_terminal_first_rule_contract(monkeypatch) -> None:
         CheckpointKind.UNKNOWN_BLOCKER,
     ]
     assert all(rule.bank == "hsbc" for rule in rules)
-    assert all(rule.action_texts == () for rule in rules)
+    assert rules[7].name == "hsbc-security-notice"
+    assert rules[7].action_texts == ("繼續",)
+    assert all(rule.action_texts == () for rule in (*rules[:7], *rules[8:]))
     assert rules[4].phases == (
         CheckpointPhase.POST_SUBMIT,
         CheckpointPhase.POST_SUBMIT_SETTLE,
@@ -97,6 +100,35 @@ def test_shared_api_and_terminal_first_rule_contract(monkeypatch) -> None:
     assert [rule.container_selector for rule in rules[-5:]] == [
         ".modal.show", "[role='dialog']", "#userId", "#password", "#captchaInput"
     ]
+
+
+def test_security_notice_is_exact_scoped_and_clicks_once() -> None:
+    manager, browser = _launch_browser()
+    try:
+        page = browser.new_page()
+        page.set_content(
+            '<button id="outside">繼續</button>'
+            '<div role="dialog">資訊安全提醒：請妥善保管密碼<button>繼續</button></div>'
+            "<script>document.body.dataset.inside='0';document.body.dataset.outside='0';"
+            "outside.onclick=()=>document.body.dataset.outside++;"
+            "document.querySelector('[role=dialog] button').onclick=()=>{document.body.dataset.inside++;document.querySelector('[role=dialog]').hidden=true}</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
+        assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
+        assert outcome.rule_name == "hsbc-security-notice"
+        assert page.locator("body").get_attribute("data-inside") == "1"
+        assert page.locator("body").get_attribute("data-outside") == "0"
+
+        page.set_content(
+            '<div role="dialog">資訊安全：偵測到異常登入，請確認是否本人<button>繼續</button></div>'
+            "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>document.body.dataset.clicks++</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
+        assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert page.locator("body").get_attribute("data-clicks") == "0"
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +179,8 @@ def test_auth_exact_host_hash_identity_controls_public_menu_and_exception(caplog
         assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/login"))
         assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/login/device"))
 
+        real.set_content("<main>登出 信用卡 " + "x" * 300 + "</main>")
+        assert crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/u/dashboard"))
         real.set_content("<main>帳單 選單 繳款 Statement Menu " + "x" * 300 + "</main>")
         assert not crawler._logged_in(_page_proxy(real, "https://card.hsbc.com.tw/#/dashboard"))
         real.set_content(f"<main>{dashboard}</main><input id='password'>")

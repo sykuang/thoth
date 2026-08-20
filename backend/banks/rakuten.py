@@ -182,7 +182,7 @@ class RakutenCrawler(BankCrawler):
             current = urlparse(page.url or "")
             path = (current.path or "").lower()
             if (
-                (current.hostname or "").lower() != "www.rakuten-bank.com.tw"
+                not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS)
                 or not path.startswith("/ebank/")
                 or LOGIN_PATH_HINT in path
             ):
@@ -285,7 +285,7 @@ class RakutenCrawler(BankCrawler):
                 page,
                 CAPTCHA_IMG,
                 expected_len=4,
-                min_confidence=0.85,
+                min_confidence=0.95,
                 tmp_path=self.captcha_tmp,
             ) or ""
             if not captcha:
@@ -305,7 +305,7 @@ class RakutenCrawler(BankCrawler):
                         page,
                         CAPTCHA_IMG,
                         expected_len=4,
-                        min_confidence=0.85,
+                        min_confidence=0.95,
                         tmp_path=self.captcha_tmp,
                     ) or ""
             if not captcha:

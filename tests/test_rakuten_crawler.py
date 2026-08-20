@@ -176,6 +176,12 @@ def test_authenticated_origin_requires_exact_bank_host_and_ebank_prefix() -> Non
 
     page.url = "https://www.rakuten-bank.com.tw/ebank/home"
     assert crawler._logged_in(page) is True
+    page.url = "http://www.rakuten-bank.com.tw/ebank/home"
+    assert crawler._logged_in(page) is False
+    page.url = "https://www.rakuten-bank.com.tw:444/ebank/home"
+    assert crawler._logged_in(page) is False
+    page.url = "https://user@www.rakuten-bank.com.tw/ebank/home"
+    assert crawler._logged_in(page) is False
     page.url = "https://evilrakuten-bank.com.tw/ebank/home"
     assert crawler._logged_in(page) is False
     page.url = "https://www.rakuten-bank.com.tw/public/ebank/home"
@@ -564,6 +570,7 @@ def test_captcha_refreshes_image_at_most_once_before_one_submit(monkeypatch) -> 
 
     refresh.click.assert_called_once_with()
     assert solve.call_count == 2
+    assert all(call.kwargs["min_confidence"] == 0.95 for call in solve.call_args_list)
     assert stable.call_count == 2
     button.click.assert_called_once_with()
 

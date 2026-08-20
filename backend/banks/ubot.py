@@ -18,7 +18,6 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -205,7 +204,7 @@ class UbotCrawler(BankCrawler):
         詳見 wiki/concepts/bank-crawler-login-positive-signal-rule.md
         """
         try:
-            if (urlparse(page.url or "").hostname or "").lower() != "www.ubot.com.tw":
+            if not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS):
                 return False
             r = page.evaluate(JS_LOGGED_IN_POSITIVE)
         except Exception:
@@ -294,6 +293,7 @@ class UbotCrawler(BankCrawler):
                     "下次再說",
                     "Later",
                     "Skip",
+                    "確認",
                 ),
                 required_body_pattern=_OPTIONAL_PASSWORD_PATTERN,
             ),
@@ -359,7 +359,7 @@ class UbotCrawler(BankCrawler):
 
         button = _unique_visible_enabled_exact(
             page,
-            "button.ubot-primary-green",
+            "button",
             "登入",
         )
         if button is None:

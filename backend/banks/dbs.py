@@ -107,15 +107,14 @@ class DbsCrawler(BankCrawler):
                 or LOGIN_PATH_HINT in parsed.path.lower()
             ):
                 return False
-            if any(
-                frame is not page.main_frame
-                and not self._frame_origin_allowed(page, frame)
-                for frame in page.frames
-            ):
-                return False
             scopes = [
                 page,
-                *(frame for frame in page.frames if frame is not page.main_frame),
+                *(
+                    frame
+                    for frame in page.frames
+                    if frame is not page.main_frame
+                    and self._frame_origin_allowed(page, frame)
+                ),
             ]
             body_parts = []
             for scope in scopes:
@@ -132,7 +131,16 @@ class DbsCrawler(BankCrawler):
                     for index in range(bodies.count())
                 )
             body = "\n".join(body_parts)
-            identity = "帳戶總覽" in body or "資產總覽" in body
+            known_overview = parsed.path.rstrip("/").lower() == "/digitw/overview"
+            identity = (
+                "帳戶總覽" in body
+                or "資產總覽" in body
+                or (
+                    known_overview
+                    and "總覽" in body
+                    and ("帳戶" in body or "資產" in body)
+                )
+            )
             logout = "登出" in body or re.search(
                 r"(?<![A-Za-z])logout(?![A-Za-z])", body, re.IGNORECASE
             ) is not None

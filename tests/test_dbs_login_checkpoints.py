@@ -249,6 +249,9 @@ def test_auth_requires_exact_host_path_identity_and_rejects_public_or_child_form
         assert not crawler._logged_in(_PageProxy(real, f"https://internet-banking.dbs.com.tw{LOGIN_PATH_HINT}/"))
         assert not crawler._logged_in(_PageProxy(real, f"https://internet-banking.dbs.com.tw{LOGIN_PATH_HINT}/challenge"))
 
+        real.set_content("<main>登出 總覽 帳戶 資產 " + "x" * 300 + "</main>")
+        assert crawler._logged_in(_PageProxy(real, "https://internet-banking.dbs.com.tw/digitw/overview"))
+        assert not crawler._logged_in(_PageProxy(real, "https://internet-banking.dbs.com.tw/digitw/public"))
         real.set_content("<main>存款 轉帳 信用卡 投資 " + "x" * 300 + "</main>")
         assert not crawler._logged_in(_PageProxy(real, "https://internet-banking.dbs.com.tw/digitw/home"))
         real.set_content("<main>LoggedOut 帳戶總覽 " + "x" * 300 + "</main>")
@@ -302,8 +305,26 @@ def test_authentication_rejects_identity_from_foreign_child_frame() -> None:
         locator=main.locator,
     )
 
+    def set_main_body(text: str) -> None:
+        empty = _empty_locator()
+        body_item = Mock()
+        body_item.inner_text.return_value = text
+        body = Mock()
+        body.count.return_value = 1
+        body.nth.return_value = body_item
+        main.locator.side_effect = lambda selector: {
+            "#username": empty,
+            "#password": empty,
+            "#loginbutton": empty,
+            "body": body,
+        }[selector]
+
+    set_main_body("public page")
     assert _crawler()._logged_in(page) is False
-    main.locator.assert_not_called()
+    foreign.locator.assert_not_called()
+
+    set_main_body("登出 帳戶總覽 " + "x" * 300)
+    assert _crawler()._logged_in(page) is True
     foreign.locator.assert_not_called()
 
 

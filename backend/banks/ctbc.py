@@ -49,12 +49,20 @@ def _submit_login_once(page) -> None:
     """Click the uniquely safe login action once, never retrying unknown dispatch."""
     try:
         candidates = page.locator(SEL_SUBMIT)
-        if candidates.count() != 1:
+        eligible = []
+        for index in range(candidates.count()):
+            candidate = candidates.nth(index)
+            classes = (candidate.get_attribute("class") or "").split()
+            if (
+                candidate.is_visible()
+                and candidate.is_enabled()
+                and "disabled" not in classes
+                and " ".join(candidate.inner_text().split()) == "登入"
+            ):
+                eligible.append(candidate)
+        if len(eligible) != 1:
             raise CtbcLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
-        button = candidates.first
-        classes = (button.get_attribute("class") or "").split()
-        if not button.is_visible() or not button.is_enabled() or "disabled" in classes:
-            raise CtbcLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+        button = eligible[0]
     except CtbcLoginError:
         raise
     except Exception:
@@ -189,7 +197,7 @@ class CtbcCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(8000)
 
     def is_authenticated(self, page) -> bool:
         return self._logged_in(page)

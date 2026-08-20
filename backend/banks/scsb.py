@@ -96,7 +96,9 @@ class ScsbCrawler(BankCrawler):
             current = urlparse(page.url or "")
             path = current.path.lower()
             if (
-                (current.hostname or "").lower() != "ebank.scsb.com.tw"
+                not self._exact_https_origin_allowed(
+                    page.url, frozenset({"ebank.scsb.com.tw"})
+                )
                 or not path.startswith(("/aply/", "/ibhm/"))
             ):
                 return False
@@ -179,6 +181,18 @@ class ScsbCrawler(BankCrawler):
             action_texts=("I got it",),
             max_actions=1,
         )
+        fraud_notice = LoginCheckpointRule(
+            name="scsb-fraud-notice",
+            bank="scsb",
+            phases=(CheckpointPhase.PRE_SUBMIT,),
+            kind=CheckpointKind.DISMISSIBLE_NOTICE,
+            container_selector=".custom-modal.show",
+            action_texts=("我知道了",),
+            required_body_pattern=re.compile(
+                r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}詐騙[\s\S]{0,300}$"
+            ),
+            max_actions=1,
+        )
         return (
             *(
                 LoginCheckpointRule(
@@ -214,6 +228,14 @@ class ScsbCrawler(BankCrawler):
                 for suffix, selector in alert_scopes
             ),
             intro,
+            fraud_notice,
+            LoginCheckpointRule(
+                name="scsb-unknown-custom-modal",
+                bank="scsb",
+                phases=all_phases,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=".custom-modal.show",
+            ),
             LoginCheckpointRule(
                 name="scsb-unknown-modal",
                 bank="scsb",

@@ -133,6 +133,7 @@ class HsbcCrawler(BankCrawler):
             and (
                 "我的卡片" in body
                 or "卡片清單" in body
+                or "信用卡" in body
                 or re.search(r"(?<![A-Za-z])My Cards(?![A-Za-z])", body, re.IGNORECASE)
                 is not None
             )
@@ -159,6 +160,10 @@ class HsbcCrawler(BankCrawler):
             r"驗證碼(?:錯誤|不正確)，?請重新輸入|Invalid credentials|Account locked)"
             r"[\s。.!！?？:：,，]*$",
             re.IGNORECASE,
+        )
+        security_notice = re.compile(
+            r"^(?![\s\S]*(?:異常登入|是否本人|裝置驗證|新裝置|OTP|驗證碼|條款|授權|確認交易))"
+            r"(?=[\s\S]*資訊安全)(?=[\s\S]*密碼)[\s\S]{1,120}$"
         )
         modal_scopes = (("modal", ".modal.show"), ("dialog", "[role='dialog']"))
         alert_scopes = (
@@ -190,6 +195,15 @@ class HsbcCrawler(BankCrawler):
                     container_selector=selector, required_body_pattern=error,
                 )
                 for suffix, selector in alert_scopes
+            ),
+            LoginCheckpointRule(
+                name="hsbc-security-notice",
+                bank="hsbc",
+                phases=post_settle,
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector="[role='dialog']",
+                action_texts=("繼續",),
+                required_body_pattern=security_notice,
             ),
             *(
                 LoginCheckpointRule(

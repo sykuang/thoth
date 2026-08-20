@@ -372,6 +372,7 @@ def test_real_child_frame_login_form_prevents_auth_shortcut() -> None:
             phase=CheckpointPhase.POST_SUBMIT,
             rules=crawler.login_checkpoint_rules(),
             is_authenticated=crawler._logged_in,
+            is_scope_owned=lambda frame: crawler._frame_origin_allowed(page, frame),
         )
         assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
         assert outcome.rule_name == "taishin-login-form-still-visible"
@@ -476,13 +477,13 @@ def test_login_prepare_and_authentication_are_thin_one_shot_adapters(monkeypatch
     authenticated.assert_called_once_with(page)
 
 
-def test_logged_in_is_one_shot_and_requires_exact_host_and_two_dashboard_keywords() -> None:
+def test_logged_in_is_one_shot_and_requires_exact_origin_logout_and_dashboard_identity() -> None:
     page = Mock()
     page.url = "https://my.taishinbank.com.tw/TIBNetBank/home"
     page.frames = []
     page.main_frame = Mock()
     page.locator.return_value.count.return_value = 0
-    page.evaluate.return_value = "帳戶總覽 我的資產 " + "x" * 500
+    page.evaluate.return_value = "登出 帳戶總覽 " + "x" * 500
 
     crawler = _crawler()
     assert crawler._logged_in(page) is True
@@ -491,8 +492,40 @@ def test_logged_in_is_one_shot_and_requires_exact_host_and_two_dashboard_keyword
 
     page.url = "https://evil-taishinbank.com/TIBNetBank/home"
     assert crawler._logged_in(page) is False
+    assert not crawler._is_login_frame_url("http://my.taishinbank.com.tw/svc/rwd/index.html")
+    assert not crawler._is_login_frame_url("https://my.taishinbank.com.tw:444/svc/rwd/index.html")
+    assert not crawler._is_login_frame_url("https://user@my.taishinbank.com.tw/svc/rwd/index.html")
+    page.url = "http://my.taishinbank.com.tw/TIBNetBank/home"
+    assert crawler._logged_in(page) is False
+    page.url = "https://my.taishinbank.com.tw/TIBNetBank/home"
+    page.evaluate.return_value = "帳戶總覽 " + "x" * 500
+    assert crawler._logged_in(page) is False
     page.frames = [Mock(url="https://evil-taishinbank.com/svc/rwd/index.html")]
     assert crawler._find_login_frame(page) is None
+
+
+def test_authentication_ignores_foreign_frame_identity() -> None:
+    main = Mock()
+    main.url = "https://my.taishinbank.com.tw/TIBNetBank/home"
+    main.evaluate.return_value = "登出 " + "x" * 500
+    empty = Mock()
+    empty.count.return_value = 0
+    main.locator.return_value = empty
+    foreign = Mock()
+    foreign.url = "https://evil.example/embedded"
+    foreign.locator.return_value = empty
+    foreign.evaluate.return_value = "帳戶總覽"
+    page = SimpleNamespace(
+        url=main.url,
+        main_frame=main,
+        frames=[main, foreign],
+        locator=main.locator,
+        evaluate=main.evaluate,
+    )
+
+    assert _crawler()._logged_in(page) is False
+    foreign.locator.assert_not_called()
+    foreign.evaluate.assert_not_called()
 
 
 def test_multiple_matching_login_frames_fail_closed_in_shared_lifecycle(
