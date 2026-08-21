@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
 
+from scrapling.fetchers import StealthySession
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
@@ -117,6 +119,38 @@ class FubonCrawler(BankCrawler):
     def __init__(self):
         super().__init__(name="fubon")
         self.creds = TaipeiFubonCreds.load()
+
+    def _execute_browser_flow(
+        self,
+        login_url: str,
+        *,
+        headless: bool,
+        page_action,
+        fetch_kwargs: dict,
+    ) -> None:
+        with StealthySession(
+            headless=headless,
+            user_data_dir=str(self.session_dir),
+            hide_canvas=True,
+            block_webrtc=True,
+            dns_over_https=True,
+            **fetch_kwargs,
+        ) as engine:
+            if engine.context is None:
+                raise RuntimeError("富邦瀏覽器 context 未建立")
+            page = engine.context.new_page()
+            page.set_default_navigation_timeout(180000)
+            page.set_default_timeout(180000)
+            if headers := fetch_kwargs.get("extra_headers"):
+                page.set_extra_http_headers(headers)
+            try:
+                page.goto(login_url, referer="https://www.google.com/")
+                page.wait_for_load_state("load")
+                page.wait_for_load_state("domcontentloaded")
+                page_action(page)
+                page.wait_for_timeout(2000)
+            finally:
+                page.close()
 
     def _host_filter(self) -> str:
         return "taipeifubon.com"

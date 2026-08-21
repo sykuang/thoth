@@ -10,7 +10,6 @@ from unittest.mock import Mock, call
 import pytest
 
 import backend.banks.fubon as fubon_module
-import backend.core.base as base_module
 from backend.banks.fubon import FubonCrawler, FubonLoginError, _safe_url
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -455,8 +454,8 @@ def test_ambiguous_login_frames_fail_run_before_submit_or_collect(monkeypatch, t
         real_wait = page.wait_for_timeout
         monkeypatch.setattr(page, "wait_for_timeout", lambda _milliseconds: real_wait(1))
         monkeypatch.setattr(
-            base_module.StealthyFetcher,
-            "fetch",
+            crawler,
+            "_execute_browser_flow",
             lambda _url, *, page_action, **_kwargs: page_action(page),
         )
 
@@ -755,8 +754,8 @@ def test_delayed_explicit_error_with_mounted_fields_blocks_after_one_submit(
         real_wait = page.wait_for_timeout
         monkeypatch.setattr(page, "wait_for_timeout", lambda _milliseconds: real_wait(5))
         monkeypatch.setattr(
-            base_module.StealthyFetcher,
-            "fetch",
+            crawler,
+            "_execute_browser_flow",
             lambda _url, *, page_action, **_kwargs: page_action(page),
         )
 
