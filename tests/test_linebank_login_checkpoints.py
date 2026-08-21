@@ -24,6 +24,15 @@ def _crawler() -> LinebankCrawler:
     return crawler
 
 
+def test_linebank_collect_telemetry_does_not_log_account_values() -> None:
+    source = inspect.getsource(linebank_module.LinebankCrawler.collect)
+
+    assert "value={opt_value" not in source
+    assert "帳戶 {opt_value}" not in source
+    assert "個帳戶: {opts}" not in source
+    assert "讀 select 失敗: {e}" not in source
+
+
 def test_linebank_shared_login_api_and_ordered_rules() -> None:
     rules = _crawler().login_checkpoint_rules()
     post = (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE)

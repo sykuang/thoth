@@ -86,7 +86,7 @@ def solve_captcha(
         if not el or not el.is_visible():
             _log(f"[captcha] selector {img_selector!r} 不可見")
             return None
-        data = el.screenshot()
+        data = el.screenshot(timeout=5000)
         if not isinstance(data, bytes):
             return None
         conf = None
@@ -191,7 +191,7 @@ def wait_captcha_stable(
         el = page.query_selector(img_selector)
         if el and el.is_visible():
             try:
-                raw = el.screenshot()
+                raw = el.screenshot(timeout=5000)
                 if not isinstance(raw, bytes):
                     raise TypeError
                 h = hashlib.sha256(raw).digest()

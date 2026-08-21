@@ -571,5 +571,5 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     )
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
     assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "84829b291e3fef54338ce860cb1102edc3a13974d9c7503ad34279dc2a00123c"
+        "5e097f6078447d64afb36200a9308d7478c4e847ee658412104ee012a5e2a481"
     )

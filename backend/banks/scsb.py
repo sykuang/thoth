@@ -75,6 +75,17 @@ def _log(*a):
     print(*a, file=sys.stderr)
 
 
+def _safe_select_inventory(selects: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "option_count": len(item.get("options") or []),
+        }
+        for item in selects
+    ]
+
+
 class ScsbLoginError(RuntimeError):
     """SCSB login 送出後失敗——立刻中止，絕不自動重打（防鎖帳號）。"""
 
@@ -480,7 +491,7 @@ class ScsbCrawler(BankCrawler):
                 _log(f"  [nav] ❌ leaf {leaf_zh!r} (展開 {accordion_zh} 後) 找不到")
                 return False
             except Exception as e:
-                _log(f"  [nav] 失敗: {e}")
+                _log(f"  [nav] 失敗: {type(e).__name__}")
                 return False
 
         # 1. My Overview / 我的總覽 — accordion 點開 = navigate
@@ -507,7 +518,7 @@ class ScsbCrawler(BankCrawler):
             _log(f"[collect] menu DOM audit: {len(menu_audit)} matching elements")
         except Exception as e:
             out["menu_dom_audit"] = []
-            _log(f"[collect] menu DOM audit fail: {e}")
+            _log(f"[collect] menu DOM audit fail: {type(e).__name__}")
 
         _navigate("My Overview", wait_ms=10000)
         # SCSB My Overview 預設眼睛 icon 隱藏餘額，需點開
@@ -526,7 +537,7 @@ class ScsbCrawler(BankCrawler):
             out["overview_text"] = (page.evaluate("document.body.innerText") or "")
         except Exception:
             out["overview_text"] = ""
-        _log(f"  overview url={out['overview_url']} text len={len(out['overview_text'])}")
+        _log(f"  overview text len={len(out['overview_text'])}")
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "overview.png"), full_page=True)
 
@@ -688,7 +699,7 @@ class ScsbCrawler(BankCrawler):
             page.screenshot(path=str(debug_dir / "twd_inquiry_form.png"), full_page=True)
 
             # 點完跳到查詢條件頁——填表 + 按 Confirm
-            _log(f"[twd_inq] 已跳到 {page.url}，填表查詢")
+            _log("[twd_inq] 已進入查詢頁，填表查詢")
             try:
                 # 1) Account dropdown 選第一個（或全部？先試第一個）
                 #    SCSB 用 native <select>
@@ -699,7 +710,7 @@ class ScsbCrawler(BankCrawler):
                         options: [...s.options].slice(0, 10).map(o => ({value: o.value, text: o.textContent.trim().slice(0, 50)}))
                     }));
                 }""")
-                _log(f"[twd_inq] 表單 selects: {accts_in_select}")
+                _log(f"[twd_inq] 表單 selects: {_safe_select_inventory(accts_in_select)}")
 
                 # 找含帳號 options 的 select
                 target_sel = None
@@ -713,13 +724,13 @@ class ScsbCrawler(BankCrawler):
                     if target_sel:
                         break
                 if target_sel and target_val:
-                    _log(f"[twd_inq] 選帳號: select={target_sel} value={target_val[:10]}…")
+                    _log(f"[twd_inq] 選帳號: select={target_sel} selected=true")
                     result["account_no"] = target_val.strip()
                     try:
                         page.select_option(f"#{target_sel}" if target_sel else "select", value=target_val)
                         page.wait_for_timeout(1500)
                     except Exception as e:
-                        _log(f"[twd_inq] select_option 失敗: {e}")
+                        _log(f"[twd_inq] select_option 失敗: {type(e).__name__}")
 
                 # 2) 查詢期間：預設當日會沒有明細，明確選「近一月」較穩。
                 clicked_range = page.evaluate("""() => {
@@ -778,7 +789,7 @@ class ScsbCrawler(BankCrawler):
                         picked_start = True
                         break
                     except Exception as e:
-                        _log(f"[twd_inq] 填日期失敗 {sel}: {e}")
+                        _log(f"[twd_inq] 填日期失敗: {type(e).__name__}")
                 if not picked_start:
                     _log("[twd_inq] 找不到可填的查詢起日 input")
 
@@ -794,7 +805,7 @@ class ScsbCrawler(BankCrawler):
                 page.screenshot(path=str(debug_dir / "twd_inquiry_results.png"), full_page=True)
 
             except Exception as e:
-                _log(f"[twd_inq] 填表失敗: {e}")
+                _log(f"[twd_inq] 填表失敗: {type(e).__name__}")
 
             # dump 點完後 dom
             result["url"] = page.url
@@ -802,7 +813,7 @@ class ScsbCrawler(BankCrawler):
                 result["text"] = (page.evaluate("document.body.innerText") or "")[:8000]
             except Exception:
                 result["text"] = ""
-            _log(f"[twd_inq] url={result['url']}, text len={len(result['text'])}")
+            _log(f"[twd_inq] text len={len(result['text'])}")
 
             # regex 抽明細交易（SCSB 帳戶明細表格用 \t 分隔，欄位：Time/Summary/Expense/Deposit/Balance/Remarks）
             # 金額格式 'NT$ 60,404'，Expense 或 Deposit 其一可為空
@@ -848,7 +859,7 @@ class ScsbCrawler(BankCrawler):
                     result[key] = m.group(1).replace(",", "")
 
         except Exception as e:
-            _log(f"[twd_inq] ❌ 整段失敗: {e}")
+            _log(f"[twd_inq] ❌ 整段失敗: {type(e).__name__}")
             result["error"] = str(e)
         return result
 
@@ -952,7 +963,7 @@ class ScsbCrawler(BankCrawler):
                             leaf_result["text_final"] = (page.evaluate("document.body.innerText") or "")[:12000]
                             leaf_result["url_final"] = page.url
                     except Exception as e:
-                        _log(f"[card_inq:{key}] 填表失敗: {e}")
+                        _log(f"[card_inq:{key}] 填表失敗: {type(e).__name__}")
 
                 # 2026-06-13 升級：Statement Inquiry 加月份 tab 迭代抓帳單
                 # SCSB 顯示「2026/05 / 2026/04 / 2026/03」3 個月份 tab，點切換每月帳單
@@ -994,11 +1005,11 @@ class ScsbCrawler(BankCrawler):
                                 _log(f"[card_inq:{key}] {mo} tab 找不到")
                         leaf_result["months"] = months_data
                     except Exception as e:
-                        _log(f"[card_inq:{key}] 月份 tab 切換失敗: {e}")
+                        _log(f"[card_inq:{key}] 月份 tab 切換失敗: {type(e).__name__}")
 
                 result["leaves"][key] = leaf_result
             except Exception as e:
-                _log(f"[card_inq:{key}] ❌ 失敗: {e}")
+                _log(f"[card_inq:{key}] ❌ 失敗: {type(e).__name__}")
                 result["leaves"][key] = {"error": str(e)}
 
         return result
@@ -1019,12 +1030,9 @@ if __name__ == "__main__":
     if result.get("error"):
         _log(f"  ❌ error: {result['error']}")
     else:
-        data = result.get("data", {})
+        data = result.get("data")
+        if not isinstance(data, dict):
+            data = {}
         _log("\n===== 抓取摘要 =====")
-        _log(f"  最終 url: {data.get('_final_url')}")
-        _log(f"  Overview url: {data.get('overview_url')}")
         _log(f"  抓到帳號: {len(data.get('accounts', []))} 個")
-        for a in data.get("accounts", [])[:5]:
-            _log(f"    - {a['account_no']} | {a['currency']} | {a['balance']}")
-        _log(f"  totals: {data.get('totals', {})}")
-        _log(f"  攔到 endpoint: {data.get('_all_endpoints', [])}")
+        _log(f"  攔到 endpoint: {len(data.get('_all_endpoints', []))}")

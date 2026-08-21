@@ -149,6 +149,10 @@ def _any_visible(page, selector: str) -> bool:
 class UbotLoginError(RuntimeError):
     """聯邦 UBOT login 送出後失敗——立刻中止，絕不自動重打（防鎖帳號）。"""
 
+    def __init__(self, message: str, *, safe_code: str | None = None) -> None:
+        self.safe_code = safe_code
+        super().__init__(message)
+
 
 def _ubot_card_bill_fact(out: dict):
     limits = (out.get("card_limit") or {}).get("CardList") or []
@@ -339,7 +343,10 @@ class UbotCrawler(BankCrawler):
 
         captcha = self._ocr_with_regen(page, max_attempts=5)
         if not captcha:
-            raise UbotLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+            raise UbotLoginError(
+                "圖形驗證碼 OCR 失敗；未送出登入",
+                safe_code="captcha_ocr_failed",
+            )
         try:
             candidates = page.locator(SEL_CAPTCHA)
             if candidates.count() != 1:
@@ -501,7 +508,7 @@ class UbotCrawler(BankCrawler):
                     selects[1].select_option(value="3")  # last month
                     page.wait_for_timeout(700)
                 except Exception as e:
-                    _log(f"[twd] 選 index={idx} 失敗: {e}")
+                    _log(f"[twd] 選 index={idx} 失敗: {type(e).__name__}")
                     continue
                 page.evaluate(
                     "(() => { const b=[...document.querySelectorAll('button')].filter(e=>e.offsetParent!==null)"
@@ -512,7 +519,7 @@ class UbotCrawler(BankCrawler):
                 if body:
                     results.append(body)
         except Exception as e:
-            _log(f"[twd] 失敗: {e}")
+            _log(f"[twd] 失敗: {type(e).__name__}")
         return results
 
     def _collect_card_billed(self, page, collector: ResponseCollector) -> list:
@@ -560,20 +567,20 @@ if __name__ == "__main__":
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     _log(f"\n[done] 已存: {out_file}")
     if result.get("error"):
-        _log(f"  error: {result['error']} url={result.get('final_url')}")
+        _log(f"  error: {result['error']}")
     data = result.get("data", {})
     _log("\n===== 抓取摘要 =====")
     dt = data.get("deposit_twd") or {}
     if isinstance(dt, dict):
         nt = dt.get("NTList", [])
-        _log(f"  台幣存款帳戶: {len(nt)} 個  總額={dt.get('TotalData', {}).get('Deposit', '?')}")
+        _log(f"  台幣存款帳戶: {len(nt)} 個")
     cs = data.get("card_summary") or {}
     if isinstance(cs, dict):
-        _log(f"  信用卡彙總: {len(cs.get('CardList', []))} 筆  本期應繳={cs.get('TotalData', {}).get('Card', '?')}")
+        _log(f"  信用卡彙總: {len(cs.get('CardList', []))} 筆")
     twd = data.get("twd_txns") or []
     n_twd = sum(len(b.get("NTDetailList", [])) for b in twd if isinstance(b, dict))
     _log(f"  台幣交易明細: {n_twd} 筆（{len(twd)} 個帳戶）")
     cb = data.get("card_billed") or []
     n_cb = sum(len(b.get("CardList", [])) for b in cb if isinstance(b, dict))
     _log(f"  信用卡已出帳明細: {n_cb} 筆（{len(cb)} 期）")
-    _log(f"\n  攔到的 endpoint: {data.get('_all_endpoints', [])}")
+    _log(f"\n  攔到的 endpoint: {len(data.get('_all_endpoints', []))}")

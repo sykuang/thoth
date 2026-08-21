@@ -955,8 +955,11 @@ class BankCrawler(ABC):
                         # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
                         # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
                         import sys as _sys
+                        safe_code = str(getattr(e, "safe_code", ""))
                         if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
                             msg = f"{type(e).__name__}: {e}"
+                        elif re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
+                            msg = f"{type(e).__name__}: code={safe_code}"
                         else:
                             msg = f"{type(e).__name__}: login failed"
                         print(

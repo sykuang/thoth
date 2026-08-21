@@ -11,7 +11,7 @@ import pytest
 
 import backend.banks.fubon as fubon_module
 import backend.core.base as base_module
-from backend.banks.fubon import FubonCrawler, FubonLoginError
+from backend.banks.fubon import FubonCrawler, FubonLoginError, _safe_url
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
@@ -374,6 +374,65 @@ def test_auth_is_one_shot_locator_only_exception_safe_and_private(caplog) -> Non
     assert "PRIVATE" not in caplog.text
 
 
+def test_auth_bounds_each_owned_scope_body_read() -> None:
+    crawler = _crawler()
+    main = Mock()
+    main.name = ""
+    main.url = "https://ebank.taipeifubon.com.tw/B2C/home"
+    controls = Mock()
+    controls.count.return_value = 0
+    body = Mock()
+    body.count.return_value = 1
+    body.nth.return_value = body
+    body.inner_text.return_value = "登出 帳戶總覽 " + "x" * 600
+    main.locator.side_effect = lambda selector: (
+        body if selector == "body" else controls
+    )
+    page = SimpleNamespace(
+        url=main.url,
+        main_frame=main,
+        frames=[main],
+        locator=main.locator,
+    )
+
+    assert crawler._logged_in(page)
+    body.inner_text.assert_called_once_with(timeout=5000)
+
+
+def test_safe_url_omits_userinfo_query_and_fragment() -> None:
+    private = "https://user:pass@ebank.taipeifubon.com.tw/B2C/common/Index.faces?token=PRIVATE#secret"
+
+    safe = _safe_url(private)
+
+    assert safe == "https://ebank.taipeifubon.com.tw/Index.faces"
+    assert "PRIVATE" not in safe
+    assert "user" not in safe
+    assert "pass" not in safe
+    assert _safe_url("https://ebank.taipeifubon.com.tw:bad/B2C/home?token=PRIVATE") == "<invalid>"
+    assert _safe_url("javascript:PRIVATE") == "<invalid>"
+    assert _safe_url("https://ebank.taipeifubon.com.tw/account/1234567890") == (
+        "https://ebank.taipeifubon.com.tw/<redacted-path>"
+    )
+    assert _safe_url("https://ebank.taipeifubon.com.tw/B2C/home;jsessionid=PRIVATE") == (
+        "https://ebank.taipeifubon.com.tw/<redacted-path>"
+    )
+    assert _safe_url("https://ebank.taipeifubon.com.tw/account/alice-private") == (
+        "https://ebank.taipeifubon.com.tw/<redacted-path>"
+    )
+
+
+def test_deposit_menu_telemetry_does_not_dump_dynamic_text() -> None:
+    source = inspect.getsource(fubon_module.FubonCrawler.collect)
+
+    assert "for c in deposit_audit" not in source
+    assert "我的存款 click: {deposit_click}" not in source
+    assert "存款交易查詢 click: {txn_click}" not in source
+    assert "click result: {click_result}" not in source
+    assert "帳務查詢 click: {bill_click}" not in source
+    assert "帳單明細查詢 click: {billed_click}" not in source
+    assert "未出帳單 click: {pending_click}" not in source
+
+
 def test_ambiguous_login_frames_fail_run_before_submit_or_collect(monkeypatch, tmp_path) -> None:
     manager, browser = _launch_browser()
     try:
@@ -724,4 +783,4 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FubonCrawler")
     start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == "56cd4e867af0bd9e57ec3ea0b9d70463a8ec341d5d38a14fc9fb77ea3bf17e0f"
+    assert hashlib.sha256(payload.encode()).hexdigest() == "c63f1bac7ba85d1e772c50ba6b403692e8c65cd7f46180a50964837dda2e6389"

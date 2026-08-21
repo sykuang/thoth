@@ -337,12 +337,20 @@ def evaluate_login_checkpoint(
 
 
 class LoginCheckpointTerminal(RuntimeError):
-    def __init__(self, budget: LoginBudget, outcome: CheckpointOutcome) -> None:
+    def __init__(
+        self,
+        budget: LoginBudget,
+        outcome: CheckpointOutcome,
+        *,
+        phase: CheckpointPhase | None = None,
+    ) -> None:
         self.budget = budget
         self.outcome = outcome
+        self.phase = phase
         rule = f", rule_name={outcome.rule_name}" if outcome.rule_name else ""
+        phase_text = f", phase={phase}" if phase else ""
         super().__init__(
-            f"terminal login checkpoint: kind={outcome.kind}{rule}, "
+            f"terminal login checkpoint: kind={outcome.kind}{rule}{phase_text}, "
             f"credential_submissions={budget.credential_submissions}, "
             f"protocol_resubmits={budget.protocol_resubmits}, "
             f"captcha_resubmits={budget.captcha_resubmits}, reloads={budget.reloads}"
@@ -366,12 +374,12 @@ def reduce_login_checkpoint(
         CheckpointKind.EXPLICIT_LOGIN_ERROR,
         CheckpointKind.UNKNOWN_BLOCKER,
     ):
-        raise LoginCheckpointBlocked(budget, outcome)
+        raise LoginCheckpointBlocked(budget, outcome, phase=phase)
     if outcome.kind in (
         CheckpointKind.OTP_REQUIRED,
         CheckpointKind.PASSWORD_CHANGE_REQUIRED,
     ):
-        raise LoginInteractionRequired(budget, outcome)
+        raise LoginInteractionRequired(budget, outcome, phase=phase)
     if outcome.kind is CheckpointKind.AUTHENTICATED:
         return CheckpointPhase.POST_SUBMIT_SETTLE, budget
     if outcome.kind in (
@@ -382,7 +390,7 @@ def reduce_login_checkpoint(
         return phase, budget
     if outcome.kind is CheckpointKind.READY_FOR_CREDENTIALS:
         if phase is not CheckpointPhase.PRE_SUBMIT or budget.credential_submissions != 0:
-            raise LoginCheckpointBlocked(budget, outcome)
+            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(budget, credential_submissions=1)
     if outcome.kind is CheckpointKind.PROTOCOL_RESUBMIT:
         if (
@@ -391,7 +399,7 @@ def reduce_login_checkpoint(
             or budget.protocol_resubmits >= 1
             or not outcome.rule_name
         ):
-            raise LoginCheckpointBlocked(budget, outcome)
+            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
@@ -404,7 +412,7 @@ def reduce_login_checkpoint(
             or budget.captcha_resubmits >= 1
             or not outcome.rule_name
         ):
-            raise LoginCheckpointBlocked(budget, outcome)
+            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
@@ -412,6 +420,6 @@ def reduce_login_checkpoint(
         )
     if outcome.kind is CheckpointKind.STARTUP_RECOVERY:
         if budget.reloads >= 1:
-            raise LoginCheckpointBlocked(budget, outcome)
+            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
         return CheckpointPhase.PRE_SUBMIT, replace(budget, reloads=1)
-    raise LoginCheckpointBlocked(budget, outcome)
+    raise LoginCheckpointBlocked(budget, outcome, phase=phase)

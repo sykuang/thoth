@@ -4,17 +4,29 @@ from backend.core import captcha as captcha_mod
 
 
 class _Element:
+    def __init__(self) -> None:
+        self.screenshot_timeouts: list[int | None] = []
+
     def is_visible(self) -> bool:
         return True
 
-    def screenshot(self, *, path: str | None = None) -> bytes:
+    def screenshot(
+        self,
+        *,
+        path: str | None = None,
+        timeout: int | None = None,
+    ) -> bytes:
         assert path is None
+        self.screenshot_timeouts.append(timeout)
         return b"captcha"
 
 
 class _Page:
+    def __init__(self) -> None:
+        self.element = _Element()
+
     def query_selector(self, _selector: str) -> _Element:
-        return _Element()
+        return self.element
 
     def wait_for_timeout(self, _milliseconds: int) -> None:
         return None
@@ -116,12 +128,31 @@ def test_captcha_helpers_never_log_plaintext_raw_or_exception_and_do_not_persist
 
 
 def test_wait_captcha_stable_hashes_screenshots_in_memory(tmp_path) -> None:
+    page = _Page()
     target = tmp_path / "stable.png"
     assert captcha_mod.wait_captcha_stable(
-        _Page(),
+        page,
         "img",
         tries=2,
         gap_ms=0,
         tmp_path=target,
     )
+    assert page.element.screenshot_timeouts == [5000, 5000]
     assert not target.exists()
+
+
+def test_solve_captcha_bounds_element_screenshot_timeout(tmp_path, monkeypatch) -> None:
+    page = _Page()
+    monkeypatch.setattr(
+        captcha_mod,
+        "_ocr_classification",
+        lambda _data, *, probability=False: "123456",
+    )
+
+    assert captcha_mod.solve_captcha(
+        page,
+        "img",
+        expected_len=6,
+        tmp_path=tmp_path / "captcha.png",
+    ) == "123456"
+    assert page.element.screenshot_timeouts == [5000]

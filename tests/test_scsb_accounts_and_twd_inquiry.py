@@ -1,7 +1,10 @@
 """SCSB 帳戶分類與台幣明細導航回歸測試。"""
 from __future__ import annotations
 
-from backend.banks.scsb import ScsbCrawler
+import inspect
+
+import backend.banks.scsb as scsb_module
+from backend.banks.scsb import ScsbCrawler, _safe_select_inventory
 from backend.core.persist import persist_scsb
 from backend.core.store import BankStore
 
@@ -90,3 +93,30 @@ def test_scsb_twd_inquiry_accepts_chinese_menu_labels():
     assert "台幣存匯" in nav
     assert "TWD Deposit" in nav  # fallback only
     assert "交易明細" in nav
+
+
+def test_scsb_select_telemetry_omits_account_values_and_labels():
+    private_account = "90000000987654"
+
+    audit = _safe_select_inventory(
+        [
+            {
+                "id": "account",
+                "name": "account",
+                "options": [
+                    {"value": "", "text": "請選擇查詢帳號"},
+                    {"value": private_account, "text": private_account},
+                ],
+            }
+        ]
+    )
+
+    assert audit == [{"id": "account", "name": "account", "option_count": 2}]
+    assert private_account not in repr(audit)
+
+
+def test_scsb_module_never_logs_account_number_or_balance() -> None:
+    source = inspect.getsource(scsb_module)
+
+    assert "value={target_val" not in source
+    assert "{a['account_no']} | {a['currency']} | {a['balance']}" not in source

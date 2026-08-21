@@ -302,7 +302,7 @@ class LinebankCrawler(BankCrawler):
             page.goto("https://accessibility.linebank.com.tw/transaction", wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(6000)  # 等 SPA fetch
         except Exception as e:
-            _log(f"[linebank][collect] goto /transaction 失敗: {e}")
+            _log(f"[linebank][collect] goto /transaction 失敗: {type(e).__name__}")
 
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "10_transaction.png"), full_page=True)
@@ -314,7 +314,7 @@ class LinebankCrawler(BankCrawler):
             txn_url, txn_text = "", ""
         out["transaction_url"] = txn_url
         out["transaction_text"] = txn_text
-        _log(f"[linebank][collect] transaction url={txn_url} text_len={len(txn_text)}")
+        _log(f"[linebank][collect] transaction text_len={len(txn_text)}")
 
         # ─── Step 2.5: 讀 <select> 帳戶清單 → 對每個帳戶選 → 查詢 ───
         # 無障礙版必須先在 dropdown 選一個帳戶, 點「查詢」才會 fetch 該帳戶餘額 + 交易
@@ -334,19 +334,18 @@ class LinebankCrawler(BankCrawler):
                 return {opts};
             }""")
         except Exception as e:
-            select_info = {"error": str(e)}
-            _log(f"[linebank][collect] 讀 select 失敗: {e}")
+            select_info = {"error": type(e).__name__}
+            _log(f"[linebank][collect] 讀 select 失敗: {type(e).__name__}")
 
         opts_raw = (select_info or {}).get("opts") or []
         # 強制 type narrow：每個 opt 預期 dict[str, str]
         opts: list[dict] = [o for o in opts_raw if isinstance(o, dict)]
-        _log(f"[linebank][collect] dropdown 有 {len(opts)} 個帳戶: {opts}")
+        _log(f"[linebank][collect] dropdown 有 {len(opts)} 個帳戶")
         out["account_options"] = opts
 
         for i, opt in enumerate(opts):
             opt_value = str(opt.get("value", ""))
-            opt_text = str(opt.get("text", ""))
-            _log(f"[linebank][collect] → 查詢帳戶 [{i+1}/{len(opts)}] value={opt_value!r} text={opt_text!r}")
+            _log(f"[linebank][collect] → 查詢帳戶 [{i+1}/{len(opts)}]")
             try:
                 # 用 JS 直接 set <select>.value 並 dispatch change/input（React onChange 認得）
                 page.evaluate("""(value) => {
@@ -369,7 +368,7 @@ class LinebankCrawler(BankCrawler):
                     return false;
                 }""")
                 if not clicked:
-                    _log(f"[linebank][collect] ⚠️ 帳戶 {opt_value} 沒找到「查詢」按鈕")
+                    _log(f"[linebank][collect] ⚠️ 帳戶#{i+1} 沒找到「查詢」按鈕")
                     continue
                 page.wait_for_timeout(6000)  # 等 API + 表格 render
 
@@ -385,9 +384,9 @@ class LinebankCrawler(BankCrawler):
                     "url": page.url,
                     "text": acct_text,
                 })
-                _log(f"[linebank][collect] 帳戶 {opt_value} 查詢後 text_len={len(acct_text)}")
+                _log(f"[linebank][collect] 帳戶#{i+1} 查詢後 text_len={len(acct_text)}")
             except Exception as e:
-                _log(f"[linebank][collect] 查詢帳戶 {opt_value!r} 失敗: {e}")
+                _log(f"[linebank][collect] 查詢帳戶#{i+1} 失敗: {type(e).__name__}")
 
         out["accounts_queried"] = accounts_queried
 
@@ -406,7 +405,7 @@ class LinebankCrawler(BankCrawler):
         out["api_responses"] = api_responses
         publish_card_bill_facts(out, [])
         _log(f"[linebank][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
-        _log(f"[linebank][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:20]}")
+        _log(f"[linebank][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
         return BankCollectResult(**out)
 
 

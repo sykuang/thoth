@@ -316,6 +316,32 @@ def test_run_redacts_untyped_login_exception_text(
     assert "PRIVATE" not in capsys.readouterr().err
 
 
+def test_run_keeps_valid_machine_readable_login_error_code(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    class CodedLoginError(RuntimeError):
+        safe_code = "captcha_ocr_failed"
+
+    def fail(_page):
+        raise CodedLoginError("PRIVATE-LOGIN-DOM-987654")
+
+    monkeypatch.setattr(crawler, "prepare_login_page", fail)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        lambda *_args, **_kwargs: CheckpointOutcome(
+            CheckpointKind.READY_FOR_CREDENTIALS
+        ),
+    )
+
+    assert result["error"] == "CodedLoginError: code=captcha_ocr_failed"
+    assert "PRIVATE" not in result["error"]
+    assert "PRIVATE" not in capsys.readouterr().err
+
+
 def test_run_recovery_hook_exception_fails_closed_without_leaking(
     monkeypatch, tmp_path, capsys
 ) -> None:

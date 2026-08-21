@@ -85,6 +85,8 @@ def test_unknown_state_never_requests_resubmit():
 
     assert raised.value.budget == budget
     assert raised.value.outcome.action_label is None
+    assert raised.value.phase is CheckpointPhase.POST_SUBMIT
+    assert "phase=post_submit" in str(raised.value)
     assert "rule_name" not in str(raised.value)
 
 

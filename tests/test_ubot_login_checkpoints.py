@@ -580,9 +580,10 @@ def test_submit_ocr_failure_sends_zero() -> None:
     crawler, page, _candidates, button, _modals = _submit_fixture()
     crawler._ocr_with_regen.return_value = None
 
-    with pytest.raises(UbotLoginError, match="未送出登入"):
+    with pytest.raises(UbotLoginError, match="未送出登入") as error:
         crawler.submit_credentials_once(page)
 
+    assert error.value.safe_code == "captcha_ocr_failed"
     button.click.assert_not_called()
     _candidates.count.assert_not_called()
 

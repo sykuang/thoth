@@ -34,6 +34,7 @@ import re
 import sys
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -59,6 +60,23 @@ _DYNAMIC_LOGIN_FIELD_ID = re.compile(r"^m1_[A-Z]{10}$")
 
 def _log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def _safe_url(value: object) -> str:
+    try:
+        parsed = urlsplit(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "<invalid>"
+        port = f":{parsed.port}" if parsed.port else ""
+        route = (parsed.path.rsplit("/", 1)[-1] or "").split(";", 1)[0]
+        if not re.fullmatch(
+            r"(?:Index|ContextFrame|PreLogin)\.faces|[A-Z0-9]{6,}_Home\.faces|dispatcher",
+            route,
+        ):
+            route = "<redacted-path>"
+        return f"{parsed.scheme}://{parsed.hostname}{port}/{route}"
+    except (TypeError, ValueError):
+        return "<invalid>"
 
 
 class FubonLoginError(RuntimeError):
@@ -173,7 +191,7 @@ class FubonCrawler(BankCrawler):
                     return False
                 bodies = scope.locator("body")
                 body_parts.extend(
-                    bodies.nth(index).inner_text()
+                    bodies.nth(index).inner_text(timeout=5000)
                     for index in range(bodies.count())
                 )
             body = "\n".join(body_parts)
@@ -482,7 +500,10 @@ class FubonCrawler(BankCrawler):
         }""")
         _log(f"[fubon][collect] 找到 {len(candidates)} 個信用卡子項候選")
         for c in candidates:
-            _log(f"  - {c['tag']} '{c['text']}' cls='{c['cls'][:30]}' visible={c['visible']} href='{c['href'][:80]}' onclick='{c['onclick'][:80]}'")
+            _log(
+                f"  - {c['tag']} '{c['text']}' cls='{c['cls'][:30]}' "
+                f"visible={c['visible']} href='{_safe_url(c['href'])}'"
+            )
 
         # Telemetry 2026-06-18: 同時 dump 存款/帳戶相關 menu 候選 (給 cloud 看真實有哪些字)
         # 目的: 確認富邦 menu 用「帳戶總覽」「存款查詢」「我的帳戶」哪個字眼, 才能規劃 collect path
@@ -512,9 +533,7 @@ class FubonCrawler(BankCrawler):
             });
         }""")
         out["deposit_menu_audit"] = deposit_audit
-        _log(f"[fubon][collect] [TELEMETRY] 存款相關 menu 候選 {len(deposit_audit)} 條:")
-        for c in deposit_audit[:30]:
-            _log(f"  - {c['tag']} '{c['text']}' visible={c['visible']} href='{c.get('href','')[:60]}'")
+        _log(f"[fubon][collect] [TELEMETRY] 存款相關 menu 候選 {len(deposit_audit)} 條")
 
         if not candidates:
             out["error"] = "no_credit_card_items"
@@ -548,7 +567,11 @@ class FubonCrawler(BankCrawler):
         # fallback3: 真的沒 <A> 才退 DIV/SPAN
         if not target and candidates:
             target = candidates[0]
-        _log(f"[fubon][collect] 選擇 target: tag={target['tag']} text='{target['text']}' visible={target['visible']} href='{target['href'][:80]}'")
+        _log(
+            f"[fubon][collect] 選擇 target: tag={target['tag']} "
+            f"text='{target['text']}' visible={target['visible']} "
+            f"href='{_safe_url(target['href'])}'"
+        )
 
         # === Step 4: click target ===
         # 算 txnFrame offset
@@ -593,7 +616,10 @@ class FubonCrawler(BankCrawler):
             }
             return {ok: false, error: 'no_anchor_found'};
         }""", {"targetText": target["text"], "targetCls": target["cls"]})
-        _log(f"[fubon][collect] click result: {click_result}")
+        _log(
+            f"[fubon][collect] click result: "
+            f"ok={bool(isinstance(click_result, dict) and click_result.get('ok'))}"
+        )
         page.wait_for_timeout(6000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "02_after_click.png"), full_page=True)
@@ -607,7 +633,7 @@ class FubonCrawler(BankCrawler):
             if name == "txnFrame":
                 content_frame = f
                 break
-        _log(f"[fubon][collect] 切換後 txnFrame url={content_frame.url[:100]}")
+        _log(f"[fubon][collect] 切換後 txnFrame url={_safe_url(content_frame.url)}")
 
         # 立刻抓「我的信用卡」頁卡片清單 (CCCQU001_Home)
         cards_page_text = ""
@@ -647,7 +673,10 @@ class FubonCrawler(BankCrawler):
             }
             return {ok: false, error: 'click_failed_after_match', found: found};
         }""")
-        _log(f"[fubon][collect] 帳務查詢 click: {bill_click}")
+        _log(
+            f"[fubon][collect] 帳務查詢 click: "
+            f"ok={bool(isinstance(bill_click, dict) and bill_click.get('ok'))}"
+        )
         page.wait_for_timeout(6000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "03_after_bill_click.png"), full_page=True)
@@ -658,7 +687,7 @@ class FubonCrawler(BankCrawler):
             if (f.name or "") == "txnFrame":
                 content_frame = f
                 break
-        _log(f"[fubon][collect] 帳務查詢 click 後 txnFrame url={content_frame.url[:120]}")
+        _log(f"[fubon][collect] 帳務查詢 click 後 txnFrame url={_safe_url(content_frame.url)}")
 
         # === Step 4.8: 抓「繳款及額度查詢」頁的 text 後，先試點「帳單明細查詢」===
         # 帳務查詢頁有 sub-tabs: 繳款及額度查詢 / 帳單明細查詢 / 未出帳單消費明細 / 消費分析
@@ -683,7 +712,10 @@ class FubonCrawler(BankCrawler):
             }
             return {ok: false, error: 'no_billed_tab'};
         }""")
-        _log(f"[fubon][collect] 帳單明細查詢 click: {billed_click}")
+        _log(
+            f"[fubon][collect] 帳單明細查詢 click: "
+            f"ok={bool(isinstance(billed_click, dict) and billed_click.get('ok'))}"
+        )
         page.wait_for_timeout(6000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "04_after_billed.png"), full_page=True)
@@ -699,7 +731,7 @@ class FubonCrawler(BankCrawler):
             billed_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
         out["billed_page_text"] = billed_page_text
         out["billed_page_url"] = content_frame.url
-        _log(f"[fubon][collect] billed 頁 url={content_frame.url[:120]} text_len={len(billed_page_text)}")
+        _log(f"[fubon][collect] billed 頁 url={_safe_url(content_frame.url)} text_len={len(billed_page_text)}")
 
         # 嘗試 click 未出帳單消費明細
         pending_click = content_frame.evaluate("""() => {
@@ -717,7 +749,10 @@ class FubonCrawler(BankCrawler):
         }""")
         out["pending_click_ok"] = (
             isinstance(pending_click, dict) and pending_click.get("ok") is True)
-        _log(f"[fubon][collect] 未出帳單 click: {pending_click}")
+        _log(
+            f"[fubon][collect] 未出帳單 click: "
+            f"ok={bool(isinstance(pending_click, dict) and pending_click.get('ok'))}"
+        )
         page.wait_for_timeout(6000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "05_after_pending.png"), full_page=True)
@@ -732,7 +767,7 @@ class FubonCrawler(BankCrawler):
             pending_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
         out["pending_page_text"] = pending_page_text
         out["pending_page_url"] = content_frame.url
-        _log(f"[fubon][collect] pending 頁 url={content_frame.url[:120]} text_len={len(pending_page_text)}")
+        _log(f"[fubon][collect] pending 頁 url={_safe_url(content_frame.url)} text_len={len(pending_page_text)}")
 
         # === Step 5: dump 點完後所有 frames ===
         page.wait_for_timeout(2000)
@@ -751,7 +786,7 @@ class FubonCrawler(BankCrawler):
         out["frames"] = frames_data
         _log(f"[fubon][collect] 點完後 dump {len(frames_data)} frames")
         for fd in frames_data:
-            _log(f"  - {fd['name']} url={fd['url'][:80]} text_len={len(fd['text'])}")
+            _log(f"  - {fd['name']} url={_safe_url(fd['url'])} text_len={len(fd['text'])}")
 
         # === Step 6: 找信用卡明細頁 frame ===
         card_frame_text = None
@@ -767,7 +802,7 @@ class FubonCrawler(BankCrawler):
                 out["card_frame_name"] = fd["name"]
                 out["card_frame_match"] = "url" if url_hit else "text"
         if card_frame_text:
-            _log(f"[fubon][collect] ✓ 找到信用卡 frame: name={out.get('card_frame_name')} url={out.get('card_frame_url')[:100]} text_len={len(card_frame_text)}")
+            _log(f"[fubon][collect] ✓ 找到信用卡 frame: name={out.get('card_frame_name')} url={_safe_url(out.get('card_frame_url'))} text_len={len(card_frame_text)}")
             out["card_frame_text"] = card_frame_text
         else:
             _log("[fubon][collect] ⚠️ 沒命中信用卡 frame，僅 dump 待分析")
@@ -789,7 +824,7 @@ class FubonCrawler(BankCrawler):
             page.wait_for_timeout(5000)
             _log(f"[fubon][collect] 回 home navigate ok={home_back is not None}")
         except Exception as e:
-            _log(f"[fubon][collect] 回 home 失敗: {e}")
+            _log(f"[fubon][collect] 回 home 失敗: {type(e).__name__}")
 
         # 重新抓 txnFrame
         deposit_frame = None
@@ -813,7 +848,10 @@ class FubonCrawler(BankCrawler):
                     return {ok: false, error: String(e)};
                 }
             }""")
-            _log(f"[fubon][collect] 我的存款 click: {deposit_click}")
+            _log(
+                f"[fubon][collect] 我的存款 click: "
+                f"ok={bool(isinstance(deposit_click, dict) and deposit_click.get('ok'))}"
+            )
             page.wait_for_timeout(8000)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "06_after_deposit.png"), full_page=True)
@@ -830,7 +868,7 @@ class FubonCrawler(BankCrawler):
                 deposit_page_text = deposit_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
             out["deposit_page_text"] = deposit_page_text
             out["deposit_page_url"] = deposit_frame.url
-            _log(f"[fubon][collect] deposit 頁 url={deposit_frame.url[:120]} text_len={len(deposit_page_text)}")
+            _log(f"[fubon][collect] deposit 頁 url={_safe_url(deposit_frame.url)} text_len={len(deposit_page_text)}")
         else:
             _log("[fubon][collect] ⚠️ 回 home 後找不到 txnFrame, 跳過 deposit step")
             out["deposit_page_text"] = ""
@@ -848,7 +886,7 @@ class FubonCrawler(BankCrawler):
             page.wait_for_timeout(5000)
             _log("[fubon][collect] 回 home 準備點 存款交易查詢")
         except Exception as e:
-            _log(f"[fubon][collect] 回 home(交易查詢前) 失敗: {e}")
+            _log(f"[fubon][collect] 回 home(交易查詢前) 失敗: {type(e).__name__}")
 
         txn_query_frame = None
         page.wait_for_timeout(2000)
@@ -889,7 +927,10 @@ class FubonCrawler(BankCrawler):
                 return {ok: false, error: 'no_deposit_txn_anchor'};
             }""")
             out["deposit_txn_click"] = txn_click
-            _log(f"[fubon][collect] 存款交易查詢 click: {txn_click}")
+            _log(
+                f"[fubon][collect] 存款交易查詢 click: "
+                f"ok={bool(isinstance(txn_click, dict) and txn_click.get('ok'))}"
+            )
             page.wait_for_timeout(8000)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "07_after_deposit_txn_query.png"), full_page=True)
@@ -904,7 +945,7 @@ class FubonCrawler(BankCrawler):
                 txn_query_text = txn_query_frame.evaluate("() => document.body.innerText.slice(0, 30000)") or ""
             out["deposit_txn_page_text"] = txn_query_text
             out["deposit_txn_page_url"] = txn_query_frame.url
-            _log(f"[fubon][collect] deposit txn 頁 url={txn_query_frame.url[:120]} text_len={len(txn_query_text)}")
+            _log(f"[fubon][collect] deposit txn 頁 url={_safe_url(txn_query_frame.url)} text_len={len(txn_query_text)}")
 
             # 真正補交易明細: 富邦 CDSQU001 query form 是 native select + radio/buttons。
             # 對每個帳戶選「近1個月」並按「開始查詢」，結果頁 text 用 persist parser 入庫。
@@ -944,7 +985,7 @@ class FubonCrawler(BankCrawler):
                         }""", opt)
                         page.wait_for_timeout(1200)
                     except Exception as e:
-                        _log(f"[fubon][collect] deposit txn select evaluate 失敗: {e}")
+                        _log(f"[fubon][collect] deposit txn select evaluate 失敗: {type(e).__name__}")
 
                     with contextlib.suppress(Exception):
                         txn_query_frame.check("#form1\\:rdoTxDetail", force=True)
@@ -962,7 +1003,10 @@ class FubonCrawler(BankCrawler):
                         query_result = {"ok": True, "selectedText": selected_text, "pickedPeriod": picked_period}
                     except Exception as e:
                         query_result = {"ok": False, "selectedText": selected_text, "pickedPeriod": picked_period, "error": str(e)}
-                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢: {query_result}")
+                    _log(
+                        f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢: "
+                        f"ok={query_result['ok']} picked_period={picked_period}"
+                    )
                     page.wait_for_timeout(9000)
                     page.wait_for_timeout(1000)
                     for f in page.frames:
@@ -978,7 +1022,7 @@ class FubonCrawler(BankCrawler):
                         "url": result_url,
                         "text": result_text,
                     })
-                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} result url={result_url[:120]} text_len={len(result_text)}")
+                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} result url={_safe_url(result_url)} text_len={len(result_text)}")
                     with contextlib.suppress(Exception):
                         page.screenshot(path=str(debug_dir / f"08_deposit_txn_result_{acct_idx}.png"), full_page=True)
 
@@ -1002,9 +1046,9 @@ class FubonCrawler(BankCrawler):
                                     txn_query_frame = f
                                     break
                         except Exception as e:
-                            _log(f"[fubon][collect] deposit txn 回查詢頁失敗: {e}")
+                            _log(f"[fubon][collect] deposit txn 回查詢頁失敗: {type(e).__name__}")
                 except Exception as e:
-                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢例外: {e}")
+                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢例外: {type(e).__name__}")
                     deposit_txn_results.append({"account_no": account_no, "selected_text": opt.get("text"), "error": str(e)})
             out["deposit_txn_results"] = deposit_txn_results
         else:
@@ -1016,7 +1060,7 @@ class FubonCrawler(BankCrawler):
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         publish_card_bill_facts(out, [_fubon_card_bill_fact(out.get("amount_page_text") or "")])
-        _log(f"[fubon][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")
+        _log(f"[fubon][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
         return BankCollectResult(**out)
 
 

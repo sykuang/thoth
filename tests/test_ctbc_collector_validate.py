@@ -14,12 +14,22 @@ Collector 該 skip + log, 不該往下游 persist 送結構不全的 dict.
 """
 from __future__ import annotations
 
+import inspect
+
 import pytest
+
+import backend.banks.ctbc as ctbc_module
 
 from backend.banks.ctbc import (
     _build_qu002_011_post_body,
     _filter_valid_ctbc_details,
 )
+
+
+def test_ctbc_collect_telemetry_does_not_log_account_identifiers():
+    source = inspect.getsource(ctbc_module.CtbcCrawler._collect_twd_deposit_history)
+
+    assert "account_id[:" not in source
 
 
 # ============================================================

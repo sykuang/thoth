@@ -427,8 +427,7 @@ class CtbcCrawler(BankCrawler):
         for target_text in card_targets:
             nav_result = self._goto_credit_card(page, target_text=target_text)
             nav_logs.append({"target": target_text, **nav_result})
-            _log(f"[collect][card-nav] {target_text} → clicked={nav_result.get('clicked')}, "
-                 f"url={nav_result.get('after_click_url', '?')[:80]}")
+            _log(f"[collect][card-nav] {target_text} → clicked={bool(nav_result.get('clicked'))}")
             page.wait_for_timeout(6000)
         out["card_nav_probe"] = nav_logs  # 改成多家紀錄
         out["card_nav_probe_2"] = None     # 舊欄位保留向後相容
@@ -467,7 +466,7 @@ class CtbcCrawler(BankCrawler):
                 _log(f"[collect][card-mega-menu-dump] {len(menu_items)} items")
         except Exception as e:
             out["card_mega_menu_dump"] = {"error": str(e)}
-            _log(f"[collect][card-mega-menu-dump] ERROR: {e}")
+            _log(f"[collect][card-mega-menu-dump] ERROR: {type(e).__name__}")
 
         # 抽所有 creditcard / creditCard / card 相關的 resource
         card_resources = sorted({
@@ -477,7 +476,7 @@ class CtbcCrawler(BankCrawler):
             and any(k in (h.req_body.get("resource") or "").lower() for k in ("credit", "card", "ccrd", "stmt", "bill"))
         } - {""})
         out["card_resources"] = card_resources
-        _log(f"[collect][card-resources] {card_resources}")
+        _log(f"[collect][card-resources] count={len(card_resources)}")
 
         # 把所有 card 相關 resource 的最新 rsData 撈下來
         card_api_dump = {}
@@ -581,7 +580,7 @@ class CtbcCrawler(BankCrawler):
             _log("[twd-history] collector.auth_token 沒攔到 Bearer, 無法主動 POST")
             return history
 
-        for acct in info_list:
+        for account_index, acct in enumerate(info_list, start=1):
             account_id = acct.get("accountId")
             if not account_id:
                 continue
@@ -600,7 +599,7 @@ class CtbcCrawler(BankCrawler):
                     continue
                 detail_list, skipped = _filter_valid_ctbc_details(detail_list_raw)
                 if skipped > 0:
-                    _log(f"[twd-history] account={account_id[:8]}*** {month} "
+                    _log(f"[twd-history] account_index={account_index} {month} "
                          f"skipped {skipped} raw detail rows missing actDtTm")
                 if detail_list:
                     months_data[month] = detail_list
@@ -613,7 +612,7 @@ class CtbcCrawler(BankCrawler):
                 "months": months_data,
                 "errors": errors,
             })
-            _log(f"[twd-history] account={account_id[:8]}*** "
+            _log(f"[twd-history] account_index={account_index} "
                  f"total={total} months={list(months_data.keys())} errors={list(errors.keys())}")
 
         return history
@@ -760,13 +759,9 @@ if __name__ == "__main__":
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     _log(f"\n[done] 已存: {out_file}")
     if result.get("error"):
-        _log(f"  error: {result['error']} url={result.get('final_url')}")
+        _log(f"  error: {result['error']}")
     data = result.get("data", {})
-    summ = data.get("summary") or {}
-    _log(f"\n  台幣存款餘額: {(summ.get('twdDepositSummary') or {}).get('totalCurrentBal')}")
-    cc = summ.get("creditCardSummary") or {}
-    _log(f"  信用卡: 額度={cc.get('quota')} 可用={cc.get('availBal')} 應繳={cc.get('unpaidStmt')} 繳款日={cc.get('pmtExpDt')}")
     dep = data.get("twd_deposit") or {}
     demdep = (dep.get("demDepBalSummaryResponse") or {}).get("infoList") if isinstance(dep, dict) else None
-    _log(f"  台幣帳戶: {demdep}")
-    _log(f"  攔到的 resource: {data.get('_all_resources', [])}")
+    _log(f"  台幣帳戶: {len(demdep or [])}")
+    _log(f"  攔到的 resource: {len(data.get('_all_resources', []))}")
