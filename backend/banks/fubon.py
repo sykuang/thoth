@@ -468,6 +468,13 @@ class FubonCrawler(BankCrawler):
         - DOM 全部渲染（不靠 hover），視覺上只顯示一頁，但 querySelector 都拿得到
         - 走 txnFrame 直接定位「我的信用卡」/「帳務/繳款」等子項 click 即可
         """
+        def bounded_evaluate(scope, expression: str, arg=None):
+            return scope.locator("html").evaluate(
+                f"(root, arg) => ({expression})(arg)",
+                arg,
+                timeout=5000,
+            )
+
         out: dict = {}
         page.wait_for_timeout(8000)
 
@@ -494,7 +501,7 @@ class FubonCrawler(BankCrawler):
 
         # === Step 2: 在 txnFrame 找信用卡相關子項 (carousel 全渲染，offscreen 也存在) ===
         # 優先序：直接走「我的信用卡」進信用卡頁，或「帳務/繳款」進帳單查詢
-        candidates = content_frame.evaluate("""() => {
+        candidates = bounded_evaluate(content_frame, """() => {
             const targets = ['我的信用卡', '帳務/繳款', '消費分期', '紅利/哩程', '預借現金', '信用卡帳單', '信用卡明細', '帳單查詢'];
             const out = [];
             for (const el of document.querySelectorAll('a, button, span, div, li')) {
@@ -521,7 +528,7 @@ class FubonCrawler(BankCrawler):
         # Telemetry 2026-06-18: 同時 dump 存款/帳戶相關 menu 候選 (給 cloud 看真實有哪些字)
         # 目的: 確認富邦 menu 用「帳戶總覽」「存款查詢」「我的帳戶」哪個字眼, 才能規劃 collect path
         # 同時 dump 所有 <a> visible text 前 100 條 (上限避免 result_summary 爆)
-        deposit_audit = content_frame.evaluate(r"""() => {
+        deposit_audit = bounded_evaluate(content_frame, r"""() => {
             const KW = /(帳戶|存款|餘額|台幣|外幣|定存|數位帳戶|主帳|匯款|轉帳|資產)/;
             const out = [];
             for (const el of document.querySelectorAll('a, button, li, span, div')) {
@@ -604,7 +611,7 @@ class FubonCrawler(BankCrawler):
         _log(f"[fubon][collect] txnFrame offset=({offset_x}, {offset_y})")
 
         # 走 frame.evaluate 找 A tag (相同 text 多個時優先 <A>，並用 cls 區分 menu_CCCxx)
-        click_result = content_frame.evaluate("""(args) => {
+        click_result = bounded_evaluate(content_frame, """(args) => {
             const {targetText, targetCls} = args;
             // 第一順位：tag=A 且 cls 含 targetCls
             for (const el of document.querySelectorAll('a')) {
@@ -651,7 +658,7 @@ class FubonCrawler(BankCrawler):
         # 立刻抓「我的信用卡」頁卡片清單 (CCCQU001_Home)
         cards_page_text = ""
         with contextlib.suppress(Exception):
-            cards_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 10000)") or ""
+            cards_page_text = bounded_evaluate(content_frame, "() => document.body.innerText.slice(0, 10000)") or ""
         out["cards_page_text"] = cards_page_text
         out["cards_page_url"] = content_frame.url
         _log(f"[fubon][collect] cards 頁 text_len={len(cards_page_text)}")
@@ -659,7 +666,7 @@ class FubonCrawler(BankCrawler):
         # === Step 4.6: 再 click「帳務查詢」進帳單明細頁 ===
         # 富邦右上吊牌 quick links: 帳務查詢 / 網路辦卡 / 申辦進度查詢
         # 必須找 <A> tag（LI 是裝飾外殼）
-        bill_click = content_frame.evaluate("""() => {
+        bill_click = bounded_evaluate(content_frame, """() => {
             const targets = ['帳務查詢', '帳單查詢', '消費明細查詢', '消費明細', '帳單'];
             const found = [];
             for (const t of targets) {
@@ -707,12 +714,12 @@ class FubonCrawler(BankCrawler):
         # 先抓額度頁，再嘗試切到帳單明細
         amount_page_text = ""
         with contextlib.suppress(Exception):
-            amount_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 15000)") or ""
+            amount_page_text = bounded_evaluate(content_frame, "() => document.body.innerText.slice(0, 15000)") or ""
         out["amount_page_text"] = amount_page_text
         _log(f"[fubon][collect] amount 頁 text_len={len(amount_page_text)}")
 
         # 嘗試 click 帳單明細查詢
-        billed_click = content_frame.evaluate("""() => {
+        billed_click = bounded_evaluate(content_frame, """() => {
             const targets = ['帳單明細查詢', '帳單明細'];
             for (const t of targets) {
                 for (const el of document.querySelectorAll('a')) {
@@ -741,13 +748,13 @@ class FubonCrawler(BankCrawler):
                 break
         billed_page_text = ""
         with contextlib.suppress(Exception):
-            billed_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
+            billed_page_text = bounded_evaluate(content_frame, "() => document.body.innerText.slice(0, 20000)") or ""
         out["billed_page_text"] = billed_page_text
         out["billed_page_url"] = content_frame.url
         _log(f"[fubon][collect] billed 頁 url={_safe_url(content_frame.url)} text_len={len(billed_page_text)}")
 
         # 嘗試 click 未出帳單消費明細
-        pending_click = content_frame.evaluate("""() => {
+        pending_click = bounded_evaluate(content_frame, """() => {
             const targets = ['未出帳單消費明細', '未出帳消費明細', '未出帳明細'];
             for (const t of targets) {
                 for (const el of document.querySelectorAll('a')) {
@@ -777,7 +784,7 @@ class FubonCrawler(BankCrawler):
                 break
         pending_page_text = ""
         with contextlib.suppress(Exception):
-            pending_page_text = content_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
+            pending_page_text = bounded_evaluate(content_frame, "() => document.body.innerText.slice(0, 20000)") or ""
         out["pending_page_text"] = pending_page_text
         out["pending_page_url"] = content_frame.url
         _log(f"[fubon][collect] pending 頁 url={_safe_url(content_frame.url)} text_len={len(pending_page_text)}")
@@ -787,7 +794,7 @@ class FubonCrawler(BankCrawler):
         frames_data = []
         for f in page.frames:
             try:
-                txt = f.evaluate("() => document.body.innerText.slice(0, 15000)")
+                txt = bounded_evaluate(f, "() => document.body.innerText.slice(0, 15000)")
                 if txt and len(txt) > 50:
                     frames_data.append({
                         "name": f.name or "",
@@ -851,7 +858,7 @@ class FubonCrawler(BankCrawler):
 
         if deposit_frame:
             # 點 a.task_CBOQU003 (我的存款) — 不是 click text 因為 DIV/SPAN 同名沒 routing
-            deposit_click = deposit_frame.evaluate(r"""() => {
+            deposit_click = bounded_evaluate(deposit_frame, r"""() => {
                 const a = document.querySelector('a.task_CBOQU003, a.menu_CBO03');
                 if (!a) return {ok: false, error: 'no_deposit_anchor'};
                 try {
@@ -878,7 +885,7 @@ class FubonCrawler(BankCrawler):
 
             deposit_page_text = ""
             with contextlib.suppress(Exception):
-                deposit_page_text = deposit_frame.evaluate("() => document.body.innerText.slice(0, 20000)") or ""
+                deposit_page_text = bounded_evaluate(deposit_frame, "() => document.body.innerText.slice(0, 20000)") or ""
             out["deposit_page_text"] = deposit_page_text
             out["deposit_page_url"] = deposit_frame.url
             _log(f"[fubon][collect] deposit 頁 url={_safe_url(deposit_frame.url)} text_len={len(deposit_page_text)}")
@@ -911,7 +918,7 @@ class FubonCrawler(BankCrawler):
                 break
 
         if txn_query_frame:
-            txn_click = txn_query_frame.evaluate(r"""() => {
+            txn_click = bounded_evaluate(txn_query_frame, r"""() => {
                 const selectors = [
                     'a.task_CDSQU001', 'a.menu_CDS04',
                     'a.task_CDSQU004', 'a.menu_CDS0103',
@@ -955,7 +962,7 @@ class FubonCrawler(BankCrawler):
                     break
             txn_query_text = ""
             with contextlib.suppress(Exception):
-                txn_query_text = txn_query_frame.evaluate("() => document.body.innerText.slice(0, 30000)") or ""
+                txn_query_text = bounded_evaluate(txn_query_frame, "() => document.body.innerText.slice(0, 30000)") or ""
             out["deposit_txn_page_text"] = txn_query_text
             out["deposit_txn_page_url"] = txn_query_frame.url
             _log(f"[fubon][collect] deposit txn 頁 url={_safe_url(txn_query_frame.url)} text_len={len(txn_query_text)}")
@@ -965,7 +972,7 @@ class FubonCrawler(BankCrawler):
             deposit_txn_results = []
             acct_options = []
             with contextlib.suppress(Exception):
-                acct_options = txn_query_frame.evaluate(r"""() => {
+                acct_options = bounded_evaluate(txn_query_frame, r"""() => {
                     const sel = [...document.querySelectorAll('select')].find(s =>
                         [...s.options].some(o => /\d{10,16}/.test(o.textContent || o.value || ''))
                     );
@@ -984,7 +991,7 @@ class FubonCrawler(BankCrawler):
                     # comboAccountChange/checkAccountType，不能用 Playwright select_option。
                     selected_text = None
                     try:
-                        selected_text = txn_query_frame.evaluate(r"""(opt) => {
+                        selected_text = bounded_evaluate(txn_query_frame, r"""(opt) => {
                             const s = document.getElementById('form1:comboAccount') || document.querySelector('[name="form1:comboAccount"]');
                             if (!s) return null;
                             if (opt.value) s.value = opt.value;
@@ -1026,7 +1033,7 @@ class FubonCrawler(BankCrawler):
                         if (f.name or "") == "txnFrame":
                             txn_query_frame = f
                             break
-                    result_text = txn_query_frame.evaluate("() => document.body.innerText.slice(0, 50000)") or ""
+                    result_text = bounded_evaluate(txn_query_frame, "() => document.body.innerText.slice(0, 50000)") or ""
                     result_url = txn_query_frame.url
                     deposit_txn_results.append({
                         "account_no": account_no,
@@ -1041,7 +1048,7 @@ class FubonCrawler(BankCrawler):
 
                     # 回 query form 查下一個帳號。若回不去就重新開 CDSQU001。
                     with contextlib.suppress(Exception):
-                        txn_query_frame.evaluate(r"""() => {
+                        bounded_evaluate(txn_query_frame, r"""() => {
                             const back = [...document.querySelectorAll('a,button,input[type=button]')]
                                 .find(b => /回上一頁|重新查詢|回查詢頁|返回/.test((b.textContent || b.value || '').trim()));
                             if (back) back.click();

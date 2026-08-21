@@ -810,8 +810,13 @@ def test_legacy_login_debug_synthetic_actions_and_raw_ocr_are_absent() -> None:
 
 
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
+    collect_source = inspect.getsource(FubonCrawler.collect)
+    assert collect_source.count(".evaluate(") == 1
+    assert "timeout=5000" in collect_source
+    assert collect_source.count("bounded_evaluate(") > 10
+
     tree = ast.parse(Path(fubon_module.__file__).read_text())
     crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FubonCrawler")
     start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == "c63f1bac7ba85d1e772c50ba6b403692e8c65cd7f46180a50964837dda2e6389"
+    assert hashlib.sha256(payload.encode()).hexdigest() == "06d145845646df30a172ff500a8428f943deb39949947d267dc9d5b239f62c16"
