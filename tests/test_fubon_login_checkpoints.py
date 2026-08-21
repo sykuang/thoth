@@ -381,6 +381,7 @@ def test_auth_bounds_each_owned_scope_body_read() -> None:
     main.url = "https://ebank.taipeifubon.com.tw/B2C/home"
     controls = Mock()
     controls.count.return_value = 0
+    controls.nth.side_effect = TimeoutError
     body = Mock()
     body.count.return_value = 1
     body.nth.return_value = body
@@ -519,6 +520,7 @@ def _submit_fixture():
 
     empty = Mock()
     empty.count.return_value = 0
+    empty.nth.side_effect = TimeoutError
     frame.locator.side_effect = lambda selector: {
         "input[type='password']": passwords,
         "#m1_userCaptcha": captcha,
@@ -633,7 +635,8 @@ def test_submit_pre_click_failures_are_private_and_zero_submit(failure: str, cap
     elif failure == "captcha":
         captcha.get_attribute.side_effect = RuntimeError(secret)
     else:
-        submit.count.return_value = 2
+        duplicate = Mock()
+        submit.nth.side_effect = [submit, duplicate]
 
     with pytest.raises(FubonLoginError, match="未送出登入") as error:
         crawler.submit_credentials_once(page)
@@ -699,7 +702,7 @@ def test_ocr_requires_unique_image_and_refresh_action(count: int, monkeypatch) -
     frame = Mock()
     image = Mock()
     image.count.return_value = 1 if count else 0
-    image.nth.return_value = image
+    image.nth.side_effect = [image] if count else TimeoutError
     image.is_visible.return_value = True
     image.screenshot.return_value = b"captcha"
     action = Mock()
@@ -708,7 +711,7 @@ def test_ocr_requires_unique_image_and_refresh_action(count: int, monkeypatch) -
     action.inner_text.return_value = "重新產生"
     actions = Mock()
     actions.count.return_value = count
-    actions.nth.return_value = action
+    actions.nth.side_effect = [action, Mock()] if count == 2 else TimeoutError
     frame.locator.side_effect = lambda selector: image if selector == "#m1_captchaImage" else actions
     monkeypatch.setattr(fubon_module, "ocr_bytes", Mock(return_value=None))
 
@@ -786,6 +789,7 @@ def test_login_is_thin_and_prepare_short_circuits_authenticated(monkeypatch) -> 
 def test_legacy_login_debug_synthetic_actions_and_raw_ocr_are_absent() -> None:
     source = inspect.getsource(fubon_module)
     login_region = source[: source.index("    def collect(")]
+    assert ".count()" not in login_region
     for forbidden in (
         "base64",
         "page.screenshot",

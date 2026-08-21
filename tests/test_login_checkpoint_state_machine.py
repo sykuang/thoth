@@ -11,6 +11,7 @@ from backend.core.login_checkpoints import (
     LoginCheckpointRule,
     LoginInteractionRequired,
     _matching_body_fingerprint,
+    bounded_locator_matches,
     evaluate_login_checkpoint,
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
@@ -70,6 +71,29 @@ def test_checkpoint_evaluator_bounds_and_restores_page_timeout() -> None:
     assert outcome == CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
     assert page.calls == [5000, 180000]
     assert page.timeout == 180000
+
+
+def test_locator_snapshot_is_bounded_without_query_count() -> None:
+    class Match:
+        def __init__(self, exists: bool) -> None:
+            self.exists = exists
+
+        def element_handle(self, *, timeout: int):
+            assert timeout == 100
+            if not self.exists:
+                raise TimeoutError("bounded snapshot elapsed")
+            return object()
+
+    class Locator:
+        def count(self):
+            raise AssertionError("queryCount must not be used")
+
+        def nth(self, index: int) -> Match:
+            return Match(index < 2)
+
+    matches = list(bounded_locator_matches(Locator()))
+
+    assert len(matches) == 2
 
 
 @pytest.mark.parametrize(

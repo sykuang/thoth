@@ -46,6 +46,7 @@ from backend.core.login_checkpoints import (
     CheckpointPhase,
     LoginCheckpointRule,
     bounded_login_inspection,
+    bounded_locator_matches,
 )
 
 BASE = "https://ebank.taipeifubon.com.tw/B2C/common/Index.faces"
@@ -185,15 +186,12 @@ class FubonCrawler(BankCrawler):
             )
             for scope in scopes:
                 controls = scope.locator(controls_selector)
-                if any(
-                    controls.nth(index).is_visible()
-                    for index in range(controls.count())
-                ):
+                if any(item.is_visible() for item in bounded_locator_matches(controls)):
                     return False
                 bodies = scope.locator("body")
                 body_parts.extend(
-                    bodies.nth(index).inner_text(timeout=5000)
-                    for index in range(bodies.count())
+                    body.inner_text(timeout=5000)
+                    for body in bounded_locator_matches(bodies)
                 )
             body = "\n".join(body_parts)
             return (
@@ -218,10 +216,13 @@ class FubonCrawler(BankCrawler):
             header_frame = self._find_header_frame(page)
             if header_frame is None:
                 raise FubonLoginError("找不到唯一的登入頁首；未送出登入")
-            headers = header_frame.locator("#header_form\\:header_login")
-            if headers.count() != 1:
+            headers = tuple(bounded_locator_matches(
+                header_frame.locator("#header_form\\:header_login"),
+                first_timeout_ms=5000,
+            ))
+            if len(headers) != 1:
                 raise FubonLoginError("找不到唯一且可操作的頁首登入按鈕；未送出登入")
-            header = headers.nth(0)
+            header = headers[0]
             if (
                 not header.is_visible()
                 or not header.is_enabled()
@@ -236,8 +237,7 @@ class FubonCrawler(BankCrawler):
                 raise FubonLoginError("找不到唯一的一般登入頁面；未送出登入")
             actions = login_frame.locator("a, button")
             eligible = []
-            for index in range(actions.count()):
-                action = actions.nth(index)
+            for action in bounded_locator_matches(actions, first_timeout_ms=5000):
                 if (
                     action.is_visible()
                     and action.is_enabled()
@@ -305,10 +305,12 @@ class FubonCrawler(BankCrawler):
         attempts = min(max(max_attempts, 0), 5)
         for attempt in range(attempts):
             try:
-                images = frame.locator("#m1_captchaImage")
-                if images.count() != 1:
+                images = tuple(bounded_locator_matches(
+                    frame.locator("#m1_captchaImage"), first_timeout_ms=5000
+                ))
+                if len(images) != 1:
                     return None
-                image = images.nth(0)
+                image = images[0]
                 if not image.is_visible():
                     return None
                 raw = image.screenshot(timeout=5000)
@@ -327,8 +329,7 @@ class FubonCrawler(BankCrawler):
             try:
                 candidates = frame.locator("a, button")
                 eligible = []
-                for index in range(candidates.count()):
-                    action = candidates.nth(index)
+                for action in bounded_locator_matches(candidates, first_timeout_ms=5000):
                     if (
                         action.is_visible()
                         and action.is_enabled()
@@ -350,8 +351,7 @@ class FubonCrawler(BankCrawler):
                 raise FubonLoginError("找不到唯一的登入頁面；未送出登入")
             candidates = frame.locator("input[type='password']")
             ordered = []
-            for index in range(candidates.count()):
-                field = candidates.nth(index)
+            for field in bounded_locator_matches(candidates, first_timeout_ms=5000):
                 if not field.is_visible():
                     continue
                 field_id = field.get_attribute("id") or ""
@@ -385,10 +385,12 @@ class FubonCrawler(BankCrawler):
                 if len(field.input_value()) != len(value):
                     raise FubonLoginError("登入欄位輸入長度不符；未送出登入")
 
-            captchas = frame.locator("#m1_userCaptcha")
-            if captchas.count() != 1:
+            captchas = tuple(bounded_locator_matches(
+                frame.locator("#m1_userCaptcha"), first_timeout_ms=5000
+            ))
+            if len(captchas) != 1:
                 raise FubonLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            captcha_field = captchas.nth(0)
+            captcha_field = captchas[0]
             if (
                 not captcha_field.is_visible()
                 or not captcha_field.is_enabled()
@@ -405,10 +407,12 @@ class FubonCrawler(BankCrawler):
             if len(captcha_field.input_value()) != 6:
                 raise FubonLoginError("驗證碼欄位輸入長度不符；未送出登入")
 
-            submits = frame.locator("#btnLogin2")
-            if submits.count() != 1:
+            submits = tuple(bounded_locator_matches(
+                frame.locator("#btnLogin2"), first_timeout_ms=5000
+            ))
+            if len(submits) != 1:
                 raise FubonLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
-            submit = submits.nth(0)
+            submit = submits[0]
             if (
                 not submit.is_visible()
                 or not submit.is_enabled()
@@ -442,8 +446,8 @@ class FubonCrawler(BankCrawler):
                         ):
                             checkpoints = scope.locator(selector)
                             if any(
-                                checkpoints.nth(index).is_visible()
-                                for index in range(checkpoints.count())
+                                item.is_visible()
+                                for item in bounded_locator_matches(checkpoints)
                             ):
                                 return
         except Exception:

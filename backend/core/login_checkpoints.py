@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -64,6 +64,8 @@ _GENERIC_ROLE_BUTTON_SELECTOR = re.compile(
 )
 _BROWSER_DEFAULT_TIMEOUT_MS = 180000
 _LOGIN_INSPECTION_TIMEOUT_MS = 5000
+_LOCATOR_SNAPSHOT_TIMEOUT_MS = 100
+_MAX_LOCATOR_MATCHES = 500
 
 
 @contextmanager
@@ -73,6 +75,28 @@ def bounded_login_inspection(page: Any):
         yield
     finally:
         page.set_default_timeout(_BROWSER_DEFAULT_TIMEOUT_MS)
+
+
+def bounded_locator_matches(
+    locator: Any, *, first_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
+) -> Iterator[Any]:
+    seen_handles: list[Any] = []
+    for index in range(_MAX_LOCATOR_MATCHES + 1):
+        try:
+            candidate = locator.nth(index)
+            handle = candidate.element_handle(
+                timeout=first_timeout_ms if index == 0 else _LOCATOR_SNAPSHOT_TIMEOUT_MS
+            )
+        except (IndexError, StopIteration, TimeoutError, PatchrightTimeoutError, PlaywrightTimeoutError):
+            return
+        if handle is None:
+            return
+        if any(handle is seen for seen in seen_handles):
+            return
+        seen_handles.append(handle)
+        if index == _MAX_LOCATOR_MATCHES:
+            raise RuntimeError("login checkpoint locator exceeded safe match limit")
+        yield candidate
 
 
 def _is_simple_scoped_selector(selector: str) -> bool:
@@ -211,12 +235,11 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     matched = []
     for scope in scopes:
         containers = scope.locator(rule.container_selector)
-        for index in range(containers.count()):
-            container = containers.nth(index)
+        for container in bounded_locator_matches(containers):
             if not container.is_visible():
                 continue
             nested = container.locator(rule.container_selector)
-            if any(nested.nth(i).is_visible() for i in range(nested.count())):
+            if any(item.is_visible() for item in bounded_locator_matches(nested)):
                 continue
             fingerprint = _matching_body_fingerprint(container, rule.required_body_pattern)
             if fingerprint is None:
@@ -236,7 +259,7 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
             form_controls = container.locator(
                 "input, select, textarea, [contenteditable]:not([contenteditable='false'])"
             )
-            if any(form_controls.nth(i).is_visible() for i in range(form_controls.count())):
+            if any(item.is_visible() for item in bounded_locator_matches(form_controls)):
                 return CheckpointOutcome(
                     CheckpointKind.UNKNOWN_BLOCKER,
                     rule_name=rule.name,
@@ -250,8 +273,7 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     }
     for container, fingerprint in matched:
         actions = container.locator(rule.action_selector)
-        for action_index in range(actions.count()):
-            action = actions.nth(action_index)
+        for action in bounded_locator_matches(actions):
             if not action.is_visible():
                 continue
             if action_labels:

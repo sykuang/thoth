@@ -43,6 +43,12 @@ class Locator:
     def nth(self, index: int):
         return Locator([self.nodes[index]])
 
+    def element_handle(self, *, timeout: int):
+        assert timeout == 100
+        if not self.nodes:
+            raise TimeoutError
+        return self.nodes[0]
+
     def is_visible(self):
         return bool(self.nodes and self.nodes[0].attached and self.nodes[0].visible)
 
