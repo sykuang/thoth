@@ -260,6 +260,7 @@ class FubonCrawler(BankCrawler):
             page.wait_for_timeout(12000)
             if self._logged_in(page):
                 return
+            _log("[fubon][phase] prepare_auth_checked")
             header_frame = self._find_header_frame(page)
             if header_frame is None:
                 raise FubonLoginError("找不到唯一的登入頁首；未送出登入")
@@ -277,12 +278,16 @@ class FubonCrawler(BankCrawler):
             ):
                 raise FubonLoginError("找不到唯一且可操作的頁首登入按鈕；未送出登入")
             header.click(timeout=8000)
+            _log("[fubon][phase] header_clicked")
             page.wait_for_timeout(5000)
 
             login_frame = self._find_login_frame(page)
             if login_frame is None:
                 raise FubonLoginError("找不到唯一的一般登入頁面；未送出登入")
-            actions = login_frame.locator("a, button")
+            _log("[fubon][phase] login_frame_ready")
+            actions = login_frame.locator("a, button").filter(
+                has_text=re.compile(r"^\s*一般登入\s*$")
+            )
             eligible = []
             for action in bounded_locator_matches(actions, first_timeout_ms=5000):
                 if (
