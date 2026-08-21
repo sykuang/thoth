@@ -558,6 +558,28 @@ def test_submit_uses_exact_dynamic_field_contract_and_true_keyboard() -> None:
     page.fill.assert_not_called()
 
 
+def test_post_submit_inspection_bounds_and_restores_page_timeout() -> None:
+    crawler, page, _frame, _fields, _passwords, _captcha, submit = _submit_fixture()
+    timeout = 180000
+
+    def set_default_timeout(value: int) -> None:
+        nonlocal timeout
+        timeout = value
+
+    def logged_in(_page) -> bool:
+        assert timeout == 5000
+        return True
+
+    page.set_default_timeout.side_effect = set_default_timeout
+    crawler._logged_in = Mock(side_effect=logged_in)
+
+    crawler.submit_credentials_once(page)
+
+    submit.click.assert_called_once_with(timeout=8000)
+    assert page.set_default_timeout.call_args_list == [call(5000), call(180000)]
+    assert timeout == 180000
+
+
 def test_submit_ignores_hidden_password_variants_but_keeps_visible_cardinality() -> None:
     crawler, page, _frame, fields, passwords, _captcha, submit = _submit_fixture()
     hidden = Mock()

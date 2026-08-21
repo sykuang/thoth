@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
@@ -61,6 +62,17 @@ _SIMPLE_SCOPED_SELECTOR = re.compile(rf"(?:[A-Za-z][A-Za-z0-9-]*)?{_SCOPING_ATOM
 _GENERIC_ROLE_BUTTON_SELECTOR = re.compile(
     r'''\[role=(?:button|'button'|"button")\]''', re.IGNORECASE
 )
+_BROWSER_DEFAULT_TIMEOUT_MS = 180000
+_LOGIN_INSPECTION_TIMEOUT_MS = 5000
+
+
+@contextmanager
+def bounded_login_inspection(page: Any):
+    page.set_default_timeout(_LOGIN_INSPECTION_TIMEOUT_MS)
+    try:
+        yield
+    finally:
+        page.set_default_timeout(_BROWSER_DEFAULT_TIMEOUT_MS)
 
 
 def _is_simple_scoped_selector(selector: str) -> bool:
@@ -285,7 +297,7 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     )
 
 
-def evaluate_login_checkpoint(
+def _evaluate_login_checkpoint(
     page: Any,
     *,
     bank: str,
@@ -334,6 +346,31 @@ def evaluate_login_checkpoint(
         else CheckpointKind.UNKNOWN_BLOCKER
     )
     return CheckpointOutcome(fallback)
+
+
+def evaluate_login_checkpoint(
+    page: Any,
+    *,
+    bank: str,
+    phase: CheckpointPhase,
+    rules: tuple[LoginCheckpointRule, ...],
+    is_authenticated: Callable[[Any], bool],
+    is_scope_owned: Callable[[Any], bool] | None = None,
+) -> CheckpointOutcome:
+    if any(rule.bank != bank for rule in rules):
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    try:
+        with bounded_login_inspection(page):
+            return _evaluate_login_checkpoint(
+                page,
+                bank=bank,
+                phase=phase,
+                rules=rules,
+                is_authenticated=is_authenticated,
+                is_scope_owned=is_scope_owned,
+            )
+    except Exception:
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
 
 
 class LoginCheckpointTerminal(RuntimeError):

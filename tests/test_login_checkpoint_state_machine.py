@@ -11,6 +11,7 @@ from backend.core.login_checkpoints import (
     LoginCheckpointRule,
     LoginInteractionRequired,
     _matching_body_fingerprint,
+    evaluate_login_checkpoint,
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
 )
@@ -39,6 +40,36 @@ def test_checkpoint_body_fingerprint_uses_operation_local_timeout() -> None:
 
     assert _matching_body_fingerprint(container, None) is not None
     assert container.timeout == 5000
+
+
+def test_checkpoint_evaluator_bounds_and_restores_page_timeout() -> None:
+    class Page:
+        timeout = 180000
+        calls: list[int] = []
+        frames: list[object] = []
+        main_frame = object()
+
+        def set_default_timeout(self, timeout: int) -> None:
+            self.timeout = timeout
+            self.calls.append(timeout)
+
+    page = Page()
+
+    def is_authenticated(current: Page) -> bool:
+        assert current.timeout == 5000
+        return False
+
+    outcome = evaluate_login_checkpoint(
+        page,
+        bank="test-bank",
+        phase=CheckpointPhase.PRE_SUBMIT,
+        rules=(),
+        is_authenticated=is_authenticated,
+    )
+
+    assert outcome == CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+    assert page.calls == [5000, 180000]
+    assert page.timeout == 180000
 
 
 @pytest.mark.parametrize(

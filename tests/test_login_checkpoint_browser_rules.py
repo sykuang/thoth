@@ -75,6 +75,10 @@ class Page:
         self.root = Node(queries=queries or {})
         self.frames = [self, *frames]
         self.main_frame = self
+        self.default_timeout = 180000
+
+    def set_default_timeout(self, timeout: int):
+        self.default_timeout = timeout
 
     def locator(self, selector: str):
         return self.root.queries.get(selector) and Locator(self.root.queries[selector]) or Locator([])

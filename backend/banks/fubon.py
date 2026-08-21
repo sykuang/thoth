@@ -45,6 +45,7 @@ from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
     LoginCheckpointRule,
+    bounded_login_inspection,
 )
 
 BASE = "https://ebank.taipeifubon.com.tw/B2C/common/Index.faces"
@@ -425,25 +426,26 @@ class FubonCrawler(BankCrawler):
             raise FubonLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
-            page.wait_for_timeout(3000)
-            for _ in range(10):
-                page.wait_for_timeout(1000)
-                if self._logged_in(page):
-                    return
-                scopes = [
-                    page,
-                    *(child for child in page.frames if child is not page.main_frame),
-                ]
-                for scope in scopes:
-                    for selector in (
-                        ".modal.show", "[role='dialog']", ".error", ".alert", "[role='alert']",
-                    ):
-                        checkpoints = scope.locator(selector)
-                        if any(
-                            checkpoints.nth(index).is_visible()
-                            for index in range(checkpoints.count())
+            with bounded_login_inspection(page):
+                page.wait_for_timeout(3000)
+                for _ in range(10):
+                    page.wait_for_timeout(1000)
+                    if self._logged_in(page):
+                        return
+                    scopes = [
+                        page,
+                        *(child for child in page.frames if child is not page.main_frame),
+                    ]
+                    for scope in scopes:
+                        for selector in (
+                            ".modal.show", "[role='dialog']", ".error", ".alert", "[role='alert']",
                         ):
-                            return
+                            checkpoints = scope.locator(selector)
+                            if any(
+                                checkpoints.nth(index).is_visible()
+                                for index in range(checkpoints.count())
+                            ):
+                                return
         except Exception:
             raise FubonLoginError("登入後狀態無法安全確認；禁止自動重試") from None
 
