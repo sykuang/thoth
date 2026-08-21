@@ -388,8 +388,8 @@ class FubonCrawler(BankCrawler):
             for field, value in zip(fields, values, strict=True):
                 field.click()
                 field.click(click_count=3)
-                page.keyboard.press("Backspace")
-                page.keyboard.type(value, delay=80)
+                field.press("Backspace", timeout=5000)
+                field.press_sequentially(value, delay=80, timeout=5000)
                 if len(field.input_value()) != len(value):
                     raise FubonLoginError("登入欄位輸入長度不符；未送出登入")
 
@@ -410,8 +410,8 @@ class FubonCrawler(BankCrawler):
                 raise FubonLoginError("圖形驗證碼 OCR 失敗；未送出登入")
             captcha_field.click()
             captcha_field.click(click_count=3)
-            page.keyboard.press("Backspace")
-            page.keyboard.type(captcha, delay=80)
+            captcha_field.press("Backspace", timeout=5000)
+            captcha_field.press_sequentially(captcha, delay=80, timeout=5000)
             if len(captcha_field.input_value()) != 6:
                 raise FubonLoginError("驗證碼欄位輸入長度不符；未送出登入")
 

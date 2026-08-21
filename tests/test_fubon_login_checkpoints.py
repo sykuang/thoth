@@ -543,16 +543,14 @@ def test_submit_uses_exact_dynamic_field_contract_and_true_keyboard() -> None:
     crawler.submit_credentials_once(page)
 
     ordered = [fields[1], fields[2], fields[0], captcha]
-    for field in ordered:
+    values = ["A123456789", "USER123456", "PASSWORD-PRIVATE", "654321"]
+    for field, value in zip(ordered, values, strict=True):
         assert field.click.call_args_list == [call(), call(click_count=3)]
+        field.press.assert_called_once_with("Backspace", timeout=5000)
+        field.press_sequentially.assert_called_once_with(value, delay=80, timeout=5000)
         field.input_value.assert_called_once_with()
-    assert page.keyboard.press.call_args_list == [call("Backspace")] * 4
-    assert page.keyboard.type.call_args_list == [
-        call("A123456789", delay=80),
-        call("USER123456", delay=80),
-        call("PASSWORD-PRIVATE", delay=80),
-        call("654321", delay=80),
-    ]
+    page.keyboard.press.assert_not_called()
+    page.keyboard.type.assert_not_called()
     crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=5)
     submit.click.assert_called_once_with(timeout=8000)
     assert frame.locator.call_args_list.count(call("input[type='password']")) == 1
