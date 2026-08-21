@@ -189,7 +189,7 @@ def _interaction(kind: CheckpointKind) -> str | None:
 def _matching_body_fingerprint(
     container: Any, required_pattern: re.Pattern[str] | None
 ) -> bytes | None:
-    body = container.inner_text()
+    body = container.inner_text(timeout=5000)
     if required_pattern and not required_pattern.search(body):
         return None
     return sha256(body.encode()).digest()

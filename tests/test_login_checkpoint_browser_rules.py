@@ -46,7 +46,7 @@ class Locator:
     def is_visible(self):
         return bool(self.nodes and self.nodes[0].attached and self.nodes[0].visible)
 
-    def inner_text(self):
+    def inner_text(self, *, timeout: int | None = None):
         return self.nodes[0].text
 
     def is_enabled(self):

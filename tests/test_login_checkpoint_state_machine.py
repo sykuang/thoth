@@ -10,6 +10,7 @@ from backend.core.login_checkpoints import (
     LoginCheckpointBlocked,
     LoginCheckpointRule,
     LoginInteractionRequired,
+    _matching_body_fingerprint,
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
 )
@@ -24,6 +25,20 @@ def _checkpoint_rule(name: str, kind: CheckpointKind) -> LoginCheckpointRule:
         container_selector=f"#{name}",
         action_texts=("Continue",) if kind is CheckpointKind.DUPLICATE_SESSION else (),
     )
+
+
+def test_checkpoint_body_fingerprint_uses_operation_local_timeout() -> None:
+    class Container:
+        timeout: int | None = None
+
+        def inner_text(self, *, timeout: int | None = None) -> str:
+            self.timeout = timeout
+            return "blocked"
+
+    container = Container()
+
+    assert _matching_body_fingerprint(container, None) is not None
+    assert container.timeout == 5000
 
 
 @pytest.mark.parametrize(
