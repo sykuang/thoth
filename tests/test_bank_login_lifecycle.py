@@ -342,6 +342,101 @@ def test_run_keeps_valid_machine_readable_login_error_code(
     assert "PRIVATE" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("safe_code", ("privateaccount1234", object()))
+def test_run_rejects_unregistered_or_non_string_login_error_codes(
+    monkeypatch, tmp_path, capsys, safe_code
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    class CodedLoginError(RuntimeError):
+        safe_code: object
+
+    error = CodedLoginError("PRIVATE-LOGIN-DOM-987654")
+    error.safe_code = safe_code
+
+    def fail(_page):
+        raise error
+
+    monkeypatch.setattr(crawler, "prepare_login_page", fail)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        lambda *_args, **_kwargs: CheckpointOutcome(
+            CheckpointKind.READY_FOR_CREDENTIALS
+        ),
+    )
+
+    assert result["error"] == "CodedLoginError: login failed"
+    assert "PRIVATE" not in result["error"]
+    assert "PRIVATE" not in capsys.readouterr().err
+
+
+def test_run_redacts_collect_and_logout_exception_details(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail_collect(_page, _collector):
+        raise RuntimeError("PRIVATE-COLLECT-DOM-987654")
+
+    def fail_logout(_page):
+        raise RuntimeError("PRIVATE-LOGOUT-DOM-654321")
+
+    monkeypatch.setattr(crawler, "collect", fail_collect)
+    monkeypatch.setattr(crawler, "logout", fail_logout)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "collect_failed: RuntimeError"
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+    assert "Traceback" not in stderr
+
+
+def test_default_logout_logs_only_fixed_status(capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+    frame = SimpleNamespace(
+        url="https://example.com/PRIVATE?token=PRIVATE",
+        evaluate=lambda _script: "PRIVATE Logout label",
+    )
+    page = SimpleNamespace(frames=[frame], wait_for_timeout=lambda _milliseconds: None)
+
+    assert BankCrawler.logout(crawler, page)
+
+    stderr = capsys.readouterr().err
+    assert "PRIVATE" not in stderr
+    assert "已點登出控制" in stderr
+
+
+def test_default_logout_redacts_frame_errors_and_urls(capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail(_script):
+        raise RuntimeError("PRIVATE-LOGOUT-DOM-987654")
+
+    frame = SimpleNamespace(
+        url="https://example.com/PRIVATE?token=PRIVATE",
+        evaluate=fail,
+    )
+    page = SimpleNamespace(frames=[frame], wait_for_timeout=lambda _milliseconds: None)
+
+    assert not BankCrawler.logout(crawler, page)
+
+    stderr = capsys.readouterr().err
+    assert "PRIVATE" not in stderr
+    assert "RuntimeError" in stderr
+
+
 def test_run_recovery_hook_exception_fails_closed_without_leaking(
     monkeypatch, tmp_path, capsys
 ) -> None:

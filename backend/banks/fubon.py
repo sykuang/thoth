@@ -310,7 +310,7 @@ class FubonCrawler(BankCrawler):
                 image = images.nth(0)
                 if not image.is_visible():
                     return None
-                raw = image.screenshot()
+                raw = image.screenshot(timeout=5000)
                 text = ocr_bytes(
                     raw,
                     expected_len=6,

@@ -955,10 +955,10 @@ class BankCrawler(ABC):
                         # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
                         # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
                         import sys as _sys
-                        safe_code = str(getattr(e, "safe_code", ""))
+                        safe_code = getattr(e, "safe_code", None)
                         if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
                             msg = f"{type(e).__name__}: {e}"
-                        elif re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
+                        elif isinstance(safe_code, str) and safe_code in {"captcha_ocr_failed"}:
                             msg = f"{type(e).__name__}: code={safe_code}"
                         else:
                             msg = f"{type(e).__name__}: login failed"
@@ -1002,10 +1002,15 @@ class BankCrawler(ABC):
                     # collect 階段 raise（包含 SCSB/Taishin 等明細查詢 raise）
                     # 一樣寫進 error，但 logged_in 仍 True → finally 會跑 logout。
                     import sys as _sys
-                    import traceback as _tb
-                    msg = f"collect_failed: {type(e).__name__}: {e}"
-                    print(f"[{self.name}][collect] raise → {msg}", file=_sys.stderr)
-                    print(_tb.format_exc(), file=_sys.stderr)
+                    if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
+                        msg = f"collect_failed: {type(e).__name__}: {e}"
+                        print(f"[{self.name}][collect] raise → {msg}", file=_sys.stderr)
+                    else:
+                        msg = f"collect_failed: {type(e).__name__}"
+                        print(
+                            f"[{self.name}][collect] raise → {msg}: details withheld",
+                            file=_sys.stderr,
+                        )
                     result["error"] = msg
             finally:
                 # 已登入且仍在owned origin才best-effort logout；foreign origin零互動。
@@ -1014,7 +1019,11 @@ class BankCrawler(ABC):
                         self.logout(page)
                     except Exception as e:
                         import sys as _sys
-                        print(f"[{self.name}][logout] exception {e!r} (best-effort, swallow)", file=_sys.stderr)
+                        print(
+                            f"[{self.name}][logout] exception {type(e).__name__} "
+                            "(details withheld; best-effort, swallow)",
+                            file=_sys.stderr,
+                        )
             return page
 
         # 所有 crawler 從 base 繼承同一套 macOS fingerprint spoof。
@@ -1119,14 +1128,17 @@ class BankCrawler(ABC):
                     }}
                 """)
                 if clicked:
-                    print(f"[{self.name}][logout] ✓ 已點「{clicked}」in {f.url[:80]}", file=_sys.stderr)
+                    print(f"[{self.name}][logout] ✓ 已點登出控制", file=_sys.stderr)
                     try:
                         page.wait_for_timeout(3000)  # 等 server 處理 logout
                     except Exception:
                         pass
                     return True
             except Exception as e:
-                print(f"[{self.name}][logout] frame {f.url[:60]} 掃描失敗: {e}", file=_sys.stderr)
+                print(
+                    f"[{self.name}][logout] frame 掃描失敗: {type(e).__name__}",
+                    file=_sys.stderr,
+                )
                 continue
         print(f"[{self.name}][logout] ⚠️ 沒找到登出按鈕（best-effort，繼續）", file=_sys.stderr)
         return False

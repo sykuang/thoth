@@ -656,6 +656,7 @@ def test_ocr_screenshots_five_times_refreshes_four_and_never_leaks(monkeypatch, 
 
     assert crawler._ocr_captcha(frame, max_attempts=5) is None
     assert image.screenshot.call_count == ocr.call_count == 5
+    assert image.screenshot.call_args_list == [call(timeout=5000)] * 5
     assert all(
         item == call(
             b"PRIVATE-IMAGE-BYTES",
