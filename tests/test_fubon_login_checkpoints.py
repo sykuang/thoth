@@ -783,7 +783,11 @@ def test_login_is_thin_and_prepare_short_circuits_authenticated(monkeypatch) -> 
 
     crawler._logged_in = Mock(return_value=True)
     crawler.prepare_login_page(page)
-    assert page.mock_calls == [call.wait_for_timeout(12000)]
+    assert page.mock_calls == [
+        call.set_default_timeout(5000),
+        call.wait_for_timeout(12000),
+        call.set_default_timeout(180000),
+    ]
 
 
 def test_legacy_login_debug_synthetic_actions_and_raw_ocr_are_absent() -> None:
