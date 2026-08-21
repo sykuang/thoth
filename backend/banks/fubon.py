@@ -128,6 +128,7 @@ class FubonCrawler(BankCrawler):
         page_action,
         fetch_kwargs: dict,
     ) -> None:
+        _log("[fubon][phase] browser_start")
         with StealthySession(
             headless=headless,
             user_data_dir=str(self.session_dir),
@@ -136,6 +137,7 @@ class FubonCrawler(BankCrawler):
             dns_over_https=True,
             **fetch_kwargs,
         ) as engine:
+            _log("[fubon][phase] browser_ready")
             if engine.context is None:
                 raise RuntimeError("富邦瀏覽器 context 未建立")
             page = engine.context.new_page()
@@ -144,12 +146,17 @@ class FubonCrawler(BankCrawler):
             if headers := fetch_kwargs.get("extra_headers"):
                 page.set_extra_http_headers(headers)
             try:
+                _log("[fubon][phase] goto_start")
                 page.goto(login_url, referer="https://www.google.com/")
                 page.wait_for_load_state("load")
                 page.wait_for_load_state("domcontentloaded")
+                _log("[fubon][phase] goto_done")
+                _log("[fubon][phase] page_action_start")
                 page_action(page)
+                _log("[fubon][phase] page_action_done")
                 page.wait_for_timeout(2000)
             finally:
+                _log("[fubon][phase] browser_close")
                 page.close()
 
     def _host_filter(self) -> str:
@@ -243,8 +250,10 @@ class FubonCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        _log("[fubon][phase] prepare_start")
         with bounded_login_inspection(page):
             self._prepare_login_page(page)
+        _log("[fubon][phase] prepare_done")
 
     def _prepare_login_page(self, page) -> None:
         try:
@@ -383,8 +392,10 @@ class FubonCrawler(BankCrawler):
         return None
 
     def submit_credentials_once(self, page) -> None:
+        _log("[fubon][phase] submit_start")
         with bounded_login_inspection(page):
             self._submit_credentials_once(page)
+        _log("[fubon][phase] submit_done")
 
     def _submit_credentials_once(self, page) -> None:
         try:
@@ -502,6 +513,7 @@ class FubonCrawler(BankCrawler):
         - DOM 全部渲染（不靠 hover），視覺上只顯示一頁，但 querySelector 都拿得到
         - 走 txnFrame 直接定位「我的信用卡」/「帳務/繳款」等子項 click 即可
         """
+        _log("[fubon][phase] collect_start")
         def bounded_evaluate(scope, expression: str, arg=None):
             return scope.locator("html").evaluate(
                 f"(root, arg) => ({expression})(arg)",

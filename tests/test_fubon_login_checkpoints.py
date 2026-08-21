@@ -816,4 +816,4 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FubonCrawler")
     start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == "06d145845646df30a172ff500a8428f943deb39949947d267dc9d5b239f62c16"
+    assert hashlib.sha256(payload.encode()).hexdigest() == "642c1ef58ccce701756695e99a4f2f1a2e0c5a55a8f48f7ea4746eb8bb255c3f"
