@@ -239,6 +239,7 @@ def test_sync_clears_portfolio_summary_cache(client, monkeypatch):
     fake.fail_positions = True
     failed = client.post("/snaptrade/sync", headers=headers)
     assert failed.status_code == 502
+    assert failed.headers["X-SnapTrade-Error-Code"] == "unexpected_upstream"
     assert cleared == []
 
 
@@ -564,6 +565,7 @@ def test_sdk_v13_invalid_option_multiplier_preserves_previous_snapshot(
     failed = client.post("/snaptrade/sync", headers=headers)
 
     assert failed.status_code == 502
+    assert failed.headers["X-SnapTrade-Error-Code"] == "option_multiplier_invalid"
     assert client.get("/snaptrade/portfolio", headers=headers).json() == before
 
 
@@ -1066,6 +1068,12 @@ def test_unexpected_value_error_detail_is_not_exposed():
         assert "SENSITIVE_SENTINEL" not in error.detail
     else:
         raise AssertionError("expected HTTPException")
+
+
+def test_sync_error_code_does_not_reflect_untrusted_error_message():
+    from backend.server.routers.snaptrade import _sync_error_code
+
+    assert _sync_error_code(ValueError("SENSITIVE_SENTINEL")) == "unexpected_upstream"
 
 
 def test_missing_server_configuration_fails_closed(client, monkeypatch):
