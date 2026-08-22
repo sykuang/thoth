@@ -1693,7 +1693,23 @@ class BankStore:
                              AND (last_payment_date IS NULL OR ? >= last_payment_date)
                             THEN ? ELSE last_payment_date END,
                           updated_at = ?
-                    WHERE user_id = ? AND card_no = ?""",
+                    WHERE user_id = ? AND card_no = ?
+                      AND NOT (
+                        (
+                          (CAST(? AS TEXT) IS NOT NULL
+                           AND payment_due_date IS NOT NULL
+                           AND ? = payment_due_date)
+                          OR (CAST(? AS TEXT) IS NOT NULL
+                              AND statement_close_date IS NOT NULL
+                              AND ? = statement_close_date)
+                          OR (CAST(? AS TEXT) IS NULL
+                              AND CAST(? AS TEXT) IS NULL
+                              AND payment_due_date IS NULL
+                              AND statement_close_date IS NULL)
+                        )
+                        AND last_payment_date IS NOT NULL
+                        AND (CAST(? AS TEXT) IS NULL OR ? < last_payment_date)
+                      )""",
                 (
                     cycle_date, cycle_date, fact.get("bill_due_amount"),
                     cycle_date, cycle_date, statement_date,
@@ -1701,6 +1717,10 @@ class BankStore:
                     payment_date, payment_date, fact.get("last_payment_amount"),
                     payment_date, payment_date, payment_date,
                     now, self.user_id, fact.get("number"),
+                    due_date, due_date,
+                    statement_date, statement_date,
+                    due_date, statement_date,
+                    payment_date, payment_date,
                 ),
             )
             updated += cursor.rowcount

@@ -161,7 +161,7 @@ def test_older_incoming_payment_does_not_regress_saved_pair(tmp_path, monkeypatc
             "FROM cards WHERE card_no='****7001'"
         ).fetchone()
         assert row is not None
-        assert tuple(row) == (900.0, 500.0, "2026-08-10")
+        assert tuple(row) == (1000.0, 500.0, "2026-08-10")
     finally:
         store.close()
 
@@ -213,6 +213,81 @@ def test_same_due_cycle_can_add_statement_date_and_refresh_amount(tmp_path, monk
         ).fetchone()
         assert row is not None
         assert tuple(row) == (1000.0, "2026-09-01", "2026-09-20")
+    finally:
+        store.close()
+
+
+def test_persist_collected_rejects_same_cycle_stale_tuple(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+
+    def fake_persist(data, target_store, rules=None):
+        target_store.upsert_cards([{"number": "****7001", "name": "A"}])
+        return {}
+
+    monkeypatch.setitem(persist_mod.PERSISTERS, "demo", fake_persist)
+    fresh = {
+        "scope": "bank", "status": "paid", "remaining_due": 0,
+        "statement_close_date": "2026-08-03", "payment_due_date": "2026-08-18",
+        "last_payment_amount": 45814, "last_payment_date": "2026-08-19",
+    }
+    stale = {
+        "scope": "bank", "status": "unpaid", "remaining_due": 400,
+        "statement_close_date": "2026-08-03", "payment_due_date": "2026-08-18",
+        "last_payment_amount": 400, "last_payment_date": "2026-08-18",
+    }
+    try:
+        persist_mod.persist_collected(
+            "demo", {"card_bill_facts_ok": True, "card_bill_facts": [fresh]}, store,
+        )
+        persist_mod.persist_collected(
+            "demo", {"card_bill_facts_ok": True, "card_bill_facts": [stale]}, store,
+        )
+
+        row = store.conn.execute(
+            "SELECT bill_due_amount, statement_close_date, payment_due_date, "
+            "last_payment_amount, last_payment_date FROM cards WHERE card_no='****7001'"
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == (
+            0.0, "2026-08-03", "2026-08-18", 45814.0, "2026-08-19",
+        )
+    finally:
+        store.close()
+
+
+def test_same_statement_cycle_rejects_stale_tuple_when_due_date_is_new(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+
+    def fake_persist(data, target_store, rules=None):
+        target_store.upsert_cards([{"number": "****7001", "name": "A"}])
+        return {}
+
+    monkeypatch.setitem(persist_mod.PERSISTERS, "demo", fake_persist)
+    fresh = {
+        "scope": "bank", "status": "paid", "remaining_due": 0,
+        "statement_close_date": "2026-08-03",
+        "last_payment_amount": 45814, "last_payment_date": "2026-08-19",
+    }
+    stale = {
+        "scope": "bank", "status": "unpaid", "remaining_due": 400,
+        "statement_close_date": "2026-08-03", "payment_due_date": "2026-08-18",
+        "last_payment_amount": 400, "last_payment_date": "2026-08-18",
+    }
+    try:
+        persist_mod.persist_collected(
+            "demo", {"card_bill_facts_ok": True, "card_bill_facts": [fresh]}, store,
+        )
+        stale_delta = persist_mod.persist_collected(
+            "demo", {"card_bill_facts_ok": True, "card_bill_facts": [stale]}, store,
+        )
+
+        row = store.conn.execute(
+            "SELECT bill_due_amount, statement_close_date, payment_due_date, "
+            "last_payment_amount, last_payment_date FROM cards WHERE card_no='****7001'"
+        ).fetchone()
+        assert stale_delta["card_bill_facts_applied"] == 0
+        assert row is not None
+        assert tuple(row) == (0.0, "2026-08-03", None, 45814.0, "2026-08-19")
     finally:
         store.close()
 

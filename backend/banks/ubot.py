@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
 
@@ -23,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import (
     card_bill_date,
-    card_bill_money,
     make_card_bill_fact,
     publish_card_bill_facts,
 )
@@ -154,36 +154,139 @@ class UbotLoginError(RuntimeError):
         super().__init__(message)
 
 
+_MAX_BILL_AMOUNT = Decimal("100000000")
+
+
+def _ubot_bill_amount(value) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        amount = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError, AttributeError):
+        return None
+    if not amount.is_finite() or amount < 0 or amount > _MAX_BILL_AMOUNT:
+        return None
+    return amount
+
+
 def _ubot_card_bill_fact(out: dict):
-    limits = (out.get("card_limit") or {}).get("CardList") or []
-    summaries = (out.get("card_summary") or {}).get("CardList") or []
-    limit_summary = limits[0] if limits and isinstance(limits[0], dict) else {}
-    card_summary = summaries[0] if summaries and isinstance(summaries[0], dict) else {}
+    limit_payload = out.get("card_limit")
+    summary_payload = out.get("card_summary")
+    limit_payload = {} if limit_payload is None else limit_payload
+    summary_payload = {} if summary_payload is None else summary_payload
+    if not isinstance(limit_payload, dict) or not isinstance(summary_payload, dict):
+        return None
+    limits = limit_payload.get("CardList", [])
+    summaries = summary_payload.get("CardList", [])
+    if (
+        not isinstance(limits, list)
+        or not isinstance(summaries, list)
+        or any(not isinstance(row, dict) for row in (*limits, *summaries))
+    ):
+        return None
+    limit_summary = limits[0] if limits else {}
+    card_summary = summaries[0] if summaries else {}
     summary = {**card_summary, **limit_summary}
 
-    pay_records = []
-    history = out.get("card_pay_history") or {}
+    history = out.get("card_pay_history")
+    if history is not None and not isinstance(history, dict):
+        return None
+    pay_records = None
     if isinstance(history, dict):
         for key in ("DateList", "PayList", "payList", "records"):
-            if isinstance(history.get(key), list):
-                pay_records = [row for row in history[key] if isinstance(row, dict)]
+            if key in history:
+                if not isinstance(history[key], list):
+                    return None
+                pay_records = history[key]
                 break
-    latest_pay = max(
-        pay_records,
-        default={},
-        key=lambda row: str(row.get("postDate") or row.get("effectDate") or ""),
+    normalized_payments: list[tuple[str, Decimal]] = []
+    if pay_records:
+        for row in pay_records:
+            if not isinstance(row, dict):
+                return None
+            payment_date = card_bill_date(
+                row.get("postDate") or row.get("effectDate")
+                or row.get("payDate") or row.get("PayDate")
+            )
+            raw_amount = row.get("payAmt")
+            if raw_amount is None:
+                raw_amount = row.get("amount")
+            payment_amount = _ubot_bill_amount(raw_amount)
+            if payment_date is None or payment_amount is None:
+                return None
+            normalized_payments.append((payment_date, payment_amount))
+    else:
+        raw_payment_date = summary.get("lastPayDate")
+        raw_payment_amount = summary.get("lastPayAmt")
+        pair_supplied = raw_payment_date is not None or raw_payment_amount is not None
+        payment_date = card_bill_date(raw_payment_date)
+        payment_amount = _ubot_bill_amount(raw_payment_amount)
+        sentinel = payment_amount == 0 and str(raw_payment_date).strip() == "00000000"
+        if pair_supplied and not sentinel:
+            if payment_date is None or payment_amount is None:
+                return None
+            normalized_payments.append((payment_date, payment_amount))
+
+    latest_payment = max(normalized_payments, default=None, key=lambda item: item[0])
+    payment_date = latest_payment[0] if latest_payment else None
+    payment_amount = latest_payment[1] if latest_payment else None
+
+    billed = out.get("card_billed")
+    if billed is not None and not isinstance(billed, list):
+        return None
+    statements: list[tuple[str, str, Decimal, Decimal]] = []
+    for body in billed or []:
+        if not isinstance(body, dict) or not isinstance(body.get("CardHeader"), dict):
+            return None
+        header = body["CardHeader"]
+        statement_date = card_bill_date(header.get("stmtDate"))
+        statement_due_date = card_bill_date(header.get("dueDate"))
+        current_balance = _ubot_bill_amount(header.get("currBal"))
+        original_due = _ubot_bill_amount(header.get("dueAmt"))
+        if (
+            statement_date is None
+            or statement_due_date is None
+            or current_balance is None
+            or original_due is None
+        ):
+            return None
+        statements.append((statement_date, statement_due_date, current_balance, original_due))
+
+    if statements:
+        latest_statement_date = max(item[0] for item in statements)
+        latest_statements = {
+            item for item in statements if item[0] == latest_statement_date
+        }
+        if len(latest_statements) != 1:
+            return None
+        latest_statement = latest_statements.pop()
+    else:
+        latest_statement = None
+    statement_date = latest_statement[0] if latest_statement else None
+    summary_due_date = card_bill_date(summary.get("dueDate"))
+    if latest_statement and latest_statement[1] != summary_due_date:
+        return None
+
+    remaining = _ubot_bill_amount(summary.get("payAmt"))
+    statement_amount = None
+    if latest_statement and latest_statement[2] == latest_statement[3]:
+        statement_amount = latest_statement[2]
+    paid_this_cycle = sum(
+        (amount for paid_on, amount in normalized_payments
+         if statement_date is not None and paid_on >= statement_date),
+        Decimal(0),
     )
-    payment_amount = latest_pay.get("payAmt")
-    payment_date = latest_pay.get("postDate") or latest_pay.get("effectDate")
-    if card_bill_money(payment_amount) is None or card_bill_date(payment_date) is None:
-        payment_amount = summary.get("lastPayAmt")
-        payment_date = summary.get("lastPayDate")
-    if card_bill_money(payment_amount) is None or card_bill_date(payment_date) is None:
-        payment_amount = None
-        payment_date = None
+    if (
+        remaining is not None
+        and statement_amount is not None
+        and statement_amount > 0
+        and paid_this_cycle >= statement_amount
+    ):
+        remaining = Decimal(0)
 
     return make_card_bill_fact(
-        remaining_due=summary.get("payAmt"),
+        remaining_due=remaining,
+        statement_close_date=statement_date,
         payment_due_date=summary.get("dueDate"),
         last_payment_amount=payment_amount,
         last_payment_date=payment_date,

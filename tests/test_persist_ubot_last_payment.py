@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.banks.ubot import _ubot_card_bill_fact
+from backend.core import persist as persist_mod
 from backend.core.persist import persist_ubot
 from backend.core.persist._common import _ubot_date
 from backend.core.store import BankStore
@@ -90,6 +91,203 @@ def test_ubot_collector_treats_pay_amt_as_current_due_without_double_subtract():
     assert fact["remaining_due"] == 1000.0
 
 
+def test_ubot_full_payment_for_current_statement_zeros_remaining_due():
+    data = _base_data(pay_amt="45814")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{
+            "postDate": "2026/08/19",
+            "effectDate": "2026/08/19",
+            "payAmt": "45,814",
+        }],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 0
+    assert fact["status"] == "paid"
+    assert fact.get("statement_close_date") == "2026-08-03"
+    assert fact.get("payment_due_date") == "2026-08-18"
+    assert fact.get("last_payment_amount") == 45814
+    assert fact.get("last_payment_date") == "2026-08-19"
+
+
+def test_ubot_partial_payment_equal_to_remaining_does_not_zero_due():
+    data = _base_data(pay_amt="400")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+        "currBal": "800",
+        "dueAmt": "800",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{"postDate": "2026/08/19", "payAmt": "400"}],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 400
+    assert fact["status"] == "unpaid"
+
+
+def test_ubot_same_cycle_overpayment_zeros_due():
+    data = _base_data(pay_amt="800")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+        "currBal": "800",
+        "dueAmt": "800",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{"postDate": "2026/08/19", "payAmt": "900"}],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 0
+    assert fact["status"] == "paid"
+
+
+def test_ubot_previous_statement_payment_does_not_zero_current_due():
+    data = _base_data(pay_amt="800")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+        "currBal": "800",
+        "dueAmt": "800",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{"postDate": "2026/07/19", "payAmt": "800"}],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 800
+    assert fact["status"] == "unpaid"
+
+
+def test_ubot_normalizes_payment_dates_before_selecting_latest():
+    data = _base_data(pay_amt="800")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+        "currBal": "800",
+        "dueAmt": "800",
+    })
+    data["card_pay_history"] = {
+        "DateList": [
+            {"postDate": "2026/08/19", "payAmt": "800"},
+            {"postDate": "20260818", "payAmt": "1"},
+        ],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 0
+    assert fact.get("last_payment_date") == "2026-08-19"
+    assert fact.get("last_payment_amount") == 800
+
+
+def test_ubot_malformed_statement_header_fails_closed():
+    data = _base_data(pay_amt="800")
+    data["card_billed"][0]["CardHeader"] = "not-a-header"
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+def test_ubot_conflicting_latest_statement_headers_fail_closed():
+    data = _base_data(pay_amt="800")
+    data["card_billed"].append({
+        "CardHeader": {
+            "stmtDate": "20260603",
+            "dueDate": "20260618",
+            "currBal": "900",
+            "dueAmt": "900",
+        },
+        "CardList": [],
+    })
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+def test_ubot_malformed_payment_row_fails_closed():
+    data = _base_data(pay_amt="800")
+    data["card_pay_history"] = {
+        "DateList": [
+            {"postDate": "2026/06/05", "payAmt": "800"},
+            {"postDate": "not-a-date", "payAmt": "1"},
+        ],
+    }
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+@pytest.mark.parametrize("source", ["card_limit", "card_summary"])
+@pytest.mark.parametrize("bad_value", [{"not": "a-list"}, "", None])
+def test_ubot_malformed_summary_card_list_fails_closed(source, bad_value):
+    data = _base_data(pay_amt="800")
+    data[source]["CardList"] = bad_value
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+@pytest.mark.parametrize("source", ["card_limit", "card_summary"])
+@pytest.mark.parametrize("bad_value", [[], "", 0, False])
+def test_ubot_falsy_malformed_top_level_summary_fails_closed(source, bad_value):
+    data = _base_data(pay_amt="800")
+    data[source] = bad_value
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+def test_ubot_malformed_payment_list_container_fails_closed():
+    data = _base_data(pay_amt="800")
+    data["card_pay_history"] = {"DateList": {"not": "a-list"}}
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+def test_ubot_malformed_summary_payment_pair_fails_closed():
+    data = _base_data(
+        pay_amt="800", last_pay_amt="800", last_pay_date="not-a-date",
+    )
+
+    assert _ubot_card_bill_fact(data) is None
+
+
+def test_ubot_distinct_decimal_amounts_do_not_collapse_to_equal_floats():
+    data = _base_data(pay_amt="100000000")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+        "currBal": "100000000",
+        "dueAmt": "100000000",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{"postDate": "2026/08/19", "payAmt": "99999999.999999999"}],
+    }
+
+    fact = _ubot_card_bill_fact(data)
+
+    assert fact is not None
+    assert fact["remaining_due"] == 100000000
+    assert fact["status"] == "unpaid"
+
+
 def test_ubot_sentinel_payment_pair_is_omitted_not_fatal():
     fact = _ubot_card_bill_fact(_base_data())
 
@@ -113,6 +311,32 @@ def _read_card(store: BankStore, card_no: str) -> dict | None:
         "last_payment_amount": row[2],
         "last_payment_date": row[3],
     }
+
+
+def test_persist_collected_writes_zero_after_current_statement_full_payment(store):
+    card_no = "****2302"
+    data = _base_data(card_no=card_no, pay_amt="45814")
+    data["card_limit"]["CardList"][0]["dueDate"] = "20260818"
+    data["card_billed"][0]["CardHeader"].update({
+        "stmtDate": "20260803",
+        "dueDate": "20260818",
+    })
+    data["card_pay_history"] = {
+        "DateList": [{"postDate": "2026/08/19", "payAmt": "45,814"}],
+    }
+    fact = _ubot_card_bill_fact(data)
+    assert fact is not None
+    data["card_bill_facts_ok"] = True
+    data["card_bill_facts"] = [fact]
+
+    delta = persist_mod.persist_collected("ubot", data, store)
+
+    card = _read_card(store, card_no)
+    assert delta["card_bill_facts_applied"] == 1
+    assert card is not None
+    assert card["bill_due_amount"] == 0
+    assert card["last_payment_amount"] == 45814
+    assert card["last_payment_date"] == "2026-08-19"
 
 
 def test_persist_writes_bill_due_amount_from_payAmt(store):
