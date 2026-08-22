@@ -26,7 +26,7 @@ _SYNC_ERROR_MARKERS = (
     ("transactions 尚未完成初次同步", "transactions_initial_sync_pending"),
     ("transactions freshness 格式錯誤", "transactions_freshness_invalid"),
     ("transactions freshness 已過期", "transactions_freshness_stale"),
-    ("回傳部分資料", "partial_snapshot"),
+    ("positions data_freshness 格式錯誤", "positions_freshness_invalid"),
     ("response rows 格式錯誤", "response_rows_invalid"),
     ("response envelope 格式錯誤", "response_envelope_invalid"),
     ("pagination", "activities_pagination_invalid"),

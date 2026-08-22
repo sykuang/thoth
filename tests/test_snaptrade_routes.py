@@ -325,34 +325,36 @@ def test_invalid_or_stale_transaction_freshness_preserves_previous_snapshot(
     assert client.get("/snaptrade/portfolio", headers=headers).json() == before
 
 
-def test_partial_positions_response_preserves_previous_snapshot(client, monkeypatch):
+def test_account_total_remains_authoritative_when_positions_sum_differs(client, monkeypatch):
     fake = FakeSnapTradeGateway()
-    _install_fake(monkeypatch, fake)
-    headers = _register(client, "snaptrade-partial@example.com")
-    assert _connect(client, headers).status_code == 200
-    assert client.post("/snaptrade/sync", headers=headers).status_code == 200
-    before = client.get("/snaptrade/portfolio", headers=headers).json()
-
     fake.partial_positions_only = True
-    failed = client.post("/snaptrade/sync", headers=headers)
-
-    assert failed.status_code == 502
-    assert client.get("/snaptrade/portfolio", headers=headers).json() == before
-
-
-def test_partial_balances_response_preserves_previous_snapshot(client, monkeypatch):
-    fake = FakeSnapTradeGateway()
     _install_fake(monkeypatch, fake)
-    headers = _register(client, "snaptrade-partial-balances@example.com")
+    headers = _register(client, "snaptrade-position-total@example.com")
     assert _connect(client, headers).status_code == 200
-    assert client.post("/snaptrade/sync", headers=headers).status_code == 200
-    before = client.get("/snaptrade/portfolio", headers=headers).json()
 
+    synced = client.post("/snaptrade/sync", headers=headers)
+
+    assert synced.status_code == 200
+    body = client.get("/snaptrade/portfolio", headers=headers).json()
+    assert body["accounts"][0]["balance_total"] == "1250.00"
+    assert len(body["balances"]) == 1
+    assert body["positions"] == []
+
+
+def test_account_total_remains_authoritative_when_cash_sum_differs(client, monkeypatch):
+    fake = FakeSnapTradeGateway()
     fake.partial_balances_only = True
-    failed = client.post("/snaptrade/sync", headers=headers)
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-cash-total@example.com")
+    assert _connect(client, headers).status_code == 200
 
-    assert failed.status_code == 502
-    assert client.get("/snaptrade/portfolio", headers=headers).json() == before
+    synced = client.post("/snaptrade/sync", headers=headers)
+
+    assert synced.status_code == 200
+    body = client.get("/snaptrade/portfolio", headers=headers).json()
+    assert body["accounts"][0]["balance_total"] == "1250.00"
+    assert body["balances"] == []
+    assert len(body["positions"]) == 1
 
 
 def test_incomplete_holdings_sync_status_preserves_previous_snapshot(client, monkeypatch):
@@ -628,8 +630,11 @@ def test_sdk_v13_gateway_uses_unified_positions_without_removed_options_api(monk
     calls: list[str] = []
     monkeypatch.setattr(
         snaptrade,
-        "_raw_rows",
-        lambda api, operation, **kwargs: calls.append(operation) or [{"id": "position"}],
+        "_raw_payload",
+        lambda api, operation, **kwargs: calls.append(operation) or {
+            "results": [{"id": "position"}],
+            "data_freshness": {"as_of": "2026-08-23T00:00:00Z"},
+        },
     )
     gateway: Any = object.__new__(SnapTradeSDKGateway)
     gateway.client = SimpleNamespace(account_information=object())
@@ -637,6 +642,28 @@ def test_sdk_v13_gateway_uses_unified_positions_without_removed_options_api(monk
     assert gateway.list_positions("user", "secret", "account") == [{"id": "position"}]
     assert gateway.list_option_positions("user", "secret", "account") == []
     assert calls == ["get_all_account_positions"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"results": []},
+        {"results": [], "data_freshness": {}},
+        {"results": [], "data_freshness": {"as_of": ""}},
+        {"results": [], "data_freshness": {"as_of": "not-a-date"}},
+        {"results": [], "data_freshness": {"as_of": "2026-08-23T00:00:00"}},
+    ],
+)
+def test_sdk_v13_positions_require_valid_data_freshness(monkeypatch, payload):
+    from backend.server import snaptrade
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    monkeypatch.setattr(snaptrade, "_raw_payload", lambda *args, **kwargs: payload)
+    gateway: Any = object.__new__(SnapTradeSDKGateway)
+    gateway.client = SimpleNamespace(account_information=object())
+
+    with pytest.raises(RuntimeError, match="positions data_freshness 格式錯誤"):
+        gateway.list_positions("user", "secret", "account")
 
 
 def test_sdk_v13_connection_contract_accepts_redirect_uri_camel_case():

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -24,6 +25,9 @@ _PROVIDER = "snaptrade"
 _ACTIVITY_PAGE_SIZE = 1000
 _MAX_ACTIVITY_PAGES = 100
 _MAX_TRANSACTION_SYNC_LAG = timedelta(days=7)
+_RFC3339_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$",
+)
 
 
 class SnapTradeNotConfigured(RuntimeError):
@@ -132,6 +136,24 @@ def _rows(value: Any) -> list[dict[str, Any]]:
                 raise RuntimeError("SnapTrade 2xx response rows 格式錯誤")
             return rows
     raise RuntimeError("SnapTrade 2xx response envelope 格式錯誤")
+
+
+def _position_rows(value: Any) -> list[dict[str, Any]]:
+    value = _plain(value)
+    if not isinstance(value, dict):
+        raise RuntimeError("SnapTrade 2xx response envelope 格式錯誤")
+    rows = value.get("results")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("SnapTrade 2xx response rows 格式錯誤")
+    freshness = value.get("data_freshness")
+    as_of = freshness.get("as_of") if isinstance(freshness, Mapping) else None
+    if not isinstance(as_of, str) or _RFC3339_DATETIME.fullmatch(as_of) is None:
+        raise RuntimeError("SnapTrade positions data_freshness 格式錯誤")
+    try:
+        datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError("SnapTrade positions data_freshness 格式錯誤") from error
+    return rows
 
 
 def _nested(data: Mapping[str, Any], *path: str) -> Any:
@@ -310,12 +332,14 @@ class SnapTradeSDKGateway:
         )
 
     def list_positions(self, user_id: str, user_secret: str, account_id: str) -> list[dict[str, Any]]:
-        return _raw_rows(
-            self.client.account_information,
-            "get_all_account_positions",
-            user_id=user_id,
-            user_secret=user_secret,
-            account_id=account_id,
+        return _position_rows(
+            _raw_payload(
+                self.client.account_information,
+                "get_all_account_positions",
+                user_id=user_id,
+                user_secret=user_secret,
+                account_id=account_id,
+            ),
         )
 
     def list_option_positions(
@@ -556,28 +580,6 @@ class SnapTradeService:
             mapped_positions = self._map_positions(account_id, raw_positions, synced_at)
             mapped_activities = self._map_activities(account_id, raw_activities, synced_at)
 
-            reported_total = _decimal(_nested(raw, "balance", "total", "amount"))
-            account_currency = _text(_nested(raw, "balance", "total", "currency"))
-            reported_cash = sum(
-                (_decimal(balance["cash"]) or Decimal(0))
-                for balance in mapped_balances
-            )
-            position_values = [_decimal(position["market_value"]) for position in mapped_positions]
-            values_comparable = (
-                account_currency is not None
-                and all(balance["currency"] == account_currency for balance in mapped_balances)
-                and all(position["currency"] == account_currency for position in mapped_positions)
-                and all(value is not None for value in position_values)
-            )
-            if reported_total is not None and not holdings_unavailable and values_comparable:
-                mapped_total = reported_cash + sum(
-                    (value or Decimal(0)) for value in position_values
-                )
-                tolerance = max(Decimal("0.01"), abs(reported_total) * Decimal("0.001"))
-                if abs(reported_total - mapped_total) > tolerance:
-                    raise RuntimeError(
-                        f"SnapTrade account {account_id} 回傳部分資料；保留前次 snapshot",
-                    )
             accounts.append(self._map_account(raw, slug, activities_supported, synced_at))
             balances.extend(mapped_balances)
             positions.extend(mapped_positions)
