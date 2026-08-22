@@ -29,9 +29,9 @@ dependencies = [
     # W1 (2026-06-17): real-timeout regex engine for ReDoS protection.
     # stdlib `re` 加 signal.SIGALRM 在 worker thread 失效，必須改用此 lib。
     "regex>=2025.5.9",
-    # Keep the version already verified with this project's SnapTrade credentials;
-    # override the SDK's stale typing-extensions pin below.
-    "snaptrade-python-sdk==11.0.182",
+    # SnapTrade's current commercial auth contract requires an explicit auth mode;
+    # v11's legacy constructor now signs otherwise-valid credentials as 401.
+    "snaptrade-python-sdk==13.0.9",
     "typing-extensions>=4.15",
 ]
 

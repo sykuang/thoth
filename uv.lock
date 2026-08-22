@@ -1993,7 +1993,7 @@ wheels = [
 
 [[package]]
 name = "snaptrade-python-sdk"
-version = "11.0.182"
+version = "13.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -2004,9 +2004,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b0/b7/958d7570d963e3e888e21d42cc50b3e9db9d52d51a90ec843e68d38308d0/snaptrade_python_sdk-11.0.182.tar.gz", hash = "sha256:42ca4f9925ba2cb922722417a74f1073abd3e7e1288d9f8d31e1a6facb759a18", size = 287809, upload-time = "2026-04-22T01:28:57.054Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/bd/0d22d9d1874d905f38eddd662cfaa791e813ceb14da0721ab08e5edf3f7e/snaptrade_python_sdk-13.0.9.tar.gz", hash = "sha256:a8ea1676a3a4e44e12a322a754a7487621ae9e46d4da8cf911ac830288749e6b", size = 337555, upload-time = "2026-08-21T20:20:03.951Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/dd/321f754d5a14716938b621683caa66be590f9f87e6a19223583063c84084/snaptrade_python_sdk-11.0.182-py3-none-any.whl", hash = "sha256:545eab1a723383631bcaa7efa4a54badacf18442f9ffd3f8184597f41d2285ed", size = 1112128, upload-time = "2026-04-22T01:28:55.173Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/ae/217ae40765fd88b9d285edc5854a428075d3c2ece2f91a9a0f8188e20fff/snaptrade_python_sdk-13.0.9-py3-none-any.whl", hash = "sha256:eee7e644573d4b6e5e7d1762b9f6eb14c70a9a5f59d0bc4fd499ac5a90bb66fb", size = 1112320, upload-time = "2026-08-21T20:20:02.071Z" },
 ]
 
 [[package]]
@@ -2082,7 +2082,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "regex", specifier = ">=2025.5.9" },
     { name = "scrapling", extras = ["fetchers"], specifier = ">=0.4.9" },
-    { name = "snaptrade-python-sdk", specifier = "==11.0.182" },
+    { name = "snaptrade-python-sdk", specifier = "==13.0.9" },
     { name = "typing-extensions", specifier = ">=4.15" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "websockets", specifier = ">=14.0" },

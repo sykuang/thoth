@@ -28,8 +28,8 @@ class FakeSnapTradeGateway:
         self.registered: list[str] = []
         self.remote_users: set[str] = set()
         self.deleted: list[str] = []
-        self.option_positions: list[dict[str, Any]] = []
-        self.account_total = "1250.00"
+        self.extra_positions: list[dict[str, Any]] = []
+        self.account_total: str | None = "1250.00"
         self.connection_disabled = False
         self.transactions_last_successful_sync = datetime.now(UTC).date().isoformat()
         self.transactions_first_transaction_date = "2024-08-08"
@@ -116,18 +116,18 @@ class FakeSnapTradeGateway:
                 },
             },
             "units": "2.5",
-            # SnapTrade v11 also emits fractional_units. It is metadata, not
+            # SnapTrade also emits fractional_units. It is metadata, not
             # an extra quantity to add to units.
             "fractional_units": "2.5",
             "price": "400.00",
             "average_purchase_price": "350.00",
             "currency": {"code": "USD"},
-        }]
+        }, *self.extra_positions]
 
     def list_option_positions(
         self, user_id: str, user_secret: str, account_id: str,
     ) -> list[dict[str, Any]]:
-        return self.option_positions
+        return []
 
     def list_activities(
         self, user_id: str, user_secret: str, account_id: str,
@@ -500,28 +500,25 @@ def test_option_position_does_not_synthesize_market_value_without_multiplier():
     assert mapped[0]["market_value"] is None
 
 
-def test_sdk_v11_option_holdings_are_saved(client, monkeypatch):
+def test_sdk_v13_unified_option_holdings_are_saved(client, monkeypatch):
     fake = FakeSnapTradeGateway()
     fake.account_total = "3250.00"
-    fake.option_positions = [{
-        "symbol": {
+    fake.extra_positions = [{
+        "instrument": {
             "id": "broker-option-id",
+            "kind": "option",
+            "symbol": "AAPL 260918C00200000",
             "description": "AAPL Sep 2026 200 Call",
-            "option_symbol": {
-                "id": "universal-option-id",
-                "ticker": "AAPL 260918C00200000",
-                "option_type": "CALL",
-                "strike_price": "200",
-                "expiration_date": "2026-09-18",
-                "underlying_symbol": {
-                    "symbol": "AAPL",
-                    "currency": {"code": "USD"},
-                },
-            },
+            "option_type": "CALL",
+            "strike_price": "200",
+            "expiration_date": "2026-09-18",
+            "multiplier": "100",
+            "underlying": {"symbol": "AAPL"},
         },
         "units": "2",
         "price": "10",
-        "average_purchase_price": "8",
+        "cost_basis": "8",
+        "currency": "USD",
     }]
     _install_fake(monkeypatch, fake)
     headers = _register(client, "snaptrade-options@example.com")
@@ -538,6 +535,36 @@ def test_sdk_v11_option_holdings_are_saved(client, monkeypatch):
     assert position["asset_type"] == "OPTION"
     assert position["currency"] == "USD"
     assert position["market_value"] == "2000"
+
+
+@pytest.mark.parametrize("multiplier", [None, "0", "-1", "bad", "NaN", "Infinity"])
+def test_sdk_v13_invalid_option_multiplier_preserves_previous_snapshot(
+    client, monkeypatch, multiplier,
+):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, f"snaptrade-option-multiplier-{multiplier}@example.com")
+    assert _connect(client, headers).status_code == 200
+    assert client.post("/snaptrade/sync", headers=headers).status_code == 200
+    before = client.get("/snaptrade/portfolio", headers=headers).json()
+
+    fake.account_total = None
+    fake.extra_positions = [{
+        "instrument": {
+            "id": "broker-option-id",
+            "kind": "option",
+            "symbol": "AAPL 260918C00200000",
+            "multiplier": multiplier,
+        },
+        "units": "2",
+        "price": "10",
+        "currency": "USD",
+    }]
+
+    failed = client.post("/snaptrade/sync", headers=headers)
+
+    assert failed.status_code == 502
+    assert client.get("/snaptrade/portfolio", headers=headers).json() == before
 
 
 def test_ibkr_flex_fetches_activities_when_transaction_sync_is_complete(client, monkeypatch):
@@ -567,10 +594,10 @@ def test_missing_transaction_sync_status_fails_closed(client, monkeypatch):
     assert fake.activity_calls == 0
 
 
-def test_sdk_v11_gateway_uses_canonical_api_root(monkeypatch):
+def test_sdk_v13_gateway_uses_commercial_auth_and_canonical_api_root(monkeypatch):
     import snaptrade_client
 
-    captured: dict[str, str] = {}
+    captured: dict[str, Any] = {}
 
     class Client:
         def __init__(self, **kwargs):
@@ -585,9 +612,32 @@ def test_sdk_v11_gateway_uses_canonical_api_root(monkeypatch):
     SnapTradeSDKGateway()
 
     assert captured["host"] == "https://api.snaptrade.com"
+    assert captured["auth"].mode == "commercialApiKey"
+    assert captured["auth"].client_id == "client"
+    assert captured["auth"].consumer_key == "consumer"
+    assert "client_id" not in captured
+    assert "consumer_key" not in captured
 
 
-def test_sdk_v11_connection_contract_accepts_redirect_uri_camel_case():
+def test_sdk_v13_gateway_uses_unified_positions_without_removed_options_api(monkeypatch):
+    from backend.server import snaptrade
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        snaptrade,
+        "_raw_rows",
+        lambda api, operation, **kwargs: calls.append(operation) or [{"id": "position"}],
+    )
+    gateway: Any = object.__new__(SnapTradeSDKGateway)
+    gateway.client = SimpleNamespace(account_information=object())
+
+    assert gateway.list_positions("user", "secret", "account") == [{"id": "position"}]
+    assert gateway.list_option_positions("user", "secret", "account") == []
+    assert calls == ["get_all_account_positions"]
+
+
+def test_sdk_v13_connection_contract_accepts_redirect_uri_camel_case():
     from backend.server.snaptrade import SnapTradeSDKGateway
 
     gateway: Any = object.__new__(SnapTradeSDKGateway)
@@ -601,7 +651,7 @@ def test_sdk_v11_connection_contract_accepts_redirect_uri_camel_case():
     )
 
 
-def test_sdk_v11_raw_json_preserves_decimal_precision():
+def test_sdk_v13_raw_json_preserves_decimal_precision():
     from backend.server.snaptrade import SnapTradeSDKGateway, SnapTradeService
 
     class RawBalanceAPI:

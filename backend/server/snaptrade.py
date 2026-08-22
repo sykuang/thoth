@@ -93,7 +93,7 @@ def _response(value: Any) -> Any:
 
 
 def _raw_payload(api: Any, operation: str, **kwargs: Any) -> Any:
-    """Use the pinned v11 transport without its lossy float deserializer."""
+    """Use the generated raw transport without its lossy float deserializer."""
     mapped = getattr(api, f"_{operation}_mapped_args")(**kwargs)
     call_args = {
         "query_params": mapped.query or {},
@@ -147,9 +147,10 @@ def _decimal(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+    return number if number.is_finite() else None
 
 
 def _decimal_text(value: Any) -> str | None:
@@ -230,11 +231,15 @@ class SnapTradeSDKGateway:
         if not _configured():
             raise SnapTradeNotConfigured("SnapTrade server credentials 尚未設定")
         from snaptrade_client import SnapTrade
+        from snaptrade_client.auth import SnapTradeAuth
 
-        self.client = SnapTrade(
-            host="https://api.snaptrade.com",
+        auth = SnapTradeAuth.commercial_api_key(
             consumer_key=os.environ["SNAPTRADE_CONSUMER_KEY"],
             client_id=os.environ["SNAPTRADE_CLIENT_ID"],
+        )
+        self.client = SnapTrade(
+            host="https://api.snaptrade.com",
+            auth=auth,
         )
 
     def register_user(self, user_id: str) -> dict[str, Any]:
@@ -307,7 +312,7 @@ class SnapTradeSDKGateway:
     def list_positions(self, user_id: str, user_secret: str, account_id: str) -> list[dict[str, Any]]:
         return _raw_rows(
             self.client.account_information,
-            "get_user_account_positions",
+            "get_all_account_positions",
             user_id=user_id,
             user_secret=user_secret,
             account_id=account_id,
@@ -316,13 +321,8 @@ class SnapTradeSDKGateway:
     def list_option_positions(
         self, user_id: str, user_secret: str, account_id: str,
     ) -> list[dict[str, Any]]:
-        return _raw_rows(
-            self.client.options,
-            "list_option_holdings",
-            user_id=user_id,
-            user_secret=user_secret,
-            account_id=account_id,
-        )
+        # SDK v13's unified positions endpoint already includes option holdings.
+        return []
 
     def list_activities(self, user_id: str, user_secret: str, account_id: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -665,20 +665,31 @@ class SnapTradeService:
                 or symbol
             )
             option_symbol = _nested(row, "symbol", "option_symbol")
+            instrument_kind = _text(_nested(row, "instrument", "kind"))
             asset_type = (
-                _text(_nested(row, "instrument", "kind"))
-                or _text(_nested(row, "symbol", "symbol", "type", "code"))
+                instrument_kind.upper()
+                if instrument_kind
+                else _text(_nested(row, "symbol", "symbol", "type", "code"))
                 or (
                     "OPTION"
                     if isinstance(option_symbol, Mapping)
                     else None
                 )
             )
+            instrument_multiplier = _decimal(_nested(row, "instrument", "multiplier"))
+            if (
+                instrument_kind
+                and instrument_kind.upper() in {"OPTION", "OPTIONS"}
+                and (instrument_multiplier is None or instrument_multiplier <= 0)
+            ):
+                raise RuntimeError("SnapTrade option position 缺少有效 multiplier")
             market_value = None
             if price is not None:
                 if isinstance(option_symbol, Mapping):
                     multiplier = Decimal(10 if option_symbol.get("is_mini_option") is True else 100)
                     market_value = format(quantity * price * multiplier, "f")
+                elif instrument_multiplier is not None:
+                    market_value = format(quantity * price * instrument_multiplier, "f")
                 elif (asset_type or "").upper() not in {"OPTION", "OPTIONS"}:
                     market_value = format(quantity * price, "f")
             out.append({
