@@ -29,6 +29,7 @@ const biometric = source('src/lib/biometric.ts');
 const api = source('src/lib/api.ts');
 const push = source('src/lib/push.ts');
 const pushNative = source('src/lib/pushNative.ts');
+const categoryRules = source('src/app/(tabs)/settings/categories.tsx');
 
 excludes(transactions, 'transactions-fab', 'transaction screen must not expose a placeholder FAB');
 excludes(transactions, "console.log('FAB tapped')", 'transaction screen must not retain a dead FAB handler');
@@ -76,6 +77,10 @@ excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transaction
 includes(accounts, "flexBasis: '48%', flexGrow: 0", 'desktop bank groups must keep stable two-column width');
 
 includes(settings, 'accessibilityState={{ expanded }}', 'settings disclosures must expose expanded accessibility state');
+includes(categoryRules, 'AccessibilityInfo.announceForAccessibility', 'rule search must announce result changes');
+includes(categoryRules, 'min-h-11', 'rule search clear action must keep a 44pt touch target');
+includes(categoryRules, 'testID={`rule-row-${r.id}`}', 'rule rows must use a non-interactive container');
+includes(categoryRules, 'accessibilityLabel={`編輯規則 ${r.name}`}', 'each rule must expose an independent edit control');
 includes(dashboard, 'showPortfolioCard &&', 'dashboard must not reserve an empty portfolio column');
 includes(dashboard, 'showKpiCard &&', 'dashboard must not reserve an empty KPI column');
 includes(login, '敏感資料加密保存', 'login value copy must stay user-facing');

@@ -12,8 +12,9 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Stack } from 'expo-router';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   Alert,
   Modal,
@@ -76,6 +77,13 @@ export default function CategoriesScreen() {
 
   const allCategoryOptions = sortCategoryKeys(categoriesQ.data?.categories ?? []);
   const visibleRules = filterCategoryRules(rulesQ.data ?? [], ruleSearch);
+
+  useEffect(() => {
+    if (!ruleSearch.trim()) return;
+    AccessibilityInfo.announceForAccessibility(
+      visibleRules.length === 0 ? '找不到符合的規則' : `找到 ${visibleRules.length} 條規則`,
+    );
+  }, [ruleSearch, visibleRules.length]);
 
   const createMut = useMutation<CategoryRule, ApiError, FormState>({
     mutationFn: (body) =>
@@ -532,7 +540,7 @@ export default function CategoriesScreen() {
                 testID="rules-search-clear"
                 accessibilityRole="button"
                 accessibilityLabel="清除規則搜尋"
-                className="px-3 py-2.5 rounded-xl bg-ink-100 dark:bg-ink-800"
+                className="min-h-11 px-3 rounded-xl bg-ink-100 dark:bg-ink-800 items-center justify-center"
                 onPress={() => setRuleSearch('')}
               >
                 <Text className="text-ink-700 dark:text-ink-200 text-small font-medium">清除</Text>
@@ -555,12 +563,10 @@ export default function CategoriesScreen() {
             </View>
           ) : null}
           {visibleRules.map((r) => (
-            <Pressable
+            <View
               key={r.id}
-              onPress={() => openEdit(r)}
-              accessibilityRole="button"
-              accessibilityLabel={`編輯規則 ${r.name}`}
-              className="py-4 border-b border-ink-100 dark:border-ink-800 last:border-b-0 active:bg-ink-50 dark:active:bg-ink-800"
+              testID={`rule-row-${r.id}`}
+              className="py-4 border-b border-ink-100 dark:border-ink-800 last:border-b-0"
             >
               <View className="flex-row items-start justify-between gap-3">
                 <View className="flex-1">
@@ -595,25 +601,27 @@ export default function CategoriesScreen() {
                 {r.pattern}
               </Text>
               <View className="flex-row items-center justify-end gap-2 mt-3">
-                <View className="px-3 py-1.5 rounded-lg bg-brand-50 dark:bg-brand-950 border border-brand-200 dark:border-brand-900">
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`編輯規則 ${r.name}`}
+                  className="min-h-11 px-3 rounded-lg bg-brand-50 dark:bg-brand-950 border border-brand-200 dark:border-brand-900 items-center justify-center"
+                  onPress={() => openEdit(r)}
+                >
                   <Text className="text-brand-600 dark:text-brand-400 text-micro font-semibold">
                     ✎ 編輯
                   </Text>
-                </View>
+                </Pressable>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`刪除規則 ${r.name}`}
-                  onPress={(e) => {
-                    e.stopPropagation();  // 避免 row click 開 modal
-                    deleteMut.mutate(r.id);
-                  }}
-                  className="px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900"
+                  onPress={() => deleteMut.mutate(r.id)}
+                  className="min-h-11 px-3 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 items-center justify-center"
                   disabled={deleteMut.isPending}
                 >
                   <Text className="text-red-600 dark:text-red-400 text-micro font-semibold">刪</Text>
                 </Pressable>
               </View>
-            </Pressable>
+            </View>
           ))}
         </View>
 

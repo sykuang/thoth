@@ -32,6 +32,7 @@ const rules = [
   rule(1, '薪資', 'SALARY|Payroll|台積', '薪資'),
   rule(2, '貸款利息支出', '放款利息|循環息', '金融', '利息'),
   rule(3, '早餐店', '早餐|蛋餅', '飲食', '早餐'),
+  rule(4, '通勤', '捷運', '交通', '月票'),
 ];
 
 deepEqual(
@@ -47,9 +48,9 @@ deepEqual(
 );
 
 deepEqual(
-  filterCategoryRules(rules, '利息').map((item) => item.id),
-  [2],
-  '搜尋會同時比對規則名稱與子分類',
+  filterCategoryRules(rules, '月票').map((item) => item.id),
+  [4],
+  '搜尋會比對只出現在子分類的文字',
 );
 
 deepEqual(
