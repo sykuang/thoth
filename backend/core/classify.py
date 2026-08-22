@@ -60,7 +60,7 @@ FEE_KW = (
 PAYMENT_KW = (
     # 中文
     "自動扣繳", "本行扣繳", "自扣", "自動扣款", "提款機繳款",
-    "網路銀行繳款", "全國繳費網繳款", "繳款", "繳費", "扣繳",
+    "網路銀行繳款", "全國繳費網繳款", "繳款", "扣繳",
     "銀行帳戶自動轉帳", "信用卡款",
     # 英文 (HSBC posted 可能 mix)
     "Payment", "PAYMENT", "Repayment",
@@ -107,7 +107,8 @@ def classify_by_desc_and_sign(
       1. 「分期」→ installment (跟金額符號無關)
       2. 「年費」→ annual_fee
       3. 「手續費/利息/違約金」→ fee
-      4. 「自動扣繳/繳款」→ payment
+      4. 明確「自動扣繳/繳款」→ payment；單獨「繳費」不是還款證據，
+         避免把停車場等商戶線上繳費誤判成信用卡還款
       5. 「回饋/刷卡金/cashback/CB_」→ cashback
       6. 「退款/退費/Refund」→ refund
       7. 純看符號:

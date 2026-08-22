@@ -81,6 +81,11 @@ class TestFallbackKeyword:
     def test_payment_keyword_atm(self) -> None:
         assert classify.classify_by_desc_and_sign("他行提款機繳款（轉帳）", -33645) == PAYMENT
 
+    def test_generic_payment_word_is_merchant_spending(self) -> None:
+        # E.SUN classifier sees bank-perspective +60; API/UI later normalizes it to -60.
+        assert classify.classify_by_desc_and_sign("連加＊嘟嘟房－線上繳費", 60) == SPENDING
+        assert classify.classify_by_desc_and_sign("繳費", 60) == SPENDING
+
     def test_cashback_keyword_chinese(self) -> None:
         assert classify.classify_by_desc_and_sign("刷卡現金回饋－日本指定商店", -15) == CASHBACK
 

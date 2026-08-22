@@ -1433,28 +1433,35 @@ def update_transaction(
             )
 
     if "splits" in body:
-        # Phase 10 (2026-07-29) 分類拆帳: 子項總和必須等於母筆金額, 所以要先讀母筆。
-        # 用 transform 後的 cashflow_amount 而非 raw amount — 信用卡 raw 是帳單視角
-        # (消費為正), transform 後才是使用者視角的絕對值金額, 跟 UI 顯示的數字一致,
-        # 使用者在畫面上看到 1200 就該填 1200。
-        parent_row = db_api.get_txn(
-            bank=bank, kind=kind, txn_id=txn_id, user_id=user["id"],
-        )
-        if parent_row is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此筆交易")
-        parent = transform(bank, parent_row)
-        parent_amount = abs(int(parent.get("cashflow_amount") or 0))
-        if parent_amount <= 0:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                "此筆交易金額為 0 或無法認列現金流, 無法拆帳",
+        # [] / null means "clear splits", not "validate a new split". Accept it before
+        # reading cashflow_amount so category-only writes from older clients also work
+        # for neutral transactions.
+        raw_splits = body.get("splits")
+        if raw_splits is None or (isinstance(raw_splits, list) and not raw_splits):
+            update_kwargs["splits"] = []
+        else:
+            # Phase 10 (2026-07-29) 分類拆帳: 子項總和必須等於母筆金額, 所以要先讀母筆。
+            # 用 transform 後的 cashflow_amount 而非 raw amount — 信用卡 raw 是帳單視角
+            # (消費為正), transform 後才是使用者視角的絕對值金額, 跟 UI 顯示的數字一致,
+            # 使用者在畫面上看到 1200 就該填 1200。
+            parent_row = db_api.get_txn(
+                bank=bank, kind=kind, txn_id=txn_id, user_id=user["id"],
             )
-        try:
-            update_kwargs["splits"] = _normalize_splits_input(
-                body.get("splits"), parent_amount,
-            )
-        except ValueError as e:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+            if parent_row is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此筆交易")
+            parent = transform(bank, parent_row)
+            parent_amount = abs(int(parent.get("cashflow_amount") or 0))
+            if parent_amount <= 0:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "此筆交易金額為 0 或無法認列現金流, 無法拆帳",
+                )
+            try:
+                update_kwargs["splits"] = _normalize_splits_input(
+                    raw_splits, parent_amount,
+                )
+            except ValueError as e:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
 
     try:
         with db_api.transaction(bank=bank) as tx:

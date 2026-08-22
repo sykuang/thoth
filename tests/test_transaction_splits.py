@@ -326,6 +326,39 @@ def test_split_cleared_by_empty_list(client, data_root):
     assert r.json()["total_expense"] == 1200
 
 
+def test_category_patch_with_empty_splits_allows_neutral_parent(client, data_root):
+    token = _register(client, email="neutral-empty-splits@p.com")
+    client.post("/accounts", json={"bank": "esun", "label": "t"}, headers=_auth(token))
+    _seed_bank_db(
+        data_root,
+        "esun",
+        pending=[{
+            "card_no": "1234",
+            "date": "2026-08-16",
+            "desc": "連加＊嘟嘟房－線上繳費",
+            "amount": 60,
+            "category": "飲食",
+            "subcategory": "餐廳",
+            "txn_type": "payment",
+            "flow_type": "transfer",
+        }],
+    )
+    parent = client.get(
+        "/transactions?bank=esun&kind=pending", headers=_auth(token),
+    ).json()["items"][0]
+    assert parent["cashflow_amount"] == 0
+
+    response = client.patch(
+        f"/transactions/esun/pending/{parent['raw']['id']}",
+        json={"category": "交通", "subcategory": "汽車", "splits": []},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["category"] == "交通"
+    assert response.json()["subcategory"] == "汽車"
+
+
 # ============================================================
 # sync 保存 (overlay pattern 的核心價值)
 # ============================================================
