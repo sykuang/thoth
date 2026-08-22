@@ -29,6 +29,7 @@ import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { sortCategoryKeys } from '@/lib/category-color';
+import { filterCategoryRules } from '@/lib/categoryRules';
 import type { CategoryRule, RecategorizeResult } from '@/types/api';
 
 type FormState = {
@@ -62,6 +63,7 @@ export default function CategoriesScreen() {
   const [editForm, setEditForm] = useState<FormState>(EMPTY_FORM);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
+  const [ruleSearch, setRuleSearch] = useState('');
 
   const rulesQ = useQuery<CategoryRule[]>({
     queryKey: ['rules'],
@@ -73,6 +75,7 @@ export default function CategoriesScreen() {
   });
 
   const allCategoryOptions = sortCategoryKeys(categoriesQ.data?.categories ?? []);
+  const visibleRules = filterCategoryRules(rulesQ.data ?? [], ruleSearch);
 
   const createMut = useMutation<CategoryRule, ApiError, FormState>({
     mutationFn: (body) =>
@@ -503,7 +506,39 @@ export default function CategoriesScreen() {
 
         {/* Rules list */}
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
-          <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">規則清單</Text>
+          <View className="flex-row items-center justify-between mb-3">
+            <Text className="text-ink-900 dark:text-ink-50 text-h2">規則清單</Text>
+            {rulesQ.data ? (
+              <Text className="text-ink-500 dark:text-ink-400 text-small">
+                {ruleSearch.trim() ? `${visibleRules.length} / ${rulesQ.data.length}` : `${rulesQ.data.length} 條`}
+              </Text>
+            ) : null}
+          </View>
+          <View className="flex-row items-center gap-2 mb-3">
+            <TextInput
+              testID="rules-search-input"
+              accessibilityLabel="搜尋自動分類規則"
+              className={`${inputBase} flex-1`}
+              value={ruleSearch}
+              onChangeText={setRuleSearch}
+              placeholder="搜尋名稱、分類或比對文字"
+              placeholderTextColor="#94a3b8"
+              autoCapitalize="none"
+              autoCorrect={false}
+              returnKeyType="search"
+            />
+            {ruleSearch ? (
+              <Pressable
+                testID="rules-search-clear"
+                accessibilityRole="button"
+                accessibilityLabel="清除規則搜尋"
+                className="px-3 py-2.5 rounded-xl bg-ink-100 dark:bg-ink-800"
+                onPress={() => setRuleSearch('')}
+              >
+                <Text className="text-ink-700 dark:text-ink-200 text-small font-medium">清除</Text>
+              </Pressable>
+            ) : null}
+          </View>
           {rulesQ.isLoading && <ActivityIndicator />}
           {rulesQ.error && (
             <Text className="text-red-600 dark:text-red-400 text-small">
@@ -513,39 +548,61 @@ export default function CategoriesScreen() {
           {rulesQ.data?.length === 0 && (
             <Text className="text-ink-400 dark:text-ink-500 text-small text-center py-4">尚無規則</Text>
           )}
-          {rulesQ.data?.map((r) => (
+          {(rulesQ.data?.length ?? 0) > 0 && visibleRules.length === 0 ? (
+            <View className="items-center py-8">
+              <Text className="text-ink-700 dark:text-ink-200 text-body font-medium">找不到符合的規則</Text>
+              <Text className="text-ink-400 dark:text-ink-500 text-small mt-1">換個規則名稱、分類或比對文字試試</Text>
+            </View>
+          ) : null}
+          {visibleRules.map((r) => (
             <Pressable
               key={r.id}
               onPress={() => openEdit(r)}
-              className="flex-row items-center justify-between py-3 border-b border-ink-100 dark:border-ink-800 last:border-b-0 active:bg-ink-50 dark:active:bg-ink-800"
+              accessibilityRole="button"
+              accessibilityLabel={`編輯規則 ${r.name}`}
+              className="py-4 border-b border-ink-100 dark:border-ink-800 last:border-b-0 active:bg-ink-50 dark:active:bg-ink-800"
             >
-              <View className="flex-1">
-                <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-1">
-                  {r.name} → {r.category}{' '}
-                  <Text className="text-ink-400 dark:text-ink-500 text-small font-normal">
-                    (優先序 {r.priority})
-                  </Text>
-                  {/* Phase 8.3: auto_excluded 徽章 */}
-                  {r.auto_excluded === 1 && (
-                    <Text className="text-amber-700 dark:text-amber-400 text-micro font-semibold">
-                      {' '}🚫不算收支
+              <View className="flex-row items-start justify-between gap-3">
+                <View className="flex-1">
+                  <Text className="text-ink-900 dark:text-ink-50 text-h3">{r.name}</Text>
+                  <View className="flex-row flex-wrap items-center gap-1.5 mt-1.5">
+                    <View className="px-2 py-0.5 rounded-full bg-brand-50 dark:bg-brand-950">
+                      <Text className="text-brand-700 dark:text-brand-300 text-micro font-medium">
+                        {r.category}{r.subcategory ? `・${r.subcategory}` : ''}
+                      </Text>
+                    </View>
+                    <Text className="text-ink-400 dark:text-ink-500 text-micro">
+                      優先序 {r.priority}
                     </Text>
-                  )}
-                </Text>
-                <Text className="text-ink-500 dark:text-ink-400 text-micro font-mono">{r.pattern}</Text>
+                    {r.auto_excluded === 1 ? (
+                      <Text className="text-amber-700 dark:text-amber-400 text-micro font-semibold">
+                        🚫 不算收支
+                      </Text>
+                    ) : null}
+                  </View>
+                </View>
+                <Switch
+                  accessibilityLabel={`${r.name} 規則啟用狀態`}
+                  value={r.enabled === 1 || (r.enabled as unknown as boolean) === true}
+                  onValueChange={(v) => toggleMut.mutate({ id: r.id, enabled: v })}
+                />
               </View>
-              <View className="flex-row items-center gap-2">
-                {/* Phase 8: 編輯按鈕 (除了整 row click 也可這裡) */}
+              <Text
+                className="text-ink-500 dark:text-ink-400 text-micro font-mono mt-2"
+                numberOfLines={2}
+                ellipsizeMode="tail"
+              >
+                {r.pattern}
+              </Text>
+              <View className="flex-row items-center justify-end gap-2 mt-3">
                 <View className="px-3 py-1.5 rounded-lg bg-brand-50 dark:bg-brand-950 border border-brand-200 dark:border-brand-900">
                   <Text className="text-brand-600 dark:text-brand-400 text-micro font-semibold">
                     ✎ 編輯
                   </Text>
                 </View>
-                <Switch
-                  value={r.enabled === 1 || (r.enabled as unknown as boolean) === true}
-                  onValueChange={(v) => toggleMut.mutate({ id: r.id, enabled: v })}
-                />
                 <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`刪除規則 ${r.name}`}
                   onPress={(e) => {
                     e.stopPropagation();  // 避免 row click 開 modal
                     deleteMut.mutate(r.id);

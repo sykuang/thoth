@@ -57,7 +57,7 @@
     "desktop:icon": "tauri icon",
     "lint": "expo lint",
     "test:decimal": "tsx src/lib/decimal.test.ts && tsx src/lib/transactionTimeline.test.ts && tsx src/lib/currency.test.ts",
-    "test:transactions": "tsx src/lib/txnFilter.test.ts && tsx src/lib/txnDisplay.test.ts",
+    "test:transactions": "tsx src/lib/txnFilter.test.ts && tsx src/lib/txnDisplay.test.ts && tsx src/lib/categoryRules.test.ts",
     "test:replica": "tsx src/lib/authRetryPolicy.test.ts && tsx src/lib/replica.test.ts && tsx src/lib/replicaSync.test.ts && tsx src/lib/dashboardCache.test.ts && tsx src/lib/localStats.test.ts && tsx src/lib/localPortfolio.test.ts && tsx src/lib/accountTabCache.test.ts",
     "test:routes": "tsx src/lib/routeParents.test.ts && tsx src/lib/syncRefresh.test.ts && tsx src/lib/pushProvider.test.ts && tsx src/lib/uiContract.test.ts",
     "typecheck": "tsc --noEmit"
