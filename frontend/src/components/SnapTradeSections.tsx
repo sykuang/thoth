@@ -8,6 +8,7 @@ import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { formatApiError } from '@/lib/api';
 import { formatAbsoluteDecimalCurrency, formatDecimalCurrency } from '@/lib/currency';
 import { formatDecimal } from '@/lib/decimal';
+import { formatSnapTradeUiError } from '@/lib/snaptradeUi';
 import type {
   BrokerageAccount,
   SnapTradePortfolio,
@@ -76,6 +77,17 @@ export function SnapTradeConnectionSettings() {
   });
   const status = statusQuery.data;
   const error = connect.error ?? portal.error ?? sync.error ?? statusQuery.error;
+  const statusMessage = statusQuery.isPending
+    ? '讀取連線狀態…'
+    : statusQuery.isError || !status
+      ? '無法讀取連線狀態，請稍後重試'
+      : !status.configured
+        ? '伺服器尚未設定 SnapTrade'
+        : status.connection_count
+          ? `已連結 ${status.connection_count} 個券商；帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」`
+          : status.registered
+            ? '已建立 SnapTrade 使用者，尚未連結券商'
+            : '尚未開始連結';
 
   return (
     <View>
@@ -83,26 +95,24 @@ export function SnapTradeConnectionSettings() {
         <View className="flex-1">
           <Text className="text-ink-900 dark:text-ink-50 text-h3">SnapTrade 券商連結</Text>
           <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
-            {!status
-              ? '讀取連線狀態…'
-              : !status.configured
-                ? '伺服器尚未設定 SnapTrade'
-                : status.connection_count
-                  ? `已連結 ${status.connection_count} 個券商；帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」`
-                  : status.registered
-                    ? '已建立 SnapTrade 使用者，尚未連結券商'
-                    : '尚未開始連結'}
+            {statusMessage}
           </Text>
         </View>
         <ActionButton
           label={
-            Platform.OS === 'web' && connect.data
+            statusQuery.isError
+              ? '重試'
+              : Platform.OS === 'web' && connect.data
               ? '開啟 SnapTrade'
               : status?.registered
                 ? '管理連結'
                 : '連結券商'
           }
           onPress={() => {
+            if (statusQuery.isError) {
+              void statusQuery.refetch();
+              return;
+            }
             if (Platform.OS !== 'web' || !connect.data) {
               connect.mutate();
               return;
@@ -115,10 +125,19 @@ export function SnapTradeConnectionSettings() {
             connect.reset();
             portal.mutate(connection);
           }}
-          disabled={!status?.configured || connect.isPending || portal.isPending || sync.isPending}
+          disabled={
+            statusQuery.isFetching
+            || (!statusQuery.isError && (
+              !status?.configured || connect.isPending || portal.isPending || sync.isPending
+            ))
+          }
         />
       </View>
-      {error && <Text className="text-red-600 text-small pb-3">{formatApiError(error)}</Text>}
+      {error && (
+        <Text className="text-red-600 text-small pb-3">
+          {formatSnapTradeUiError(error, formatApiError(error), false)}
+        </Text>
+      )}
     </View>
   );
 }
@@ -173,7 +192,11 @@ export function SnapTradeAccountsSection() {
           secondary
         />
       </View>
-      {error && <Text className="text-red-600 text-small mb-3">{formatApiError(error)}</Text>}
+      {error && (
+        <Text className="text-red-600 text-small mb-3">
+          {formatSnapTradeUiError(error, formatApiError(error), hasSnapshot)}
+        </Text>
+      )}
       {portfolio.accounts.map((account) => (
         <AccountCard
           key={account.id}

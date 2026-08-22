@@ -72,6 +72,11 @@ includes(accounts, "'text-emerald-600 dark:text-emerald-400'", 'account-tab asse
 includes(accounts, "formatCurrency(billDue, 'TWD')", 'credit-card rows must show the amount due beside the due-date label');
 excludes(accounts, 'const primaryAmount = card.used_credit', 'credit-card rows must not present aggregate credit usage as the bill due');
 includes(brokerageAccounts, 'formatAbsoluteDecimalCurrency', 'brokerage account totals must use color rather than signs');
+includes(brokerageAccounts, "statusQuery.isError\n              ? '重試'", 'failed SnapTrade status must expose a retry action');
+includes(brokerageAccounts, 'void statusQuery.refetch()', 'SnapTrade retry action must refetch status');
+includes(brokerageAccounts, "statusQuery.isError || !status", 'failed SnapTrade status must not remain labelled as loading');
+includes(brokerageAccounts, "? '無法讀取連線狀態，請稍後重試'", 'failed SnapTrade status must explain the retry state');
+includes(brokerageAccounts, 'formatSnapTradeUiError(error, formatApiError(error), hasSnapshot)', 'brokerage sync errors must disclose cached snapshot fallback');
 excludes(accounts, 'borderLeftWidth: 4', 'normal bank groups must not use warning-style side stripes');
 excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transactions must not use status-style side stripes');
 includes(accounts, "flexBasis: '48%', flexGrow: 0", 'desktop bank groups must keep stable two-column width');
