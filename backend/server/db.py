@@ -686,6 +686,24 @@ def _ensure_schema(conn: Any) -> None:
             "ALTER TABLE category_rules ADD COLUMN auto_excluded INTEGER NOT NULL DEFAULT 0",
         )
 
+    # 2026-08-22: payment gateway prefixes cannot determine merchant category.
+    # Migrate only the untouched historical default; any user-edited pattern is preserved.
+    food_pattern = (
+        r"ＳＵＫＩＹＡ|SUKIYA|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
+        r"拉麵店|麵屋|燒肉|壽司郎|ＡＰＥ.*美食|１０１美食|"
+        r"美食街|餐酒|食堂|お好み|定食|cafe|CAFE|Cafe"
+    )
+    old_food_pattern = (
+        r"ＳＵＫＩＹＡ|SUKIYA|連加|街口電支|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
+        r"拉麵店|麵屋|燒肉|壽司郎|ＴａｐＰａｙ|TapPay|ＡＰＥ.*美食|１０１美食|"
+        r"美食街|餐酒|食堂|お好み|定食|cafe|CAFE|Cafe"
+    )
+    conn.execute(
+        "UPDATE category_rules SET pattern=?, updated_at=? "
+        "WHERE name=? AND pattern=?",
+        (food_pattern, now_iso(), "餐飲全形連鎖", old_food_pattern),
+    )
+
     # L5-1 migration: v1 cred → v2
     if DB_BACKEND == "postgres":
         for stmt in _split_statements(_MIGRATE_V1_TO_V2):

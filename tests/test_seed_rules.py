@@ -6,6 +6,8 @@ Phase 8 (2026-06-15) — DEFAULT_RULES 擴充到 13 主類 + 5 收入類完整�
 """
 from __future__ import annotations
 
+import sqlite3
+
 
 def test_register_seeds_default_rules(client):
     """新註冊 user 應自動有完整 default rules (Phase 8: 13 主類 + 5 收入類覆蓋)."""
@@ -52,6 +54,69 @@ def test_seed_default_rules_idempotent(client):
         name_counts[r["name"]] = name_counts.get(r["name"], 0) + 1
     for name, n in name_counts.items():
         assert n == 1, f"rule {name!r} 重複塞了 {n} 次"
+
+
+def test_schema_migrates_only_unchanged_food_gateway_pattern():
+    """Remove gateway prefixes from the old default without overwriting user edits."""
+    from backend.server import db
+    from backend.server.seed_rules import DEFAULT_RULES
+
+    old_pattern = (
+        r"ＳＵＫＩＹＡ|SUKIYA|連加|街口電支|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
+        r"拉麵店|麵屋|燒肉|壽司郎|ＴａｐＰａｙ|TapPay|ＡＰＥ.*美食|１０１美食|"
+        r"美食街|餐酒|食堂|お好み|定食|cafe|CAFE|Cafe"
+    )
+    new_pattern = (
+        r"ＳＵＫＩＹＡ|SUKIYA|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
+        r"拉麵店|麵屋|燒肉|壽司郎|ＡＰＥ.*美食|１０１美食|"
+        r"美食街|餐酒|食堂|お好み|定食|cafe|CAFE|Cafe"
+    )
+    seeded_pattern = next(r["pattern"] for r in DEFAULT_RULES if r["name"] == "餐飲全形連鎖")
+    assert seeded_pattern == new_pattern
+    customized_pattern = old_pattern + "|我的餐廳"
+
+    conn = sqlite3.connect(":memory:")
+    db._ensure_schema(conn)
+    fixtures = (
+        (1, "餐飲全形連鎖", old_pattern, "2026-08-22T00:00:01.000Z"),
+        (2, "餐飲全形連鎖", customized_pattern, "2026-08-22T00:00:02.000Z"),
+        (3, "自訂同內容", old_pattern, "2026-08-22T00:00:03.000Z"),
+        (4, "餐飲全形連鎖", new_pattern, "2026-08-22T00:00:04.000Z"),
+    )
+    for user_id, name, pattern, timestamp in fixtures:
+        conn.execute(
+            "INSERT INTO category_rules "
+            "(user_id, name, pattern, category, subcategory, priority, enabled, "
+            "auto_excluded, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, pattern, "飲食", "餐廳", 105, 1, 0, timestamp, timestamp),
+        )
+    conn.commit()
+
+    db._ensure_schema(conn)
+
+    rows = {
+        row[0]: (row[1], row[2], row[3])
+        for row in conn.execute(
+            "SELECT user_id, name, pattern, updated_at FROM category_rules ORDER BY user_id",
+        )
+    }
+    assert rows[1][0:2] == ("餐飲全形連鎖", new_pattern)
+    assert rows[1][2] != "2026-08-22T00:00:01.000Z"
+    assert rows[2] == (
+        "餐飲全形連鎖", customized_pattern, "2026-08-22T00:00:02.000Z",
+    )
+    assert rows[3] == ("自訂同內容", old_pattern, "2026-08-22T00:00:03.000Z")
+    assert rows[4] == ("餐飲全形連鎖", new_pattern, "2026-08-22T00:00:04.000Z")
+
+    first_run_rows = rows
+    db._ensure_schema(conn)
+    second_run_rows = {
+        row[0]: (row[1], row[2], row[3])
+        for row in conn.execute(
+            "SELECT user_id, name, pattern, updated_at FROM category_rules ORDER BY user_id",
+        )
+    }
+    assert second_run_rows == first_run_rows
 
 
 # ============================================================

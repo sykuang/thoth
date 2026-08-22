@@ -294,7 +294,7 @@ DEFAULT_RULES: list[dict] = [
     # Phase 8.3 (2026-06-18) — 全形 merchant + long-tail 補洞
     #
     # 起因: 測試使用者的 production sample 669 筆 txn 跑完只命中 41% (379 筆未分類).
-    # 主因 HSBC 信用卡 desc 全形字 (ＡＰＥxxx / ＴＡＯＢＡＯ / 街口電支－),
+    # 主因 HSBC 信用卡 desc 全形字 (ＡＰＥxxx / ＴＡＯＢＡＯ 等),
     # 半形/中文 default pattern 漏掉. 補 37 條後命中率 100%.
     #
     # ⚠️ 鐵則: backend/server/categorizer.py safe_match() 用 regex.IGNORECASE
@@ -302,10 +302,10 @@ DEFAULT_RULES: list[dict] = [
     #         Pattern 必須大小寫雙寫. 詳見 wiki [[fullwidth-regex-case-folding-pitfall]].
     # ============================================================================
 
-    # ─── 餐飲全形連鎖 / 連加*/ 街口電支－/ SUKIYA / 義式餐廳 ───
+    # ─── 餐飲全形連鎖 / SUKIYA / 義式餐廳 ───
     {"name": "餐飲全形連鎖",
-     "pattern": r"ＳＵＫＩＹＡ|SUKIYA|連加|街口電支|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
-                r"拉麵店|麵屋|燒肉|壽司郎|ＴａｐＰａｙ|TapPay|ＡＰＥ.*美食|１０１美食|"
+     "pattern": r"ＳＵＫＩＹＡ|SUKIYA|可不可熟成|瑞苗媽媽|春陽茶事|創義麵|義麵|"
+                r"拉麵店|麵屋|燒肉|壽司郎|ＡＰＥ.*美食|１０１美食|"
                 r"美食街|餐酒|食堂|お好み|定食|cafe|CAFE|Cafe",
      "category": "飲食", "subcategory": "餐廳", "priority": 105},
     {"name": "瑞幸咖啡茶飲",

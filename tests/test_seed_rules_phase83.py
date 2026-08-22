@@ -65,6 +65,15 @@ def test_phase83_unique_names():
     assert not dups, f"duplicate rule names: {dups}"
 
 
+def test_food_rule_excludes_payment_gateway_prefixes():
+    """Payment gateway prefixes cannot decide the underlying merchant category."""
+    food_rule = next(r for r in DEFAULT_RULES if r["name"] == "餐飲全形連鎖")
+    assert not safe_match(food_rule["pattern"], "連加＊測試苗媽媽廚房")
+    assert not safe_match(food_rule["pattern"], "街口電支－統一超商")
+    assert not safe_match(food_rule["pattern"], "TapPay＊嘟嘟房－線上繳費")
+    assert not safe_match(food_rule["pattern"], "ＴａｐＰａｙ＊未知商家")
+
+
 def test_phase83_priority_tiers():
     """priority 分層合理:
        200+: 強 fallback (稅/收入/股票交割/罰款/發票)
@@ -134,11 +143,8 @@ REAL_HSBC_SAMPLES = [
     ("違規Ａ０１Ｈ１６０４１Ａ１２６５１８５", "金融"),
     ("ＷＬ＊ＳＴＥＡＭＰＵＲＣＨＡＳＥ４２５", "娛樂"),
     ("信義運動中心ＴａｉｐｅｉＣｉｔｙ", "娛樂"),
-    # 「街口電支－統一超商」同時命中「街口支付」(P105) + 「餐飲全形連鎖」(P105)
-    # — priority 一樣時 by name 字母序「街口支付」先勝, 歸金融/電子支付
-    # (合理: 街口本質是支付通道, merchant 是 7-11; 若要細分餐飲, user 可手動改 priority)
+    # 「街口電支」不再由payment gateway prefix硬判餐飲；獨立「街口支付」仍歸電子支付。
     ("街口電支－統一超商ＴＡＩＰＥＩＴＷＮ", "金融"),
-    ("連加＊測試苗媽媽廚房ＴａｉｐｅｉＴＷＮ", "飲食"),
     ("耐斯車隊ＴａｉｐｅｉＣｉｔｙＴＷＮ", "交通"),
     ("中油 5500 元", "交通"),
     ("ＰＵＲＥＶＰＮ．ＣＯＭＣＡＵＳ", "通訊"),
