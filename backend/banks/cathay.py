@@ -221,7 +221,7 @@ class CathayCrawler(BankCrawler):
                 phases=(CheckpointPhase.PRE_SUBMIT,),
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
                 container_selector="#divSystemLoginMsgList.show",
-                action_texts=("下一", "我知道了", "關閉", "確定"),
+                action_texts=("下一", "下一則", "我知道了", "關閉", "確定"),
                 max_actions=12,
             ),
             LoginCheckpointRule(

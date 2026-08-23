@@ -37,7 +37,7 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
         (CheckpointPhase.PRE_SUBMIT,),
         CheckpointKind.DISMISSIBLE_NOTICE,
         "#divSystemLoginMsgList.show",
-        ("下一", "我知道了", "關閉", "確定"),
+        ("下一", "下一則", "我知道了", "關閉", "確定"),
         12,
     )
     assert not hasattr(CathayCrawler, "_dismiss_announcements")
@@ -124,6 +124,43 @@ def test_cathay_rule_advances_only_the_scoped_announcement() -> None:
             )
             assert _evaluate(page).kind is CheckpointKind.READY_FOR_CREDENTIALS
             assert page.locator("[data-unshown]").is_visible()
+        finally:
+            browser.close()
+
+
+def test_cathay_rule_handles_current_previous_next_labels() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <div id="divSystemLoginMsgList" class="show">
+                  <button id="previous">上一則</button>
+                  <button id="next">下一則</button>
+                </div>
+                <script>
+                  document.body.dataset.previousClicks = '0';
+                  document.body.dataset.nextClicks = '0';
+                  document.querySelector('#previous').onclick = () =>
+                    document.body.dataset.previousClicks++;
+                  document.querySelector('#next').onclick = () => {
+                    document.body.dataset.nextClicks++;
+                    document.querySelector('#divSystemLoginMsgList').insertAdjacentText('afterbegin', '第二頁 ');
+                  };
+                </script>
+                """
+            )
+
+            outcome = _evaluate(page)
+            assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
+            assert outcome.action_label == "下一則"
+            assert page.locator("body").get_attribute("data-previous-clicks") == "0"
+            assert page.locator("body").get_attribute("data-next-clicks") == "1"
         finally:
             browser.close()
 
