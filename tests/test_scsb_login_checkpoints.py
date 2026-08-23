@@ -117,6 +117,7 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
     assert intro.action_texts == ("I got it",)
     assert intro.max_actions == 1
     fraud = rules[10]
+    assert fraud.action_selector == "button.btn-gradient"
     assert fraud.action_texts == ("我知道了",)
     assert fraud.required_body_pattern is not None
     assert fraud.first_match_timeout_ms == 5000
@@ -174,13 +175,29 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         assert page.locator("body").get_attribute("data-outside") == "0"
 
         page.set_content(
-            '<div class="custom-modal show">親愛的客戶，請留意詐騙訊息<button>我知道了</button></div>'
-            "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>{document.body.dataset.clicks++;document.querySelector('div').hidden=true}</script>"
+            """
+            <div class="custom-modal show">親愛的客戶，請留意詐騙訊息
+              <button class="btn-close"></button>
+              <a>掌上銀App－行動認證申請操作步驟</a>
+              <button class="btn btn-outline-primary">本日不再顯示</button>
+              <button class="btn btn-gradient">我知道了</button>
+            </div>
+            <script>
+              document.body.dataset.target='0'; document.body.dataset.other='0';
+              document.querySelectorAll('.btn-close,a,.btn-outline-primary').forEach(
+                x=>x.onclick=()=>document.body.dataset.other++
+              );
+              document.querySelector('.btn-gradient').onclick=()=>{
+                document.body.dataset.target++;document.querySelector('div').hidden=true
+              };
+            </script>
+            """
         )
         outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
         assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
         assert outcome.rule_name == "scsb-fraud-notice"
-        assert page.locator("body").get_attribute("data-clicks") == "1"
+        assert page.locator("body").get_attribute("data-target") == "1"
+        assert page.locator("body").get_attribute("data-other") == "0"
 
         page.set_content(
             '<div class="custom-modal show">親愛的客戶，一般通知<button>我知道了</button></div>'

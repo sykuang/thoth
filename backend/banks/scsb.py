@@ -198,6 +198,7 @@ class ScsbCrawler(BankCrawler):
             phases=(CheckpointPhase.PRE_SUBMIT,),
             kind=CheckpointKind.DISMISSIBLE_NOTICE,
             container_selector=".custom-modal.show",
+            action_selector="button.btn-gradient",
             action_texts=("我知道了",),
             required_body_pattern=re.compile(
                 r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}詐騙[\s\S]{0,300}$"
