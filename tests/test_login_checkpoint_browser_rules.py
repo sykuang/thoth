@@ -289,6 +289,11 @@ def test_form_bearing_notice_is_never_dismissed():
         {"container_selector": ""},
         {"phases": ()},
         {"max_actions": 0},
+        {"first_match_timeout_ms": 0},
+        {"first_match_timeout_ms": 5001},
+        {"first_match_timeout_ms": True},
+        {"first_match_timeout_ms": 1.5},
+        {"first_match_timeout_ms": "5000"},
     ],
 )
 def test_rule_rejects_invalid_minimum_fields(values):

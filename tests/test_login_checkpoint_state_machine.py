@@ -10,6 +10,7 @@ from backend.core.login_checkpoints import (
     LoginCheckpointBlocked,
     LoginCheckpointRule,
     LoginInteractionRequired,
+    _evaluate_rule,
     _matching_body_fingerprint,
     bounded_locator_matches,
     evaluate_login_checkpoint,
@@ -94,6 +95,101 @@ def test_locator_snapshot_is_bounded_without_query_count() -> None:
     matches = list(bounded_locator_matches(Locator()))
 
     assert len(matches) == 2
+
+
+def test_rule_can_raise_first_locator_timeout_without_using_query_count() -> None:
+    timeouts: list[int] = []
+
+    class Missing:
+        def element_handle(self, *, timeout: int):
+            timeouts.append(timeout)
+            raise TimeoutError(f"missing after {timeout}")
+
+    class MissingLocator:
+        def nth(self, _index: int) -> Missing:
+            return Missing()
+
+    class Action:
+        def __init__(self, container) -> None:
+            self.container = container
+
+        def element_handle(self, *, timeout: int):
+            timeouts.append(timeout)
+            return object()
+
+        def is_visible(self) -> bool:
+            return True
+
+        def inner_text(self) -> str:
+            return "Continue"
+
+        def is_enabled(self) -> bool:
+            return True
+
+        def get_attribute(self, _name: str):
+            return None
+
+        def click(self) -> None:
+            self.container.visible = False
+
+    class Actions:
+        def __init__(self, container) -> None:
+            self.container = container
+
+        def nth(self, index: int):
+            return Action(self.container) if index == 0 else Missing()
+
+    class Container:
+        visible = True
+
+        def element_handle(self, *, timeout: int):
+            timeouts.append(timeout)
+            if timeout < 5000:
+                raise TimeoutError("cloud locator not ready")
+            return object()
+
+        def is_visible(self) -> bool:
+            return self.visible
+
+        def locator(self, selector: str):
+            if selector == "button, a, [role=button]":
+                return Actions(self)
+            return MissingLocator()
+
+        def inner_text(self, *, timeout: int) -> str:
+            return "known notice"
+
+        def wait_for(self, *, state: str, timeout: int) -> None:
+            assert state == "hidden"
+            assert timeout == 500
+            assert not self.visible
+
+    container = Container()
+
+    class Containers:
+        def nth(self, index: int):
+            return container if index == 0 else Missing()
+
+    class Scope:
+        def locator(self, _selector: str) -> Containers:
+            return Containers()
+
+    rule = LoginCheckpointRule(
+        name="slow-cloud-notice",
+        bank="test-bank",
+        phases=(CheckpointPhase.PRE_SUBMIT,),
+        kind=CheckpointKind.DISMISSIBLE_NOTICE,
+        container_selector="#notice",
+        action_texts=("Continue",),
+        first_match_timeout_ms=5000,
+    )
+
+    assert _evaluate_rule([Scope()], rule) == CheckpointOutcome(
+        CheckpointKind.DISMISSIBLE_NOTICE,
+        rule_name="slow-cloud-notice",
+        action_label="Continue",
+    )
+    assert timeouts == [5000, 100, 100, 100, 5000, 100]
 
 
 @pytest.mark.parametrize(

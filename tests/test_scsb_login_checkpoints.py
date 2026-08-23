@@ -119,6 +119,7 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
     fraud = rules[10]
     assert fraud.action_texts == ("我知道了",)
     assert fraud.required_body_pattern is not None
+    assert fraud.first_match_timeout_ms == 5000
     assert all(rule.bank == "scsb" for rule in rules)
     assert all(
         rule.kind not in {CheckpointKind.CAPTCHA_RETRY, CheckpointKind.PROTOCOL_RESUBMIT}

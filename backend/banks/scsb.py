@@ -203,6 +203,7 @@ class ScsbCrawler(BankCrawler):
                 r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}詐騙[\s\S]{0,300}$"
             ),
             max_actions=1,
+            first_match_timeout_ms=5000,
         )
         return (
             *(

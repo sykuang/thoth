@@ -114,6 +114,7 @@ class LoginCheckpointRule:
     action_texts: tuple[str, ...] = ()
     required_body_pattern: re.Pattern[str] | None = None
     max_actions: int = 1
+    first_match_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
 
     @property
     def is_clickable(self) -> bool:
@@ -129,6 +130,8 @@ class LoginCheckpointRule:
             or self.action_selector != self.action_selector.strip()
             or not self.phases
             or self.max_actions < 1
+            or type(self.first_match_timeout_ms) is not int
+            or not (1 <= self.first_match_timeout_ms <= _LOGIN_INSPECTION_TIMEOUT_MS)
         ):
             raise ValueError("invalid login checkpoint rule")
         if not _is_simple_scoped_selector(self.container_selector):
@@ -235,7 +238,9 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     matched = []
     for scope in scopes:
         containers = scope.locator(rule.container_selector)
-        for container in bounded_locator_matches(containers):
+        for container in bounded_locator_matches(
+            containers, first_timeout_ms=rule.first_match_timeout_ms
+        ):
             if not container.is_visible():
                 continue
             nested = container.locator(rule.container_selector)
@@ -273,7 +278,9 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     }
     for container, fingerprint in matched:
         actions = container.locator(rule.action_selector)
-        for action in bounded_locator_matches(actions):
+        for action in bounded_locator_matches(
+            actions, first_timeout_ms=rule.first_match_timeout_ms
+        ):
             if not action.is_visible():
                 continue
             if action_labels:
