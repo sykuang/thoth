@@ -1,6 +1,6 @@
 import ts from 'typescript';
 
-import { getDisplayDescription } from './txnDisplay';
+import { formatTransactionSource, getDisplayDescription } from './txnDisplay';
 
 function equal(actual: unknown, expected: unknown, message: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -39,6 +39,34 @@ equal(
   'user overwrite should replace the combined bank description',
 );
 
+equal(
+  formatTransactionSource('富邦銀行', {
+    kind: 'billed',
+    accountNo: null,
+    accountOrCard: '900051******7021',
+  }),
+  '富邦銀行 - 7021',
+  'credit-card source should combine the bank and bare card last four digits',
+);
+equal(
+  formatTransactionSource('中國信託', {
+    kind: 'twd',
+    accountNo: ' 1234567890123456 ',
+    accountOrCard: '****3456',
+  }),
+  '中國信託 - 1234567890123456',
+  'deposit-account source should display the complete canonical account number',
+);
+equal(
+  formatTransactionSource('富邦銀行', {
+    kind: 'pending',
+    accountNo: null,
+    accountOrCard: null,
+  }),
+  '富邦銀行',
+  'transaction source should keep the bank-only fallback when no account or card is available',
+);
+
 const modalPath = 'src/components/transactions/TxnDetailModal.tsx';
 const modalSource = ts.sys.readFile(modalPath);
 if (!modalSource) throw new Error(`cannot read ${modalPath}`);
@@ -47,6 +75,9 @@ const rawDescriptionBinding = `const [rawDisplayDescription] = getDisplayDescrip
     description_overwrite: null,
   });`;
 function assertModalDescriptionContract(source: string): void {
+  if (!source.includes('formatTransactionSource(\n                    BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank,\n                    {\n                      kind: txn.kind,\n                      accountNo: txn.account_no,\n                      accountOrCard: txn.account_or_card,\n                    },\n                  )')) {
+    throw new Error('transaction detail subtitle does not combine bank with account/card source');
+  }
   if (source.includes('<DetailRow label="備註"')) {
     throw new Error('bank memo must not render as a separate detail row');
   }

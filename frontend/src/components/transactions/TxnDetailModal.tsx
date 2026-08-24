@@ -33,7 +33,7 @@ import {
   renderAmount,
 } from '@/lib/currency';
 import { maskCardNo } from '@/lib/mask';
-import { SCOPE_LABEL, getDisplayDescription } from '@/lib/txnDisplay';
+import { SCOPE_LABEL, formatTransactionSource, getDisplayDescription } from '@/lib/txnDisplay';
 import {
   type CardDateBasis,
   type SupportedBank,
@@ -368,7 +368,14 @@ export function TxnDetailModal({
               ) : null}
               <View className="flex-row items-center gap-2 flex-wrap">
                 <Text className="text-ink-500 dark:text-ink-400 text-small">
-                  {BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank}
+                  {formatTransactionSource(
+                    BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank,
+                    {
+                      kind: txn.kind,
+                      accountNo: txn.account_no,
+                      accountOrCard: txn.account_or_card,
+                    },
+                  )}
                 </Text>
                 <Text className="text-ink-300 dark:text-ink-600">·</Text>
                 <Text className="text-ink-500 dark:text-ink-400 text-small">

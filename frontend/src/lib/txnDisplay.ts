@@ -6,6 +6,30 @@
  * cross-importing the screen module.
  */
 
+import { maskCardNo } from './mask';
+
+/**
+ * 交易明細來源副標：銀行名稱 + 帳號／卡號。
+ * 存款帳戶顯示完整 canonical `account_no`；信用卡直接顯示末四碼（不加遮罩符號）。
+ * 缺少來源號碼時保留既有銀行名稱，避免顯示多餘分隔符。
+ */
+export function formatTransactionSource(
+  bankLabel: string,
+  source: {
+    kind: 'twd' | 'billed' | 'pending';
+    accountNo: string | null | undefined;
+    accountOrCard: string | null | undefined;
+  },
+): string {
+  const accountNo = source.kind === 'twd' ? source.accountNo?.trim() : null;
+  if (accountNo) return `${bankLabel} - ${accountNo}`;
+
+  const masked = maskCardNo(source.accountOrCard);
+  if (masked === '—') return bankLabel;
+  const cardLastFour = masked.startsWith('****') ? masked.slice(4) : masked;
+  return `${bankLabel} - ${cardLastFour}`;
+}
+
 /**
  * Phase 7.5 (2026-06-15 使用者指示): MoneyBook-style row 左欄日期堆疊.
  * 把 "2026-06-12" 拆成 { month: "6月", day: "12" } 兩段顯示.
