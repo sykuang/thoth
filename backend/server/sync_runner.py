@@ -70,6 +70,7 @@ def run_sync_job_for_account(
     headless: bool = True,
     *,
     batch_id: int | None = None,
+    force_full_history: bool = False,
 ) -> int:
     """[L5-1] INSERT queued → 開 daemon thread, 走 account_id 路徑。
 
@@ -87,9 +88,16 @@ def run_sync_job_for_account(
         raise ValueError(f"account_id {account_id} not found")
     if acct.bank not in SUPPORTED_BANKS:
         raise ValueError(f"unknown bank: {acct.bank!r}; supported: {sorted(SUPPORTED_BANKS)}")
+    history_mode = (
+        "full"
+        if acct.bank == "scsb" and (
+            force_full_history or not sync_jobs_repo.has_completed_for_account(account_id)
+        )
+        else "incremental"
+    )
     job_id = sync_jobs_repo.queue(
         user_id=acct.user_id, bank=acct.bank, account_id=account_id,
-        batch_id=batch_id,
+        batch_id=batch_id, history_mode=history_mode,
     )
 
     t = threading.Thread(target=_exec_sync, args=(job_id,), daemon=True)
@@ -127,6 +135,7 @@ def _exec_sync(job_id: int) -> None:
     bank = job["bank"]
     account_id = job.get("account_id")  # L5-1: 新欄, 老 job 為 None
     batch_id = job.get("batch_id")  # 2026-06-23: batch 內 job → skip 個別 sync_done
+    history_mode = job.get("history_mode") or "incremental"
 
     # L14 (2026-06-23 使用者指示): sync 前 snapshot 該 user 全部 cards 的
     # (bill_due_amount, last_payment_date) — sync 後 diff 偵測「新帳單」/「新繳款」
@@ -147,11 +156,15 @@ def _exec_sync(job_id: int) -> None:
     # （常見是永豐 sinopac）誤判為 stuck >15min 而 failed。單獨 sync 不會排隊，所以不踩。
     old_user_id = os.environ.get("BANK_CRAWLER_USER_ID")
     old_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
+    old_history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
     summary: dict | None = None
     error: str | None = None
     try:
         with _dispatch_lock:
             sync_jobs_repo.mark_running(job_id)
+            if history_mode not in {"full", "incremental"}:
+                raise ValueError(f"invalid history_mode: {history_mode!r}")
+            os.environ["BANK_CRAWLER_HISTORY_MODE"] = history_mode
             if account_id is not None:
                 # L5-1 新路徑: 走 from_account, v2 表
                 os.environ["BANK_CRAWLER_ACCOUNT_ID"] = str(account_id)
@@ -173,6 +186,10 @@ def _exec_sync(job_id: int) -> None:
                     os.environ.pop("BANK_CRAWLER_ACCOUNT_ID", None)
                 else:
                     os.environ["BANK_CRAWLER_ACCOUNT_ID"] = old_account_id
+                if old_history_mode is None:
+                    os.environ.pop("BANK_CRAWLER_HISTORY_MODE", None)
+                else:
+                    os.environ["BANK_CRAWLER_HISTORY_MODE"] = old_history_mode
     except Exception as e:
         error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 

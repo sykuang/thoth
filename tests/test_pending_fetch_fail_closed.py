@@ -157,7 +157,12 @@ def test_scsb_second_scope_failure_rolls_back_first_scope(store, monkeypatch):
 
     monkeypatch.setattr(store, "refresh_card_pending", fail_current)
     with pytest.raises(RuntimeError, match="current refresh failed"):
-        persist_scsb({"card_inquiry": {"leaves": {
+        persist_scsb({
+            "accounts": [{
+                "account_no": "90000000111111", "currency": "TWD",
+                "balance": "9", "type_header": "活儲存款",
+            }],
+            "card_inquiry": {"leaves": {
             "unbilled": {
                 "nav": {"ok": True},
                 "text": "You currently have no new transactions",
@@ -167,8 +172,9 @@ def test_scsb_second_scope_failure_rolls_back_first_scope(store, monkeypatch):
                 "text": "No real-time transaction records",
             },
         }}}, store, rules=[])
-    store.conn.rollback()
     _assert_kept(store)
+    row = store.conn.execute("SELECT COUNT(*) FROM accounts").fetchone()
+    assert row is not None and row[0] == 0
 
 
 def test_scsb_wrong_page_never_clears_current(store):

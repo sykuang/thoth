@@ -26,12 +26,14 @@ class CardBillWriteBarrier:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
-    def upsert_cards(self, rows: list[dict[str, Any]]) -> Any:
+    def upsert_cards(
+        self, rows: list[dict[str, Any]], commit: bool = True,
+    ) -> Any:
         sanitized = [
             {key: value for key, value in row.items() if key not in _CANONICAL_BILL_COLUMNS}
             for row in rows
         ]
-        return self._store.upsert_cards(sanitized)
+        return self._store.upsert_cards(sanitized, commit=commit)
 
 
 def _money(value: Any) -> float | None:

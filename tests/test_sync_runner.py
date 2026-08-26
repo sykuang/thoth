@@ -64,6 +64,25 @@ def test_run_sync_job_creates_queued_row(isolated, monkeypatch):
     assert row["status"] == "queued"
 
 
+def test_account_sync_uses_full_history_once_then_incremental(isolated, monkeypatch):
+    import backend.server.sync_runner as sr
+    from backend.server import sync_jobs_repo
+    from backend.server.creds_store import AccountsRepo
+
+    monkeypatch.setattr(sr, "_exec_sync", lambda job_id: None)
+    account = AccountsRepo().create(1, "scsb", "主帳")
+
+    first_id = sr.run_sync_job_for_account(account.id)
+    assert sr.get_job(first_id)["history_mode"] == "full"
+
+    sync_jobs_repo.mark_done(first_id, "{}")
+    update_id = sr.run_sync_job_for_account(account.id)
+    assert sr.get_job(update_id)["history_mode"] == "incremental"
+
+    forced_id = sr.run_sync_job_for_account(account.id, force_full_history=True)
+    assert sr.get_job(forced_id)["history_mode"] == "full"
+
+
 def test_sync_runner_updates_status_done_on_success(isolated, monkeypatch):
     """假 crawler 成功跑完 → 清 Dashboard cache，再標 done。"""
     import backend.server.sync_runner as sr

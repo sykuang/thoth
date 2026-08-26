@@ -44,6 +44,10 @@ param serverFernetKey string
 @secure()
 param serverApiKey string
 
+@description('Separate API key for privileged admin-only operations.')
+@secure()
+param adminApiKey string
+
 @description('PostgreSQL admin password. Generate: openssl rand -hex 24')
 @secure()
 param pgAdminPassword string
@@ -416,6 +420,20 @@ resource kvSecretApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
+resource kvSecretAdminApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: kv
+  name: 'admin-api-key'
+  properties: {
+    value: adminApiKey
+    attributes: {
+      enabled: true
+    }
+  }
+  dependsOn: [
+    deployerSecretsOfficer
+  ]
+}
+
 resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: kv
   name: 'database-url-vnet-v2'
@@ -537,6 +555,11 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           identity: mi.id
         }
         {
+          name: 'admin-api-key'
+          keyVaultUrl: kvSecretAdminApiKey.properties.secretUri
+          identity: mi.id
+        }
+        {
           name: 'database-url-vnet-v2'
           keyVaultUrl: kvSecretDatabaseUrl.properties.secretUri
           identity: mi.id
@@ -567,6 +590,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'JWT_SECRET', secretRef: 'jwt-secret' }
             { name: 'SERVER_FERNET_KEY', secretRef: 'fernet-key-v2' }
             { name: 'SERVER_API_KEY', secretRef: 'api-key' }
+            { name: 'ADMIN_API_KEY', secretRef: 'admin-api-key' }
             { name: 'DB_BACKEND', value: 'postgres' }
             // Production frontend registers Expo push tokens by default. Keep
             // backend provider aligned; otherwise scheduler/payment reminders

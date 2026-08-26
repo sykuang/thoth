@@ -21,7 +21,7 @@ from backend.server.db import get_conn, now_iso
 
 _COLS = (
     "id, user_id, bank, account_id, status, created_at, started_at, "
-    "finished_at, error_msg, result_summary, batch_id"
+    "finished_at, error_msg, result_summary, batch_id, history_mode"
 )
 
 # 任何 sync 跑超過這時間都算 stale (sync 最慢 10 分鐘左右 — cathay/ctbc anti-bot 完整流程).
@@ -42,6 +42,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         "error_msg": row[8],
         "result_summary": row[9],
         "batch_id": row[10],
+        "history_mode": row[11],
     }
 
 
@@ -51,20 +52,23 @@ def queue(
     bank: str,
     account_id: int | None = None,
     batch_id: int | None = None,
+    history_mode: str = "incremental",
 ) -> int:
     """INSERT queued row, return new id.
 
     `batch_id` 為非 None 時, 收尾邏輯會走 batch summary 路徑
     (sync_runner._maybe_send_batch_summary), skip 個別 sync_done push.
     """
+    if history_mode not in {"full", "incremental"}:
+        raise ValueError(f"invalid history_mode: {history_mode!r}")
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO sync_jobs
-                (user_id, bank, account_id, status, created_at, batch_id)
-            VALUES (?, ?, ?, 'queued', ?, ?) RETURNING id
+                (user_id, bank, account_id, status, created_at, batch_id, history_mode)
+            VALUES (?, ?, ?, 'queued', ?, ?, ?) RETURNING id
             """,
-            (user_id, bank, account_id, now_iso(), batch_id),
+            (user_id, bank, account_id, now_iso(), batch_id, history_mode),
         )
         row = cur.fetchone()
     if row is None:
@@ -92,6 +96,17 @@ def list_recent_for_user(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
             (user_id, limit),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def has_completed_for_account(account_id: int) -> bool:
+    """A failed/aborted first sync does not turn later retries into incremental syncs."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sync_jobs "
+            "WHERE account_id=? AND status='done' LIMIT 1",
+            (account_id,),
+        ).fetchone()
+    return row is not None
 
 
 def sweep_stale_running() -> int:

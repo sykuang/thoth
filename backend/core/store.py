@@ -24,6 +24,7 @@ import re
 import sqlite3  # only allowed here + bank_pg.py + server/db.py (the 3 db layer files)
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import datetime, UTC
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
@@ -812,7 +813,8 @@ class BankStore:
         return out
 
     # ---- 1. 台幣已過帳交易：append-only ----
-    def upsert_twd_txns(self, txns: list[dict], rules: list[dict] | None = None) -> int:
+    def upsert_twd_txns(self, txns: list[dict], rules: list[dict] | None = None,
+                        commit: bool = True) -> int:
         """寫入台幣交易。若 `rules` 提供，每筆 desc 跑 categorize → 寫 category + subcategory + auto_excluded 欄。"""
         from backend.server.categorizer import categorize_with_excluded  # 延遲 import 避免 cli 依賴
         before = self.conn.total_changes
@@ -848,7 +850,8 @@ class BankStore:
                  now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
                  1 if _is_subscription(sub) else 0),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.conn.total_changes - before
 
     # ---- 2. 信用卡已出帳明細：append-only ----
@@ -1333,6 +1336,23 @@ class BankStore:
                     counter[raw_key] = max(counter[raw_key], occurrence_count)
         return adopted_identities, False
 
+    @contextmanager
+    def savepoint(self, name: str):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("invalid savepoint name")
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except Exception:
+            self.conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            self.conn.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+        else:
+            self.conn.execute(f"RELEASE SAVEPOINT {name}")
+
+    def commit(self) -> None:
+        self.conn.commit()
+
     def refresh_card_pending(self, scope: str, txns: list[dict],
                              rules: list[dict] | None = None,
                              fetch_ok: bool | None = None,
@@ -1529,7 +1549,7 @@ class BankStore:
         return int(row["n"] if row else 0)
 
     # ---- 4. 餘額走勢：同日 UPSERT ----
-    def upsert_balance_history(self, rows: list[dict]) -> int:
+    def upsert_balance_history(self, rows: list[dict], commit: bool = True) -> int:
         before = self.conn.total_changes
         now = _now()
         for r in rows:
@@ -1548,11 +1568,12 @@ class BankStore:
                 (self.user_id, r.get("snapshotDate"), r.get("twdBalance"), r.get("fxBalance"),
                  loan_balance, now),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.conn.total_changes - before
 
     # ---- 5. 帳戶狀態：UPSERT ----
-    def upsert_accounts(self, accts: list[dict]) -> int:
+    def upsert_accounts(self, accts: list[dict], commit: bool = True) -> int:
         """Upsert accounts。
 
         新增欄位（使用者鐵律：所有爬蟲都該抓帳號級餘額）：
@@ -1586,7 +1607,8 @@ class BankStore:
                  raw_balance, a.get("raw_balance_date"),
                  now),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return len(accts)
 
     # ---- 6. 卡片狀態：UPSERT ----
@@ -1602,7 +1624,7 @@ class BankStore:
             )
         ]
 
-    def upsert_cards(self, cards: list[dict]) -> int:
+    def upsert_cards(self, cards: list[dict], commit: bool = True) -> int:
         """Step 2 (2026-06-14): 接 credit_limit / used_credit /
         statement_close_date / payment_due_date 四欄 (各家 collector 分階段補).
         2026-06-14 (active): 接 active 欄 (DBS isDisplayImg=False → 0).
@@ -1656,7 +1678,8 @@ class BankStore:
                  now,
                  active_update_marker, active_update_marker),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return len(cards)
 
     def update_card_bill_facts(self, facts: list[dict]) -> int:
@@ -1744,12 +1767,34 @@ class BankStore:
         if commit:
             self.conn.commit()
 
-    def log_sync(self, summary: dict) -> None:
+    def delete_daily_metrics(self, categories: list[str], commit: bool = True) -> int:
+        if not categories:
+            return 0
+        placeholders = ",".join("?" for _ in categories)
+        deleted = self.conn.execute(
+            f"DELETE FROM daily_metrics WHERE user_id = ? AND category IN ({placeholders})",
+            (self.user_id, *categories),
+        ).rowcount
+        if commit:
+            self.conn.commit()
+        return deleted
+
+    def clear_sync_log(self, commit: bool = True) -> int:
+        deleted = self.conn.execute(
+            "DELETE FROM sync_log WHERE user_id = ?",
+            (self.user_id,),
+        ).rowcount
+        if commit:
+            self.conn.commit()
+        return deleted
+
+    def log_sync(self, summary: dict, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO sync_log (user_id, synced_at, summary) VALUES (?,?,?)",
             (self.user_id, _now(), json.dumps(summary, ensure_ascii=False)),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     # ---- 查詢 ----
     def stats(self) -> dict:

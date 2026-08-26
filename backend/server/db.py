@@ -175,7 +175,8 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
     finished_at    TEXT,
     error_msg      TEXT,
     result_summary TEXT,
-    batch_id       INTEGER
+    batch_id       INTEGER,
+    history_mode   TEXT NOT NULL DEFAULT 'incremental'
 );
 -- ix_sync_jobs_batch: 移到 _ensure_schema ALTER 補欄位之後建,
 -- 避免老 sqlite (sync_jobs 已存在但沒 batch_id 欄) 跑 CREATE INDEX 炸 "no such column"
@@ -670,6 +671,11 @@ def _ensure_schema(conn: Any) -> None:
     # 2026-06-23: 老 sync_jobs 表缺 batch_id 欄位 → 補上 (老 row 為 NULL, 走 legacy 單則 push)
     if "batch_id" not in cols:
         conn.execute("ALTER TABLE sync_jobs ADD COLUMN batch_id INTEGER")
+    if "history_mode" not in cols:
+        conn.execute(
+            "ALTER TABLE sync_jobs ADD COLUMN history_mode "
+            "TEXT NOT NULL DEFAULT 'incremental'",
+        )
     # batch_id 欄位確定存在後才能建 index (老 sqlite 沒 batch_id 直接 CREATE INDEX 會炸)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS ix_sync_jobs_batch ON sync_jobs(batch_id)",

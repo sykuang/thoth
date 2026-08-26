@@ -75,20 +75,94 @@ def test_post_sync_account_unknown_id_404(client):
     assert r.status_code == 404
 
 
+def test_admin_can_force_full_history_for_existing_account(client, monkeypatch):
+    token = _register(client, "admin-full-history@palace.example")
+    created = client.post(
+        "/accounts", json={"bank": "scsb", "label": "主帳"}, headers=_auth(token),
+    )
+    account_id = created.json()["id"]
+
+    disabled = client.post(f"/sync/admin/account/{account_id}/full-history")
+    assert disabled.status_code == 503
+
+    seen: dict[str, object] = {}
+
+    def _fake_run(account_id: int, headless: bool = True, *, force_full_history: bool = False):
+        seen.update(
+            account_id=account_id,
+            headless=headless,
+            force_full_history=force_full_history,
+        )
+        return 321
+
+    import backend.server.routers.sync as sync_routes
+    monkeypatch.setattr(sync_routes, "run_sync_job_for_account", _fake_run)
+    monkeypatch.setenv("SERVER_API_KEY", "same-key-is-not-admin-separation")
+    monkeypatch.setenv("ADMIN_API_KEY", "same-key-is-not-admin-separation")
+    misconfigured = client.post(
+        f"/sync/admin/account/{account_id}/full-history",
+        headers={
+            "X-API-Key": "same-key-is-not-admin-separation",
+            "X-Admin-Key": "same-key-is-not-admin-separation",
+        },
+    )
+    assert misconfigured.status_code == 503
+
+    monkeypatch.setenv("SERVER_API_KEY", "client-test-key")
+    monkeypatch.setenv("ADMIN_API_KEY", "admin-test-key")
+
+    denied = client.post(
+        f"/sync/admin/account/{account_id}/full-history",
+        headers={"X-API-Key": "client-test-key"},
+    )
+    assert denied.status_code == 401
+
+    response = client.post(
+        f"/sync/admin/account/{account_id}/full-history",
+        headers={
+            "X-API-Key": "client-test-key",
+            "X-Admin-Key": "admin-test-key",
+        },
+    )
+    assert response.status_code == 202
+    assert response.json()["history_mode"] == "full"
+    assert seen == {
+        "account_id": account_id,
+        "headless": True,
+        "force_full_history": True,
+    }
+
+
+def test_admin_full_history_rejects_bank_without_full_history_support(client, monkeypatch):
+    token = _register(client, "admin-unsupported-history@palace.example")
+    created = client.post(
+        "/accounts", json={"bank": "ctbc", "label": "主帳"}, headers=_auth(token),
+    )
+    monkeypatch.setenv("ADMIN_API_KEY", "admin-test-key")
+
+    response = client.post(
+        f"/sync/admin/account/{created.json()['id']}/full-history",
+        headers={"X-Admin-Key": "admin-test-key"},
+    )
+
+    assert response.status_code == 400
+
+
 def test_sync_account_sets_account_id_env_in_dispatch(client, monkeypatch):
-    """確認 daemon thread 內 dispatch 時 BANK_CRAWLER_ACCOUNT_ID 有被設。"""
+    """確認 daemon thread 內 dispatch 時 account、user、history mode 都有設定。"""
     seen_env: dict[str, str | None] = {}
 
     def _fake_dispatch(bank: str, user_id: int, headless: bool):
         seen_env["account_id"] = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
         seen_env["user_id"] = os.environ.get("BANK_CRAWLER_USER_ID")
+        seen_env["history_mode"] = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
         return {"delta": {}, "stats": {}}
 
     import backend.server.sync_runner as sr
     monkeypatch.setattr(sr, "_dispatch_crawler_and_persist", _fake_dispatch)
     token = _register(client)
 
-    r = client.post("/accounts", json={"bank": "ctbc", "label": "x"}, headers=_auth(token))
+    r = client.post("/accounts", json={"bank": "scsb", "label": "x"}, headers=_auth(token))
     aid = r.json()["id"]
     r = client.post(f"/sync/account/{aid}", json={}, headers=_auth(token))
     job_id = r.json()["job_id"]
@@ -96,6 +170,11 @@ def test_sync_account_sets_account_id_env_in_dispatch(client, monkeypatch):
 
     assert seen_env["account_id"] == str(aid)
     assert seen_env["user_id"] is not None  # 兩個都該被設
+    assert seen_env["history_mode"] == "full"
+
+    second = client.post(f"/sync/account/{aid}", json={}, headers=_auth(token))
+    _wait_job_done(client, second.json()["job_id"], token)
+    assert seen_env["history_mode"] == "incremental"
 
 
 def test_legacy_sync_bank_route_does_not_set_account_id_env(client, monkeypatch):

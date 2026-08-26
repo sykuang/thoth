@@ -19,12 +19,15 @@ collect 走「DOM innerText regex」務實路線，不解密 API。
 from __future__ import annotations
 
 import base64
-import contextlib
+import json
+import os
 import re
 import sys
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -77,11 +80,7 @@ def _log(*a):
 
 def _safe_select_inventory(selects: list[dict]) -> list[dict]:
     return [
-        {
-            "id": item.get("id"),
-            "name": item.get("name"),
-            "option_count": len(item.get("options") or []),
-        }
+        {"option_count": len(item.get("options") or [])}
         for item in selects
     ]
 
@@ -96,7 +95,30 @@ class ScsbCrawler(BankCrawler):
 
     def __init__(self):
         super().__init__(name="scsb")
+        self._cleanup_private_artifacts()
+        history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if history_mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {history_mode!r}")
+        self.full_history = history_mode == "full"
         self.creds = ScsbCreds.load()
+
+    @staticmethod
+    def _cleanup_private_artifacts() -> None:
+        from backend.core.store import _data_root
+
+        debug_dir = _data_root() / "scsb_collect"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (Path(__file__).resolve().parents[1] / "data" / "scsb_collected.json").unlink(
+            missing_ok=True,
+        )
+        for legacy_name in (
+            "overview.png", "card.png", "twd.png", "twd_inquiry.png",
+            "twd_inquiry_form.png", "twd_inquiry_results.png",
+            "card_inq_unbilled.png", "card_inq_unbilled_results.png",
+            "card_inq_current.png", "card_inq_current_results.png",
+            "card_inq_statement.png", "card_inq_statement_results.png",
+        ):
+            (debug_dir / legacy_name).unlink(missing_ok=True)
 
     def _host_filter(self) -> str:
         return "scsb.com"
@@ -433,12 +455,6 @@ class ScsbCrawler(BankCrawler):
         page.evaluate(JS_KILL_MODAL)
         page.wait_for_timeout(2000)
 
-        # W (2026-06-17): 走 BANK_DATA_ROOT env，避免 hardcode home path
-        # — cloud container 沒 ~/src/thoth，會 FileNotFoundError。
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "scsb_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
         # SCSB SPA 菜單是 Vue/React，DOM e.click() 不觸發 vnode handler，
         # 必須用 Playwright 原生 page.click（送真實 mouse event）。
         #
@@ -497,32 +513,8 @@ class ScsbCrawler(BankCrawler):
                 return False
 
         # 1. My Overview / 我的總覽 — accordion 點開 = navigate
-        # 2026-06-18 evidence dump: 先 inventory menu DOM 給 telemetry — 不論成功與否
-        try:
-            menu_audit = page.evaluate(
-                "(() => { "
-                "const out=[]; "
-                "for (const tag of ['button','a','div','span','li']) {"
-                "  for (const e of document.querySelectorAll(tag)) {"
-                "    if (e.offsetParent === null) continue;"
-                "    const t=(e.textContent||'').trim();"
-                "    if (t.length===0 || t.length>40) continue;"
-                "    if (/Overview|Deposit|Credit|Card|Loan|Investment|存款|信用卡|貸款|投資|總覽|餘額|轉帳/i.test(t)) {"
-                "      out.push({tag, text:t, cls:(e.className||'').slice(0,60)});"
-                "      if (out.length >= 40) return out;"
-                "    }"
-                "  }"
-                "}"
-                "return out;"
-                "})()",
-            ) or []
-            out["menu_dom_audit"] = menu_audit[:40]
-            _log(f"[collect] menu DOM audit: {len(menu_audit)} matching elements")
-        except Exception as e:
-            out["menu_dom_audit"] = []
-            _log(f"[collect] menu DOM audit fail: {type(e).__name__}")
-
-        _navigate("My Overview", wait_ms=10000)
+        if not _navigate("My Overview", wait_ms=10000):
+            raise RuntimeError("overview-navigation-failed")
         # SCSB My Overview 預設眼睛 icon 隱藏餘額，需點開
         try:
             page.evaluate(
@@ -534,46 +526,60 @@ class ScsbCrawler(BankCrawler):
             page.wait_for_timeout(3000)
         except Exception:
             pass
-        out["overview_url"] = page.url
         try:
             out["overview_text"] = (page.evaluate("document.body.innerText") or "")
         except Exception:
             out["overview_text"] = ""
         _log(f"  overview text len={len(out['overview_text'])}")
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "overview.png"), full_page=True)
+        overview_twd_inventory = self._extract_overview_twd_inventory(out["overview_text"])
+        expected_twd_accounts = {
+            account["account_no"] for account in overview_twd_inventory
+        }
+        overview_inventory_authoritative = self._overview_twd_inventory_authoritative(
+            out["overview_text"],
+        )
+        if not expected_twd_accounts and not overview_inventory_authoritative:
+            raise RuntimeError("overview-twd-inventory-unavailable")
 
         # 2. TWD Deposit / 台幣存款 — 我的總覽 accordion 下 leaf
-        _navigate("TWD Deposit", wait_ms=8000)
-        out["twd_url"] = page.url
-        try:
-            out["twd_text"] = (page.evaluate("document.body.innerText") or "")
-            page.screenshot(path=str(debug_dir / "twd.png"), full_page=True)
-        except Exception:
-            out["twd_text"] = ""
+        if expected_twd_accounts:
+            if not _navigate("TWD Deposit", wait_ms=8000):
+                raise RuntimeError("twd-navigation-failed")
+            try:
+                out["twd_text"] = (page.evaluate("document.body.innerText") or "")
+            except Exception:
+                out["twd_text"] = ""
 
-        # 2b. TWD Deposit → Account Balance and Account Statement (深入點 leaf)
-        out["twd_inquiry"] = self._collect_twd_inquiry(page, debug_dir)
+            # 2b. TWD Deposit → Account Balance and Account Statement (深入點 leaf)
+            out["twd_inquiry"] = self._collect_twd_inquiry(
+                page, expected_twd_accounts)
+        else:
+            out["twd_text"] = ""
+            out["twd_inquiry"] = {"accounts": [], "records": []}
 
         # 3. Credit Card / 信用卡 — accordion 本身 = navigate
-        _navigate("Credit Card", wait_ms=8000)
-        out["card_url"] = page.url
+        if not _navigate("Credit Card", wait_ms=8000):
+            raise RuntimeError("card-navigation-failed")
         try:
             out["card_text"] = (page.evaluate("document.body.innerText") or "")
-            page.screenshot(path=str(debug_dir / "card.png"), full_page=True)
         except Exception:
             out["card_text"] = ""
 
         # 3b. Credit Card → Account Management → 信用卡明細 leaf (設計規範：每家都要抓信用卡明細)
-        out["card_inquiry"] = self._collect_credit_card_inquiry(page, debug_dir)
+        out["card_inquiry"] = self._collect_credit_card_inquiry(page)
 
         # 從各頁 innerText regex 抽帳號/餘額/卡號
         all_text = "\n".join([out.get("overview_text", ""), out.get("twd_text", ""), out.get("card_text", "")])
         out["accounts"] = self._extract_accounts(all_text)
+        parsed_account_numbers = {account["account_no"] for account in out["accounts"]}
+        out["accounts"].extend(
+            account for account in overview_twd_inventory
+            if account["account_no"] not in parsed_account_numbers
+        )
         out["totals"] = self._extract_totals(all_text)
+        for raw_text_key in ("overview_text", "twd_text", "card_text"):
+            out.pop(raw_text_key, None)
 
-        out["_final_url"] = page.url
-        out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         publish_card_bill_facts(out, [])
         return BankCollectResult(**out)
 
@@ -630,6 +636,52 @@ class ScsbCrawler(BankCrawler):
         return accounts
 
     @staticmethod
+    def _extract_overview_twd_inventory(text: str) -> list[dict]:
+        """Extract TWD deposit identities without requiring a readable balance."""
+        headers = re.compile(
+            r"活儲存款|活期儲蓄存款|活期儲蓄|活期存款|定期儲蓄存款|"
+            r"定期儲蓄|定期存款|綜合存款|支票存款|支存|Checking|"
+            r"TWD Deposit|臺幣存款|台幣存款|貸款|Loan",
+            re.I,
+        )
+        inventory = []
+        seen = set()
+        for account in re.finditer(r"(?<!\d)(\d{14})(?!\d)", text):
+            candidates = list(headers.finditer(text[max(0, account.start() - 180):account.start()]))
+            if not candidates:
+                continue
+            type_header = candidates[-1].group()
+            account_no = account.group(1)
+            if re.search(r"貸款|Loan", type_header, re.I) or account_no in seen:
+                continue
+            suffix = text[account.end():account.end() + 120]
+            currency = re.search(r"NT\$|USD|JPY|EUR|HKD|GBP|AUD|CNY", suffix)
+            if currency and currency.group() != "NT$":
+                continue
+            seen.add(account_no)
+            inventory.append({
+                "account_no": account_no,
+                "currency": "TWD",
+                "balance": None,
+                "type_header": type_header,
+            })
+        return inventory
+
+    @staticmethod
+    def _overview_twd_inventory_authoritative(text: str) -> bool:
+        """An overview heading alone may be a partially rendered page, not a true empty set."""
+        has_summary = bool(re.search(
+            r"我的帳戶摘要|所有帳戶查詢|Account Summary|All Accounts",
+            text, re.I,
+        ))
+        explicit_empty = bool(re.search(
+            r"(?:目前沒有|目前尚無|尚無|查無|沒有|無)(?:任何)?(?:台幣|臺幣|TWD)?(?:存款)?帳戶|"
+            r"(?:no|do not have any|currently have no)\s+(?:TWD\s+|deposit\s+)?accounts?",
+            text, re.I,
+        ))
+        return has_summary and explicit_empty
+
+    @staticmethod
     def _extract_totals(text: str) -> dict:
         """抽總額類數字（台幣總餘額、外幣總值等）。"""
         totals = {}
@@ -680,192 +732,734 @@ class ScsbCrawler(BankCrawler):
                 }, 1500));
             }"""
 
-    def _collect_twd_inquiry(self, page, debug_dir) -> dict:
-        """點 TWD Deposit → TWD Account Inquiry → Account Balance and Account Statement (leaf)。
+    @staticmethod
+    def _twd_inquiry_period_script(*, full_history: bool = True) -> str:
+        """JS: 新帳號/強制回補查全量；既有帳號只查最近一個曆月。"""
+        script = r"""() => {
+            const fullHistory = __FULL_HISTORY__;
+            const visible = (el) => el && el.offsetParent !== null;
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const inputs = [...document.querySelectorAll('input')].filter(visible);
+            const ownContext = (el) => norm([
+                el.id, el.name, el.placeholder, el.getAttribute('aria-label'),
+                ...(el.labels ? [...el.labels].map(label => label.textContent) : []),
+            ].filter(Boolean).join(' '));
+            const custom = inputs.find(el =>
+                el.type === 'radio' && /(^|\s)(自訂|Custom)(\s|$)/i.test(
+                    norm(`${ownContext(el)} ${el.parentElement?.innerText || ''}`)
+                )
+            );
+            const dateInputs = inputs.filter(el => ['date', 'text'].includes(el.type));
+            let startInput = dateInputs.find(el => /(查詢起日|起日|start)/i.test(ownContext(el)));
+            let endInput = dateInputs.find(el => /(查詢迄日|迄日|end)/i.test(ownContext(el)));
+            if ((!startInput || !endInput) && dateInputs.length === 2) {
+                [startInput, endInput] = dateInputs;
+            }
+            if (!custom || !startInput || !endInput || startInput === endInput) {
+                return {ok: false, error: 'custom-period-controls-missing'};
+            }
 
-        SCSB SPA 三層 accordion 結構：
-          Level 1: TWD Deposit (accordion-button)
-          Level 2: TWD Account Inquiry (accordion-button, nested in Level 1)
-          Level 3 (leaf): Account Balance and Account Statement (accordion-button, nested in Level 2)
-        三層都是 button.accordion-button——leaf 點下去才會 SPA route 跳轉。
-        """
-        result: dict = {}
+            custom.click();
+            const parseDate = (value) => {
+                const match = String(value || '').match(/^(\d{4})[-/](\d{2})[-/](\d{2})$/);
+                if (!match) return null;
+                const [year, month, day] = match.slice(1).map(Number);
+                const date = new Date(year, month - 1, day);
+                return date.getFullYear() === year
+                    && date.getMonth() === month - 1
+                    && date.getDate() === day ? date : null;
+            };
+            const end = parseDate(endInput.value) || new Date();
+            const systemMin = parseDate(startInput.min);
+            let start;
+            let period;
+            if (fullHistory) {
+                start = systemMin;
+                period = 'system-limit';
+                if (!start) {
+                    const year = end.getFullYear() - 1;
+                    const day = Math.min(end.getDate(), new Date(year, end.getMonth() + 1, 0).getDate());
+                    start = new Date(year, end.getMonth(), day);
+                    period = 'one-year';
+                }
+            } else {
+                const year = end.getMonth() === 0 ? end.getFullYear() - 1 : end.getFullYear();
+                const month = (end.getMonth() + 11) % 12;
+                const day = Math.min(end.getDate(), new Date(year, month + 1, 0).getDate());
+                start = new Date(year, month, day);
+                if (systemMin && start < systemMin) start = systemMin;
+                period = 'one-month';
+            }
+            if (start > end) return {ok: false, error: 'invalid-period-limit'};
+
+            const format = (date, separator) => [
+                date.getFullYear(),
+                String(date.getMonth() + 1).padStart(2, '0'),
+                String(date.getDate()).padStart(2, '0'),
+            ].join(separator);
+            const setValue = (input, date) => {
+                const separator = input.type === 'date' ? '-' : '/';
+                const value = format(date, separator);
+                const setter = Object.getOwnPropertyDescriptor(
+                    Object.getPrototypeOf(input), 'value'
+                )?.set;
+                if (setter) setter.call(input, value); else input.value = value;
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+                input.blur();
+            };
+            custom.dataset.thothScsbTwdPeriod = 'custom';
+            startInput.dataset.thothScsbTwdPeriod = 'start';
+            endInput.dataset.thothScsbTwdPeriod = 'end';
+            setValue(startInput, start);
+            setValue(endInput, end);
+            const expectedStart = format(start, '/');
+            const expectedEnd = format(end, '/');
+            const actualStart = parseDate(startInput.value);
+            const actualEnd = parseDate(endInput.value);
+            return {
+                ok: custom.checked
+                    && !!actualStart && !!actualEnd
+                    && format(actualStart, '/') === expectedStart
+                    && format(actualEnd, '/') === expectedEnd,
+                period,
+                start: expectedStart,
+                end: expectedEnd,
+            };
+        }"""
+        return script.replace("__FULL_HISTORY__", "true" if full_history else "false")
+
+    @staticmethod
+    def _twd_inquiry_period_verification_script() -> str:
+        """JS: Vue/React state 更新後再次核對實際送出的日期。"""
+        return r"""(expected) => {
+            const normalize = (value) => String(value || '').replaceAll('-', '/');
+            const custom = document.querySelector('[data-thoth-scsb-twd-period="custom"]');
+            const start = document.querySelector('[data-thoth-scsb-twd-period="start"]');
+            const end = document.querySelector('[data-thoth-scsb-twd-period="end"]');
+            return {
+                ok: !!custom?.checked
+                    && normalize(start?.value) === expected.start
+                    && normalize(end?.value) === expected.end,
+            };
+        }"""
+
+    @staticmethod
+    def _twd_inquiry_prepare_result_wait_script() -> str:
+        """JS: 清除 binding，並記住同條件舊結果以拒絕 stale same-query DOM。"""
+        return r"""(expected) => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const normalize = (value) => String(value || '').replace(/[-.]/g, '/');
+            const exactToken = (text, value) => {
+                const escaped = normalize(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp(`(^|\\D)${escaped}(?=$|\\D)`).test(normalize(text));
+            };
+            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
+            window.__thothScsbTwdResultScope = null;
+            window.__thothScsbTwdOldScopeText = null;
+            window.__thothScsbTwdOldTables = new WeakMap();
+            for (const table of document.querySelectorAll('table')) {
+                if (visible(table) && tablePattern.test(table.innerText || '')) {
+                    window.__thothScsbTwdOldTables.set(table, table.innerText || '');
+                }
+            }
+            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
+            window.__thothScsbTwdOldEmpty = new WeakMap();
+            for (const empty of document.querySelectorAll('body *')) {
+                if (visible(empty) && emptyPattern.test(empty.innerText || '')
+                    && ![...empty.children].some(child => emptyPattern.test(child.innerText || ''))) {
+                    window.__thothScsbTwdOldEmpty.set(empty, empty.innerText || '');
+                }
+            }
+            for (const table of document.querySelectorAll('table')) {
+                if (!visible(table) || !tablePattern.test(table.innerText || '')) continue;
+                for (let scope = table.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                    const criteria = [...scope.querySelectorAll('*')].filter(el => {
+                        if (!visible(el) || [...el.children].some(visible)) return false;
+                        const own = el.textContent || '';
+                        return exactToken(own, expected.account_no)
+                            && exactToken(own, expected.start)
+                            && exactToken(own, expected.end);
+                    });
+                    if (criteria.length === 1) {
+                        window.__thothScsbTwdOldScopeText = scope.innerText || '';
+                        return;
+                    }
+                }
+            }
+            for (const empty of document.querySelectorAll('body *')) {
+                if (!visible(empty) || !emptyPattern.test(empty.innerText || '')
+                    || [...empty.children].some(child => emptyPattern.test(child.innerText || ''))) continue;
+                for (let scope = empty.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                    const criteria = [...scope.querySelectorAll('*')].filter(el => {
+                        if (!visible(el) || [...el.children].some(visible)) return false;
+                        const own = el.textContent || '';
+                        return exactToken(own, expected.account_no)
+                            && exactToken(own, expected.start)
+                            && exactToken(own, expected.end);
+                    });
+                    if (criteria.length === 1) {
+                        window.__thothScsbTwdOldScopeText = scope.innerText || '';
+                        return;
+                    }
+                }
+            }
+        }"""
+
+    @staticmethod
+    def _twd_inquiry_result_ready_script() -> str:
+        """JS: criteria 與本次新增/改變的結果必須位於同一個非 body 容器。"""
+        return r"""(expected) => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const normalize = (value) => String(value || '').replaceAll('-', '/');
+            const exactToken = (text, value) => {
+                const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp(`(^|\\D)${escaped}(?=$|\\D)`).test(text);
+            };
+            const criteriaNodes = (scope) => [...scope.querySelectorAll('*')].filter(el => {
+                const own = normalize(el.innerText);
+                return visible(el) && /查詢條件|Query Criteria/i.test(own)
+                    && exactToken(own, expected.start) && exactToken(own, expected.end)
+                    && exactToken(own, expected.account_no)
+                    && ![...el.children].some(child => /查詢條件|Query Criteria/i.test(child.innerText || ''));
+            });
+            const boundScope = (result) => {
+                for (let scope = result.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                    if (criteriaNodes(scope).length === 1) {
+                        const scopeText = scope.innerText || '';
+                        if (window.__thothScsbTwdOldScopeText !== null
+                            && scopeText === window.__thothScsbTwdOldScopeText) continue;
+                        return scope;
+                    }
+                }
+                return null;
+            };
+            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
+            const table = [...document.querySelectorAll('table')].find(el =>
+                visible(el)
+                && tablePattern.test(el.innerText || '')
+                && (!window.__thothScsbTwdOldTables.has(el)
+                    || window.__thothScsbTwdOldTables.get(el) !== (el.innerText || ''))
+                && boundScope(el)
+            );
+            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
+            const empty = [...document.querySelectorAll('body *')].find(el =>
+                visible(el)
+                && emptyPattern.test(el.innerText || '')
+                && ![...el.children].some(child => emptyPattern.test(child.innerText || ''))
+                && (!window.__thothScsbTwdOldEmpty.has(el)
+                    || window.__thothScsbTwdOldEmpty.get(el) !== (el.innerText || ''))
+                && boundScope(el)
+            );
+            const result = table || empty;
+            window.__thothScsbTwdResultScope = result ? boundScope(result) : null;
+            return !!result;
+        }"""
+
+    @staticmethod
+    def _twd_inquiry_extract_result_script() -> str:
+        """JS: 只回傳 readiness 已綁定之容器內的 transaction table／空結果。"""
+        return r"""(expected) => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const normalize = (value) => String(value || '').replaceAll('-', '/');
+            const exactToken = (text, value) => {
+                const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp(`(^|\\D)${escaped}(?=$|\\D)`).test(text);
+            };
+            const scope = window.__thothScsbTwdResultScope;
+            if (!visible(scope)) return {ok: false, empty: false, row_count: 0, text: ''};
+            const criteria = [...scope.querySelectorAll('*')].some(el => {
+                const own = normalize(el.innerText);
+                return visible(el)
+                    && /查詢條件|Query Criteria/i.test(own)
+                    && exactToken(own, expected.start)
+                    && exactToken(own, expected.end)
+                    && exactToken(own, expected.account_no)
+                    && ![...el.children].some(child => /查詢條件|Query Criteria/i.test(child.innerText || ''));
+            });
+            if (!criteria) return {ok: false, empty: false, row_count: 0, text: ''};
+            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
+            const table = [...scope.querySelectorAll('table')].find(el =>
+                visible(el) && tablePattern.test(el.innerText || '')
+            );
+            if (table) {
+                const rowCount = [...table.rows].filter(row => row.querySelectorAll('td').length).length;
+                return {ok: true, empty: false, row_count: rowCount, text: table.innerText || ''};
+            }
+            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
+            const empty = [...scope.querySelectorAll('*')].some(el =>
+                visible(el)
+                && emptyPattern.test(el.innerText || '')
+                && ![...el.children].some(child => emptyPattern.test(child.innerText || ''))
+            );
+            return {ok: empty, empty, row_count: 0, text: ''};
+        }"""
+
+    @staticmethod
+    def _is_twd_query_request(request, expected: dict) -> bool:
+        parsed = urlparse(request.url)
+        body = request.post_data or ""
+        fields: dict[str, list[str]] = {}
+        invalid_fields: set[str] = set()
+
+        def add_field(key, value):
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                fields.setdefault(str(key), []).append(str(value))
+            else:
+                invalid_fields.add(str(key))
+
         try:
-            # 用一段 JS 把三層都精確展開、最後 click leaf
-            # 2026-06-24: SCSB UI 已是中文「臺幣存匯 / 交易明細」，不能只找英文 TWD Deposit。
+            payload = json.loads(body)
+        except (TypeError, json.JSONDecodeError):
+            for key, value in parse_qsl(body, keep_blank_values=True):
+                add_field(key, value)
+        else:
+            def walk(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if isinstance(child, (dict, list)):
+                            invalid_fields.add(str(key))
+                            walk(child)
+                        else:
+                            add_field(key, child)
+                elif isinstance(value, list):
+                    for child in value:
+                        walk(child)
+            walk(payload)
+
+        def exact(aliases, value, *, date_value=False):
+            if any(alias in invalid_fields for alias in aliases):
+                return False
+            expected_value = str(value).replace("-", "/") if date_value else str(value)
+            candidates = [
+                candidate.replace("-", "/") if date_value else candidate
+                for alias in aliases for candidate in fields.get(alias, [])
+            ]
+            return bool(candidates) and all(
+                candidate == expected_value for candidate in candidates
+            )
+
+        return (
+            BankCrawler._exact_https_origin_allowed(
+                request.url, frozenset({"ebank.scsb.com.tw"}),
+            )
+            and parsed.path in {"/ibap/api/query", "/ibap/ibap/query"}
+            and request.method == "POST"
+            and request.resource_type in {"xhr", "fetch"}
+            and exact(
+                ("account_no", "accountNo", "account", "accountNumber", "acctNo"),
+                expected["account_no"],
+            )
+            and exact(
+                ("start", "startDate", "start_date", "fromDate", "queryStartDate"),
+                expected["start"], date_value=True,
+            )
+            and exact(
+                ("end", "endDate", "end_date", "toDate", "queryEndDate"),
+                expected["end"], date_value=True,
+            )
+        )
+
+    @staticmethod
+    def _is_statement_month_request(request, month: str) -> bool:
+        parsed = urlparse(request.url)
+        if not (
+            BankCrawler._exact_https_origin_allowed(
+                request.url, frozenset({"ebank.scsb.com.tw"}),
+            )
+            and parsed.path in {"/ibap/api/query", "/ibap/ibap/query"}
+            and request.method == "POST"
+            and request.resource_type in {"xhr", "fetch"}
+        ):
+            return False
+        body = request.post_data or ""
+        fields: dict[str, list[str]] = {}
+        invalid: set[str] = set()
+        aliases = {"month", "statementMonth", "billMonth", "queryMonth"}
+
+        def add(key, value):
+            key = str(key)
+            if key not in aliases:
+                return
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                fields.setdefault(key, []).append(str(value))
+            else:
+                invalid.add(key)
+
+        try:
+            payload = json.loads(body)
+        except (TypeError, json.JSONDecodeError):
+            for key, value in parse_qsl(body, keep_blank_values=True):
+                add(key, value)
+        else:
+            def walk(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if isinstance(child, (dict, list)):
+                            if key in aliases:
+                                invalid.add(key)
+                            walk(child)
+                        else:
+                            add(key, child)
+                elif isinstance(value, list):
+                    for child in value:
+                        walk(child)
+            walk(payload)
+        if invalid:
+            return False
+        expected = month.replace("/", "")
+        values = [
+            candidate.replace("/", "")
+            for alias in aliases for candidate in fields.get(alias, [])
+        ]
+        return bool(values) and all(value == expected for value in values)
+
+    @staticmethod
+    def _twd_inquiry_result_state_script() -> str:
+        """JS: 只在本次綁定結果容器內回傳 error/pagination booleans。"""
+        return r"""() => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const scope = window.__thothScsbTwdResultScope;
+            if (!visible(scope)) return {error: true, pagination: false};
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const disabled = (el) => el.closest('[disabled],[aria-disabled="true"],.disabled');
+            const current = (el) => el.closest('[aria-current="page"],.active');
+            const enabled = (el) => visible(el) && !disabled(el);
+            const scopeText = norm(scope.textContent).toLowerCase();
+            const error = [...scope.querySelectorAll('.alert,.toast,[role="alert"]')]
+                .some(el => visible(el) && norm(el.textContent))
+                || [
+                    '系統錯誤', '系統忙碌', '請稍後再試', '連線逾時', '連線已逾時',
+                    '請重新登入', '登入失效', 'system error', 'session expired',
+                    'login required', 'timed out', 'timeout', 'unexpected error',
+                ].some(marker => scopeText.includes(marker));
+            const nextPattern = /^(下一頁|下頁|Next(?: page)?|載入更多|Load more|[›»→])$/i;
+            const nextHint = /(goToNextPage|nextPage|next-page|page-next)/i;
+            const directNext = [...scope.querySelectorAll('button,a,[role="button"]')]
+                .some(el => enabled(el) && !current(el) && (
+                    el.getAttribute('rel') === 'next'
+                    || nextPattern.test(norm(el.textContent))
+                    || nextPattern.test(norm(el.getAttribute('aria-label')))
+                    || nextHint.test([
+                        el.id, el.className, el.getAttribute('onclick'),
+                        el.getAttribute('data-action'), el.getAttribute('href'),
+                    ].filter(Boolean).join(' '))
+                ));
+            const numbered = [...scope.querySelectorAll(
+                '.pagination,[class*="pagination"],nav[aria-label*="pagination" i],[role="navigation"][aria-label*="pagination" i]'
+            )].some(container => [...container.querySelectorAll('button,a,[role="button"]')]
+                .some(el => enabled(el)
+                    && !current(el)
+                    && /^\d+$/.test(norm(el.textContent))));
+            return {error, pagination: directNext || numbered};
+        }"""
+
+    @staticmethod
+    def _parse_twd_inquiry_records(text: str) -> tuple[list[dict], bool]:
+        """解析完整交易 DOM；raw preview 的 8 KB 上限不得截斷入庫資料。"""
+        records = []
+        candidate_count = 0
+
+        def _parse_money(value: str) -> str | None:
+            raw = value.replace("NT$", "").strip() if value else ""
+            if not raw:
+                return ""
+            if not re.fullmatch(r"-?(?:\d{1,15}|\d{1,3}(?:,\d{3}){1,4})", raw):
+                return None
+            return raw.replace(",", "")
+
+        for line in text.split("\n"):
+            if not re.match(r"^\s*\d{3,4}[-/]\d{2}[-/]\d{2}\b", line):
+                continue
+            candidate_count += 1
+            cols = line.split("\t")
+            if len(cols) not in (5, 6):
+                continue
+            date_str = cols[0].strip()
+            if not re.match(r"^\d{3,4}/\d{2}/\d{2}$", date_str):
+                continue
+            year, month, day = (int(part) for part in date_str.split("/"))
+            canonical_year = year + 1911 if year < 1000 else year
+            try:
+                date(canonical_year, month, day)
+            except ValueError:
+                continue
+            date_str = f"{canonical_year:04d}/{month:02d}/{day:02d}"
+            summary = cols[1].strip()
+            expense = _parse_money(cols[2].strip())
+            deposit = _parse_money(cols[3].strip())
+            balance = _parse_money(cols[4].strip())
+            if (
+                not summary
+                or balance in (None, "")
+                or expense is None
+                or deposit is None
+                or bool(expense) == bool(deposit)
+                or (expense and expense.startswith("-"))
+                or (deposit and deposit.startswith("-"))
+            ):
+                continue
+
+            records.append({
+                "date": date_str,
+                "summary": summary,
+                "expense": expense,
+                "deposit": deposit,
+                "balance": balance,
+                "remarks": cols[5].strip() if len(cols) > 5 else "",
+            })
+        return records, len(records) == candidate_count
+
+    @staticmethod
+    def _statement_month_tabs(text: str) -> list[str]:
+        """回傳 Data Time 後銀行實際揭露的全部 YYYY/MM tabs。"""
+        data_time = text.find("Data Time")
+        if data_time < 0:
+            return []
+        return list(dict.fromkeys(
+            re.findall(r"20\d{2}/(?:0[1-9]|1[0-2])(?![/\d])", text[data_time:])
+        ))
+
+    @staticmethod
+    def _statement_month_summary(text: str) -> dict:
+        lower = text.lower()
+        if any(marker in lower for marker in (
+            "系統錯誤", "系統忙碌", "請稍後再試", "session expired",
+            "system error", "unexpected error", "login required",
+            "connection timed out", "gateway timeout", "request timeout",
+            "連線逾時", "登入逾時", "重新登入", "please log in",
+        )):
+            raise ValueError("statement month page error")
+        required_labels = (
+            "Current Period Total Amount Due",
+            "Current Period Total Minimum Amount Due",
+        )
+        if not all(label in text for label in required_labels):
+            raise ValueError("incomplete statement month summary")
+
+        def grab(label: str) -> int | None:
+            start = text.find(label)
+            if start < 0:
+                return None
+            tail = text[start + len(label):].lstrip()
+            value = tail.splitlines()[0].strip() if tail else ""
+            if value in {"", "-", "--", "---"}:
+                return None
+            match = re.fullmatch(
+                r"(?:NT\$\s*)?(\d+|\d{1,3}(?:,\d{3})+)(?:\.(\d{1,2}))?",
+                value,
+            )
+            if not match:
+                raise ValueError("invalid statement month amount")
+            try:
+                amount = Decimal(value.replace("NT$", "").replace(",", "").strip())
+            except InvalidOperation as exc:
+                raise ValueError("invalid statement month amount") from exc
+            if not amount.is_finite() or amount != amount.to_integral_value():
+                raise ValueError("fractional statement month amount")
+            return int(amount)
+
+        due = grab("Current Period Total Amount Due")
+        return {
+            "due_amount": due,
+            "min_payment": grab("Current Period Total Minimum Amount Due"),
+            "has_data": due is not None,
+        }
+
+    @staticmethod
+    def _card_leaf_scope_text_script() -> str:
+        return r"""(leafText) => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const exactLeaf = [...document.querySelectorAll('body *')].filter(el =>
+                visible(el)
+                && (el.textContent || '').trim() === leafText
+                && ![...el.children].some(child =>
+                    (child.textContent || '').trim() === leafText)
+            );
+            for (const leaf of exactLeaf) {
+                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                    const text = scope.innerText || '';
+                    if ((scope.querySelector('table')
+                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))
+                        && text.includes(leafText)) return text;
+                }
+            }
+            return null;
+        }"""
+
+    @staticmethod
+    def _statement_month_target_script() -> str:
+        return """([month, leafText]) => {
+            const visible = (el) => el && el.offsetParent !== null;
+            const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                visible(el) && (el.textContent || '').trim() === leafText
+                && ![...el.children].some(child =>
+                    (child.textContent || '').trim() === leafText));
+            for (const leaf of leaves) {
+                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                    const text = scope.innerText || '';
+                    if (!(scope.querySelector('table')
+                        || /Current Period Total|查無.*帳單|no .*statement/i.test(text))) continue;
+                    const matches = [...scope.querySelectorAll('button,a,li')].filter(el =>
+                        visible(el) && (el.textContent || '').trim() === month);
+                    if (matches.length !== 1) return {ok: false, panel: null};
+                    const control = matches[0];
+                    const rawTarget = control.getAttribute('data-bs-target')
+                        || control.getAttribute('data-target')
+                        || control.getAttribute('href')
+                        || (control.getAttribute('aria-controls')
+                            ? `#${CSS.escape(control.getAttribute('aria-controls'))}` : null);
+                    const panel = rawTarget && rawTarget.startsWith('#')
+                        && document.querySelectorAll(rawTarget).length === 1
+                        && scope.contains(document.querySelector(rawTarget))
+                        ? rawTarget : null;
+                    return {ok: true, panel};
+                }
+            }
+            return {ok: false, panel: null};
+        }"""
+
+    def _collect_twd_account(self, page, selector: str, account_no: str) -> dict:
+        """查一個 SCSB 台幣帳戶；任何期間、結果或 parser 不完整都 fail closed。"""
+        page.select_option(selector, value=account_no)
+        page.wait_for_timeout(1500)
+
+        period = page.evaluate(
+            self._twd_inquiry_period_script(
+                full_history=getattr(self, "full_history", True),
+            ),
+        )
+        _log(f"[twd_inq] period → {period}")
+        if not period.get("ok"):
+            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
+        page.wait_for_timeout(500)
+        period_check = page.evaluate(
+            self._twd_inquiry_period_verification_script(), period,
+        )
+        if not period_check.get("ok"):
+            raise RuntimeError("lookback-period-not-applied")
+
+        page.wait_for_timeout(1500)
+        expected = {**period, "account_no": account_no}
+        page.evaluate(self._twd_inquiry_prepare_result_wait_script(), expected)
+        with page.expect_request(
+            lambda request: self._is_twd_query_request(request, expected),
+            timeout=120000,
+        ) as request_info:
+            clicked_confirm = page.evaluate(
+                "(() => { const btns=[...document.querySelectorAll('button,a')];"
+                " const b=btns.find(e=>e.offsetParent!==null && /^(Confirm|查詢|確認|Search)$/i.test((e.innerText||'').trim()));"
+                " if(b){ b.click(); return b.innerText; } return null; })()",
+            )
+        _log(f"[twd_inq] click Confirm → {clicked_confirm}")
+        query_response = request_info.value.response()
+        if not clicked_confirm or query_response is None or not query_response.ok:
+            raise RuntimeError("query-submit-unavailable")
+        page.wait_for_function(
+            self._twd_inquiry_result_ready_script(),
+            arg=expected,
+            timeout=120000,
+        )
+        result_state = page.evaluate(self._twd_inquiry_result_state_script())
+        if result_state.get("error") or result_state.get("pagination"):
+            raise RuntimeError("query-result-incomplete")
+
+        extracted = page.evaluate(self._twd_inquiry_extract_result_script(), expected)
+        if not extracted.get("ok"):
+            raise RuntimeError("query-result-unbound")
+        result_text = extracted.get("text") or ""
+        records, parse_complete = self._parse_twd_inquiry_records(result_text)
+        if (
+            not parse_complete
+            or len(records) != extracted.get("row_count")
+            or (not records and not extracted.get("empty"))
+        ):
+            raise RuntimeError("partial-transaction-table")
+        start_date = date.fromisoformat(period["start"].replace("/", "-"))
+        end_date = date.fromisoformat(period["end"].replace("/", "-"))
+        for record in records:
+            record_date = date.fromisoformat(record["date"].replace("/", "-"))
+            if not start_date <= record_date <= end_date:
+                raise RuntimeError("transaction-outside-query-period")
+            record["account_no"] = account_no
+
+        return {
+            "account_no": account_no,
+            "period": period,
+            "records": records,
+        }
+
+    def _collect_twd_inquiry(
+        self, page, expected_accounts: set[str],
+    ) -> dict:
+        """進入 SCSB 台幣交易明細頁，逐一查完所有帳戶。"""
+        try:
             ret = page.evaluate(self._twd_inquiry_nav_script())
-            _log(f"[twd_inq] JS sequence → {ret}")
+            _log(f"[twd_inq] JS sequence ok={bool(ret and ret.get('ok'))}")
+            if not isinstance(ret, dict) or ret.get("ok") is not True:
+                raise RuntimeError("twd-inquiry-navigation-failed")
             page.wait_for_timeout(8000)
             page.evaluate(JS_KILL_MODAL)
             page.wait_for_timeout(1500)
-            page.screenshot(path=str(debug_dir / "twd_inquiry_form.png"), full_page=True)
 
-            # 點完跳到查詢條件頁——填表 + 按 Confirm
-            _log("[twd_inq] 已進入查詢頁，填表查詢")
-            try:
-                # 1) Account dropdown 選第一個（或全部？先試第一個）
-                #    SCSB 用 native <select>
-                accts_in_select = page.evaluate("""() => {
-                    const sels = [...document.querySelectorAll('select')];
-                    return sels.map(s => ({
-                        id: s.id, name: s.name,
-                        options: [...s.options].slice(0, 10).map(o => ({value: o.value, text: o.textContent.trim().slice(0, 50)}))
-                    }));
-                }""")
-                _log(f"[twd_inq] 表單 selects: {_safe_select_inventory(accts_in_select)}")
+            selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
+                id: s.id, name: s.name,
+                options: [...s.options].map(o => ({value: o.value}))
+            }))""")
+            _log(f"[twd_inq] 表單 selects: {_safe_select_inventory(selects)}")
 
-                # 找含帳號 options 的 select
-                target_sel = None
-                target_val = None
-                for sel in accts_in_select:
-                    for opt in sel.get("options", []):
-                        if opt.get("value") and re.search(r"\d{10,}", opt.get("value", "")):
-                            target_sel = sel.get("id") or sel.get("name")
-                            target_val = opt["value"]
-                            break
-                    if target_sel:
-                        break
-                if target_sel and target_val:
-                    _log(f"[twd_inq] 選帳號: select={target_sel} selected=true")
-                    result["account_no"] = target_val.strip()
-                    try:
-                        page.select_option(f"#{target_sel}" if target_sel else "select", value=target_val)
-                        page.wait_for_timeout(1500)
-                    except Exception as e:
-                        _log(f"[twd_inq] select_option 失敗: {type(e).__name__}")
-
-                # 2) 查詢期間：預設當日會沒有明細，明確選「近一月」較穩。
-                clicked_range = page.evaluate("""() => {
-                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                    const els = [...document.querySelectorAll('button,label,a,span,div')]
-                        .filter(e => e.offsetParent !== null);
-                    const target = els.find(e => ['近一月', '最近一個月', 'Last Month'].includes(norm(e.innerText || e.textContent || '')));
-                    if (target) { target.click(); return norm(target.innerText || target.textContent || ''); }
-                    return null;
-                }""")
-                _log(f"[twd_inq] click range → {clicked_range}")
-                page.wait_for_timeout(800)
-
-                # 3) 補 start date（30 天前）
-                # SCSB SPA 用 Vue/React，page.fill 寫值不會觸發 input event → 前端 binding 不認
-                # 改用 keyboard type 或 dispatchEvent 強制觸發
-                from datetime import datetime, timedelta
-                start_dt = (datetime.now() - timedelta(days=30)).strftime("%Y/%m/%d")
-                date_inputs = page.evaluate("""() => {
-                    return [...document.querySelectorAll('input')]
-                        .filter(i => i.offsetParent !== null)
-                        .map(i => ({
-                            id: i.id, name: i.name, type: i.type, value: i.value,
-                            placeholder: i.placeholder,
-                            label: (i.closest('.form-group,.row,div')?.innerText || '').slice(0, 80),
-                        }));
-                }""")
-                _log(f"[twd_inq] inputs: {date_inputs}")
-                picked_start = False
-                for di in date_inputs:
-                    hay = " ".join(str(di.get(k) or "") for k in ("id", "name", "type", "placeholder", "label"))
-                    if "迄" in hay or "end" in hay.lower():
-                        continue
-                    if not ("起" in hay or "start" in hay.lower() or "日期" in hay or "date" in hay.lower()):
-                        continue
-                    sel = f"#{di['id']}" if di.get("id") else f"input[name='{di['name']}']" if di.get("name") else None
-                    if not sel:
-                        continue
-                    try:
-                        page.click(sel)
-                        page.wait_for_timeout(300)
-                        page.keyboard.press("Control+A")
-                        page.keyboard.press("Delete")
-                        page.wait_for_timeout(200)
-                        page.keyboard.type(start_dt, delay=50)
-                        page.wait_for_timeout(300)
-                        page.evaluate(
-                            "(sel) => { const el=document.querySelector(sel); if(el){"
-                            "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                            "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                            "  el.blur(); } }",
-                            sel,
-                        )
-                        page.wait_for_timeout(500)
-                        _log(f"[twd_inq] 填 start date (kbd type): {sel} = {start_dt}")
-                        picked_start = True
-                        break
-                    except Exception as e:
-                        _log(f"[twd_inq] 填日期失敗: {type(e).__name__}")
-                if not picked_start:
-                    _log("[twd_inq] 找不到可填的查詢起日 input")
-
-                # 4) 點 Confirm
-                page.wait_for_timeout(1500)
-                clicked_confirm = page.evaluate(
-                    "(() => { const btns=[...document.querySelectorAll('button,a')];"
-                    " const b=btns.find(e=>e.offsetParent!==null && /^(Confirm|查詢|確認|Search)$/i.test((e.innerText||'').trim()));"
-                    " if(b){ b.click(); return b.innerText; } return null; })()",
+            targets = []
+            seen_accounts = set()
+            for select in selects:
+                select_id = select.get("id") or ""
+                select_name = select.get("name") or ""
+                if not select_id and not select_name:
+                    continue
+                selector = (
+                    f"select[id={json.dumps(select_id)}]"
+                    if select_id
+                    else f"select[name={json.dumps(select_name)}]"
                 )
-                _log(f"[twd_inq] click Confirm → {clicked_confirm}")
-                page.wait_for_timeout(10000)
-                page.screenshot(path=str(debug_dir / "twd_inquiry_results.png"), full_page=True)
+                for option in select.get("options") or []:
+                    account_no = (option.get("value") or "").strip()
+                    if not re.search(r"\d{10,}", account_no) or account_no in seen_accounts:
+                        continue
+                    seen_accounts.add(account_no)
+                    targets.append((selector, account_no))
+            if not targets:
+                raise RuntimeError("account-control-unavailable")
+            if seen_accounts != expected_accounts:
+                raise RuntimeError("account-inventory-incomplete")
 
-            except Exception as e:
-                _log(f"[twd_inq] 填表失敗: {type(e).__name__}")
+            account_results = []
+            all_records = []
+            for index, (selector, account_no) in enumerate(targets, start=1):
+                _log(f"[twd_inq] query account index={index}/{len(targets)}")
+                account_result = self._collect_twd_account(page, selector, account_no)
+                records = account_result.pop("records")
+                account_result["record_count"] = len(records)
+                account_results.append(account_result)
+                all_records.extend(records)
 
-            # dump 點完後 dom
-            result["url"] = page.url
-            try:
-                result["text"] = (page.evaluate("document.body.innerText") or "")[:8000]
-            except Exception:
-                result["text"] = ""
-            _log(f"[twd_inq] text len={len(result['text'])}")
+            first = account_results[0]
+            result = {
+                "account_no": first["account_no"],
+                "period": first["period"],
+                "records": all_records,
+                "accounts": account_results,
+            }
+            _log(f"[twd_inq] accounts={len(account_results)} records={len(all_records)}")
+            return result
+        except Exception as error:
+            _log(f"[twd_inq] ❌ 整段失敗: {type(error).__name__}")
+            raise RuntimeError("SCSB TWD inquiry failed") from None
 
-            # regex 抽明細交易（SCSB 帳戶明細表格用 \t 分隔，欄位：Time/Summary/Expense/Deposit/Balance/Remarks）
-            # 金額格式 'NT$ 60,404'，Expense 或 Deposit 其一可為空
-            txt = result["text"]
-            recs = []
-            # pattern: 日期\t摘要\tExpense(可空)\tDeposit(可空)\tBalance\tRemarks
-            for line in txt.split("\n"):
-                if not line.startswith("20") and not re.match(r"^\d{3}/\d{2}/\d{2}\t", line):
-                    continue
-                cols = line.split("\t")
-                if len(cols) < 5:
-                    continue
-                date_str = cols[0].strip()
-                if not re.match(r"^\d{3,4}/\d{2}/\d{2}$", date_str):
-                    continue
-                summary = cols[1].strip()
-                expense_raw = cols[2].strip()
-                deposit_raw = cols[3].strip()
-                balance_raw = cols[4].strip()
-                remarks = cols[5].strip() if len(cols) > 5 else ""
-                def _strip_nt(s):
-                    return s.replace("NT$", "").replace(",", "").strip() if s else ""
-                recs.append({
-                    "date": date_str,
-                    "summary": summary,
-                    "expense": _strip_nt(expense_raw),
-                    "deposit": _strip_nt(deposit_raw),
-                    "balance": _strip_nt(balance_raw),
-                    "remarks": remarks,
-                })
-            result["records"] = recs
-            _log(f"[twd_inq] 抽到 {len(recs)} 筆交易")
-
-            # 抓 Account Balance / Available Balance / Total Expenditure / Total Deposit
-            for label, key in [
-                ("Account Balance", "account_balance"),
-                ("Available Balance", "available_balance"),
-                ("Total Expenditure", "total_expenditure"),
-                ("Total Deposit", "total_deposit"),
-            ]:
-                m = re.search(rf"{label}\s*\n\s*NT\$\s*([\d,]+)", txt)
-                if m:
-                    result[key] = m.group(1).replace(",", "")
-
-        except Exception as e:
-            _log(f"[twd_inq] ❌ 整段失敗: {type(e).__name__}")
-            result["error"] = str(e)
-        return result
-
-    def _collect_credit_card_inquiry(self, page, debug_dir) -> dict:
+    def _collect_credit_card_inquiry(self, page) -> dict:
         """SCSB 信用卡明細 — 三層 accordion 後抓多個 leaf。
 
           Level 1: Credit Card Services (已展開)
@@ -876,6 +1470,8 @@ class ScsbCrawler(BankCrawler):
             - Statement Inquiry and Payment  帳單查詢 (= billed)
             - Account Balance Inquiry        卡片餘額
         """
+        from backend.core.persist.scsb import _scsb_page_error, _scsb_parse_card_rows
+
         result: dict = {"leaves": {}}
         leaves_to_visit = [
             ("Unbilled Transaction Details", "unbilled"),
@@ -885,149 +1481,336 @@ class ScsbCrawler(BankCrawler):
 
         for leaf_text, key in leaves_to_visit:
             try:
+                before_leaf_text = page.evaluate(
+                    self._card_leaf_scope_text_script(), leaf_text,
+                )
                 ret = page.evaluate("""(leafText) => {
                     const log = [];
                     const allBtns = () => [...document.querySelectorAll('button.accordion-button')];
+                    const unique = (text, visibleOnly = false) => {
+                        const matches = allBtns().filter(button =>
+                            (!visibleOnly || button.offsetParent !== null)
+                            && (button.innerText || '').trim() === text);
+                        return matches.length === 1 ? matches[0] : null;
+                    };
 
                     // Level 1: Credit Card Services
-                    let btn1 = allBtns().find(b => (b.innerText||'').trim() === 'Credit Card Services');
+                    let btn1 = unique('Credit Card Services');
                     if (!btn1) { log.push('L1 not found'); return {ok: false, log}; }
                     if (btn1.classList.contains('collapsed')) { btn1.click(); log.push('L1 expand'); }
 
                     return new Promise(resolve => setTimeout(() => {
                         // Level 2: Credit Card Account Management
-                        let btn2 = allBtns().find(b => (b.innerText||'').trim() === 'Credit Card Account Management');
+                        let btn2 = unique('Credit Card Account Management');
                         if (!btn2) { log.push('L2 not found'); resolve({ok: false, log}); return; }
                         if (btn2.classList.contains('collapsed')) { btn2.click(); log.push('L2 expand'); }
 
                         setTimeout(() => {
-                            const leaf = allBtns().find(b =>
-                                b.offsetParent !== null &&
-                                (b.innerText||'').trim() === leafText
-                            );
+                            const leaf = unique(leafText, true);
                             if (!leaf) { log.push('leaf not found: ' + leafText); resolve({ok: false, log}); return; }
                             leaf.click();
-                            resolve({ok: true, log, clicked: leafText, url: location.href});
+                            resolve({ok: true});
                         }, 1500);
                     }, 1500));
                 }""", leaf_text)
-                _log(f"[card_inq:{key}] navigate {leaf_text} → {ret}")
+                if not isinstance(ret, dict) or ret.get("ok") is not True:
+                    raise RuntimeError("card-leaf-navigation-failed")
+                page.wait_for_function("""([leafText, before]) => {
+                    const visible = (el) => el && el.offsetParent !== null;
+                    const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                        visible(el) && (el.textContent || '').trim() === leafText
+                        && ![...el.children].some(child =>
+                            (child.textContent || '').trim() === leafText));
+                    for (const leaf of leaves) {
+                        for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                            if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                            const text = scope.innerText || '';
+                            if ((scope.querySelector('table')
+                                || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))
+                                && text.includes(leafText)) {
+                                return before == null || text !== before;
+                            }
+                        }
+                    }
+                    return false;
+                }""", arg=[leaf_text, before_leaf_text], timeout=120000)
+                _log(f"[card_inq:{key}] navigation ok")
                 page.wait_for_timeout(8000)
                 page.evaluate(JS_KILL_MODAL)
                 page.wait_for_timeout(1500)
-                page.screenshot(path=str(debug_dir / f"card_inq_{key}.png"), full_page=True)
 
-                leaf_result = {"url": page.url, "nav": ret}
+                leaf_result: dict = {"nav": {"ok": True}}
                 try:
-                    leaf_result["text"] = (page.evaluate("document.body.innerText") or "")[:12000]
+                    leaf_result["text"] = page.evaluate(
+                        self._card_leaf_scope_text_script(), leaf_text,
+                    ) or ""
                 except Exception:
-                    leaf_result["text"] = ""
+                    raise RuntimeError("card-leaf-read-failed") from None
+                if leaf_text.lower() not in leaf_result["text"].lower():
+                    raise RuntimeError("card-leaf-identity-unverified")
 
                 # 若有 date input 就填表 + Confirm（同 twd_inq）
                 if leaf_text in ("Statement Inquiry and Payment", "Real-Time Transaction Records"):
                     try:
                         from datetime import datetime, timedelta
                         start_dt = (datetime.now() - timedelta(days=30)).strftime("%Y/%m/%d")
-                        date_inputs = page.evaluate("""() => {
-                            return [...document.querySelectorAll('input')]
-                                .filter(i => i.offsetParent !== null && /date/i.test((i.id||'')+(i.name||'')+(i.placeholder||'')+(i.type||'')))
-                                .map(i => ({id: i.id, name: i.name, value: i.value}));
-                        }""")
-                        for di in date_inputs:
-                            if not di.get("value") and di.get("id"):
-                                sel = f"#{di['id']}"
-                                try:
-                                    page.click(sel)
-                                    page.wait_for_timeout(200)
-                                    page.keyboard.press("Control+A")
-                                    page.keyboard.press("Delete")
-                                    page.keyboard.type(start_dt, delay=50)
-                                    page.evaluate(
-                                        "(sel) => { const el=document.querySelector(sel); if(el){"
-                                        "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                                        "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                                        "  el.blur(); } }",
-                                        sel,
-                                    )
-                                    page.wait_for_timeout(300)
-                                    break
-                                except Exception:
-                                    pass
-                        clicked = page.evaluate(
-                            "(() => { const btns=[...document.querySelectorAll('button,a')];"
-                            " const b=btns.find(e=>e.offsetParent!==null && /^(Confirm|查詢|確認|Search)$/i.test((e.innerText||'').trim()));"
-                            " if(b){ b.click(); return b.innerText; } return null; })()",
-                        )
-                        if clicked:
-                            _log(f"[card_inq:{key}] Confirm clicked")
-                            page.wait_for_timeout(8000)
-                            page.screenshot(path=str(debug_dir / f"card_inq_{key}_results.png"), full_page=True)
-                            leaf_result["text_final"] = (page.evaluate("document.body.innerText") or "")[:12000]
-                            leaf_result["url_final"] = page.url
-                    except Exception as e:
-                        _log(f"[card_inq:{key}] 填表失敗: {type(e).__name__}")
+                        date_inputs = page.evaluate("""(leafText) => {
+                            const visible = (el) => el && el.offsetParent !== null;
+                            const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                                visible(el) && (el.textContent || '').trim() === leafText
+                                && ![...el.children].some(child =>
+                                    (child.textContent || '').trim() === leafText));
+                            for (const leaf of leaves) {
+                                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                    const text = scope.innerText || '';
+                                    if (!(scope.querySelector('table')
+                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))) continue;
+                                    return [...scope.querySelectorAll('input')]
+                                        .filter(input => visible(input)
+                                            && /date/i.test((input.id||'')+(input.name||'')+(input.placeholder||'')+(input.type||''))
+                                            && input.id
+                                            && document.querySelectorAll(`#${CSS.escape(input.id)}`).length === 1)
+                                        .map(input => ({id: input.id, value: input.value}));
+                                }
+                            }
+                            return [];
+                        }""", leaf_text)
+                        pending_date_inputs = [
+                            input_data for input_data in date_inputs
+                            if not input_data.get("value") and input_data.get("id")
+                        ]
+                        filled_date = not pending_date_inputs
+                        for di in pending_date_inputs:
+                            sel = f"#{di['id']}"
+                            try:
+                                page.click(sel)
+                                page.wait_for_timeout(200)
+                                page.keyboard.press("Control+A")
+                                page.keyboard.press("Delete")
+                                page.keyboard.type(start_dt, delay=50)
+                                page.evaluate(
+                                    "(sel) => { const el=document.querySelector(sel); if(el){"
+                                    "  el.dispatchEvent(new Event('input', {bubbles:true}));"
+                                    "  el.dispatchEvent(new Event('change', {bubbles:true}));"
+                                    "  el.blur(); } }",
+                                    sel,
+                                )
+                                page.wait_for_timeout(300)
+                                filled_date = True
+                                break
+                            except Exception:
+                                continue
+                        if not filled_date:
+                            raise RuntimeError("card-query-date-unavailable")
+                        before_confirm = leaf_result["text"]
+                        clicked = page.evaluate("""(leafText) => {
+                            const visible = (el) => el && el.offsetParent !== null;
+                            const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                                visible(el) && (el.textContent || '').trim() === leafText
+                                && ![...el.children].some(child =>
+                                    (child.textContent || '').trim() === leafText));
+                            for (const leaf of leaves) {
+                                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                    const text = scope.innerText || '';
+                                    if (!(scope.querySelector('table')
+                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))) continue;
+                                    const matches = [...scope.querySelectorAll('button,a')].filter(el =>
+                                        visible(el) && /^(Confirm|查詢|確認|Search)$/i.test((el.innerText || '').trim()));
+                                    if (matches.length !== 1) return null;
+                                    matches[0].click();
+                                    return true;
+                                }
+                            }
+                            return null;
+                        }""", leaf_text)
+                        if not clicked:
+                            raise RuntimeError("card-query-submit-unavailable")
+                        _log(f"[card_inq:{key}] Confirm clicked")
+                        page.wait_for_function(r"""([before, scopeName, leafText]) => {
+                            const visible = (el) => el && el.offsetParent !== null;
+                            const exactLeaf = [...document.querySelectorAll('body *')].filter(el =>
+                                visible(el) && (el.textContent || '').trim() === leafText
+                                && ![...el.children].some(child =>
+                                    (child.textContent || '').trim() === leafText));
+                            let text = '';
+                            for (const leaf of exactLeaf) {
+                                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                    const candidate = scope.innerText || '';
+                                    if ((scope.querySelector('table')
+                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(candidate))
+                                        && candidate.includes(leafText)) {
+                                        text = candidate;
+                                        break;
+                                    }
+                                }
+                                if (text) break;
+                            }
+                            const ready = scopeName === 'current'
+                                ? /Real-Time Transaction Records[\s\S]*(?:Transaction Date|no (?:real-time )?transaction)/i.test(text)
+                                : /Statement Inquiry and Payment[\s\S]*(?:(?:Data Time[\s\S]*20\d{2}\/(?:0[1-9]|1[0-2]))|(?:查無.*帳單|no .*statement))/i.test(text);
+                            return text !== before && ready;
+                        }""", arg=[before_confirm, key, leaf_text], timeout=120000)
+                        leaf_result["text_final"] = page.evaluate(
+                            self._card_leaf_scope_text_script(), leaf_text,
+                        ) or ""
+                    except Exception:
+                        raise RuntimeError("card-query-form-failed") from None
 
                 # 2026-06-13 升級：Statement Inquiry 加月份 tab 迭代抓帳單
                 # SCSB 顯示「2026/05 / 2026/04 / 2026/03」3 個月份 tab，點切換每月帳單
                 if leaf_text == "Statement Inquiry and Payment":
                     try:
-                        import re as _re_local
-                        # 從 text 抽月份 tab 候選 (YYYY/MM 格式)
                         leaf_text_now = leaf_result.get("text", "")
-                        # 「Data Time：YYYY/MM/DD HH:MM:SS\n2026/05\n2026/04\n2026/03」pattern
-                        # 取 Data Time 之後 3-6 個月份 tab
-                        month_tabs = []
-                        dt_idx = leaf_text_now.find("Data Time")
-                        if dt_idx > 0:
-                            tail = leaf_text_now[dt_idx:dt_idx+200]
-                            for m in _re_local.finditer(r"202[0-9]/\d{2}\b", tail):
-                                mo = m.group()
-                                if mo not in month_tabs and len(month_tabs) < 6:
-                                    month_tabs.append(mo)
+                        statement_text = leaf_result.get("text_final") or leaf_text_now
+                        month_tabs = self._statement_month_tabs(statement_text)
+                        if not month_tabs and not re.search(
+                            r"查無.*帳單|no .*statement", statement_text, re.I,
+                        ):
+                            raise RuntimeError("statement-month-tabs-unavailable")
                         _log(f"[card_inq:{key}] 月份 tabs: {month_tabs}")
 
                         # 每個月份點 tab + dump
+                        month_targets = {
+                            month: page.evaluate(
+                                self._statement_month_target_script(), [month, leaf_text],
+                            )
+                            for month in month_tabs
+                        }
+                        if any(
+                            not isinstance(target, dict) or target.get("ok") is not True
+                            for target in month_targets.values()
+                        ):
+                            raise RuntimeError("statement-month-tab-unavailable")
+                        panel_selectors = [
+                            target.get("panel") for target in month_targets.values()
+                            if target.get("panel")
+                        ]
                         months_data = []
                         for mo in month_tabs:
-                            clicked_month = page.evaluate("""(month) => {
-                                const all = [...document.querySelectorAll('button,a,span,div,li')];
-                                const target = all.find(e =>
-                                    e.offsetParent !== null &&
-                                    (e.textContent || '').trim() === month
-                                );
-                                if (target) { target.click(); return true; }
-                                return false;
-                            }""", mo)
-                            if clicked_month:
-                                page.wait_for_timeout(3000)
-                                mo_text = (page.evaluate("document.body.innerText") or "")[:8000]
-                                months_data.append({"month": mo, "text": mo_text})
-                                _log(f"[card_inq:{key}] {mo} tab click OK, text len={len(mo_text)}")
-                            else:
-                                _log(f"[card_inq:{key}] {mo} tab 找不到")
-                        leaf_result["months"] = months_data
-                    except Exception as e:
-                        _log(f"[card_inq:{key}] 月份 tab 切換失敗: {type(e).__name__}")
+                            target = month_targets[mo]
 
+                            def click_month():
+                                return page.evaluate("""([month, leafText]) => {
+                                    const visible = (el) => el && el.offsetParent !== null;
+                                    const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                                        visible(el) && (el.textContent || '').trim() === leafText
+                                        && ![...el.children].some(child =>
+                                            (child.textContent || '').trim() === leafText));
+                                    for (const leaf of leaves) {
+                                        for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                            if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                            const matches = [...scope.querySelectorAll('button,a,li')].filter(el =>
+                                                visible(el) && (el.textContent || '').trim() === month);
+                                            if (matches.length !== 1) return false;
+                                            matches[0].click();
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                }""", [mo, leaf_text])
+
+                            panel_selector = target.get("panel")
+                            if panel_selectors.count(panel_selector) != 1:
+                                panel_selector = None
+                            if panel_selector:
+                                if not click_month():
+                                    raise RuntimeError("statement-month-tab-unavailable")
+                            else:
+                                with page.expect_request(
+                                    lambda request, month=mo: self._is_statement_month_request(
+                                        request, month,
+                                    ),
+                                    timeout=120000,
+                                ) as month_request_info:
+                                    if not click_month():
+                                        raise RuntimeError("statement-month-tab-unavailable")
+                                month_response = month_request_info.value.response()
+                                if month_response is None or month_response.ok is not True:
+                                    raise RuntimeError("statement-month-query-failed")
+
+                            page.wait_for_function("""([month, leafText]) => {
+                                const visible = (el) => el && el.offsetParent !== null;
+                                const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                                    visible(el) && (el.textContent || '').trim() === leafText
+                                    && ![...el.children].some(child =>
+                                        (child.textContent || '').trim() === leafText));
+                                for (const leaf of leaves) {
+                                    for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                        if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                        const active = [...scope.querySelectorAll('button,a,li')].filter(el =>
+                                            visible(el) && (el.textContent || '').trim() === month
+                                            && (el.getAttribute('aria-selected') === 'true'
+                                                || el.getAttribute('aria-current') === 'page'
+                                                || el.classList.contains('active')));
+                                        if (active.length === 1) return true;
+                                    }
+                                }
+                                return false;
+                            }""", arg=[mo, leaf_text], timeout=120000)
+
+                            if panel_selector:
+                                page.wait_for_function("""(selector) => {
+                                    const panel = document.querySelector(selector);
+                                    return panel && panel.offsetParent !== null;
+                                }""", arg=panel_selector, timeout=120000)
+                                mo_text = page.evaluate(
+                                    "(selector) => document.querySelector(selector)?.innerText || ''",
+                                    panel_selector,
+                                )
+                            else:
+                                mo_text = page.evaluate(
+                                    self._card_leaf_scope_text_script(), leaf_text,
+                                ) or ""
+                            months_data.append({
+                                "month": mo,
+                                **self._statement_month_summary(mo_text),
+                            })
+                            _log(f"[card_inq:{key}] {mo} tab click OK, text len={len(mo_text)}")
+                        leaf_result["months"] = months_data
+                    except Exception:
+                        raise RuntimeError("statement-month-collection-failed") from None
+
+                source_text = leaf_result.get("text_final") or leaf_result.get("text") or ""
+                if _scsb_page_error(source_text):
+                    raise RuntimeError("card-leaf-page-error")
+                if key in ("unbilled", "current"):
+                    rows, complete = _scsb_parse_card_rows(source_text, scope=key)
+                    lower = source_text.lower()
+                    explicit_empty = (
+                        (key == "unbilled" and (
+                            "no new transactions" in lower
+                            or "have not yet been recorded" in lower
+                        ))
+                        or (key == "current" and (
+                            "no real-time transaction" in lower
+                            or "no transaction records" in lower
+                        ))
+                    )
+                    if rows and complete:
+                        leaf_result["rows"] = rows
+                    elif explicit_empty:
+                        leaf_result["empty"] = True
+                    else:
+                        raise RuntimeError("card-transaction-scope-incomplete")
+                leaf_result.pop("text", None)
+                leaf_result.pop("text_final", None)
                 result["leaves"][key] = leaf_result
-            except Exception as e:
-                _log(f"[card_inq:{key}] ❌ 失敗: {type(e).__name__}")
-                result["leaves"][key] = {"error": str(e)}
+            except Exception:
+                _log(f"[card_inq:{key}] failed")
+                raise RuntimeError("SCSB credit-card inquiry failed") from None
 
         return result
 
 
 if __name__ == "__main__":
-    import json
     crawler = ScsbCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=True)
     except ScsbLoginError as e:
         result = {"error": "login_failed_stop", "detail": str(e)}
-
-    out_file = Path(__file__).resolve().parents[1] / "data" / "scsb_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    _log(f"\n[done] 已存: {out_file}")
 
     if result.get("error"):
         _log(f"  ❌ error: {result['error']}")
@@ -1037,4 +1820,4 @@ if __name__ == "__main__":
             data = {}
         _log("\n===== 抓取摘要 =====")
         _log(f"  抓到帳號: {len(data.get('accounts', []))} 個")
-        _log(f"  攔到 endpoint: {len(data.get('_all_endpoints', []))}")
+        _log(f"  台幣交易: {len((data.get('twd_inquiry') or {}).get('records', []))} 筆")

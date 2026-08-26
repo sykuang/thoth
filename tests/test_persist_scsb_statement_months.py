@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from backend.core.persist import persist_scsb
+from backend.core.persist.scsb import _scsb_parse_card_rows
 from backend.core.store import BankStore
 
 
@@ -119,6 +120,24 @@ Current Period Total Minimum Amount Due
     assert months["2026/05"]["min_payment"] == 1500
 
 
+def test_scsb_statement_months_accept_normalized_collector_summary(store):
+    persist_scsb({"card_inquiry": {"leaves": {"statement": {"months": [{
+        "month": "2026/05",
+        "due_amount": 12345,
+        "min_payment": 1500,
+        "has_data": True,
+    }]}}}}, store)
+
+    payload = store.conn.execute(
+        "SELECT payload_json FROM daily_metrics WHERE category='scsb_card_statement_months'"
+    ).fetchone()[0]
+    assert json.loads(payload)["2026/05"] == {
+        "due_amount": 12345,
+        "min_payment": 1500,
+        "has_data": True,
+    }
+
+
 def test_scsb_statement_no_months_field_safe(store):
     """statement 沒 months[] field → 不寫 statement_months metric。"""
     data = {
@@ -206,6 +225,23 @@ Transaction Date\tCard Last 4\tMerchant\tAmount\tAuth Code
         ("****7016", "2026-06-10", None, "Starbucks", 150),
         ("****7016", "2026-06-11", None, "7-11", 89),
     ]
+
+
+@pytest.mark.parametrize("row", [
+    "2026/99/99\t7016\tBROKEN\t100",
+    "NOT-A-DATE\t7016\tBROKEN\t100",
+    "2026/01/01\t7016\tBROKEN\t1,2,3",
+    "2026/01/01\t7016\tBROKEN\t1.234",
+    "2026/01/01 7016 BROKEN 100",
+])
+def test_scsb_card_parser_rejects_malformed_rows(row):
+    rows, complete = _scsb_parse_card_rows(
+        "Transaction Date\tCard Last 4\tMerchant\tAmount\n" + row,
+        scope="current",
+    )
+
+    assert rows == []
+    assert complete is False
 
 
 def test_scsb_partial_parse_preserves_existing_scope(store):

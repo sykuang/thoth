@@ -3,6 +3,7 @@
 Phase 1 — /sync routes（觸發 + polling 查狀態）。
 
 Endpoints:
+  POST /sync/admin/account/{account_id}/full-history  → 202 {job_id} (ADMIN_API_KEY)
   POST /sync/{bank}                    body={?headless: true}   → 202 {job_id} (legacy)
   POST /sync/account/{account_id}      body={?headless: true}   → 202 {job_id} [L5-1 新]
   GET  /sync/jobs                      → [recent 50 jobs (per user)]
@@ -10,7 +11,10 @@ Endpoints:
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+import os
+import secrets
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, status
 
 from backend.server.deps import current_user
 from backend.server.creds_store import AccountsRepo
@@ -23,6 +27,46 @@ from backend.server.sync_runner import (
 )
 
 router = APIRouter(prefix="/sync", tags=["sync"])
+
+
+def _require_admin_api_key(
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+) -> None:
+    expected = os.environ.get("ADMIN_API_KEY", "").strip()
+    client_key = os.environ.get("SERVER_API_KEY", "").strip()
+    if not expected or (client_key and secrets.compare_digest(expected, client_key)):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "admin sync is disabled")
+    if not secrets.compare_digest(x_admin_key.strip(), expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid admin API key")
+
+
+@router.post(
+    "/admin/account/{account_id}/full-history",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_require_admin_api_key)],
+)
+def force_full_history_sync(account_id: int) -> dict:
+    """Admin-only recovery path; normal account syncs stay incremental after first success."""
+    acct = AccountsRepo().get(account_id)
+    if acct is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此帳號")
+    if acct.bank != "scsb":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "full-history sync is currently supported only for scsb",
+        )
+    job_id = run_sync_job_for_account(
+        account_id=account_id,
+        headless=True,
+        force_full_history=True,
+    )
+    return {
+        "job_id": job_id,
+        "account_id": account_id,
+        "bank": acct.bank,
+        "history_mode": "full",
+        "status": "queued",
+    }
 
 
 @router.post("/all", status_code=status.HTTP_202_ACCEPTED)

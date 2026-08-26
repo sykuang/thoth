@@ -7,6 +7,7 @@ Env：
   - JWT_SECRET           — JWT 簽章 secret（必設）
   - SERVER_FERNET_KEY    — 憑證 Fernet key（用到 credentials/sync 才需要）
   - BANK_DATA_ROOT       — server.sqlite 根目錄（預設 backend/data）
+  - ADMIN_API_KEY        — admin-only 強制完整歷史同步金鑰（未設則 endpoint 停用）
 
 路由：
   - GET  /healthz                 健康檢查（無需 auth）
