@@ -104,7 +104,87 @@ def _statement_amount_from_text(text: str, label: str) -> int | None:
 def _scsb_parse_card_rows(text: str, scope: str) -> tuple[list, bool]:
     """Parse SCSB card rows and report whether every data-looking row parsed."""
     rows = []
-    if not text or "Transaction Date" not in text:
+    if not text:
+        return rows, False
+    if "交易日" in text and "交易時間" in text:
+        lines = text.splitlines()
+        header_index = next((
+            i for i, line in enumerate(lines)
+            if "交易日" in line and "交易時間" in line and "\t" in line
+        ), None)
+        if header_index is None:
+            return rows, False
+        header_cells = [cell.strip() for cell in lines[header_index].split("\t")]
+        card_index = next((
+            i for i, cell in enumerate(header_cells) if "卡號末4碼" in cell
+        ), None)
+        desc_index = next((
+            i for i, cell in enumerate(header_cells) if "商店名稱" in cell
+        ), None)
+        amount_index = next((
+            i for i, cell in enumerate(header_cells) if "交易金額" in cell
+        ), None)
+        result_index = next((
+            i for i, cell in enumerate(header_cells) if "交易結果" in cell
+        ), None)
+        if (
+            card_index is None or desc_index is None
+            or amount_index is None or result_index is None
+        ):
+            return rows, False
+        candidate_rows = malformed_rows = 0
+        for line in lines[header_index + 1:]:
+            if not line.strip():
+                continue
+            if "\t" not in line:
+                if re.match(r"^\s*\d{4}/\d{2}/\d{2}(?:\s|$)", line):
+                    candidate_rows += 1
+                    malformed_rows += 1
+                continue
+            candidate_rows += 1
+            cells = [cell.strip() for cell in line.split("\t")]
+            date_match = re.fullmatch(
+                r"(\d{4}/\d{2}/\d{2})(?:\s+\d{2}:\d{2}(?::\d{2})?)?",
+                cells[0] if cells else "",
+            )
+            if (
+                date_match is None
+                or len(cells) <= max(card_index, desc_index, amount_index, result_index)
+            ):
+                malformed_rows += 1
+                continue
+            try:
+                datetime.strptime(date_match.group(1), "%Y/%m/%d")
+            except ValueError:
+                malformed_rows += 1
+                continue
+            result_value = cells[result_index]
+            if not re.fullmatch(
+                r"(?:成功|交易成功|授權成功|success|approved)", result_value, re.I,
+            ):
+                malformed_rows += 1
+                continue
+            card_match = re.search(r"(\d{4})\s*$", cells[card_index])
+            amount_value = cells[amount_index]
+            if card_match is None or not re.fullmatch(
+                r"(?:NT\$\s*)?-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?",
+                amount_value,
+            ):
+                malformed_rows += 1
+                continue
+            desc = cells[desc_index]
+            amt = _num_real(amount_value.replace("NT$", "").replace(",", "").strip())
+            rows.append({
+                "card_no": f"****{card_match.group(1)}",
+                "scope": scope,
+                "date": date_match.group(1).replace("/", "-"),
+                "desc": desc,
+                "amount": amt,
+                "currency": "TWD",
+                "txn_type": classify.classify_by_desc_and_sign(desc, amt),
+            })
+        return rows, candidate_rows > 0 and malformed_rows == 0 and len(rows) == candidate_rows
+    if "Transaction Date" not in text:
         return rows, False
     after_header = text.split("Transaction Date", 1)[1]
     lines = after_header.splitlines()

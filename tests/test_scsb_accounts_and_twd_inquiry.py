@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import inspect
+from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 
 import backend.banks.scsb as scsb_module
 import backend.core.persist.scsb as scsb_persist_module
@@ -90,6 +91,7 @@ def test_scsb_overview_empty_inventory_requires_explicit_empty_marker():
     ) is True
 
 
+
 def test_persist_scsb_first_deposit_remains_asset_not_loan(tmp_path, monkeypatch):
     """2620...8541 必須入成 deposit，否則 portfolio 會把活儲當負債。"""
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
@@ -127,6 +129,45 @@ def test_scsb_twd_inquiry_accepts_chinese_menu_labels():
     assert "交易明細" in nav
 
 
+def test_scsb_twd_inquiry_does_not_collapse_an_already_open_top_level():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <button id="top" class="accordion-button collapsed" aria-expanded="false"
+                  onclick="const open=this.getAttribute('aria-expanded')==='true';
+                    this.setAttribute('aria-expanded', String(!open));
+                    this.classList.toggle('collapsed', open);
+                    document.querySelector('#children').style.display=open?'none':'block'">
+                  臺幣存匯
+                </button>
+                <div id="children" style="display:none">
+                  <button class="accordion-button collapsed" aria-expanded="false"
+                    onclick="this.setAttribute('aria-expanded','true');
+                      this.classList.remove('collapsed');
+                      document.querySelector('#leaf').style.display='block'">臺幣帳戶查詢</button>
+                  <button id="leaf" style="display:none"
+                    onclick="document.body.dataset.leafClicked='true'">餘額及交易明細查詢</button>
+                </div>
+                """,
+            )
+            page.locator("#top").click()  # collect() already opened the top level.
+
+            result = page.evaluate(ScsbCrawler._twd_inquiry_nav_script())
+
+            assert result["ok"] is True
+            assert page.locator("body").get_attribute("data-leaf-clicked") == "true"
+            assert page.locator("#top").get_attribute("aria-expanded") == "true"
+        finally:
+            browser.close()
+
+
 def _run_twd_period_script(
     start_min: str = "", *, shared_parent: bool = False, full_history: bool = True,
 ) -> dict:
@@ -156,8 +197,12 @@ def _run_twd_period_script(
                 """,
             )
             result = page.evaluate(
-                ScsbCrawler._twd_inquiry_period_script(full_history=full_history),
+                ScsbCrawler._twd_inquiry_period_script(
+                    full_history=full_history,
+                    end_date=date(2026, 8, 22),
+                ),
             )
+            ScsbCrawler._apply_twd_period_controls(page, result)
             result["custom_checked"] = page.locator("#custom").is_checked()
             result["actual_start"] = page.locator("#start").input_value()
             result["actual_end"] = page.locator("#end").input_value()
@@ -186,16 +231,19 @@ def test_scsb_twd_period_falls_back_to_one_calendar_year():
     assert result == {
         "ok": True,
         "period": "one-year",
-        "start": "2025/08/22",
+        "start": "2025/08/23",
         "end": "2026/08/22",
         "custom_checked": True,
-        "actual_start": "2025/08/22",
+        "actual_start": "2025/08/23",
         "actual_end": "2026/08/22",
     }
 
 
 def test_scsb_existing_account_period_uses_one_calendar_month():
-    result = _run_twd_period_script("2024-01-01", full_history=False)
+    result = _run_twd_period_script(
+        "2024-01-01",
+        full_history=False,
+    )
 
     assert result == {
         "ok": True,
@@ -208,19 +256,61 @@ def test_scsb_existing_account_period_uses_one_calendar_month():
     }
 
 
+def test_scsb_incremental_respects_a_later_system_minimum():
+    result = _run_twd_period_script("2026-08-02", full_history=False)
+
+    assert result["period"] == "one-month"
+    assert result["start"] == "2026/08/02"
+
+
+def test_scsb_splits_a_one_year_query_into_six_month_windows():
+    assert ScsbCrawler._six_month_windows("2025/08/27", "2026/08/26") == [
+        ("2026/02/27", "2026/08/26"),
+        ("2025/08/27", "2026/02/26"),
+    ]
+
+
 def test_scsb_twd_period_invalid_system_minimum_falls_back_to_one_year():
     result = _run_twd_period_script("2025-13-01")
 
     assert result["ok"] is True
     assert result["period"] == "one-year"
-    assert result["start"] == "2025/08/22"
+    assert result["start"] == "2025/08/23"
 
 
 def test_scsb_twd_period_keeps_start_and_end_distinct_in_shared_parent():
     result = _run_twd_period_script(shared_parent=True)
 
-    assert result["start"] == result["actual_start"] == "2025/08/22"
+    assert result["start"] == result["actual_start"] == "2025/08/23"
     assert result["end"] == result["actual_end"] == "2026/08/22"
+
+
+def test_scsb_twd_period_uses_the_two_live_date_placeholders():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <input type="text" placeholder="其它可見文字欄位">
+                <label><input id="radio3" type="radio" name="radioOptions">自訂</label>
+                <input id="mabcdef0123456789" type="text" placeholder="請輸入日期">
+                <input id="yabcdef0123456789" type="text" placeholder="請輸入日期" value="2026/08/22">
+                """,
+            )
+            result = page.evaluate(ScsbCrawler._twd_inquiry_period_script())
+            ScsbCrawler._apply_twd_period_controls(page, result)
+
+            assert result["ok"] is True
+            assert result["start"] == "2025/08/23"
+            assert result["end"] == "2026/08/22"
+            assert page.locator("#mabcdef0123456789").input_value() == "2025/08/23"
+        finally:
+            browser.close()
 
 
 def test_scsb_twd_period_verification_detects_controlled_input_reversion():
@@ -240,6 +330,7 @@ def test_scsb_twd_period_verification_detects_controlled_input_reversion():
                 """,
             )
             period = page.evaluate(ScsbCrawler._twd_inquiry_period_script())
+            ScsbCrawler._apply_twd_period_controls(page, period)
             page.locator("#start").evaluate("el => { el.value = '2026/08/01'; }")
 
             verified = page.evaluate(
@@ -306,7 +397,7 @@ def test_scsb_twd_result_readiness_and_extraction_bind_exact_query():
                 el.innerHTML = `
                   <div id="time">資料時間：2026/08/22 10:00:03</div>
                   <div id="criteria">查詢條件：2025/08/22 2026/08/22 90000000654321</div>
-                  <div id="empty">查無交易資料</div>`;
+                  <div id="empty">很抱歉，您在指定條件內，沒有任何餘額及交易明細的資料。</div>`;
             }""")
             page.evaluate(ScsbCrawler._twd_inquiry_prepare_result_wait_script(), expected)
             assert page.evaluate(ScsbCrawler._twd_inquiry_result_ready_script(), expected) is False
@@ -316,6 +407,169 @@ def test_scsb_twd_result_readiness_and_extraction_bind_exact_query():
             assert page.evaluate(ScsbCrawler._twd_inquiry_result_ready_script(), expected) is False
             page.locator("#empty").evaluate("el => { el.outerHTML = el.outerHTML; }")
             assert page.evaluate(ScsbCrawler._twd_inquiry_result_ready_script(), expected) is True
+        finally:
+            browser.close()
+
+
+def test_scsb_twd_unrelated_generic_empty_result_is_rejected():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                '<aside id="unrelated">沒有任何交易明細的資料<button>關閉</button></aside>',
+            )
+            expected = {
+                "start": "2026/07/27", "end": "2026/08/26",
+                "account_no": "90000000123456",
+            }
+            page.evaluate(ScsbCrawler._twd_inquiry_prepare_result_wait_script(), expected)
+            page.locator("#unrelated").evaluate("el => { el.outerHTML = el.outerHTML; }")
+
+            assert page.evaluate(
+                ScsbCrawler._twd_inquiry_result_ready_script(), expected,
+            ) is False
+        finally:
+            browser.close()
+
+
+def test_scsb_twd_result_readiness_rejects_ambiguous_matching_scopes():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <section id="first">
+                  <div>查詢條件：2025/08/22 2026/02/21 90000000123456</div>
+                  <table><tr><th>時間</th><th>摘要</th><th>支出</th><th>存入</th><th>結餘</th></tr>
+                  <tr><td>2026/01/01</td><td>STALE-WANTED</td><td>1</td><td></td><td>9</td></tr></table>
+                </section>
+                <section id="second">
+                  <div>查詢條件：2025/08/22 2026/02/21 90000000123456</div>
+                  <table><tr><th>時間</th><th>摘要</th><th>支出</th><th>存入</th><th>結餘</th></tr>
+                  <tr><td>2026/01/02</td><td>FRESH-WANTED</td><td>2</td><td></td><td>7</td></tr></table>
+                </section>
+                """,
+            )
+            expected = {
+                "start": "2025/08/22", "end": "2026/02/21",
+                "account_no": "90000000123456",
+            }
+            page.evaluate(ScsbCrawler._twd_inquiry_prepare_result_wait_script(), expected)
+            page.locator("#first table").evaluate("el => { el.outerHTML = el.outerHTML; }")
+            page.locator("#second table").evaluate("el => { el.outerHTML = el.outerHTML; }")
+
+            assert page.evaluate(
+                ScsbCrawler._twd_inquiry_result_ready_script(), expected,
+            ) is False
+        finally:
+            browser.close()
+
+
+def test_scsb_twd_extraction_uses_the_exact_changed_table():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <section id="scope">
+                  <div>查詢條件：2025/08/22 2026/02/21 90000000123456</div>
+                  <table id="stale"><tr><th>時間</th><th>摘要</th><th>支出</th><th>存入</th><th>結餘</th></tr>
+                  <tr><td>2026/01/01</td><td>STALE</td><td>1</td><td></td><td>9</td></tr></table>
+                  <table id="fresh"><tr><th>時間</th><th>摘要</th><th>支出</th><th>存入</th><th>結餘</th></tr>
+                  <tr><td>2026/01/02</td><td>FRESH</td><td>2</td><td></td><td>7</td></tr></table>
+                </section>
+                """,
+            )
+            expected = {
+                "start": "2025/08/22", "end": "2026/02/21",
+                "account_no": "90000000123456",
+            }
+            page.evaluate(ScsbCrawler._twd_inquiry_prepare_result_wait_script(), expected)
+            page.locator("#fresh").evaluate(
+                "el => { el.outerHTML = el.outerHTML.replace('FRESH', 'FRESH-NEW'); }",
+            )
+
+            assert page.evaluate(
+                ScsbCrawler._twd_inquiry_result_ready_script(), expected,
+            ) is True
+            extracted = page.evaluate(
+                ScsbCrawler._twd_inquiry_extract_result_script(), expected,
+            )
+            assert "FRESH" in extracted["text"]
+            assert "STALE" not in extracted["text"]
+        finally:
+            browser.close()
+
+
+def test_scsb_twd_new_empty_result_does_not_require_bank_to_echo_query_criteria():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                '<div id="empty">很抱歉，您在指定條件內，沒有任何餘額及交易明細的資料。</div>',
+            )
+            expected = {
+                "start": "2026/07/27", "end": "2026/08/26",
+                "account_no": "90000000123456",
+            }
+            page.evaluate(ScsbCrawler._twd_inquiry_prepare_result_wait_script(), expected)
+            assert page.evaluate(ScsbCrawler._twd_inquiry_result_ready_script(), expected) is False
+            page.locator("#empty").evaluate("el => { el.outerHTML = el.outerHTML; }")
+
+            assert page.evaluate(ScsbCrawler._twd_inquiry_result_ready_script(), expected) is True
+            assert page.evaluate(
+                ScsbCrawler._twd_inquiry_extract_result_script(), expected,
+            ) == {"ok": True, "empty": True, "row_count": 0, "text": ""}
+        finally:
+            browser.close()
+
+
+def test_scsb_twd_result_readiness_survives_a_new_document_context():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <section>
+                  <div>查詢條件：2025/08/22 2026/02/21 90000000123456</div>
+                  <table><tr><th>時間</th><th>摘要</th><th>支出</th><th>存入</th><th>結餘</th></tr>
+                  <tr><td>2026/01/01</td><td>A</td><td>1</td><td></td><td>9</td></tr></table>
+                </section>
+                """,
+            )
+            expected = {
+                "start": "2025/08/22", "end": "2026/02/21",
+                "account_no": "90000000123456",
+            }
+
+            assert page.evaluate(
+                ScsbCrawler._twd_inquiry_result_ready_script(), expected,
+            ) is True
         finally:
             browser.close()
 
@@ -360,6 +614,18 @@ def test_scsb_twd_pagination_detector_handles_aria_and_disabled_controls():
             )
             page.evaluate("window.__thothScsbTwdResultScope = document.querySelector('#scope')")
             assert page.evaluate(ScsbCrawler._twd_inquiry_result_state_script())["pagination"] is False
+            page.set_content(
+                '<section id="scope"><div role="alert">為節省查詢等待時間，建議縮短查詢期間。</div></section>',
+            )
+            page.evaluate("window.__thothScsbTwdResultScope = document.querySelector('#scope')")
+            assert page.evaluate(ScsbCrawler._twd_inquiry_result_state_script())["error"] is False
+            page.locator('[role="alert"]').evaluate("el => { el.textContent = '系統錯誤，請稍後再試'; }")
+            assert page.evaluate(ScsbCrawler._twd_inquiry_result_state_script())["error"] is True
+            page.set_content(
+                '<section id="scope"><div style="display:none">系統錯誤，請稍後再試</div><div>查詢完成</div></section>',
+            )
+            page.evaluate("window.__thothScsbTwdResultScope = document.querySelector('#scope')")
+            assert page.evaluate(ScsbCrawler._twd_inquiry_result_state_script())["error"] is False
         finally:
             browser.close()
 
@@ -489,6 +755,7 @@ def test_scsb_twd_year_query_is_bounded_and_omits_private_debug_sinks():
         inspect.getsource(ScsbCrawler.collect)
         + inspect.getsource(ScsbCrawler._collect_twd_inquiry)
         + inspect.getsource(ScsbCrawler._collect_twd_account)
+        + inspect.getsource(ScsbCrawler._collect_twd_period)
         + inspect.getsource(ScsbCrawler._collect_credit_card_inquiry)
         + inspect.getsource(scsb_persist_module.persist_scsb)
     )
@@ -502,23 +769,33 @@ def test_scsb_twd_year_query_is_bounded_and_omits_private_debug_sinks():
     assert 'put_daily_metric("overview_text_preview"' not in source
     assert '"snippet"' not in source
     assert '"url"' not in inspect.getsource(ScsbCrawler._collect_credit_card_inquiry)
+    assert "JS_KILL_MODAL" not in inspect.getsource(ScsbCrawler.collect)
+    assert "JS_KILL_MODAL" not in inspect.getsource(ScsbCrawler._collect_twd_inquiry)
 
 
 def _mock_twd_query_page(*, full_text: str = "", result_state: dict | None = None) -> MagicMock:
     page = MagicMock()
     page.url = "https://example.invalid/query"
+    query_response = Mock(ok=True)
     query_request = Mock()
-    query_request.response.return_value = Mock(ok=True)
+    query_request.response.return_value = query_response
     page.expect_request.return_value.__enter__.return_value = Mock(value=query_request)
-    page._query_request = query_request
-    page.evaluate.side_effect = [
+    page._query_response = query_response
+    confirm = MagicMock()
+    confirm.filter.return_value = confirm
+    confirm.count.return_value = 1
+    confirm.first.is_visible.return_value = True
+    confirm.evaluate.return_value = 1
+    confirm.input_value.return_value = "opaque-account"
+    page.locator.return_value = confirm
+    page._confirm_buttons = confirm
+    evaluate_results = [
         {"ok": True},
-        None,
         [{"id": "account", "name": "account", "options": [{"value": "90000000123456"}]}],
-        {"ok": True, "period": "one-year", "start": "2025/08/22", "end": "2026/08/22"},
+        {"ok": True, "period": "six-month", "start": "2026/02/23", "end": "2026/08/22"},
         {"ok": True},
         None,
-        "查詢",
+        True,
         result_state or {"error": False, "pagination": False},
         {
             "ok": True,
@@ -527,7 +804,35 @@ def _mock_twd_query_page(*, full_text: str = "", result_state: dict | None = Non
             "text": full_text,
         },
     ]
+    if not full_text:
+        evaluate_results.append({"ok": True})
+    page.evaluate.side_effect = evaluate_results
     return page
+
+
+def test_scsb_twd_response_is_read_from_request_started_by_current_click():
+    page = _mock_twd_query_page()
+    current_request = Mock()
+    current_request.response.return_value = page._query_response
+    page.expect_request.return_value.__enter__.return_value = Mock(value=current_request)
+    page.expect_response.side_effect = AssertionError("must not accept an unrelated response")
+
+    object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    page.expect_request.assert_called_once()
+    current_request.response.assert_called_once_with()
+
+
+def test_scsb_twd_result_wait_log_omits_dynamic_exception_text(capsys):
+    page = _mock_twd_query_page()
+    page.wait_for_function.side_effect = RuntimeError("PRIVATE short account alias")
+
+    with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    stderr = capsys.readouterr().err
+    assert "PRIVATE short account alias" not in stderr
+    assert "RuntimeError" in stderr
 
 
 def test_scsb_twd_query_timeout_propagates_instead_of_returning_empty(tmp_path):
@@ -537,7 +842,7 @@ def test_scsb_twd_query_timeout_propagates_instead_of_returning_empty(tmp_path):
     with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
     page.wait_for_function.assert_called_once()
-    page._query_request.response.assert_called_once()
+    page.expect_request.assert_called_once()
 
 
 def test_scsb_twd_navigation_failure_fails_closed(tmp_path):
@@ -550,6 +855,54 @@ def test_scsb_twd_navigation_failure_fails_closed(tmp_path):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
 
 
+def test_scsb_twd_submit_rejects_reverted_account_selection():
+    page = _mock_twd_query_page()
+    page._confirm_buttons.evaluate.side_effect = [1, 2]
+
+    with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    page._confirm_buttons.first.click.assert_not_called()
+
+
+def test_scsb_twd_submit_rejects_same_index_account_value_change():
+    page = _mock_twd_query_page()
+    page._confirm_buttons.input_value.side_effect = ["opaque-account-a", "opaque-account-b"]
+
+    with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    page._confirm_buttons.first.click.assert_not_called()
+
+
+def test_scsb_twd_submit_uses_native_period_controls_and_browser_click():
+    page = _mock_twd_query_page()
+
+    object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    assert page.locator.call_args_list == [
+        call('select[id="account"]'),
+        call('[data-thoth-scsb-twd-period="custom"]'),
+        call('[data-thoth-scsb-twd-period="start"]'),
+        call('[data-thoth-scsb-twd-period="end"]'),
+        call('select[id="account"]'),
+        call("button:visible, a:visible, [role=button]:visible"),
+        call('[data-thoth-scsb-twd-empty-close="true"]'),
+    ]
+    page._confirm_buttons.first.check.assert_called_once_with()
+    assert page._confirm_buttons.first.fill.call_args_list == [
+        call("2026/02/23"),
+        call("2026/08/22"),
+    ]
+    assert page._confirm_buttons.first.click.call_count == 2
+    assert page._confirm_buttons.evaluate.call_args_list == [
+        call("el => el.selectedIndex"),
+        call("el => el.selectedIndex"),
+    ]
+    assert page._confirm_buttons.input_value.call_count == 2
+    page.expect_request.assert_called_once()
+
+
 def test_scsb_card_leaf_navigation_failure_fails_closed():
     page = MagicMock()
     page.evaluate.return_value = {"ok": False}
@@ -558,48 +911,226 @@ def test_scsb_card_leaf_navigation_failure_fails_closed():
         object.__new__(ScsbCrawler)._collect_credit_card_inquiry(page)
 
 
+def test_scsb_card_parser_accepts_live_chinese_current_row():
+    text = (
+        "即時消費紀錄\n"
+        "交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果\n"
+        "2026/08/25 13:45:00\tVISA 1234\t測試商店\t1,234\t消費\t台灣\t成功"
+    )
+
+    rows, complete = scsb_persist_module._scsb_parse_card_rows(text, "current")
+
+    assert complete is True
+    assert rows == [{
+        "card_no": "****1234",
+        "scope": "current",
+        "date": "2026-08-25",
+        "desc": "測試商店",
+        "amount": 1234.0,
+        "currency": "TWD",
+        "txn_type": "spending",
+    }]
+
+
+def test_scsb_card_parser_rejects_malformed_chinese_row():
+    text = (
+        "即時消費紀錄\n"
+        "交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果\n"
+        "2026/08/25 13:45:00\tVISA 1234\t正常商店\t1,234\t消費\t台灣\t成功\n"
+        "NOT-A-DATE\tVISA 5678\t格式錯誤\t999\t消費\t台灣\t成功"
+    )
+
+    rows, complete = scsb_persist_module._scsb_parse_card_rows(text, "current")
+
+    assert len(rows) == 1
+    assert complete is False
+
+
+def test_scsb_card_parser_rejects_failed_authorization_row():
+    text = (
+        "即時消費紀錄\n"
+        "交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果\n"
+        "2026/08/25 13:45:00\tVISA 1234\t失敗商店\t1,234\t消費\t台灣\t失敗"
+    )
+
+    rows, complete = scsb_persist_module._scsb_parse_card_rows(text, "current")
+
+    assert rows == []
+    assert complete is False
+
+
+def test_scsb_current_card_table_must_share_live_heading_owner():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <div class="container mainContent"><h2 class="inner-title">即時消費紀錄</h2></div>
+                <div class="unrelated"><table><tr>
+                  <th>交易日 交易時間</th><th>交易卡別 卡號末4碼</th><th>商店名稱</th>
+                  <th>交易金額(台幣)</th><th>交易類別</th><th>交易國別</th><th>交易結果</th>
+                </tr></table></div>
+                """,
+            )
+
+            state = page.evaluate(
+                ScsbCrawler._card_leaf_table_state_script(), "即時消費紀錄",
+            )
+
+            assert state["ok"] is False
+            assert state["matching_table_count"] == 0
+        finally:
+            browser.close()
+
+
+def test_scsb_current_card_empty_rejects_extra_visible_table():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(
+                """
+                <div class="container mainContent">
+                  <h2 class="inner-title">即時消費紀錄</h2>
+                  <table id="current"><tr>
+                    <th>交易日 交易時間</th><th>交易卡別 卡號末4碼</th><th>商店名稱</th>
+                    <th>交易金額(台幣)</th><th>交易類別</th><th>交易國別</th><th>交易結果</th>
+                  </tr></table>
+                </div>
+                <table id="unrelated"><tr><th>其他資料</th></tr></table>
+                """,
+            )
+            state = page.evaluate(
+                ScsbCrawler._card_leaf_table_state_script(), "即時消費紀錄",
+            )
+
+            assert state["ok"] is False
+            assert state["visible_table_count"] == 2
+            assert state["matching_table_count"] == 1
+        finally:
+            browser.close()
+
+
+def test_scsb_card_collector_rejects_rows_from_unbound_current_table():
+    page = MagicMock()
+    control = MagicMock()
+    control.filter.return_value = control
+    control.count.return_value = 1
+    control.first.is_visible.return_value = True
+    control.first.get_attribute.return_value = "collapsed"
+    page.locator.return_value = control
+    texts = {
+        "未出帳消費明細": "未出帳消費明細\n您目前無新增交易或您的交易尚未入帳。",
+        "即時消費紀錄": (
+            "即時消費紀錄\n"
+            "交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果\n"
+            "2026/08/25 13:45:00\tVISA 1234\tUNRELATED\t1,234\t消費\t台灣\t成功\n"
+            "No real-time transaction records"
+        ),
+        "帳單查詢及繳款": "帳單查詢及繳款\n本期新增明細",
+    }
+
+    def evaluate(script, arg=None):
+        if script == ScsbCrawler._card_leaf_scope_text_script():
+            return texts[arg]
+        if script == ScsbCrawler._card_leaf_table_state_script():
+            return {
+                "ok": False, "row_count": 1, "heading_count": 1,
+                "visible_table_count": 1, "matching_table_count": 0,
+            }
+        if script == ScsbCrawler._card_statement_state_script():
+            return {"ok": True}
+        if "querySelectorAll('input')" in script:
+            return []
+        raise AssertionError("unexpected evaluate call")
+
+    page.evaluate.side_effect = evaluate
+
+    with pytest.raises(RuntimeError, match="credit-card inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_credit_card_inquiry(page)
+
+
+@pytest.mark.parametrize("table_state", [
+    {"ok": True, "row_count": 1},
+    {
+        "ok": False, "row_count": None, "heading_count": 1,
+        "visible_table_count": 2, "matching_table_count": 1,
+    },
+])
+def test_scsb_card_collector_rejects_nonempty_table_with_empty_marker(table_state):
+    page = MagicMock()
+    control = MagicMock()
+    control.filter.return_value = control
+    control.count.return_value = 1
+    control.first.is_visible.return_value = True
+    control.first.get_attribute.return_value = "collapsed"
+    page.locator.return_value = control
+    texts = {
+        "未出帳消費明細": "未出帳消費明細\n您目前無新增交易或您的交易尚未入帳。",
+        "即時消費紀錄": (
+            "即時消費紀錄\n"
+            "交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果\n"
+            "2026/08/25 13:45:00\tVISA 1234\t失敗商店\t1,234\t消費\t台灣\t失敗\n"
+            "No real-time transaction records"
+        ),
+        "帳單查詢及繳款": "帳單查詢及繳款\n本期新增明細",
+    }
+
+    def evaluate(script, arg=None):
+        if script == ScsbCrawler._card_leaf_scope_text_script():
+            return texts[arg]
+        if script == ScsbCrawler._card_leaf_table_state_script():
+            return table_state
+        if script == ScsbCrawler._card_statement_state_script():
+            return {"ok": True}
+        if "querySelectorAll('input')" in script:
+            return []
+        raise AssertionError("unexpected evaluate call")
+
+    page.evaluate.side_effect = evaluate
+
+    with pytest.raises(RuntimeError, match="credit-card inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_credit_card_inquiry(page)
+
+
 def test_scsb_card_collector_returns_normalized_data_without_raw_dom():
     page = MagicMock()
-    state = {"leaf": ""}
+    control = MagicMock()
+    control.filter.return_value = control
+    control.count.return_value = 1
+    control.first.is_visible.return_value = True
+    control.first.get_attribute.return_value = "collapsed"
+    page.locator.return_value = control
     texts = {
-        "Unbilled Transaction Details": (
-            "Unbilled Transaction Details\nYou currently have no new transactions"
+        "未出帳消費明細": (
+            "未出帳消費明細\n您目前無新增交易或您的交易尚未入帳。"
         ),
-        "Real-Time Transaction Records": (
-            "Real-Time Transaction Records\nNo real-time transaction records"
+        "即時消費紀錄": (
+            "即時消費紀錄\n交易日 交易時間\t交易卡別 卡號末4碼\t商店名稱\t交易金額(台幣)\t交易類別\t交易國別\t交易結果"
         ),
-        "Statement Inquiry and Payment": (
-            "Statement Inquiry and Payment\nData Time：2026/08/26\n2026/05\n2026/04\n"
-            "Current Period Total Amount Due\n12,345\n"
-            "Current Period Total Minimum Amount Due\n1,500\nPRIVATE TRANSACTION"
-        ),
+        "帳單查詢及繳款": "帳單查詢及繳款\n本期新增明細\nPRIVATE TRANSACTION",
     }
 
     def evaluate(script, arg=None):
         if script == ScsbCrawler._card_leaf_scope_text_script():
             assert isinstance(arg, str)
             return texts[arg]
-        if "const allBtns" in script and isinstance(arg, str) and arg in texts:
-            state["leaf"] = arg
+        if script == ScsbCrawler._card_leaf_table_state_script():
+            assert arg == "即時消費紀錄"
+            return {"ok": True, "row_count": 0}
+        if script == ScsbCrawler._card_statement_state_script():
             return {"ok": True}
-        if script == scsb_module.JS_KILL_MODAL:
-            return None
-        if script == "document.body.innerText":
-            return texts[state["leaf"]]
         if "querySelectorAll('input')" in script:
             return []
-        if "^(Confirm|查詢|確認|Search)" in script:
-            return True
-        if "rawTarget" in script:
-            assert isinstance(arg, list)
-            return {"ok": True, "panel": f"#month-panel-{arg[0].replace('/', '-')}"}
-        if isinstance(arg, str) and arg.startswith("#month-panel-"):
-            return texts["Statement Inquiry and Payment"]
-        if arg in (
-            ["2026/05", "Statement Inquiry and Payment"],
-            ["2026/04", "Statement Inquiry and Payment"],
-        ):
-            return True
         raise AssertionError("unexpected evaluate call")
 
     page.evaluate.side_effect = evaluate
@@ -607,66 +1138,74 @@ def test_scsb_card_collector_returns_normalized_data_without_raw_dom():
 
     assert result["leaves"]["unbilled"] == {"nav": {"ok": True}, "empty": True}
     assert result["leaves"]["current"] == {"nav": {"ok": True}, "empty": True}
-    assert result["leaves"]["statement"]["months"] == [
-        {
-            "month": "2026/05", "due_amount": 12345,
-            "min_payment": 1500, "has_data": True,
-        },
-        {
-            "month": "2026/04", "due_amount": 12345,
-            "min_payment": 1500, "has_data": True,
-        },
-    ]
+    assert result["leaves"]["statement"] == {"nav": {"ok": True}}
     assert "PRIVATE TRANSACTION" not in repr(result)
-    assert page.wait_for_function.call_count == 9
+    assert control.first.click.call_count == 9
+    assert [call.kwargs.get("arg") for call in page.wait_for_function.call_args_list[:3]] == [
+        ["/card/co/03/01", "未出帳消費明細"],
+        ["/card/co/08/01", "即時消費紀錄"],
+        ["/card/co/02/01", "帳單查詢及繳款"],
+    ]
+    assert page.wait_for_function.call_count == 3
+    assert not any(
+        "^(Confirm|查詢|確認|Search)" in call.args[0]
+        for call in page.evaluate.call_args_list
+        if call.args and isinstance(call.args[0], str)
+    )
+
+
+def test_scsb_card_collector_logs_safe_read_stage_without_exception_text(capsys):
+    page = MagicMock()
+    control = MagicMock()
+    control.filter.return_value = control
+    control.count.return_value = 1
+    control.first.is_visible.return_value = True
+    control.first.get_attribute.return_value = "collapsed"
+    page.locator.return_value = control
+
+    def evaluate(script, arg=None):
+        if script == ScsbCrawler._card_leaf_scope_text_script():
+            raise RuntimeError("PRIVATE DOM CONTENT")
+        raise AssertionError("unexpected evaluate call")
+
+    page.evaluate.side_effect = evaluate
+    with pytest.raises(RuntimeError, match="SCSB credit-card inquiry failed"):
+        object.__new__(ScsbCrawler)._collect_credit_card_inquiry(page)
+
+    stderr = capsys.readouterr().err
+    assert "[card_inq:unbilled] failed stage=read" in stderr
+    assert "PRIVATE DOM CONTENT" not in stderr
 
 
 def test_scsb_twd_query_request_predicate_is_exact():
-    expected = {
-        "account_no": "90000000123456",
-        "start": "2025/08/22",
-        "end": "2026/08/22",
-    }
     request = Mock(
-        url="https://ebank.scsb.com.tw/ibap/api/query",
+        url="https://ebank.scsb.com.tw/twde/twdeqr01/query",
         method="POST",
         resource_type="xhr",
-        post_data="account_no=90000000123456&start=2025%2F08%2F22&end=2026%2F08%2F22",
+        post_data="Data=opaque-ciphertext",
     )
-    assert ScsbCrawler._is_twd_query_request(request, expected) is True
+    assert ScsbCrawler._is_twd_query_request(request) is True
 
     for url in (
-        "http://ebank.scsb.com.tw/ibap/api/query",
-        "https://ebank.scsb.com.tw:444/ibap/api/query",
-        "https://ebank.scsb.com.tw/unrelated/query",
-        "https://evil.example/ibap/api/query",
+        "http://ebank.scsb.com.tw/twde/twdeqr01/query",
+        "https://ebank.scsb.com.tw:444/twde/twdeqr01/query",
+        "https://ebank.scsb.com.tw/twde/unrelated/query",
+        "https://evil.example/twde/twdeqr01/query",
     ):
         request.url = url
-        assert ScsbCrawler._is_twd_query_request(request, expected) is False
-    request.url = "https://ebank.scsb.com.tw/ibap/api/query"
+        assert ScsbCrawler._is_twd_query_request(request) is False
+    request.url = "https://ebank.scsb.com.tw/twde/twdeqr01/query"
     request.method = "GET"
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
+    assert ScsbCrawler._is_twd_query_request(request) is False
     request.method = "POST"
-    request.post_data = "foo=90000000123456&bar=2025%2F08%2F22&baz=2026%2F08%2F22"
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
-    request.post_data = (
-        "account_no=9000000012345699&start=2025%2F08%2F22&end=2026%2F08%2F22"
-    )
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
-    request.post_data = (
-        "account_no=90000000123456&accountNumber=90000000999999&"
-        "start=2025%2F08%2F22&end=2026%2F08%2F22"
-    )
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
-    request.post_data = (
-        '{"account_no":true,"accountNumber":"90000000123456",'
-        '"start":"2025/08/22","end":"2026/08/22"}'
-    )
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
-    request.post_data = "account_no=90000000999999&start=2025%2F08%2F22&end=2026%2F08%2F22"
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
+    request.post_data = "Data="
+    assert ScsbCrawler._is_twd_query_request(request) is False
+    request.post_data = "Data=opaque&extra=field"
+    assert ScsbCrawler._is_twd_query_request(request) is False
+    request.post_data = '{"Data":{"nested":"opaque"}}'
+    assert ScsbCrawler._is_twd_query_request(request) is False
     request.post_data = None
-    assert ScsbCrawler._is_twd_query_request(request, expected) is False
+    assert ScsbCrawler._is_twd_query_request(request) is False
 
 
 def test_scsb_statement_month_request_predicate_is_exact():
@@ -693,12 +1232,12 @@ def test_scsb_twd_rejected_or_paginated_result_fails_closed(tmp_path, result_sta
 
     with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
-    assert page.evaluate.call_args_list[7].args[0] == ScsbCrawler._twd_inquiry_result_state_script()
+    assert page.evaluate.call_args_list[6].args[0] == ScsbCrawler._twd_inquiry_result_state_script()
 
 
 def test_scsb_twd_collector_parses_full_dom_beyond_preview(tmp_path):
     full_text = "\n".join(
-        f"2026/01/01\t摘要{i:03d}\tNT$ 1\t\tNT$ 9,999\t備註{i:03d}-" + "x" * 40
+        f"2026/03/01\t摘要{i:03d}\tNT$ 1\t\tNT$ 9,999\t備註{i:03d}-" + "x" * 40
         for i in range(250)
     )
     page = _mock_twd_query_page(full_text=full_text)
@@ -707,8 +1246,11 @@ def test_scsb_twd_collector_parses_full_dom_beyond_preview(tmp_path):
 
     result = crawler._collect_twd_inquiry(page, {"90000000123456"})
 
-    assert page.evaluate.call_args_list[3].args[0] == (
-        ScsbCrawler._twd_inquiry_period_script(full_history=False)
+    assert page.evaluate.call_args_list[2].args[0] == (
+        ScsbCrawler._twd_inquiry_period_script(
+            full_history=False,
+            end_date=date.today(),
+        )
     )
     assert "text" not in result
     assert len(result["records"]) == 250
@@ -716,9 +1258,14 @@ def test_scsb_twd_collector_parses_full_dom_beyond_preview(tmp_path):
 
 def test_scsb_twd_collector_dom_read_failure_fails_closed(tmp_path):
     page = _mock_twd_query_page()
-    side_effects = list(page.evaluate.side_effect)
-    side_effects[-1] = RuntimeError("synthetic DOM read failure")
-    page.evaluate.side_effect = side_effects
+    results = iter(page.evaluate.side_effect)
+
+    def evaluate(script, arg=None):
+        if script == ScsbCrawler._twd_inquiry_extract_result_script():
+            raise RuntimeError("synthetic DOM read failure")
+        return next(results)
+
+    page.evaluate.side_effect = evaluate
 
     with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
@@ -733,7 +1280,7 @@ def test_scsb_twd_nonempty_result_without_rows_fails_closed(tmp_path):
 
 def test_scsb_twd_collector_rejects_unrecognized_table_row(tmp_path):
     page = _mock_twd_query_page(full_text=(
-        "2026/01/01\t完整\tNT$ 1\t\tNT$ 9\t\n"
+        "2026/03/01\t完整\tNT$ 1\t\tNT$ 9\t\n"
         "NOT-A-DATE\t損壞\tNT$ 1\t\tNT$ 8\t"
     ))
 
@@ -741,22 +1288,143 @@ def test_scsb_twd_collector_rejects_unrecognized_table_row(tmp_path):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
 
 
+def test_scsb_empty_window_closes_bound_result_and_continues_history():
+    crawler = object.__new__(ScsbCrawler)
+    crawler.full_history = True
+    crawler._six_month_windows = Mock(return_value=[
+        ("2026/02/27", "2026/08/26"),
+        ("2025/08/27", "2026/02/26"),
+    ])
+    crawler._collect_twd_period = Mock(side_effect=[[], []])
+    page = MagicMock()
+    close = MagicMock()
+    close.count.return_value = 1
+    close.first.is_visible.return_value = True
+    close.evaluate.return_value = 1
+    close.input_value.return_value = "opaque-account"
+    page.locator.return_value = close
+    page.evaluate.side_effect = [
+        {
+            "ok": True, "period": "one-year",
+            "start": "2025/08/27", "end": "2026/08/26",
+        },
+        {"ok": True},
+        {"ok": True},
+    ]
+
+    result = crawler._collect_twd_account(page, "#account", "90000000123456")
+
+    assert result["records"] == []
+    assert crawler._collect_twd_period.call_count == 2
+    assert close.first.click.call_count == 2
+    assert page.wait_for_function.call_count == 2
+
+
+def test_scsb_empty_windows_each_emit_an_exact_query_request():
+    crawler = object.__new__(ScsbCrawler)
+    crawler.full_history = True
+    crawler._six_month_windows = Mock(return_value=[
+        ("2026/02/27", "2026/08/26"),
+        ("2025/08/27", "2026/02/26"),
+    ])
+    page = MagicMock()
+
+    account_select = MagicMock()
+    account_select.count.return_value = 1
+    account_select.evaluate.return_value = 1
+    account_select.input_value.return_value = "opaque-account"
+    period_control = MagicMock()
+    period_control.count.return_value = 1
+    period_control.first = period_control
+    period_control.is_visible.return_value = True
+    confirm = MagicMock()
+    confirm.filter.return_value = confirm
+    confirm.count.return_value = 1
+    confirm.first = confirm
+    confirm.is_visible.return_value = True
+    close = MagicMock()
+    close.count.return_value = 1
+    close.first = close
+    close.is_visible.return_value = True
+
+    def locator(selector):
+        if selector == "#account":
+            return account_select
+        if selector.startswith('[data-thoth-scsb-twd-period='):
+            return period_control
+        if selector == "button:visible, a:visible, [role=button]:visible":
+            return confirm
+        if selector == '[data-thoth-scsb-twd-empty-close="true"]':
+            return close
+        raise AssertionError(f"unexpected locator: {selector}")
+
+    page.locator.side_effect = locator
+    base_period = {
+        "ok": True, "period": "one-year",
+        "start": "2025/08/27", "end": "2026/08/26",
+    }
+
+    def evaluate(script, arg=None):
+        if script == crawler._twd_inquiry_period_script(
+            full_history=True, end_date=date.today(),
+        ):
+            return base_period
+        if script == crawler._twd_inquiry_period_verification_script():
+            return {"ok": True}
+        if script == crawler._twd_inquiry_prepare_result_wait_script():
+            return None
+        if script == crawler._twd_inquiry_result_ready_script():
+            return True
+        if script == crawler._twd_inquiry_result_state_script():
+            return {"error": False, "pagination": False}
+        if script == crawler._twd_inquiry_extract_result_script():
+            return {"ok": True, "row_count": 0, "empty": True, "text": ""}
+        if script == crawler._twd_empty_result_close_script():
+            return {"ok": True}
+        raise AssertionError("unexpected evaluate call")
+
+    page.evaluate.side_effect = evaluate
+    requests = [
+        Mock(
+            url="https://ebank.scsb.com.tw/twde/twdeqr01/query",
+            method="POST", resource_type="xhr", post_data=f"Data=opaque-{index}",
+        )
+        for index in range(2)
+    ]
+    contexts = []
+    for request in requests:
+        request.response.return_value = Mock(ok=True)
+        context = MagicMock()
+        context.__enter__.return_value = Mock(value=request)
+        contexts.append(context)
+    page.expect_request.side_effect = contexts
+
+    result = crawler._collect_twd_account(page, "#account", "90000000123456")
+
+    assert result["records"] == []
+    assert page.expect_request.call_count == 2
+    for call_args, request in zip(page.expect_request.call_args_list, requests, strict=True):
+        assert call_args.args[0](request) is True
+    assert confirm.click.call_count == 2
+    assert close.click.call_count == 2
+
+
 def test_scsb_twd_collector_queries_every_account(tmp_path):
-    page = _mock_twd_query_page(full_text="2026/01/01\t第一帳戶\tNT$ 1\t\tNT$ 9\t")
+    page = _mock_twd_query_page(full_text="2026/03/01\t第一帳戶\tNT$ 1\t\tNT$ 9\t")
     side_effects = list(page.evaluate.side_effect)
-    side_effects[2] = [{
+    side_effects[1] = [{
         "id": "account",
         "name": "account",
         "options": [{"value": "90000000123456"}, {"value": "90000000654321"}],
     }]
-    side_effects.extend(side_effects[3:])
+    side_effects.extend(side_effects[2:])
     page.evaluate.side_effect = side_effects
 
     result = object.__new__(ScsbCrawler)._collect_twd_inquiry(
         page, {"90000000123456", "90000000654321"})
 
     assert page.select_option.call_count == 2
-    assert [call.kwargs["value"] for call in page.select_option.call_args_list] == [
+    assert [item.kwargs["value"] for item in page.select_option.call_args_list] == [
         "90000000123456", "90000000654321",
     ]
     assert {row["account_no"] for row in result["records"]} == {
@@ -1049,9 +1717,9 @@ def test_persist_scsb_nonfinite_balance_is_incomplete(tmp_path, monkeypatch, bal
 
 
 def test_scsb_twd_name_only_account_select_uses_name_selector(tmp_path):
-    page = _mock_twd_query_page(full_text="2026/01/01\t明細\tNT$ 1\t\tNT$ 9\t")
+    page = _mock_twd_query_page(full_text="2026/03/01\t明細\tNT$ 1\t\tNT$ 9\t")
     side_effects = list(page.evaluate.side_effect)
-    side_effects[2] = [{
+    side_effects[1] = [{
         "id": "",
         "name": "accountPicker",
         "options": [{"value": "90000000123456"}],

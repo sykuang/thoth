@@ -23,7 +23,8 @@ import json
 import os
 import re
 import sys
-from datetime import date
+from calendar import monthrange
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
@@ -47,25 +48,6 @@ SEL_USER = "#idNumber"
 SEL_PWD = "#pppd"
 SEL_CAP = "#verified"
 SEL_CAP_IMG = ".ved_img"
-
-# 強關 modal（SCSB #intro_alert.custom-modal.show 會擋）
-JS_KILL_MODAL = r"""
-(() => {
-  for(let i=0;i<6;i++){
-    let did = false;
-    const b = [...document.querySelectorAll('button,a,div,span')].find(e=>e.offsetParent!==null
-      && /^(I got it|OK|Confirm|確認|我知道了|關閉|Close|確定|Don't show again today|不再顯示|繼續|同意|稍後|下次|不再提醒|Skip)$/i
-        .test((e.textContent||'').trim())
-      && (e.textContent||'').trim().length < 25);
-    if(b){ b.click(); did=true; }
-    if(!did) break;
-  }
-  document.querySelectorAll('.modal-backdrop,.custom-modal.show,[class*=overlay]').forEach(e=>{
-    try{ e.style.display='none'; e.style.opacity=0; e.classList.remove('show'); }catch(x){}
-  });
-  return 'done';
-})()
-"""
 
 _CAPTCHA_BACKGROUND = re.compile(
     r"^url\((?P<quote>[\"']?)data:image/(?:png|jpe?g|gif|webp);base64,"
@@ -452,62 +434,40 @@ class ScsbCrawler(BankCrawler):
         """
         out: dict = {}
         page.wait_for_timeout(5000)
-        page.evaluate(JS_KILL_MODAL)
         page.wait_for_timeout(2000)
 
         # SCSB SPA 菜單是 Vue/React，DOM e.click() 不觸發 vnode handler，
         # 必須用 Playwright 原生 page.click（送真實 mouse event）。
         #
-        # 2026-06-18 evidence-driven fix（job 87 cloud audit, 0.1.36 menu_dom_audit）：
-        # 真實 menu 結構是 Bootstrap accordion (cls=accordion-button collapsed)，
-        # 字眼用「我的總覽 / 投資 / 貸款 / 信用卡」(不是英文 EN 也不是「個人總覽」)。
-        # accordion-button 必先點開展開 → 再點 inner leaf menu。
-        # 修法 (a) 改 SCSB_MENU map = {label: [(accordion_label, leaf_label_zh)]}
-        # (b) _navigate accordion-aware: 先 query button:has-text(accordion) →
-        #     click 展開 → wait 1s → 再 query button/a 配 leaf。
-        SCSB_MENU = {
-            # label_log_name: (accordion_zh, leaf_zh, optional fallback EN)
-            "My Overview": ("我的總覽", None, "My Overview"),  # accordion 本身 = leaf
-            "TWD Deposit": ("我的總覽", "台幣存款", "TWD Deposit"),  # 在我的總覽 accordion 下
-            "Credit Card": ("信用卡", None, "Credit Card Services"),  # accordion 本身 = leaf
+        # 2026-08-26 authenticated live DOM：`臺幣存匯` 是獨立 top-level accordion，
+        # 並非「我的總覽」底下的 `台幣存款` leaf。點開後，_collect_twd_inquiry
+        # 再走 `臺幣帳戶查詢 → 餘額及交易明細查詢`。
+        menu = {
+            "My Overview": ("我的總覽", "My Overview"),
+            "TWD Deposit": ("臺幣存匯", "TWD Deposit"),
+            "Credit Card": ("信用卡", "Credit Card Services"),
         }
 
         def _navigate(label, wait_ms=8000):
-            """SCSB accordion-aware navigation."""
-            spec = SCSB_MENU.get(label)
+            """Click one top-level SCSB accordion/navigation control."""
+            spec = menu.get(label)
             if not spec:
                 _log(f"  [nav] ❌ unknown label: {label}")
                 return False
-            accordion_zh, leaf_zh, en_fallback = spec
-            _log(f"[collect] click → {label} (accordion={accordion_zh!r} leaf={leaf_zh!r})")
+            accordion_zh, en_fallback = spec
+            _log(f"[collect] click → {label} (accordion={accordion_zh!r})")
             try:
-                # Step 1: 點 accordion 展開（即使 leaf=None 也要點，那就是 navigation 本身）
                 acc_btn = page.query_selector(f"button:has-text({accordion_zh!r})")
                 if not acc_btn or not acc_btn.is_visible():
-                    # EN fallback (給 leaf=None 的 case)
-                    if en_fallback:
-                        acc_btn = page.query_selector(f"button:has-text({en_fallback!r})")
+                    acc_btn = page.query_selector(f"button:has-text({en_fallback!r})")
                 if not acc_btn or not acc_btn.is_visible():
                     _log(f"  [nav] ❌ accordion button {accordion_zh!r} 找不到")
                     return False
                 acc_btn.click()
                 page.wait_for_timeout(2000)
-                # 如果 leaf=None, accordion click 本身就是 navigation
-                if leaf_zh is None:
-                    page.wait_for_timeout(wait_ms - 2000 if wait_ms > 2000 else 1000)
-                    page.evaluate(JS_KILL_MODAL)
-                    page.wait_for_timeout(1500)
-                    return True
-                # Step 2: 點 leaf
-                leaf_btn = page.query_selector(f"button:has-text({leaf_zh!r}), a:has-text({leaf_zh!r}), div:has-text({leaf_zh!r})")
-                if leaf_btn and leaf_btn.is_visible():
-                    leaf_btn.click()
-                    page.wait_for_timeout(wait_ms)
-                    page.evaluate(JS_KILL_MODAL)
-                    page.wait_for_timeout(1500)
-                    return True
-                _log(f"  [nav] ❌ leaf {leaf_zh!r} (展開 {accordion_zh} 後) 找不到")
-                return False
+                page.wait_for_timeout(wait_ms - 2000 if wait_ms > 2000 else 1000)
+                page.wait_for_timeout(1500)
+                return True
             except Exception as e:
                 _log(f"  [nav] 失敗: {type(e).__name__}")
                 return False
@@ -541,7 +501,7 @@ class ScsbCrawler(BankCrawler):
         if not expected_twd_accounts and not overview_inventory_authoritative:
             raise RuntimeError("overview-twd-inventory-unavailable")
 
-        # 2. TWD Deposit / 台幣存款 — 我的總覽 accordion 下 leaf
+        # 2. TWD Deposit / 臺幣存匯 — 獨立 top-level accordion
         if expected_twd_accounts:
             if not _navigate("TWD Deposit", wait_ms=8000):
                 raise RuntimeError("twd-navigation-failed")
@@ -708,7 +668,10 @@ class ScsbCrawler(BankCrawler):
                 });
                 const clickIfCollapsed = (el, label) => {
                     if (!el) return false;
-                    el.click();
+                    const accordion = el.matches('button.accordion-button,[aria-expanded]');
+                    const alreadyOpen = accordion && el.getAttribute('aria-expanded') === 'true'
+                        && !el.classList.contains('collapsed');
+                    if (!alreadyOpen) el.click();
                     log.push(label + ': ' + norm(el.innerText || el.textContent || '').slice(0, 50));
                     return true;
                 };
@@ -733,10 +696,13 @@ class ScsbCrawler(BankCrawler):
             }"""
 
     @staticmethod
-    def _twd_inquiry_period_script(*, full_history: bool = True) -> str:
-        """JS: 新帳號/強制回補查全量；既有帳號只查最近一個曆月。"""
+    def _twd_inquiry_period_script(
+        *, full_history: bool = True, end_date: date | None = None,
+    ) -> str:
+        """JS: 首次/強制回補查全量；既有帳號只查最近一個曆月。"""
         script = r"""() => {
             const fullHistory = __FULL_HISTORY__;
+            const configuredEndRaw = __END_DATE__;
             const visible = (el) => el && el.offsetParent !== null;
             const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const inputs = [...document.querySelectorAll('input')].filter(visible);
@@ -750,16 +716,20 @@ class ScsbCrawler(BankCrawler):
                 )
             );
             const dateInputs = inputs.filter(el => ['date', 'text'].includes(el.type));
+            const placeholderDateInputs = dateInputs.filter(el =>
+                /^(請輸入日期|Enter date)$/i.test(norm(el.placeholder))
+            );
             let startInput = dateInputs.find(el => /(查詢起日|起日|start)/i.test(ownContext(el)));
             let endInput = dateInputs.find(el => /(查詢迄日|迄日|end)/i.test(ownContext(el)));
-            if ((!startInput || !endInput) && dateInputs.length === 2) {
+            if ((!startInput || !endInput) && placeholderDateInputs.length === 2) {
+                [startInput, endInput] = placeholderDateInputs;
+            } else if ((!startInput || !endInput) && dateInputs.length === 2) {
                 [startInput, endInput] = dateInputs;
             }
             if (!custom || !startInput || !endInput || startInput === endInput) {
                 return {ok: false, error: 'custom-period-controls-missing'};
             }
 
-            custom.click();
             const parseDate = (value) => {
                 const match = String(value || '').match(/^(\d{4})[-/](\d{2})[-/](\d{2})$/);
                 if (!match) return null;
@@ -769,7 +739,7 @@ class ScsbCrawler(BankCrawler):
                     && date.getMonth() === month - 1
                     && date.getDate() === day ? date : null;
             };
-            const end = parseDate(endInput.value) || new Date();
+            const end = parseDate(configuredEndRaw) || parseDate(endInput.value) || new Date();
             const systemMin = parseDate(startInput.min);
             let start;
             let period;
@@ -780,6 +750,7 @@ class ScsbCrawler(BankCrawler):
                     const year = end.getFullYear() - 1;
                     const day = Math.min(end.getDate(), new Date(year, end.getMonth() + 1, 0).getDate());
                     start = new Date(year, end.getMonth(), day);
+                    start.setDate(start.getDate() + 1);
                     period = 'one-year';
                 }
             } else {
@@ -797,37 +768,70 @@ class ScsbCrawler(BankCrawler):
                 String(date.getMonth() + 1).padStart(2, '0'),
                 String(date.getDate()).padStart(2, '0'),
             ].join(separator);
-            const setValue = (input, date) => {
-                const separator = input.type === 'date' ? '-' : '/';
-                const value = format(date, separator);
-                const setter = Object.getOwnPropertyDescriptor(
-                    Object.getPrototypeOf(input), 'value'
-                )?.set;
-                if (setter) setter.call(input, value); else input.value = value;
-                input.dispatchEvent(new Event('input', {bubbles: true}));
-                input.dispatchEvent(new Event('change', {bubbles: true}));
-                input.blur();
-            };
             custom.dataset.thothScsbTwdPeriod = 'custom';
             startInput.dataset.thothScsbTwdPeriod = 'start';
             endInput.dataset.thothScsbTwdPeriod = 'end';
-            setValue(startInput, start);
-            setValue(endInput, end);
-            const expectedStart = format(start, '/');
-            const expectedEnd = format(end, '/');
-            const actualStart = parseDate(startInput.value);
-            const actualEnd = parseDate(endInput.value);
             return {
-                ok: custom.checked
-                    && !!actualStart && !!actualEnd
-                    && format(actualStart, '/') === expectedStart
-                    && format(actualEnd, '/') === expectedEnd,
+                ok: true,
                 period,
-                start: expectedStart,
-                end: expectedEnd,
+                start: format(start, '/'),
+                end: format(end, '/'),
             };
         }"""
-        return script.replace("__FULL_HISTORY__", "true" if full_history else "false")
+        return (
+            script.replace("__FULL_HISTORY__", "true" if full_history else "false")
+            .replace(
+                "__END_DATE__",
+                json.dumps(end_date.isoformat() if end_date else None),
+            )
+        )
+
+    @staticmethod
+    def _apply_twd_period_controls(page, period: dict) -> None:
+        """用真實 browser actions 更新 react-datepicker state。"""
+        if not period.get("ok"):
+            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
+        controls = {
+            role: page.locator(f'[data-thoth-scsb-twd-period="{role}"]')
+            for role in ("custom", "start", "end")
+        }
+        if any(
+            control.count() != 1 or not control.first.is_visible()
+            for control in controls.values()
+        ):
+            raise RuntimeError("lookback-period-control-unavailable")
+        _log("[twd_inq] native period controls → custom")
+        controls["custom"].first.check()
+        _log("[twd_inq] native period controls → start")
+        controls["start"].first.fill(period["start"])
+        _log("[twd_inq] native period controls → end")
+        controls["end"].first.fill(period["end"])
+        _log("[twd_inq] native period controls → done")
+
+    @staticmethod
+    def _six_month_windows(start: str, end: str) -> list[tuple[str, str]]:
+        start_date = date.fromisoformat(start.replace("/", "-"))
+        end_date = date.fromisoformat(end.replace("/", "-"))
+        if start_date > end_date:
+            raise ValueError("history start is after end")
+
+        windows: list[tuple[str, str]] = []
+        cursor = start_date
+        while cursor <= end_date:
+            month_index = cursor.year * 12 + cursor.month - 1 + 6
+            year, month_zero = divmod(month_index, 12)
+            month = month_zero + 1
+            chunk_end = min(
+                date(year, month, min(cursor.day, monthrange(year, month)[1]))
+                - timedelta(days=1),
+                end_date,
+            )
+            windows.append((
+                cursor.isoformat().replace("-", "/"),
+                chunk_end.isoformat().replace("-", "/"),
+            ))
+            cursor = chunk_end + timedelta(days=1)
+        return list(reversed(windows))
 
     @staticmethod
     def _twd_inquiry_period_verification_script() -> str:
@@ -856,14 +860,15 @@ class ScsbCrawler(BankCrawler):
             };
             const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
             window.__thothScsbTwdResultScope = null;
-            window.__thothScsbTwdOldScopeText = null;
+            window.__thothScsbTwdResultElement = null;
+            window.__thothScsbTwdOldScopes = new WeakMap();
             window.__thothScsbTwdOldTables = new WeakMap();
             for (const table of document.querySelectorAll('table')) {
                 if (visible(table) && tablePattern.test(table.innerText || '')) {
                     window.__thothScsbTwdOldTables.set(table, table.innerText || '');
                 }
             }
-            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
+            const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
             window.__thothScsbTwdOldEmpty = new WeakMap();
             for (const empty of document.querySelectorAll('body *')) {
                 if (visible(empty) && emptyPattern.test(empty.innerText || '')
@@ -883,8 +888,8 @@ class ScsbCrawler(BankCrawler):
                             && exactToken(own, expected.end);
                     });
                     if (criteria.length === 1) {
-                        window.__thothScsbTwdOldScopeText = scope.innerText || '';
-                        return;
+                        window.__thothScsbTwdOldScopes.set(scope, scope.innerText || '');
+                        break;
                     }
                 }
             }
@@ -901,8 +906,8 @@ class ScsbCrawler(BankCrawler):
                             && exactToken(own, expected.end);
                     });
                     if (criteria.length === 1) {
-                        window.__thothScsbTwdOldScopeText = scope.innerText || '';
-                        return;
+                        window.__thothScsbTwdOldScopes.set(scope, scope.innerText || '');
+                        break;
                     }
                 }
             }
@@ -913,6 +918,12 @@ class ScsbCrawler(BankCrawler):
         """JS: criteria 與本次新增/改變的結果必須位於同一個非 body 容器。"""
         return r"""(expected) => {
             const visible = (el) => el && el.offsetParent !== null;
+            const oldTables = window.__thothScsbTwdOldTables instanceof WeakMap
+                ? window.__thothScsbTwdOldTables : new WeakMap();
+            const oldEmpty = window.__thothScsbTwdOldEmpty instanceof WeakMap
+                ? window.__thothScsbTwdOldEmpty : new WeakMap();
+            const oldScopes = window.__thothScsbTwdOldScopes instanceof WeakMap
+                ? window.__thothScsbTwdOldScopes : new WeakMap();
             const normalize = (value) => String(value || '').replaceAll('-', '/');
             const exactToken = (text, value) => {
                 const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -930,33 +941,40 @@ class ScsbCrawler(BankCrawler):
                     if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                     if (criteriaNodes(scope).length === 1) {
                         const scopeText = scope.innerText || '';
-                        if (window.__thothScsbTwdOldScopeText !== null
-                            && scopeText === window.__thothScsbTwdOldScopeText) continue;
+                        if (oldScopes.has(scope)
+                            && oldScopes.get(scope) === scopeText) continue;
                         return scope;
                     }
                 }
                 return null;
             };
             const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
-            const table = [...document.querySelectorAll('table')].find(el =>
+            const tables = [...document.querySelectorAll('table')].filter(el =>
                 visible(el)
                 && tablePattern.test(el.innerText || '')
-                && (!window.__thothScsbTwdOldTables.has(el)
-                    || window.__thothScsbTwdOldTables.get(el) !== (el.innerText || ''))
+                && (!oldTables.has(el)
+                    || oldTables.get(el) !== (el.innerText || ''))
                 && boundScope(el)
             );
-            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
-            const empty = [...document.querySelectorAll('body *')].find(el =>
+            const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
+            const empties = [...document.querySelectorAll('body *')].filter(el =>
                 visible(el)
                 && emptyPattern.test(el.innerText || '')
                 && ![...el.children].some(child => emptyPattern.test(child.innerText || ''))
-                && (!window.__thothScsbTwdOldEmpty.has(el)
-                    || window.__thothScsbTwdOldEmpty.get(el) !== (el.innerText || ''))
-                && boundScope(el)
+                && (!oldEmpty.has(el)
+                    || oldEmpty.get(el) !== (el.innerText || ''))
             );
-            const result = table || empty;
-            window.__thothScsbTwdResultScope = result ? boundScope(result) : null;
-            return !!result;
+            const tableScopes = tables.map(boundScope).filter(Boolean);
+            const emptyScopes = empties.map(empty =>
+                boundScope(empty)
+                || (empty.parentElement !== document.body ? empty.parentElement : empty)
+            ).filter(Boolean);
+            const scopes = [...tableScopes, ...emptyScopes];
+            const elements = [...tables, ...empties];
+            const unique = scopes.length === 1 && elements.length === 1;
+            window.__thothScsbTwdResultScope = unique ? scopes[0] : null;
+            window.__thothScsbTwdResultElement = unique ? elements[0] : null;
+            return unique;
         }"""
 
     @staticmethod
@@ -970,7 +988,14 @@ class ScsbCrawler(BankCrawler):
                 return new RegExp(`(^|\\D)${escaped}(?=$|\\D)`).test(text);
             };
             const scope = window.__thothScsbTwdResultScope;
-            if (!visible(scope)) return {ok: false, empty: false, row_count: 0, text: ''};
+            const result = window.__thothScsbTwdResultElement;
+            if (!visible(scope) || !visible(result) || !scope.contains(result)) {
+                return {ok: false, empty: false, row_count: 0, text: ''};
+            }
+            const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
+            const empty = emptyPattern.test(result.innerText || '')
+                && ![...result.children].some(child => emptyPattern.test(child.innerText || ''));
+            if (empty) return {ok: true, empty: true, row_count: 0, text: ''};
             const criteria = [...scope.querySelectorAll('*')].some(el => {
                 const own = normalize(el.innerText);
                 return visible(el)
@@ -982,85 +1007,85 @@ class ScsbCrawler(BankCrawler):
             });
             if (!criteria) return {ok: false, empty: false, row_count: 0, text: ''};
             const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
-            const table = [...scope.querySelectorAll('table')].find(el =>
-                visible(el) && tablePattern.test(el.innerText || '')
-            );
+            const table = result.tagName === 'TABLE'
+                && tablePattern.test(result.innerText || '') ? result : null;
             if (table) {
                 const rowCount = [...table.rows].filter(row => row.querySelectorAll('td').length).length;
                 return {ok: true, empty: false, row_count: rowCount, text: table.innerText || ''};
             }
-            const emptyPattern = /查無.*(?:交易|資料)|no .*transaction/i;
-            const empty = [...scope.querySelectorAll('*')].some(el =>
+            return {ok: false, empty: false, row_count: 0, text: ''};
+        }"""
+
+    @staticmethod
+    def _twd_empty_result_close_script() -> str:
+        """Tag the unique native Close action inside the bound empty-result scope."""
+        return r"""() => {
+            const visible = el => el && el.offsetParent !== null;
+            const scope = window.__thothScsbTwdResultScope;
+            if (!visible(scope)) return {ok: false};
+            const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
+            const hasEmpty = [scope, ...scope.querySelectorAll('*')].some(el =>
                 visible(el)
                 && emptyPattern.test(el.innerText || '')
                 && ![...el.children].some(child => emptyPattern.test(child.innerText || ''))
             );
-            return {ok: empty, empty, row_count: 0, text: ''};
+            if (!hasEmpty) return {ok: false};
+            const closes = [...scope.querySelectorAll('button,a,[role=button]')].filter(el =>
+                visible(el) && /^\s*(?:關閉|Close)\s*$/i.test(el.innerText || '')
+            );
+            if (closes.length !== 1) return {ok: false};
+            closes[0].dataset.thothScsbTwdEmptyClose = 'true';
+            return {ok: true};
         }"""
 
+    @classmethod
+    def _close_twd_empty_result(cls, page) -> None:
+        tagged = page.evaluate(cls._twd_empty_result_close_script())
+        if not isinstance(tagged, dict) or tagged.get("ok") is not True:
+            raise RuntimeError("empty-result-close-unavailable")
+        close = page.locator('[data-thoth-scsb-twd-empty-close="true"]')
+        if close.count() != 1 or not close.first.is_visible():
+            raise RuntimeError("empty-result-close-unavailable")
+        close.first.click()
+        page.wait_for_function(
+            """() => {
+                const close = document.querySelector('[data-thoth-scsb-twd-empty-close="true"]');
+                return !close || close.offsetParent === null;
+            }""",
+            timeout=120000,
+        )
+        _log("[twd_inq] empty result → closed")
+
     @staticmethod
-    def _is_twd_query_request(request, expected: dict) -> bool:
+    def _is_twd_query_request(request) -> bool:
+        """Match the exact SCSB TWD endpoint and its single encrypted payload field."""
         parsed = urlparse(request.url)
         body = request.post_data or ""
-        fields: dict[str, list[str]] = {}
-        invalid_fields: set[str] = set()
-
-        def add_field(key, value):
-            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-                fields.setdefault(str(key), []).append(str(value))
-            else:
-                invalid_fields.add(str(key))
-
         try:
             payload = json.loads(body)
         except (TypeError, json.JSONDecodeError):
-            for key, value in parse_qsl(body, keep_blank_values=True):
-                add_field(key, value)
+            pairs = parse_qsl(body, keep_blank_values=True)
+            payload_ok = (
+                len(pairs) == 1
+                and pairs[0][0] == "Data"
+                and bool(pairs[0][1])
+            )
         else:
-            def walk(value):
-                if isinstance(value, dict):
-                    for key, child in value.items():
-                        if isinstance(child, (dict, list)):
-                            invalid_fields.add(str(key))
-                            walk(child)
-                        else:
-                            add_field(key, child)
-                elif isinstance(value, list):
-                    for child in value:
-                        walk(child)
-            walk(payload)
-
-        def exact(aliases, value, *, date_value=False):
-            if any(alias in invalid_fields for alias in aliases):
-                return False
-            expected_value = str(value).replace("-", "/") if date_value else str(value)
-            candidates = [
-                candidate.replace("-", "/") if date_value else candidate
-                for alias in aliases for candidate in fields.get(alias, [])
-            ]
-            return bool(candidates) and all(
-                candidate == expected_value for candidate in candidates
+            payload_ok = (
+                isinstance(payload, dict)
+                and set(payload) == {"Data"}
+                and isinstance(payload["Data"], str)
+                and bool(payload["Data"])
             )
 
         return (
             BankCrawler._exact_https_origin_allowed(
                 request.url, frozenset({"ebank.scsb.com.tw"}),
             )
-            and parsed.path in {"/ibap/api/query", "/ibap/ibap/query"}
+            and parsed.path == "/twde/twdeqr01/query"
             and request.method == "POST"
             and request.resource_type in {"xhr", "fetch"}
-            and exact(
-                ("account_no", "accountNo", "account", "accountNumber", "acctNo"),
-                expected["account_no"],
-            )
-            and exact(
-                ("start", "startDate", "start_date", "fromDate", "queryStartDate"),
-                expected["start"], date_value=True,
-            )
-            and exact(
-                ("end", "endDate", "end_date", "toDate", "queryEndDate"),
-                expected["end"], date_value=True,
-            )
+            and payload_ok
         )
 
     @staticmethod
@@ -1128,14 +1153,21 @@ class ScsbCrawler(BankCrawler):
             const disabled = (el) => el.closest('[disabled],[aria-disabled="true"],.disabled');
             const current = (el) => el.closest('[aria-current="page"],.active');
             const enabled = (el) => visible(el) && !disabled(el);
-            const scopeText = norm(scope.textContent).toLowerCase();
-            const error = [...scope.querySelectorAll('.alert,.toast,[role="alert"]')]
-                .some(el => visible(el) && norm(el.textContent))
-                || [
-                    '系統錯誤', '系統忙碌', '請稍後再試', '連線逾時', '連線已逾時',
-                    '請重新登入', '登入失效', 'system error', 'session expired',
-                    'login required', 'timed out', 'timeout', 'unexpected error',
-                ].some(marker => scopeText.includes(marker));
+            const scopeText = norm(scope.innerText).toLowerCase();
+            const visibleAlerts = [...scope.querySelectorAll('.alert,.toast,[role="alert"]')]
+                .filter(visible).map(el => norm(el.innerText)).join(' ');
+            const errorMarkers = [
+                ['system_error', /系統錯誤|system error|unexpected error/i],
+                ['busy', /系統忙碌/i],
+                ['retry', /請稍後再試/i],
+                ['timeout', /連線(?:已)?逾時|timed out|timeout/i],
+                ['session', /請重新登入|登入失效|session expired|login required/i],
+                ['failed', /(?:操作|查詢).*失敗|failed/i],
+            ];
+            const matchedError = errorMarkers.find(([, pattern]) =>
+                pattern.test(visibleAlerts) || pattern.test(scopeText)
+            );
+            const error = !!matchedError;
             const nextPattern = /^(下一頁|下頁|Next(?: page)?|載入更多|Load more|[›»→])$/i;
             const nextHint = /(goToNextPage|nextPage|next-page|page-next)/i;
             const directNext = [...scope.querySelectorAll('button,a,[role="button"]')]
@@ -1154,7 +1186,9 @@ class ScsbCrawler(BankCrawler):
                 .some(el => enabled(el)
                     && !current(el)
                     && /^\d+$/.test(norm(el.textContent))));
-            return {error, pagination: directNext || numbered};
+            const result = {error, pagination: directNext || numbered};
+            if (matchedError) result.error_code = matchedError[0];
+            return result;
         }"""
 
     @staticmethod
@@ -1284,11 +1318,70 @@ class ScsbCrawler(BankCrawler):
                     if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                     const text = scope.innerText || '';
                     if ((scope.querySelector('table')
-                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))
+                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無|目前無新增交易|交易尚未入帳|帳單結帳日|帳單訊息|信用卡前期餘額/i.test(text))
                         && text.includes(leafText)) return text;
                 }
             }
             return null;
+        }"""
+
+    @staticmethod
+    def _card_leaf_table_state_script() -> str:
+        return r"""(leafText) => {
+            const visible = el => el && el.offsetParent !== null;
+            const normalize = value => String(value || '')
+                .replace(/\s+/g, '').replaceAll('（', '(').replaceAll('）', ')');
+            const expected = [
+                '交易日交易時間', '交易卡別卡號末4碼', '商店名稱', '交易金額(台幣)',
+                '交易類別', '交易國別', '交易結果',
+            ];
+            const headings = [...document.querySelectorAll('h2.inner-title')]
+                .filter(el => visible(el) && (el.innerText || '').trim() === leafText);
+            const owner = headings.length === 1
+                ? headings[0].closest('div.container.mainContent') : null;
+            const visibleTables = [...document.querySelectorAll('table')].filter(visible);
+            const tables = visibleTables.filter(table => {
+                if (!owner?.contains(table)) return false;
+                const headers = [...table.querySelectorAll('th')]
+                    .map(cell => normalize(cell.innerText))
+                    .filter(Boolean);
+                return headers.length === expected.length
+                    && expected.every((header, index) => headers[index] === header);
+            });
+            if (headings.length !== 1 || visibleTables.length !== 1 || tables.length !== 1) return {
+                ok: false,
+                row_count: null,
+                heading_count: headings.length,
+                visible_table_count: visibleTables.length,
+                matching_table_count: tables.length,
+            };
+            const rowCount = [...tables[0].querySelectorAll('tr')]
+                .filter(row => row.querySelectorAll('td').length).length;
+            return {
+                ok: true,
+                row_count: rowCount,
+                heading_count: headings.length,
+                visible_table_count: visibleTables.length,
+                matching_table_count: tables.length,
+            };
+        }"""
+
+    @staticmethod
+    def _card_statement_state_script() -> str:
+        return r"""() => {
+            const visible = el => el && el.offsetParent !== null;
+            const exact = text => [...document.querySelectorAll('body *')].filter(el =>
+                visible(el) && (el.innerText || '').trim() === text
+                && ![...el.children].some(child => visible(child)
+                    && (child.innerText || '').trim() === text));
+            const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.card-title')]
+                .filter(el => visible(el) && (el.innerText || '').trim() === '帳單查詢及繳款');
+            return {
+                ok: headings.length === 1
+                    && exact('帳單結帳日').length === 1
+                    && exact('帳單訊息').length === 1
+                    && exact('信用卡前期餘額').length === 1,
+            };
         }"""
 
     @staticmethod
@@ -1304,7 +1397,7 @@ class ScsbCrawler(BankCrawler):
                     if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                     const text = scope.innerText || '';
                     if (!(scope.querySelector('table')
-                        || /Current Period Total|查無.*帳單|no .*statement/i.test(text))) continue;
+                        || /Current Period Total|帳單結帳日|帳單訊息|信用卡前期餘額|查無.*帳單|no .*statement/i.test(text))) continue;
                     const matches = [...scope.querySelectorAll('button,a,li')].filter(el =>
                         visible(el) && (el.textContent || '').trim() === month);
                     if (matches.length !== 1) return {ok: false, panel: null};
@@ -1324,19 +1417,12 @@ class ScsbCrawler(BankCrawler):
             return {ok: false, panel: null};
         }"""
 
-    def _collect_twd_account(self, page, selector: str, account_no: str) -> dict:
-        """查一個 SCSB 台幣帳戶；任何期間、結果或 parser 不完整都 fail closed。"""
-        page.select_option(selector, value=account_no)
-        page.wait_for_timeout(1500)
-
-        period = page.evaluate(
-            self._twd_inquiry_period_script(
-                full_history=getattr(self, "full_history", True),
-            ),
-        )
-        _log(f"[twd_inq] period → {period}")
-        if not period.get("ok"):
-            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
+    def _collect_twd_period(
+        self, page, selector: str, selected_index: int, selected_value: str,
+        account_no: str, period: dict,
+    ) -> list[dict]:
+        """Submit and validate one bank-supported (at most six-month) window."""
+        self._apply_twd_period_controls(page, period)
         page.wait_for_timeout(500)
         period_check = page.evaluate(
             self._twd_inquiry_period_verification_script(), period,
@@ -1347,25 +1433,65 @@ class ScsbCrawler(BankCrawler):
         page.wait_for_timeout(1500)
         expected = {**period, "account_no": account_no}
         page.evaluate(self._twd_inquiry_prepare_result_wait_script(), expected)
+        account_select = page.locator(selector)
+        account_count = account_select.count()
+        current_index = (
+            account_select.evaluate("el => el.selectedIndex")
+            if account_count == 1 else None
+        )
+        current_value = account_select.input_value() if account_count == 1 else None
+        identity_match = (
+            current_index == selected_index and current_value == selected_value
+        )
+        _log(
+            "[twd_inq] account control "
+            f"count={account_count} identity_match={identity_match}"
+        )
+        if account_count != 1 or not identity_match:
+            raise RuntimeError("account-control-reverted")
+        confirm_buttons = page.locator(
+            "button:visible, a:visible, [role=button]:visible",
+        ).filter(
+            has_text=re.compile(r"^\s*(?:Confirm|查詢|確認|Search)\s*$", re.I),
+        )
+        if confirm_buttons.count() != 1 or not confirm_buttons.first.is_visible():
+            raise RuntimeError("query-submit-unavailable")
         with page.expect_request(
-            lambda request: self._is_twd_query_request(request, expected),
+            lambda request: self._is_twd_query_request(request),
             timeout=120000,
         ) as request_info:
-            clicked_confirm = page.evaluate(
-                "(() => { const btns=[...document.querySelectorAll('button,a')];"
-                " const b=btns.find(e=>e.offsetParent!==null && /^(Confirm|查詢|確認|Search)$/i.test((e.innerText||'').trim()));"
-                " if(b){ b.click(); return b.innerText; } return null; })()",
-            )
-        _log(f"[twd_inq] click Confirm → {clicked_confirm}")
-        query_response = request_info.value.response()
-        if not clicked_confirm or query_response is None or not query_response.ok:
+            confirm_buttons.first.click()
+        _log("[twd_inq] click Confirm → native")
+        try:
+            query_request = request_info.value
+            query_response = query_request.response()
+            _log("[twd_inq] response captured")
+            response_ok = query_response is not None and query_response.ok
+            _log(f"[twd_inq] response ok={bool(response_ok)}")
+        except Exception as error:
+            _log(f"[twd_inq] response boundary failed: {type(error).__name__}")
+            raise
+        if not response_ok:
             raise RuntimeError("query-submit-unavailable")
-        page.wait_for_function(
-            self._twd_inquiry_result_ready_script(),
-            arg=expected,
-            timeout=120000,
-        )
+        _log("[twd_inq] waiting for bound result")
+        try:
+            page.wait_for_function(
+                self._twd_inquiry_result_ready_script(),
+                arg=expected,
+                timeout=120000,
+            )
+        except Exception as error:
+            _log(f"[twd_inq] result wait failed: {type(error).__name__}")
+            raise
+        if not page.evaluate(self._twd_inquiry_result_ready_script(), expected):
+            raise RuntimeError("query-result-stale")
         result_state = page.evaluate(self._twd_inquiry_result_state_script())
+        _log(
+            "[twd_inq] result state "
+            f"error={bool(result_state.get('error'))} "
+            f"error_code={result_state.get('error_code') or 'none'} "
+            f"pagination={bool(result_state.get('pagination'))}"
+        )
         if result_state.get("error") or result_state.get("pagination"):
             raise RuntimeError("query-result-incomplete")
 
@@ -1387,11 +1513,49 @@ class ScsbCrawler(BankCrawler):
             if not start_date <= record_date <= end_date:
                 raise RuntimeError("transaction-outside-query-period")
             record["account_no"] = account_no
+        return records
+
+    def _collect_twd_account(self, page, selector: str, account_no: str) -> dict:
+        """查一個 SCSB 台幣帳戶；長區間切成銀行允許的六個月窗口。"""
+        page.select_option(selector, value=account_no)
+        page.wait_for_timeout(1500)
+        account_select = page.locator(selector)
+        if account_select.count() != 1:
+            raise RuntimeError("account-control-unavailable")
+        selected_index = account_select.evaluate("el => el.selectedIndex")
+        selected_value = account_select.input_value()
+        if (
+            not isinstance(selected_index, int) or selected_index < 0
+            or not isinstance(selected_value, str) or not selected_value
+        ):
+            raise RuntimeError("account-control-unavailable")
+        full_history = getattr(self, "full_history", True)
+        period = page.evaluate(
+            self._twd_inquiry_period_script(
+                full_history=full_history,
+                end_date=date.today(),
+            ),
+        )
+        _log(f"[twd_inq] period → {period}")
+        if not period.get("ok"):
+            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
+
+        all_records: list[dict] = []
+        query_windows = self._six_month_windows(period["start"], period["end"])
+        for index, (start, end) in enumerate(query_windows, start=1):
+            window = {**period, "start": start, "end": end}
+            _log(f"[twd_inq] window {index} → {start}..{end}")
+            records = self._collect_twd_period(
+                page, selector, selected_index, selected_value, account_no, window,
+            )
+            all_records.extend(records)
+            if not records:
+                self._close_twd_empty_result(page)
 
         return {
             "account_no": account_no,
             "period": period,
-            "records": records,
+            "records": all_records,
         }
 
     def _collect_twd_inquiry(
@@ -1404,7 +1568,6 @@ class ScsbCrawler(BankCrawler):
             if not isinstance(ret, dict) or ret.get("ok") is not True:
                 raise RuntimeError("twd-inquiry-navigation-failed")
             page.wait_for_timeout(8000)
-            page.evaluate(JS_KILL_MODAL)
             page.wait_for_timeout(1500)
 
             selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
@@ -1460,85 +1623,53 @@ class ScsbCrawler(BankCrawler):
             raise RuntimeError("SCSB TWD inquiry failed") from None
 
     def _collect_credit_card_inquiry(self, page) -> dict:
-        """SCSB 信用卡明細 — 三層 accordion 後抓多個 leaf。
+        """SCSB 信用卡明細 — 真實中文三層 accordion 後抓多個 leaf。
 
-          Level 1: Credit Card Services (已展開)
-          Level 2: Credit Card Account Management ▾
+          Level 1: 信用卡（已展開）
+          Level 2: 信用卡帳務 ▾
           Level 3 leaves (按優先序抓)：
-            - Unbilled Transaction Details   未出帳明細 (= pending)
-            - Real-Time Transaction Records  即時消費 (= current)
-            - Statement Inquiry and Payment  帳單查詢 (= billed)
-            - Account Balance Inquiry        卡片餘額
+            - 未出帳消費明細 (= pending)
+            - 即時消費紀錄 (= current)
+            - 帳單查詢及繳款 (= billed)
         """
         from backend.core.persist.scsb import _scsb_page_error, _scsb_parse_card_rows
 
         result: dict = {"leaves": {}}
         leaves_to_visit = [
-            ("Unbilled Transaction Details", "unbilled"),
-            ("Real-Time Transaction Records", "current"),
-            ("Statement Inquiry and Payment", "statement"),
+            ("未出帳消費明細", "unbilled", "/card/co/03/01"),
+            ("即時消費紀錄", "current", "/card/co/08/01"),
+            ("帳單查詢及繳款", "statement", "/card/co/02/01"),
         ]
 
-        for leaf_text, key in leaves_to_visit:
+        for leaf_text, key, route in leaves_to_visit:
+            stage = "navigate"
             try:
-                before_leaf_text = page.evaluate(
-                    self._card_leaf_scope_text_script(), leaf_text,
-                )
-                ret = page.evaluate("""(leafText) => {
-                    const log = [];
-                    const allBtns = () => [...document.querySelectorAll('button.accordion-button')];
-                    const unique = (text, visibleOnly = false) => {
-                        const matches = allBtns().filter(button =>
-                            (!visibleOnly || button.offsetParent !== null)
-                            && (button.innerText || '').trim() === text);
-                        return matches.length === 1 ? matches[0] : null;
-                    };
-
-                    // Level 1: Credit Card Services
-                    let btn1 = unique('Credit Card Services');
-                    if (!btn1) { log.push('L1 not found'); return {ok: false, log}; }
-                    if (btn1.classList.contains('collapsed')) { btn1.click(); log.push('L1 expand'); }
-
-                    return new Promise(resolve => setTimeout(() => {
-                        // Level 2: Credit Card Account Management
-                        let btn2 = unique('Credit Card Account Management');
-                        if (!btn2) { log.push('L2 not found'); resolve({ok: false, log}); return; }
-                        if (btn2.classList.contains('collapsed')) { btn2.click(); log.push('L2 expand'); }
-
-                        setTimeout(() => {
-                            const leaf = unique(leafText, true);
-                            if (!leaf) { log.push('leaf not found: ' + leafText); resolve({ok: false, log}); return; }
-                            leaf.click();
-                            resolve({ok: true});
-                        }, 1500);
-                    }, 1500));
-                }""", leaf_text)
-                if not isinstance(ret, dict) or ret.get("ok") is not True:
-                    raise RuntimeError("card-leaf-navigation-failed")
-                page.wait_for_function("""([leafText, before]) => {
-                    const visible = (el) => el && el.offsetParent !== null;
-                    const leaves = [...document.querySelectorAll('body *')].filter(el =>
-                        visible(el) && (el.textContent || '').trim() === leafText
-                        && ![...el.children].some(child =>
-                            (child.textContent || '').trim() === leafText));
-                    for (const leaf of leaves) {
-                        for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
-                            if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
-                            const text = scope.innerText || '';
-                            if ((scope.querySelector('table')
-                                || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))
-                                && text.includes(leafText)) {
-                                return before == null || text !== before;
-                            }
-                        }
+                for menu_label in ("信用卡", "信用卡帳務", leaf_text):
+                    control = page.locator("button.accordion-button:visible").filter(
+                        has_text=re.compile(rf"^\s*{re.escape(menu_label)}\s*$"),
+                    )
+                    if control.count() != 1 or not control.first.is_visible():
+                        raise RuntimeError("card-leaf-navigation-failed")
+                    classes = control.first.get_attribute("class") or ""
+                    if menu_label == leaf_text or "collapsed" in classes:
+                        control.first.click()
+                        page.wait_for_timeout(1500)
+                stage = "wait"
+                page.wait_for_function("""([route, leafText]) => {
+                    if (location.pathname !== '/card/card/page' || location.hash !== `#${route}`) {
+                        return false;
                     }
-                    return false;
-                }""", arg=[leaf_text, before_leaf_text], timeout=120000)
+                    const visible = el => el && el.offsetParent !== null;
+                    const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.card-title')]
+                        .filter(el => visible(el) && (el.innerText || '').trim() === leafText);
+                    return headings.length === 1;
+                }""", arg=[route, leaf_text], timeout=120000)
                 _log(f"[card_inq:{key}] navigation ok")
+                stage = "settle"
                 page.wait_for_timeout(8000)
-                page.evaluate(JS_KILL_MODAL)
                 page.wait_for_timeout(1500)
 
+                stage = "read"
                 leaf_result: dict = {"nav": {"ok": True}}
                 try:
                     leaf_result["text"] = page.evaluate(
@@ -1546,11 +1677,13 @@ class ScsbCrawler(BankCrawler):
                     ) or ""
                 except Exception:
                     raise RuntimeError("card-leaf-read-failed") from None
+                stage = "identity"
                 if leaf_text.lower() not in leaf_result["text"].lower():
                     raise RuntimeError("card-leaf-identity-unverified")
 
                 # 若有 date input 就填表 + Confirm（同 twd_inq）
-                if leaf_text in ("Statement Inquiry and Payment", "Real-Time Transaction Records"):
+                stage = "form"
+                if key in ("statement", "current"):
                     try:
                         from datetime import datetime, timedelta
                         start_dt = (datetime.now() - timedelta(days=30)).strftime("%Y/%m/%d")
@@ -1565,7 +1698,7 @@ class ScsbCrawler(BankCrawler):
                                     if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                                     const text = scope.innerText || '';
                                     if (!(scope.querySelector('table')
-                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))) continue;
+                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無|目前無新增交易|交易尚未入帳|帳單結帳日|帳單訊息|信用卡前期餘額/i.test(text))) continue;
                                     return [...scope.querySelectorAll('input')]
                                         .filter(input => visible(input)
                                             && /date/i.test((input.id||'')+(input.name||'')+(input.placeholder||'')+(input.type||''))
@@ -1603,70 +1736,78 @@ class ScsbCrawler(BankCrawler):
                                 continue
                         if not filled_date:
                             raise RuntimeError("card-query-date-unavailable")
-                        before_confirm = leaf_result["text"]
-                        clicked = page.evaluate("""(leafText) => {
-                            const visible = (el) => el && el.offsetParent !== null;
-                            const leaves = [...document.querySelectorAll('body *')].filter(el =>
-                                visible(el) && (el.textContent || '').trim() === leafText
-                                && ![...el.children].some(child =>
-                                    (child.textContent || '').trim() === leafText));
-                            for (const leaf of leaves) {
-                                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
-                                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
-                                    const text = scope.innerText || '';
-                                    if (!(scope.querySelector('table')
-                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(text))) continue;
-                                    const matches = [...scope.querySelectorAll('button,a')].filter(el =>
-                                        visible(el) && /^(Confirm|查詢|確認|Search)$/i.test((el.innerText || '').trim()));
-                                    if (matches.length !== 1) return null;
-                                    matches[0].click();
-                                    return true;
-                                }
-                            }
-                            return null;
-                        }""", leaf_text)
-                        if not clicked:
-                            raise RuntimeError("card-query-submit-unavailable")
-                        _log(f"[card_inq:{key}] Confirm clicked")
-                        page.wait_for_function(r"""([before, scopeName, leafText]) => {
-                            const visible = (el) => el && el.offsetParent !== null;
-                            const exactLeaf = [...document.querySelectorAll('body *')].filter(el =>
-                                visible(el) && (el.textContent || '').trim() === leafText
-                                && ![...el.children].some(child =>
-                                    (child.textContent || '').trim() === leafText));
-                            let text = '';
-                            for (const leaf of exactLeaf) {
-                                for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
-                                    if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
-                                    const candidate = scope.innerText || '';
-                                    if ((scope.querySelector('table')
-                                        || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無/i.test(candidate))
-                                        && candidate.includes(leafText)) {
-                                        text = candidate;
-                                        break;
+                        if date_inputs:
+                            before_confirm = leaf_result["text"]
+                            clicked = page.evaluate("""(leafText) => {
+                                const visible = (el) => el && el.offsetParent !== null;
+                                const leaves = [...document.querySelectorAll('body *')].filter(el =>
+                                    visible(el) && (el.textContent || '').trim() === leafText
+                                    && ![...el.children].some(child =>
+                                        (child.textContent || '').trim() === leafText));
+                                for (const leaf of leaves) {
+                                    for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                        if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                        const text = scope.innerText || '';
+                                        if (!(scope.querySelector('table')
+                                            || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無|目前無新增交易|交易尚未入帳|帳單結帳日|帳單訊息|信用卡前期餘額/i.test(text))) continue;
+                                        const matches = [...scope.querySelectorAll('button,a')].filter(el =>
+                                            visible(el) && /^(Confirm|查詢|確認|Search)$/i.test((el.innerText || '').trim()));
+                                        if (matches.length !== 1) return null;
+                                        matches[0].click();
+                                        return true;
                                     }
                                 }
-                                if (text) break;
-                            }
-                            const ready = scopeName === 'current'
-                                ? /Real-Time Transaction Records[\s\S]*(?:Transaction Date|no (?:real-time )?transaction)/i.test(text)
-                                : /Statement Inquiry and Payment[\s\S]*(?:(?:Data Time[\s\S]*20\d{2}\/(?:0[1-9]|1[0-2]))|(?:查無.*帳單|no .*statement))/i.test(text);
-                            return text !== before && ready;
-                        }""", arg=[before_confirm, key, leaf_text], timeout=120000)
-                        leaf_result["text_final"] = page.evaluate(
-                            self._card_leaf_scope_text_script(), leaf_text,
-                        ) or ""
+                                return null;
+                            }""", leaf_text)
+                            if not clicked:
+                                raise RuntimeError("card-query-submit-unavailable")
+                            _log(f"[card_inq:{key}] Confirm clicked")
+                            page.wait_for_function(r"""([before, scopeName, leafText]) => {
+                                const visible = (el) => el && el.offsetParent !== null;
+                                const exactLeaf = [...document.querySelectorAll('body *')].filter(el =>
+                                    visible(el) && (el.textContent || '').trim() === leafText
+                                    && ![...el.children].some(child =>
+                                        (child.textContent || '').trim() === leafText));
+                                let text = '';
+                                for (const leaf of exactLeaf) {
+                                    for (let scope = leaf.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+                                        if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
+                                        const candidate = scope.innerText || '';
+                                        if ((scope.querySelector('table')
+                                            || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無|目前無新增交易|交易尚未入帳|帳單結帳日|帳單訊息|信用卡前期餘額/i.test(candidate))
+                                            && candidate.includes(leafText)) {
+                                            text = candidate;
+                                            break;
+                                        }
+                                    }
+                                    if (text) break;
+                                }
+                                const ready = scopeName === 'current'
+                                    ? /即時消費紀錄[\s\S]*(?:Transaction Date|交易日期|no (?:real-time )?transaction|查無)/i.test(text)
+                                    : /帳單查詢及繳款[\s\S]*(?:(?:Data Time|資料時間)[\s\S]*20\d{2}\/(?:0[1-9]|1[0-2])|(?:查無.*帳單|no .*statement))/i.test(text);
+                                return text !== before && ready;
+                            }""", arg=[before_confirm, key, leaf_text], timeout=120000)
+                            leaf_result["text_final"] = page.evaluate(
+                                self._card_leaf_scope_text_script(), leaf_text,
+                            ) or ""
                     except Exception:
                         raise RuntimeError("card-query-form-failed") from None
 
                 # 2026-06-13 升級：Statement Inquiry 加月份 tab 迭代抓帳單
                 # SCSB 顯示「2026/05 / 2026/04 / 2026/03」3 個月份 tab，點切換每月帳單
-                if leaf_text == "Statement Inquiry and Payment":
+                stage = "statement"
+                if key == "statement":
                     try:
                         leaf_text_now = leaf_result.get("text", "")
                         statement_text = leaf_result.get("text_final") or leaf_text_now
                         month_tabs = self._statement_month_tabs(statement_text)
-                        if not month_tabs and not re.search(
+                        _log(f"[card_inq:{key}] month_tab_count={len(month_tabs)}")
+                        statement_state = page.evaluate(self._card_statement_state_script())
+                        statement_summary = (
+                            isinstance(statement_state, dict)
+                            and statement_state.get("ok") is True
+                        )
+                        if not month_tabs and not statement_summary and not re.search(
                             r"查無.*帳單|no .*statement", statement_text, re.I,
                         ):
                             raise RuntimeError("statement-month-tabs-unavailable")
@@ -1769,29 +1910,73 @@ class ScsbCrawler(BankCrawler):
                                 **self._statement_month_summary(mo_text),
                             })
                             _log(f"[card_inq:{key}] {mo} tab click OK, text len={len(mo_text)}")
-                        leaf_result["months"] = months_data
+                        if month_tabs:
+                            leaf_result["months"] = months_data
                     except Exception:
                         raise RuntimeError("statement-month-collection-failed") from None
 
+                stage = "parse"
                 source_text = leaf_result.get("text_final") or leaf_result.get("text") or ""
                 if _scsb_page_error(source_text):
                     raise RuntimeError("card-leaf-page-error")
                 if key in ("unbilled", "current"):
                     rows, complete = _scsb_parse_card_rows(source_text, scope=key)
+                    table_state = (
+                        page.evaluate(self._card_leaf_table_state_script(), leaf_text)
+                        if key == "current" else None
+                    )
+                    structural_empty = (
+                        isinstance(table_state, dict)
+                        and table_state.get("ok") is True
+                        and table_state.get("row_count") == 0
+                    )
+                    rows_bound = (
+                        key != "current"
+                        or (
+                            isinstance(table_state, dict)
+                            and table_state.get("ok") is True
+                            and table_state.get("row_count") == len(rows)
+                        )
+                    )
+                    if key == "current" and isinstance(table_state, dict):
+                        _log(
+                            "[card_inq:current] table "
+                            f"headings={table_state.get('heading_count')} "
+                            f"visible={table_state.get('visible_table_count')} "
+                            f"matching={table_state.get('matching_table_count')} "
+                            f"rows={table_state.get('row_count')}"
+                        )
                     lower = source_text.lower()
                     explicit_empty = (
                         (key == "unbilled" and (
                             "no new transactions" in lower
                             or "have not yet been recorded" in lower
+                            or "目前無新增交易" in source_text
+                            or "交易尚未入帳" in source_text
                         ))
                         or (key == "current" and (
                             "no real-time transaction" in lower
                             or "no transaction records" in lower
                         ))
                     )
-                    if rows and complete:
+                    empty_authoritative = (
+                        structural_empty or (key != "current" and explicit_empty)
+                    )
+                    current_table_has_rows = (
+                        key == "current"
+                        and isinstance(table_state, dict)
+                        and isinstance(table_state.get("row_count"), int)
+                        and table_state["row_count"] > 0
+                    )
+                    if current_table_has_rows and (
+                        not rows or not complete or not rows_bound
+                    ):
+                        raise RuntimeError("card-transaction-scope-incomplete")
+                    if rows:
+                        if not complete or not rows_bound:
+                            raise RuntimeError("card-transaction-scope-incomplete")
                         leaf_result["rows"] = rows
-                    elif explicit_empty:
+                    elif empty_authoritative:
                         leaf_result["empty"] = True
                     else:
                         raise RuntimeError("card-transaction-scope-incomplete")
@@ -1799,7 +1984,7 @@ class ScsbCrawler(BankCrawler):
                 leaf_result.pop("text_final", None)
                 result["leaves"][key] = leaf_result
             except Exception:
-                _log(f"[card_inq:{key}] failed")
+                _log(f"[card_inq:{key}] failed stage={stage}")
                 raise RuntimeError("SCSB credit-card inquiry failed") from None
 
         return result

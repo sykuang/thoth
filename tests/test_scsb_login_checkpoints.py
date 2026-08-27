@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 import base64
-import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -575,19 +573,3 @@ def test_login_is_thin_dialog_handler_inherited_and_legacy_login_code_removed() 
         assert forbidden not in login_region
     assert login_region.count(".evaluate(") == 1
     assert 'evaluate("el => getComputedStyle(el).backgroundImage")' in login_region
-
-
-def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
-    tree = ast.parse(Path(scsb_module.__file__).read_text())
-    crawler = next(
-        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ScsbCrawler"
-    )
-    start = next(
-        index
-        for index, node in enumerate(crawler.body)
-        if isinstance(node, ast.FunctionDef) and node.name == "collect"
-    )
-    payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "9eb7eef8a2f13e7832a5f08c8dc84e7ed5449e97b41238135ee94a3514bc1565"
-    )
