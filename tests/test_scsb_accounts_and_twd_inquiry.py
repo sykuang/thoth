@@ -823,6 +823,25 @@ def test_scsb_twd_response_is_read_from_request_started_by_current_click():
     current_request.response.assert_called_once_with()
 
 
+def test_scsb_twd_navigation_waits_for_exact_owned_route_instead_of_sleeping():
+    page = _mock_twd_query_page()
+
+    object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    page.wait_for_url.assert_called_once()
+    route = page.wait_for_url.call_args.args[0]
+    assert route.fullmatch(
+        "https://ebank.scsb.com.tw/twde/twde/page#/twde/qr/01/01",
+    )
+    for unsafe in (
+        "http://ebank.scsb.com.tw/twde/twde/page#/twde/qr/01/01",
+        "https://ebank.scsb.com.tw.evil.example/twde/twde/page#/twde/qr/01/01",
+        "https://ebank.scsb.com.tw:444/twde/twde/page#/twde/qr/01/01",
+    ):
+        assert not route.fullmatch(unsafe)
+    assert call(8000) not in page.wait_for_timeout.call_args_list
+
+
 def test_scsb_twd_result_wait_log_omits_dynamic_exception_text(capsys):
     page = _mock_twd_query_page()
     page.wait_for_function.side_effect = RuntimeError("PRIVATE short account alias")

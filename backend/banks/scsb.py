@@ -1567,7 +1567,14 @@ class ScsbCrawler(BankCrawler):
             _log(f"[twd_inq] JS sequence ok={bool(ret and ret.get('ok'))}")
             if not isinstance(ret, dict) or ret.get("ok") is not True:
                 raise RuntimeError("twd-inquiry-navigation-failed")
-            page.wait_for_timeout(8000)
+            page.wait_for_url(
+                re.compile(
+                    r"^https://ebank\.scsb\.com\.tw/twde/twde/page#"
+                    r"/twde/qr/01/01(?:[/?].*)?$",
+                ),
+                timeout=120000,
+            )
+            _log("[twd_inq] exact owned route ready")
             page.wait_for_timeout(1500)
 
             selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
