@@ -842,9 +842,41 @@ def test_scsb_twd_navigation_waits_for_exact_owned_route_instead_of_sleeping():
     assert call(8000) not in page.wait_for_timeout.call_args_list
 
 
+def test_scsb_twd_navigation_waits_for_expected_account_controls_before_inventory():
+    page = _mock_twd_query_page()
+
+    object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    waits = [
+        entry for entry in page.wait_for_function.call_args_list
+        if "querySelectorAll('select option')" in entry.args[0]
+    ]
+    assert len(waits) == 1
+    assert waits[0].kwargs == {"arg": ["90000000123456"], "timeout": 120000}
+    route_index = next(
+        index for index, entry in enumerate(page.method_calls)
+        if entry[0] == "wait_for_url"
+    )
+    control_index = next(
+        index for index, entry in enumerate(page.method_calls)
+        if entry == call.wait_for_function(
+            waits[0].args[0], arg=["90000000123456"], timeout=120000,
+        )
+    )
+    inventory_index = next(
+        index for index, entry in enumerate(page.method_calls)
+        if entry.args and isinstance(entry.args[0], str)
+        and "document.querySelectorAll('select')" in entry.args[0]
+    )
+    assert route_index < control_index < inventory_index
+
+
 def test_scsb_twd_result_wait_log_omits_dynamic_exception_text(capsys):
     page = _mock_twd_query_page()
-    page.wait_for_function.side_effect = RuntimeError("PRIVATE short account alias")
+    page.wait_for_function.side_effect = [
+        None,
+        RuntimeError("PRIVATE short account alias"),
+    ]
 
     with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
@@ -856,11 +888,11 @@ def test_scsb_twd_result_wait_log_omits_dynamic_exception_text(capsys):
 
 def test_scsb_twd_query_timeout_propagates_instead_of_returning_empty(tmp_path):
     page = _mock_twd_query_page()
-    page.wait_for_function.side_effect = TimeoutError("synthetic timeout")
+    page.wait_for_function.side_effect = [None, TimeoutError("synthetic timeout")]
 
     with pytest.raises(RuntimeError, match="SCSB TWD inquiry failed"):
         object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
-    page.wait_for_function.assert_called_once()
+    assert page.wait_for_function.call_count == 2
     page.expect_request.assert_called_once()
 
 

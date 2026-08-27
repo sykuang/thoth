@@ -1575,7 +1575,15 @@ class ScsbCrawler(BankCrawler):
                 timeout=120000,
             )
             _log("[twd_inq] exact owned route ready")
-            page.wait_for_timeout(1500)
+            page.wait_for_function(r"""expected => {
+                const accounts = new Set(
+                    [...document.querySelectorAll('select option')]
+                        .map(option => (option.value || '').trim())
+                        .filter(value => /\d{10,}/.test(value))
+                );
+                return expected.every(account => accounts.has(account));
+            }""", arg=sorted(expected_accounts), timeout=120000)
+            _log("[twd_inq] expected account controls ready")
 
             selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
                 id: s.id, name: s.name,
