@@ -823,44 +823,26 @@ def test_scsb_twd_response_is_read_from_request_started_by_current_click():
     current_request.response.assert_called_once_with()
 
 
-def test_scsb_twd_navigation_waits_for_exact_owned_route_instead_of_sleeping():
+def test_scsb_twd_navigation_waits_for_exact_owned_usable_state():
     page = _mock_twd_query_page()
 
     object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
 
-    page.wait_for_url.assert_called_once()
-    route = page.wait_for_url.call_args.args[0]
-    assert route.fullmatch(
-        "https://ebank.scsb.com.tw/twde/twde/page#/twde/qr/01/01",
-    )
-    for unsafe in (
-        "http://ebank.scsb.com.tw/twde/twde/page#/twde/qr/01/01",
-        "https://ebank.scsb.com.tw.evil.example/twde/twde/page#/twde/qr/01/01",
-        "https://ebank.scsb.com.tw:444/twde/twde/page#/twde/qr/01/01",
-    ):
-        assert not route.fullmatch(unsafe)
-    assert call(8000) not in page.wait_for_timeout.call_args_list
-
-
-def test_scsb_twd_navigation_waits_for_expected_account_controls_before_inventory():
-    page = _mock_twd_query_page()
-
-    object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
-
+    page.wait_for_url.assert_not_called()
     waits = [
         entry for entry in page.wait_for_function.call_args_list
         if "querySelectorAll('select option')" in entry.args[0]
     ]
     assert len(waits) == 1
+    readiness_script = waits[0].args[0]
+    assert "location.origin !== 'https://ebank.scsb.com.tw'" in readiness_script
+    assert "location.pathname !== '/twde/twde/page'" in readiness_script
+    assert "location.hash !== '#/twde/qr/01/01'" in readiness_script
     assert waits[0].kwargs == {"arg": ["90000000123456"], "timeout": 120000}
-    route_index = next(
-        index for index, entry in enumerate(page.method_calls)
-        if entry[0] == "wait_for_url"
-    )
-    control_index = next(
+    readiness_index = next(
         index for index, entry in enumerate(page.method_calls)
         if entry == call.wait_for_function(
-            waits[0].args[0], arg=["90000000123456"], timeout=120000,
+            readiness_script, arg=["90000000123456"], timeout=120000,
         )
     )
     inventory_index = next(
@@ -868,7 +850,8 @@ def test_scsb_twd_navigation_waits_for_expected_account_controls_before_inventor
         if entry.args and isinstance(entry.args[0], str)
         and "document.querySelectorAll('select')" in entry.args[0]
     )
-    assert route_index < control_index < inventory_index
+    assert readiness_index < inventory_index
+    assert call(8000) not in page.wait_for_timeout.call_args_list
 
 
 def test_scsb_twd_result_wait_log_omits_dynamic_exception_text(capsys):

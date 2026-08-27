@@ -1567,15 +1567,12 @@ class ScsbCrawler(BankCrawler):
             _log(f"[twd_inq] JS sequence ok={bool(ret and ret.get('ok'))}")
             if not isinstance(ret, dict) or ret.get("ok") is not True:
                 raise RuntimeError("twd-inquiry-navigation-failed")
-            page.wait_for_url(
-                re.compile(
-                    r"^https://ebank\.scsb\.com\.tw/twde/twde/page#"
-                    r"/twde/qr/01/01(?:[/?].*)?$",
-                ),
-                timeout=120000,
-            )
-            _log("[twd_inq] exact owned route ready")
             page.wait_for_function(r"""expected => {
+                if (location.origin !== 'https://ebank.scsb.com.tw'
+                    || location.pathname !== '/twde/twde/page'
+                    || location.hash !== '#/twde/qr/01/01') {
+                    return false;
+                }
                 const accounts = new Set(
                     [...document.querySelectorAll('select option')]
                         .map(option => (option.value || '').trim())
@@ -1583,7 +1580,7 @@ class ScsbCrawler(BankCrawler):
                 );
                 return expected.every(account => accounts.has(account));
             }""", arg=sorted(expected_accounts), timeout=120000)
-            _log("[twd_inq] expected account controls ready")
+            _log("[twd_inq] owned route and expected account controls ready")
 
             selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
                 id: s.id, name: s.name,
