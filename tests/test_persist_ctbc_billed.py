@@ -226,6 +226,71 @@ def test_ctbc_missing_unbilled_endpoint_preserves_existing_pending_rows(store):
     assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 3
 
 
+def test_ctbc_renamed_pending_is_deleted_without_unsafe_overlay_guess(tmp_path, monkeypatch):
+    """仍在清單時保留雙列；可信消失後刪 pending，但改名 TWD overlay 不猜。"""
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    pending_item = {
+        "purchaseDt": "20260910", "postingDt": "20260912",
+        "cardNoSuffixFour": "1234_0",
+        "description": "御膳食堂 TAIPEI CITY TW", "purchaseAmt": 500,
+        "origCurCode": "901", "origCurDesc": "TWD", "origCurAmt": 500,
+        "txCode": "40",
+    }
+    billed_item = {
+        "purchaseDt": "091026", "postingDt": "091226", "cardNo": "1234_0",
+        "merchantChiName": "御膳食堂", "ntAmt": 500, "foreignAmt": "",
+        "occCurCode": "", "origCurCode": "N",
+    }
+
+    first = BankStore("ctbc_lifecycle")
+    persist_ctbc({
+        "card_api_dump": {"/twrbc-card/qu006/011": {"allItems": [pending_item]}},
+        "summary": {}, "twd_deposit": {},
+    }, first, rules=[])
+    first.conn.execute(
+        "UPDATE card_pending_txns SET category='餐飲', description_overwrite='家庭聚餐'"
+    )
+    first.conn.commit()
+    first.close()
+
+    overlap = BankStore("ctbc_lifecycle")
+    persist_ctbc({
+        "card_api_dump": {
+            "/twrbc-card/qu002/010": {
+                "cardDataList": [],
+                "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
+            },
+            "/twrbc-card/qu006/011": {"allItems": [pending_item]},
+        },
+        "summary": {}, "twd_deposit": {},
+    }, overlap, rules=[])
+    billed_count = overlap.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()
+    pending_count = overlap.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
+    assert billed_count is not None and billed_count[0] == 1
+    assert pending_count is not None and pending_count[0] == 1
+    overlap.close()
+
+    settled = BankStore("ctbc_lifecycle")
+    persist_ctbc({
+        "card_api_dump": {
+            "/twrbc-card/qu002/010": {
+                "cardDataList": [],
+                "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
+            },
+            "/twrbc-card/qu006/011": {"allItems": []},
+        },
+        "summary": {}, "twd_deposit": {},
+    }, settled, rules=[])
+    row = settled.conn.execute(
+        "SELECT description, category, description_overwrite FROM card_billed_txns"
+    ).fetchone()
+    assert row is not None
+    assert tuple(row) == ("御膳食堂", None, None)
+    pending_count = settled.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
+    assert pending_count is not None and pending_count[0] == 0
+    settled.close()
+
+
 def test_ctbc_successful_empty_unbilled_endpoint_sweeps_existing_pending_rows(store):
     """qu006 明確成功回 allItems=[] 才代表真的零筆，應 sweep 舊 pending。"""
     conn = store.conn

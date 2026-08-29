@@ -1,12 +1,8 @@
-"""驗證 upsert_card_billed 連動清 card_pending_txns 中對應 stale row。
+"""驗證 billed transition 在可信 pending refresh 後清對應 stale row。
 
-背景：銀行 billed 出帳後，pending 通常 1-3 天才會從未出帳清單移除；
-過渡期 UI 會雙重計算同一筆消費（見 esun ****7032 case）。
-
-設計：寫 billed 時呼叫 _purge_overlapping_pending() 比對 4 欄全等才清：
-  card_no + consume_date + amount + description
-
-任一欄為 None 視為「資料不齊不敢清」直接 skip（保守策略）。
+銀行 billed 出帳後，pending 通常仍短暫出現在未出帳清單；只有本輪安全且唯一的
+exact transition 可在 `fetch_ok=True` refresh 時合併。抓取失敗時 membership 不動，
+多 occurrence 不猜。底層 exact helper 仍維持四欄全等與缺欄 fail-closed contract。
 """
 from __future__ import annotations
 
@@ -33,35 +29,33 @@ def _seed_pending(store: BankStore, scope: str, txns: list[dict]) -> None:
 
 # === 1. 正常 case：4 欄全等 → 清掉 pending ===
 def test_billed_purges_matching_pending(tmp_store: BankStore) -> None:
-    _seed_pending(tmp_store, "unbilled", [
-        {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
-         "amount": 1727, "currency": "TWD"},
-    ])
+    txn = {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
+           "amount": 1727, "currency": "TWD"}
+    _seed_pending(tmp_store, "unbilled", [txn])
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1
 
-    tmp_store.upsert_card_billed([
-        {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
-         "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
-    ])
+    tmp_store.upsert_card_billed([{**txn, "bill_date": "2026-06-29"}])
+    tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0, \
-        "billed 寫入後 pending 對應筆應清掉"
+        "可信 pending refresh 後 exact transition 應只留 billed"
 
 
 # === 2. 兩筆 pending 但只一筆出帳 → 只清出帳那筆 ===
 def test_billed_purges_only_matching_pending(tmp_store: BankStore) -> None:
-    _seed_pending(tmp_store, "unbilled", [
+    pending = [
         {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
          "amount": 1727, "currency": "TWD"},
         {"card_no": "****7032", "date": "2026-06-08", "desc": "優步",
          "amount": 358, "currency": "TWD"},
-    ])
+    ]
+    _seed_pending(tmp_store, "unbilled", pending)
 
     tmp_store.upsert_card_billed([
-        {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
-         "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
+        {**pending[0], "bill_date": "2026-06-29"},
     ])
+    tmp_store.refresh_card_pending("unbilled", pending, fetch_ok=True)
 
     rows = tmp_store.conn.execute(
         "SELECT description FROM card_pending_txns").fetchall()
@@ -80,6 +74,10 @@ def test_billed_does_not_purge_different_card(tmp_store: BankStore) -> None:
         {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
          "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
     ])
+    tmp_store.refresh_card_pending("unbilled", [{
+        "card_no": "****7015", "date": "2026-06-08", "desc": "中油",
+        "amount": 1727, "currency": "TWD",
+    }], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1, \
         "不同卡號的 pending 不該被清"
@@ -96,6 +94,10 @@ def test_billed_does_not_purge_different_amount(tmp_store: BankStore) -> None:
         {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
          "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
     ])
+    tmp_store.refresh_card_pending("unbilled", [{
+        "card_no": "****7032", "date": "2026-06-08", "desc": "中油",
+        "amount": 1700, "currency": "TWD",
+    }], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1, \
         "不同金額的 pending 不該被清（可能是不同筆消費）"
@@ -112,6 +114,10 @@ def test_billed_does_not_purge_different_desc(tmp_store: BankStore) -> None:
         {"card_no": "****7032", "date": "2026-06-08", "desc": "7-11 信義店",
          "amount": 100, "currency": "TWD", "bill_date": "2026-06-29"},
     ])
+    tmp_store.refresh_card_pending("unbilled", [{
+        "card_no": "****7032", "date": "2026-06-08", "desc": "7-11 內湖店",
+        "amount": 100, "currency": "TWD",
+    }], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1, \
         "不同描述視為不同筆消費，不該清（同日跨店 100 元案例）"
@@ -128,6 +134,10 @@ def test_billed_with_none_card_does_not_purge(tmp_store: BankStore) -> None:
         {"card_no": None, "date": "2026-06-08", "desc": "中油",
          "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
     ])
+    tmp_store.refresh_card_pending("unbilled", [{
+        "card_no": "****7032", "date": "2026-06-08", "desc": "中油",
+        "amount": 1727, "currency": "TWD",
+    }], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1, \
         "card_no=None 視為資料不齊不敢清（保守策略）"
@@ -145,47 +155,21 @@ def test_billed_purges_across_scopes(tmp_store: BankStore) -> None:
     ])
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 2
 
-    tmp_store.upsert_card_billed([
-        {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
-         "amount": 1727, "currency": "TWD", "bill_date": "2026-06-29"},
-    ])
+    txn = {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
+           "amount": 1727, "currency": "TWD"}
+    tmp_store.upsert_card_billed([{**txn, "bill_date": "2026-06-29"}])
+    tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
+    tmp_store.refresh_card_pending("current", [txn], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0, \
-        "不論 scope='unbilled' 或 'current'，對應同筆 pending 都該清"
+        "各 scope 經可信 refresh 後都只留 billed"
 
 
-# === 8. _purge_overlapping_pending 直接呼叫 (sweep 歷史 stale row 用) ===
-def test_purge_overlapping_pending_direct_call(tmp_store: BankStore) -> None:
-    _seed_pending(tmp_store, "unbilled", [
-        {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
-         "amount": 1727, "currency": "TWD"},
-    ])
-
-    n = tmp_store._purge_overlapping_pending(
-        card_no="****7032", consume_date="2026-06-08",
-        amount=1727, desc="中油",
-    )
-    assert n == 1
-    assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
+# === 8. 新 billed transition 只在可信 refresh 中做 exact merge ===
 
 
-# === Phase 8.5 (2026-06-18) ===
-# refresh_card_pending 自己 INSERT 完也要去重 ↔ billed 已就位的 row。
-# 真因: CTBC sync 流程是 upsert_card_billed 先, refresh_card_pending 後;
-#       refresh 內部 DELETE 全 scope + INSERT 全新 list, 把 billed 已存在
-#       的同筆又灌回 pending 表 → /transactions UNION ALL 雙顯。
-# 修法: refresh INSERT 完跑 prune SQL 把存在於 billed 的 row 砍掉。
-# 使用者 prod CTBC 4 筆重複觸發 (SUKIYA/健身工廠/中華航空/中華電信).
-
-
-def test_refresh_pending_dedups_against_existing_billed(tmp_store: BankStore) -> None:
-    """refresh_card_pending 寫完後, 應自動去掉 billed 已存在的 row。
-
-    真實 CTBC scenario:
-      1. upsert_card_billed 寫入 SUKIYA 已結帳
-      2. refresh_card_pending(unbilled, [SUKIYA + 健身房]) 一次寫兩筆
-      3. INSERT 後立刻 prune: SUKIYA 被砍 (已在 billed), 健身房保留 (未在 billed)
-    """
+def test_refresh_pending_dedups_against_new_billed_transition(tmp_store: BankStore) -> None:
+    """同一 sync 新 billed 與可信 pending 1:1 exact 時只留 billed。"""
     # 1. billed 先存在
     tmp_store.upsert_card_billed([
         {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ　台北市政",
@@ -199,7 +183,7 @@ def test_refresh_pending_dedups_against_existing_billed(tmp_store: BankStore) ->
          "amount": -268, "currency": "TWD"},   # ← 跟 billed 同 key, 應被 prune
         {"card_no": "****7036", "date": "2026-06-10", "desc": "健身房",
          "amount": -1288, "currency": "TWD"},  # ← 未在 billed, 保留
-    ])
+    ], fetch_ok=True)
 
     # 回傳數應為 1 (傳 2 筆, prune 1, 留 1)
     assert n == 1, f"refresh 應回傳實際保留數 1, 實際 {n}"
@@ -233,35 +217,15 @@ def test_refresh_pending_prune_respects_scope_isolation(tmp_store: BankStore) ->
     Why: refresh API 是 per-scope, 一次 refresh 只負責本 scope, 其他 scope 不該動。
     Prune SQL 也應限 user_id + scope.
     """
-    # 先在 current scope 塞一筆 + billed 同 key 也有
-    tmp_store.upsert_card_billed([
-        {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ",
-         "amount": -268, "currency": "TWD", "bill_date": "2026-06-05"},
-    ])
-    _seed_pending(tmp_store, "current", [
-        {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ",
-         "amount": -268, "currency": "TWD"},
-    ])
-    # _seed_pending 本身會走 refresh → 已 prune. 確認 current scope 那筆被砍了 (對, 本 scope refresh 也砍)
-    # 真正 race condition test 是: 第二次 refresh unbilled scope 不該誤砍 current 還在的 row
-    # 但因 _seed_pending 已用 refresh 跑過, current scope 那筆已被 prune.
-    # 改寫策略: 直接 INSERT 繞過 refresh, 模擬 stale current row
-    tmp_store.conn.execute(
-        """INSERT INTO card_pending_txns
-           (user_id, scope, card_no, consume_date, description, amount, currency,
-            consume_country, consume_currency, consume_amount, refreshed_at,
-            category, subcategory, txn_type, auto_excluded)
-           VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,'2026-06-18',NULL,NULL,NULL,0)""",
-        (tmp_store.user_id, "current", "****7036", "2026-05-20",
-         "ＳＵＫＩＹＡ", -268, "TWD"),
-    )
-    tmp_store.conn.commit()
+    txn = {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ",
+           "amount": -268, "currency": "TWD"}
+    _seed_pending(tmp_store, "current", [txn])
     assert tmp_store.conn.execute(
         "SELECT COUNT(*) FROM card_pending_txns WHERE scope='current'"
     ).fetchone()[0] == 1
 
-    # 跑 refresh unbilled scope — 不該砍 current 那筆
-    tmp_store.refresh_card_pending("unbilled", [])
+    # 跑另一個 scope 的可信 refresh — 不該動 current 那筆。
+    tmp_store.refresh_card_pending("unbilled", [], fetch_ok=True)
 
     cur_left = tmp_store.conn.execute(
         "SELECT COUNT(*) FROM card_pending_txns WHERE scope='current'"
@@ -317,6 +281,7 @@ def test_billed_inherits_matching_pending_user_metadata(tmp_store: BankStore) ->
         [{**txn, "bill_date": "2026-07-21"}],
         rules=[{"pattern": "晚餐", "category": "其他", "subcategory": "待確認"}],
     )
+    tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
 
     row = tmp_store.conn.execute(
         """SELECT category, subcategory, description_overwrite,

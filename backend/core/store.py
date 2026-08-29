@@ -85,7 +85,7 @@ def _pending_billed_identity(row) -> tuple | None:
     consume_date = ((row.get("consume_date") or row.get("date"))
                     if isinstance(row, dict) else row["consume_date"])
     amount = row.get("amount") if isinstance(row, dict) else row["amount"]
-    if card_no is None or consume_date is None:
+    if not str(card_no or "").strip() or not str(consume_date or "").strip():
         return None
     currency = str(currency or "").strip().upper()
     main_currency = str(main_currency or "").strip().upper()
@@ -511,10 +511,10 @@ class BankStore:
         # 不能拿 pending 去配歷史同卡同額交易。BankStore 一個 sync request 用一次。
         self._new_billed_ids: list[int] = []
         # 本 sync payload 碰到的 billed（含 ON CONFLICT existing）；可信 pending refresh
-        # 可用它接手晚到 overlay，但 existing 已有 overlay 時必須 fail-closed。
+        # 可用它接手晚到 overlay。若 overlay 衝突則不搬，但仍依權威清單更新 membership。
         self._current_billed_ids: list[int] = []
         self._adopted_pending_raw_keys: dict[tuple, dict[str, Counter]] = {}
-        self._protected_pending_ids: set[int] = set()
+        self._unsafe_pending_overlay_identities: set[tuple] = set()
         if bank_pg.enabled():
             self.db_path = None
             self.conn = bank_pg.connect(bank)
@@ -859,7 +859,6 @@ class BankStore:
         from backend.server.categorizer import categorize_with_excluded
         inserted_count = 0
         now = _now()
-        pending_metadata = self._pending_user_metadata()
         prepared_txns = []
         for original in txns:
             t = dict(original)
@@ -954,27 +953,7 @@ class BankStore:
                     )
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
-            metadata_rows = None
-            if (
-                t.get("card_no") and t.get("date")
-                and t.get("amount") is not None and t.get("desc")
-            ):
-                metadata_rows = pending_metadata.get((
-                    t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"),
-                ))
             description_overwrite = tags_overwrite = splits_overwrite = None
-            pending_id = None
-            purge_pending = True
-            if metadata_rows:
-                overlay_values = {row[:-1] for row in metadata_rows}
-                if len(overlay_values) > 1:
-                    # 跨 scope 同 exact key 卻有不同人工 overlay：無 provenance 可判誰較新。
-                    # billed 可入庫，但兩筆 pending 都保留，避免第一筆勝出後永久丟資料。
-                    self._protected_pending_ids.update(row[-1] for row in metadata_rows)
-                    purge_pending = False
-                else:
-                    (cat, sub, description_overwrite, tags_overwrite, auto_ex,
-                     splits_overwrite, pending_id) = metadata_rows.pop(0)
             # 信用卡: amount=None 讓 _flow_fields 不走「正值即收入」fallback
             # (帳單視角的正負跟 user cashflow 方向不一致, 只信 txn_type/category)
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
@@ -1002,9 +981,8 @@ class BankStore:
                 inserted_count += 1
             else:
                 existing = self.conn.execute(
-                    "SELECT id, post_date, category, subcategory, txn_type, description_overwrite, "
-                    "tags_overwrite, auto_excluded, splits_overwrite "
-                    "FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                    "SELECT id, post_date FROM card_billed_txns "
+                    "WHERE user_id = ? AND dedup_key = ?",
                     (self.user_id, key),
                 ).fetchone()
                 if existing:
@@ -1016,80 +994,10 @@ class BankStore:
                             "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
                             (existing["id"],),
                         )
-            if (not inserted and pending_id is not None and existing and (
-                    cat or sub or description_overwrite or tags_overwrite
-                    or splits_overwrite or auto_ex)):
-                # Billed 已存在但 pending 後來才被使用者編輯。不能照舊 purge 後丟 overlay。
-                # 若 existing billed 還沒有可能的人工 overlay，安全接手；否則 provenance
-                # 不足以判誰較新，保留 pending 並讓 refresh fail-closed。
-                existing_has_overlay = (
-                    existing["category"] or existing["subcategory"]
-                    or existing["description_overwrite"] or existing["tags_overwrite"]
-                    or existing["splits_overwrite"] or existing["auto_excluded"]
-                )
-                if existing_has_overlay:
-                    self._protected_pending_ids.add(pending_id)
-                    purge_pending = False
-                else:
-                    existing_flow, existing_income = _flow_fields(
-                        cat, sub, None, existing["txn_type"])
-                    self.conn.execute(
-                        "UPDATE card_billed_txns SET category=?, subcategory=?, "
-                        "description_overwrite=?, tags_overwrite=?, auto_excluded=?, "
-                        "splits_overwrite=?, flow_type=?, income_category=?, "
-                        "is_subscription=? WHERE id=?",
-                        (cat, sub, description_overwrite, tags_overwrite, 1 if auto_ex else 0,
-                         splits_overwrite, existing_flow, existing_income,
-                         1 if _is_subscription(sub) else 0, existing["id"]),
-                    )
-            # 2026-06-13: 對齊「顯示誠實」鐵律 — 寫 billed 同時把 pending 對應筆清掉。
-            # 銀行 billed 出帳後，pending 通常 1-3 天才會從未出帳清單移除；過渡期 UI
-            # 會雙重計算同一筆消費 (見 esun ****7032 過渡期 4 筆 stale row 案例)。
-            # 比對條件：card_no + consume_date + amount + desc (四欄全等 ↔ 同一筆)。
-            # 為何不只比 card_no+date+amount？同日同卡同金額不同商家有可能 (e.g. 7-11 跨店買 100)。
-            if purge_pending:
-                self._purge_overlapping_pending(
-                    card_no=t.get("card_no"),
-                    consume_date=t.get("date"),
-                    amount=t.get("amount"),
-                    desc=t.get("desc"),
-                )
         # 不在此 commit：billed INSERT、overlay adoption、pending refresh 必須同一 transaction。
         # 各 persist 最後由 refresh_card_pending／log_sync commit；中途 crash 會整批 rollback，
         # 避免下一輪 ON CONFLICT 後失去「本次新增 billed」candidate。
         return inserted_count
-
-    def _purge_overlapping_pending(
-        self,
-        card_no: str | None,
-        consume_date: str | None,
-        amount: int | float | None,
-        desc: str | None,
-    ) -> int:
-        """寫 billed 時連動清掉 pending 中同一筆消費（過渡期 stale row）。
-
-        比對 4 欄全等才清：card_no, consume_date, amount, description。
-        4 欄任一為 None 視為「資料不齊不敢清」直接 return 0（保守策略）。
-
-        Phase C-review (2026-06-17): 顯式列出已知 scope (unbilled/current),
-        避免未來新增 scope (e.g. 'instalment' 分期未來幾期) 被誤殺。
-        新增 scope 時須評估是否該被 billed 出帳事件 purge。
-
-        Returns: 清掉的 pending row 數。
-        """
-        if not card_no or not consume_date or amount is None or not desc:
-            return 0
-        cur = self.conn.execute(
-            """DELETE FROM card_pending_txns
-               WHERE user_id = ?
-                 AND card_no = ?
-                 AND consume_date = ?
-                 AND amount = ?
-                 AND description = ?
-                 AND scope IN ('unbilled', 'current')""",
-            (self.user_id, card_no, consume_date, amount, desc),
-        )
-        return cur.rowcount or 0
 
     def dedup_billed_stale_rows(self) -> int:
         """清理 card_billed_txns 中因 norm 規則演進造成的「同消費多 row」歷史包袱。
@@ -1109,7 +1017,7 @@ class BankStore:
             consume_date 都同 2026-01-27 但 post_date 是 2026-02-02 / 03-02 / 04-02 / 05-02
             → 是真的 6 期分期，不可合併
           - dedup_key 本身就包含 post_date，這裡 dedup 也要對齊
-          - 同 _purge_overlapping_pending 邏輯：同日同卡同金額不同 desc → 視為不同筆
+          - 同日同卡同金額不同 desc → 視為不同筆
 
         為何不單純留最舊？
           - ctbc EUR 外幣 case: 舊 row consume_amount=None / 新 row consume_amount=196.2
@@ -1175,38 +1083,26 @@ class BankStore:
         return (cur_b.rowcount or 0, cur_p.rowcount or 0)
 
     # ---- 3. 未出帳/即時：refresh-by-scope ----
-    def _adopt_vanished_pending_overlay(self, scope: str, txns: list[dict],
-                                        allow_adoption: bool,
-                                        pending_fetch_ok: bool) -> tuple[set[tuple], bool]:
+    def _adopt_vanished_pending_overlay(self, scope: str, txns: list[dict]) -> None:
         """把「本次從未入帳清單消失」的 pending overlay 搬到同次新寫入的 billed。
 
-        四欄 key (card_no, consume_date, amount, description) 只在銀行入帳後
-        description 不變時有效。銀行改寫商戶名 → 使用者手動設的分類/備註/拆帳
-        遺失且 pending 雙顯。這裡改用「行為」當證據：某筆從未入帳清單消失了,
-        而 billed 有一筆同 identity 的本次新增 row ⇒ 才可能是同一筆。
+        台幣只由 refresh_card_pending 的四欄 exact gate 處理；這裡只處理
+        有原幣金額證據的外幣 identity，且候選限本次新 INSERT billed。
 
-        配對 identity:
-          • 外幣: card_no + consume_date + consume_currency + consume_amount
-          • 台幣: card_no + consume_date + amount（且必須確認 pending 已消失）
-        候選只限「本次 BankStore sync 剛 INSERT」的 billed，絕不掃歷史交易。
+        配對 identity: card_no + consume_date + consume_currency + consume_amount。
+        候選只限本次 BankStore sync 新 INSERT 的 billed，絕不掃歷史交易。
 
         三道守門 (寧可漏搬, 不可錯搬 —— 錯搬會把分類蓋到別筆交易上):
-          1. allow_adoption=False → legacy caller，不啟用跨表接手。
-          2. 外幣要求 card_no + consume_currency + consume_amount 全等，可在 overlap
-             或 pending fetch 失敗時接手；台幣要求 card_no + consume_date + amount，
-             且 pending_fetch_ok=True 並確認舊 row 已從本次 pending 清單消失。
-          3. 同一 identity 上若消失的 pending 或本次新增 billed 超過一筆
+          1. caller 僅在 fetch_ok=True 時進入。
+          2. 只接受外幣 card_no + consume_currency + consume_amount 全等；台幣
+             改名後沒有穩定 transaction id，不做 fuzzy overlay adoption。
+          3. 同一 identity 上若消失的 pending 或本次 payload billed 超過一筆
              (多對多) → 該組整組放棄, 無法判定誰對誰。
 
-        候選全部是本 sync 內剛 INSERT、尚未暴露給外部編輯的 billed；規則可能已先
-        自動分類，因此 pending 人工 overlay 可以覆蓋該自動值。
+        新 INSERT billed 可能已被規則自動分類，因此 pending 人工 overlay 可以覆蓋；
+        touched existing billed 只接受 outcome-equivalent overlay，衝突時跳過。
 
-        Returns: (已成功接手的 identity, 是否因 ambiguity／split invariant 阻擋整個 scope)。
         """
-        # Legacy caller 不啟用跨表接手。
-        if not allow_adoption:
-            return set(), False
-
         rows = self.conn.execute(
             "SELECT id, scope, card_no, consume_date, amount, currency, description, "
             "consume_currency, consume_amount, category, subcategory, description_overwrite, "
@@ -1214,25 +1110,22 @@ class BankStore:
             "WHERE user_id = ? AND scope = ?",
             (self.user_id, scope),
         ).fetchall()
-        candidate_billed_ids = (self._current_billed_ids
-                                if pending_fetch_ok else self._new_billed_ids)
+        candidate_billed_ids = self._new_billed_ids
         candidate_billed_ids = list(dict.fromkeys(candidate_billed_ids))
         if not rows or not candidate_billed_ids:
-            return set(), False
+            return
 
-        # 台幣 identity 較弱，必須靠可信 pending 清單證明舊 row 已消失；外幣
-        # 原幣 identity 足夠強，可在銀行仍重疊回傳 pending 時立即接手。
-        still = {(t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"))
-                 for t in txns}
+        # 只有外幣原幣 identity 足夠強，可在可信 snapshot overlap 時接手。
+        incoming_by_identity: dict[tuple, list[dict]] = {}
+        for t in txns:
+            identity = _pending_billed_identity(t)
+            if identity is not None:
+                incoming_by_identity.setdefault(identity, []).append(t)
         candidate_identities: set[tuple] = set()
         for r in rows:
             identity = _pending_billed_identity(r)
-            if identity is None:
+            if identity is None or identity[0] != "fx":
                 continue
-            if identity[0] == "local":
-                key4 = (r["card_no"], r["consume_date"], r["amount"], r["description"])
-                if not pending_fetch_ok or key4 in still:
-                    continue
             candidate_identities.add(identity)
 
         placeholders = ",".join("?" for _ in candidate_billed_ids)
@@ -1249,8 +1142,8 @@ class BankStore:
             if identity is not None:
                 billed_by_identity.setdefault(identity, []).append(b)
 
-        # 同交易可能同時出現在 unbilled/current/realtime；跨 scope 一起判定與刪除，
-        # 否則第一個 scope 接手後，第二個 scope 又把 pending 插回造成雙顯。
+        # 同交易可能同時出現在 unbilled/current/realtime；跨 scope 一起判定
+        # overlay 是否一致，但每次 refresh 只刪自己 scope，避免回傳 count 失真。
         all_pending = self.conn.execute(
             "SELECT id, scope, card_no, consume_date, amount, currency, description, "
             "consume_currency, consume_amount, category, subcategory, description_overwrite, "
@@ -1267,8 +1160,14 @@ class BankStore:
         plans = []
         new_billed_ids = set(self._new_billed_ids)
         for identity in candidate_identities:
+            if identity in self._unsafe_pending_overlay_identities:
+                continue
             siblings = pending_by_identity.get(identity, [])
             targets = billed_by_identity.get(identity, [])
+            incoming = incoming_by_identity.get(identity, [])
+            if identity[0] == "fx" and len(incoming) > 1:
+                self._unsafe_pending_overlay_identities.add(identity)
+                continue
             overlay_rows = [p for p in siblings if (
                 p["category"] or p["subcategory"] or p["description_overwrite"]
                 or p["tags_overwrite"] or p["splits_overwrite"] or p["auto_excluded"]
@@ -1287,25 +1186,32 @@ class BankStore:
             ) for p in overlay_rows}
             if (any(n > 1 for n in scope_counts.values()) or len(raw_keys) != 1
                     or len(overlay_signatures) != 1 or len(targets) != 1):
-                return set(), True
+                self._unsafe_pending_overlay_identities.add(identity)
+                continue
 
             p = overlay_rows[0]
             target = targets[0]
-            if target["id"] not in new_billed_ids and (
-                    target["category"] or target["subcategory"]
-                    or target["description_overwrite"] or target["tags_overwrite"]
-                    or target["splits_overwrite"] or target["auto_excluded"]):
-                # existing billed 的 overlay provenance 不明；不可用 pending 強行覆蓋。
-                return set(), True
             splits = _rescale_splits(p["splits_overwrite"], target["amount"])
-            if p["splits_overwrite"] and splits is None:
-                return set(), True
+            pending_signature = (
+                p["category"], p["subcategory"], p["description_overwrite"],
+                p["tags_overwrite"], p["auto_excluded"], splits,
+            )
+            target_signature = (
+                target["category"], target["subcategory"], target["description_overwrite"],
+                target["tags_overwrite"], target["auto_excluded"], target["splits_overwrite"],
+            )
+            if (target["id"] not in new_billed_ids and any(target_signature)
+                    and target_signature != pending_signature):
+                # Existing billed 只有 outcome-equivalent overlay 才可重用；衝突時不猜。
+                self._unsafe_pending_overlay_identities.add(identity)
+                continue
             flow, income_cat = _flow_fields(
                 p["category"], p["subcategory"], None, target["txn_type"])
-            plans.append((identity, siblings, p, target, splits, flow, income_cat))
+            plans.append((
+                identity, incoming, p, target, splits, flow, income_cat,
+            ))
 
-        adopted_identities: set[tuple] = set()
-        for identity, siblings, p, target, splits, flow, income_cat in plans:
+        for identity, incoming, p, target, splits, flow, income_cat in plans:
             self.conn.execute(
                 "UPDATE card_billed_txns SET category = ?, subcategory = ?, "
                 "description_overwrite = ?, tags_overwrite = ?, auto_excluded = ?, "
@@ -1316,25 +1222,10 @@ class BankStore:
                  flow, income_cat, 1 if _is_subscription(p["subcategory"]) else 0,
                  target["id"]),
             )
-            for sibling in siblings:
-                self.conn.execute(
-                    "DELETE FROM card_pending_txns WHERE user_id = ? AND id = ?",
-                    (self.user_id, sibling["id"]),
-                )
-            adopted_identities.add(identity)
             scope_ledgers = self._adopted_pending_raw_keys.setdefault(identity, {})
-            counts_by_scope: dict[str, Counter] = {}
-            for sibling in siblings:
-                counts_by_scope.setdefault(sibling["scope"], Counter()).update(
-                    [_pending_raw_key(sibling)])
-            raw_keys = {_pending_raw_key(sibling) for sibling in siblings}
-            for raw_key in raw_keys:
-                occurrence_count = max(
-                    counts[raw_key] for counts in counts_by_scope.values())
-                for pending_scope in ("unbilled", "current", "realtime"):
-                    counter = scope_ledgers.setdefault(pending_scope, Counter())
-                    counter[raw_key] = max(counter[raw_key], occurrence_count)
-        return adopted_identities, False
+            counter = scope_ledgers.setdefault(scope, Counter())
+            counter.update(_pending_raw_key(t) for t in incoming)
+
 
     @contextmanager
     def savepoint(self, name: str):
@@ -1361,34 +1252,11 @@ class BankStore:
 
         fetch_ok 三態：
           • True  = 這次抓取可信，允許本次新 billed 接手 overlay。
-          • False = 抓取失敗／回傳不全，不做 whole-scope DELETE／INSERT；僅原幣
-                    identity 足夠強的外幣本次新 billed 可接手 overlay。
-          • None  = legacy caller；照舊 refresh，但不啟用新 billed 接手（向後相容）。
+          • False = 抓取失敗／回傳不全，不做 adoption 或 membership 修改。
+          • None  = legacy caller；照舊 refresh，但不啟用 billed transition 合併。
         """
         from backend.server.categorizer import categorize_with_excluded
-        if self._protected_pending_ids:
-            placeholders = ",".join("?" for _ in self._protected_pending_ids)
-            protected = self.conn.execute(
-                f"SELECT COUNT(*) AS n FROM card_pending_txns "
-                f"WHERE user_id = ? AND scope = ? AND id IN ({placeholders})",
-                (self.user_id, scope, *self._protected_pending_ids),
-            ).fetchone()
-            if protected and protected["n"]:
-                # Existing billed 可能已有人工 overlay，provenance 不足；保留 pending，
-                # 不讓後續 whole-scope refresh／exact prune 靜默丟掉另一份人工編輯。
-                if commit:
-                    self.conn.commit()
-                row = self.conn.execute(
-                    "SELECT COUNT(*) AS n FROM card_pending_txns "
-                    "WHERE user_id = ? AND scope = ?",
-                    (self.user_id, scope),
-                ).fetchone()
-                return int(row["n"] if row else 0)
         if fetch_ok is False:
-            # Pending endpoint 失敗時不清整個 scope；若本次已有新 billed，只有原幣
-            # identity 足夠強的外幣交易仍可立即接手。台幣缺少可信「已消失」證據，
-            # 一律保留舊 pending，不拿同卡同日同額猜測。
-            self._adopt_vanished_pending_overlay(scope, txns, True, False)
             if commit:
                 self.conn.commit()
             row = self.conn.execute(
@@ -1398,6 +1266,9 @@ class BankStore:
             return int(row["n"] if row else 0)
         now = _now()
         pending_metadata = self._pending_user_metadata(scope)
+        previous_exact_counts = {
+            exact_key: len(rows) for exact_key, rows in pending_metadata.items()
+        }
         pending_fx_metadata = self._pending_user_metadata_by_identity(scope)
         consumed_pending_ids: set[int] = set()
 
@@ -1436,32 +1307,129 @@ class BankStore:
             (t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"))
             for t in txns
         )
+        all_pending_metadata = self._pending_user_metadata()
+        current_targets: dict[tuple, list] = {}
+        transition_targets: dict[tuple, list] = {}
+        new_billed_ids = set(self._new_billed_ids)
+        current_billed_ids = list(dict.fromkeys(self._current_billed_ids))
+        if current_billed_ids:
+            placeholders = ",".join("?" for _ in current_billed_ids)
+            rows = self.conn.execute(
+                f"SELECT id, card_no, consume_date, amount, description, txn_type "
+                f"FROM card_billed_txns WHERE user_id = ? AND id IN ({placeholders})",
+                (self.user_id, *current_billed_ids),
+            ).fetchall()
+            for row in rows:
+                exact_key = (
+                    row["card_no"], row["consume_date"], row["amount"], row["description"],
+                )
+                current_targets.setdefault(exact_key, []).append(row)
+                if row["id"] in new_billed_ids:
+                    transition_targets.setdefault(exact_key, []).append(row)
+        planned_prune_counts: dict[tuple, int] = {}
+        planned_transfer_keys: set[tuple] = set()
+        exact_keys = set(incoming_exact_counts) | set(pending_metadata)
+        for exact_key in exact_keys:
+            incoming_count = incoming_exact_counts.get(exact_key, 0)
+            card_no, consume_date, amount, desc = exact_key
+            previous_count = previous_exact_counts.get(exact_key, 0)
+            complete = (
+                bool(str(card_no or "").strip())
+                and bool(str(consume_date or "").strip())
+                and amount is not None
+                and bool(str(desc or "").strip())
+            )
+            global_signatures = {
+                tuple(row[:-1]) for row in all_pending_metadata.get(exact_key, [])
+            }
+            unsafe_marker = ("exact", *exact_key)
+            if len(global_signatures) > 1:
+                self._unsafe_pending_overlay_identities.add(unsafe_marker)
+            merge_allowed = (
+                fetch_ok is True and complete and incoming_count <= 1
+                and previous_count <= 1 and len(current_targets.get(exact_key, [])) == 1
+                and len(transition_targets.get(exact_key, [])) == 1
+                and unsafe_marker not in self._unsafe_pending_overlay_identities
+            )
+            planned_prune_counts[exact_key] = int(merge_allowed and incoming_count == 1)
+            if merge_allowed and previous_count == 1:
+                planned_transfer_keys.add(exact_key)
+        for exact_key in planned_transfer_keys:
+            metadata_rows = pending_metadata.get(exact_key, [])
+            if not metadata_rows or not any(metadata_rows[0][:-1]):
+                continue
+            (cat, sub, description_overwrite, tags_overwrite, auto_ex,
+             splits_overwrite, _pending_id) = metadata_rows[0]
+            target = transition_targets[exact_key][0]
+            original_splits = splits_overwrite
+            splits_overwrite = _rescale_splits(original_splits, target["amount"])
+            if original_splits and splits_overwrite is None:
+                splits_overwrite = None
+            flow, income_cat = _flow_fields(cat, sub, None, target["txn_type"])
+            self.conn.execute(
+                "UPDATE card_billed_txns SET category=?, subcategory=?, "
+                "description_overwrite=?, tags_overwrite=?, auto_excluded=?, "
+                "splits_overwrite=?, flow_type=?, income_category=?, "
+                "is_subscription=? WHERE user_id=? AND id=?",
+                (cat, sub, description_overwrite, tags_overwrite, 1 if auto_ex else 0,
+                 splits_overwrite, flow, income_cat,
+                 1 if _is_subscription(sub) else 0, self.user_id, target["id"]),
+            )
+        unsafe_exact_keys: set[tuple] = set()
         for exact_key, rows in pending_metadata.items():
-            if (len(rows) > incoming_exact_counts[exact_key]
+            retained_count = (
+                incoming_exact_counts[exact_key] - planned_prune_counts.get(exact_key, 0)
+            )
+            if (0 < retained_count < len(rows)
                     and len({tuple(row[:-1]) for row in rows}) > 1):
-                # 同 exact key 的 occurrence 減少，但舊 rows 各有不同人工 overlay；
-                # 無法判斷哪份消失，不能靠 pop 順序留第一份、刪掉其餘。
-                return abort_refresh()
+                # 同 exact key occurrence 減少且舊 overlays 衝突：可信 snapshot 的
+                # 數量仍是權威，但不能靠 pop 順序猜哪份 metadata 留下。
+                if fetch_ok is True:
+                    unsafe_exact_keys.add(exact_key)
+                else:
+                    return abort_refresh()
+        for exact_key in unsafe_exact_keys:
+            pending_metadata[exact_key] = []
 
-        # 2026-07-30 — 消失比對 (vanished-pending adoption):
-        # 四欄 key 搬 overlay 只在銀行入帳後 description 不變時有效。銀行把
-        # 「暫無資訊」改寫成正式商戶名時, key 對不上 → 使用者手動設的分類/備註/
-        # 拆帳留在 pending, billed 是白紙, 且 pending 沒被 prune → UI 雙顯。
-        #
-        # 改用行為＋穩定 identity: 台幣 pending 消失／外幣原幣 identity 命中，且
-        # 同 transaction 僅一筆新 billed；description 改寫不再使人工 overlay 遺失。
-        _adopted_identities, blocked = self._adopt_vanished_pending_overlay(
-            scope, txns, fetch_ok is not None, fetch_ok is True)
-        if blocked:
-            # 有人工 overlay 但 identity／split invariant 不足以唯一安全接手。
-            # 不可繼續 whole-scope DELETE，否則「跳過錯搬」仍會變成資料遺失。
-            return abort_refresh()
+        remaining_exact_prunes = Counter(planned_prune_counts)
+        pruned_indices: set[int] = set()
+        exact_metadata_by_index: dict[int, tuple] = {}
+        # 先把整批 exact mappings 消耗完，再做 FX fallback；否則 renamed row
+        # 排在 exact row 前面時會先看到衝突，結果依銀行回傳順序而異。
+        for index, t in enumerate(txns):
+            exact_key = (t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"))
+            if remaining_exact_prunes[exact_key] > 0:
+                remaining_exact_prunes[exact_key] -= 1
+                # Overlay 已搬到 billed，但舊 pending occurrence 仍須標記 consumed，
+                # 否則同 identity 的 renamed FX fallback 會重複取用。
+                take_metadata(pending_metadata.get(exact_key))
+                pruned_indices.add(index)
+                continue
+            metadata = take_metadata(pending_metadata.get(exact_key))
+            if metadata is not None:
+                exact_metadata_by_index[index] = metadata
+        fx_fallback_counts: Counter = Counter()
+        for index, t in enumerate(txns):
+            if index in pruned_indices or index in exact_metadata_by_index:
+                continue
+            identity = _pending_billed_identity(t)
+            if identity and identity[0] == "fx":
+                fx_fallback_counts[identity] += 1
+
+        # 外幣原幣 identity 的唯一 1:1 overlay adoption；台幣只走上方 exact gate。
+        # 找不到唯一安全對象時不搬 overlay，但可信 snapshot 仍決定 membership。
+        if fetch_ok is True:
+            self._adopt_vanished_pending_overlay(scope, txns)
         # Phase C (2026-06-17): refresh 只清本 user 的, 不影響別 user。
         self.conn.execute(
             "DELETE FROM card_pending_txns WHERE user_id = ? AND scope = ?",
             (self.user_id, scope),
         )
-        for t in txns:
+        for index, t in enumerate(txns):
+            if index in pruned_indices:
+                # Exact merge 的 metadata 已在本次可信 refresh 搬到唯一新 billed；
+                # 直接略過 source occurrence，避免先 INSERT 再依 id 猜哪筆該刪。
+                continue
             identity = _pending_billed_identity(t)
             scope_ledgers = (self._adopted_pending_raw_keys.get(identity)
                              if identity else None)
@@ -1473,18 +1441,14 @@ class BankStore:
                 continue
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
-            metadata = take_metadata(pending_metadata.get((
-                t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"),
-            )))
+            metadata = exact_metadata_by_index.get(index)
             if metadata is None:
                 identity = _pending_billed_identity(t)
                 fx_rows = pending_fx_metadata.get(identity) if identity else None
                 unconsumed = ([m for m in fx_rows if m[-1] not in consumed_pending_ids]
                               if fx_rows else [])
-                if len(unconsumed) > 1 and any(any(m[:6]) for m in unconsumed):
-                    # 多筆同 identity 且 exact key 都對不上時，順序不是身份證據。
-                    return abort_refresh()
-                metadata = take_metadata(fx_rows)
+                if fx_fallback_counts.get(identity, 0) == 1 and len(unconsumed) == 1:
+                    metadata = take_metadata(fx_rows)
             description_overwrite = tags_overwrite = splits_overwrite = None
             if metadata:
                 (cat, sub, description_overwrite, tags_overwrite, auto_ex,
@@ -1493,8 +1457,12 @@ class BankStore:
                 original_splits = splits_overwrite
                 splits_overwrite = _rescale_splits(original_splits, t.get("amount"))
                 if original_splits and splits_overwrite is None:
-                    # 不能只保分類卻靜默丟拆帳；回滾本 scope refresh，保留原 pending。
-                    return abort_refresh()
+                    # Split 無法安全重算時只放棄 split；分類、備註、標籤與排除
+                    # 仍屬同一 exact pending row，不應一併洗掉。
+                    if fetch_ok is True:
+                        splits_overwrite = None
+                    else:
+                        return abort_refresh()
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
             self.conn.execute(
                 """INSERT INTO card_pending_txns
@@ -1513,29 +1481,6 @@ class BankStore:
                  description_overwrite, tags_overwrite, flow, income_cat,
                  1 if _is_subscription(sub) else 0, splits_overwrite),
             )
-
-        # Phase 8.5 (2026-06-18) — 結帳跨表去重:
-        # 銀行結帳後同筆 txn 同時出現在 pending (未結款 API 還回) +
-        # billed (帳單已生成). 若不去重, /transactions UNION ALL 會雙顯, UI 重複.
-        # 使用者 CTBC 4 筆重複案例 (SUKIYA/健身工廠/中華航空/中華電信) 觸發.
-        #
-        # 策略: pending 是「即時」性, billed 是「正式」, billed 為準 — pending
-        # 同 (card_no, consume_date, description, amount) 命中 billed 即 prune.
-        # 必須在 caller 端 (persist/*.py) 先 upsert_card_billed 再 refresh_card_pending,
-        # 才能保證 billed 已就位. 目前 ctbc/hsbc/ubot/cathay/esun 都是這順序.
-        self.conn.execute(
-            """DELETE FROM card_pending_txns
-               WHERE user_id = ? AND scope = ?
-                 AND EXISTS (
-                   SELECT 1 FROM card_billed_txns b
-                   WHERE b.user_id = card_pending_txns.user_id
-                     AND b.card_no = card_pending_txns.card_no
-                     AND b.consume_date = card_pending_txns.consume_date
-                     AND b.description = card_pending_txns.description
-                     AND b.amount = card_pending_txns.amount
-                 )""",
-            (self.user_id, scope),
-        ).rowcount
 
         self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")
         if commit:
