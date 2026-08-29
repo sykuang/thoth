@@ -515,6 +515,7 @@ def _submit_fixture(
         for selector in (
             "input[name='otpCode']",
             ".modal.show",
+            ".modal.show:not(.modal_loading)",
             "#ib_init_connect_error_popup",
         )
     }
@@ -594,7 +595,7 @@ def test_submit_click_timeout_after_dispatch_has_no_fallback(monkeypatch) -> Non
 def test_post_submit_structural_wait_never_acts_or_resubmits(monkeypatch) -> None:
     crawler, page, _, button, checkpoints, _ = _submit_fixture(
         monkeypatch,
-        visible_checkpoint=".modal.show",
+        visible_checkpoint=".modal.show:not(.modal_loading)",
     )
 
     crawler.submit_credentials_once(page)
@@ -602,6 +603,21 @@ def test_post_submit_structural_wait_never_acts_or_resubmits(monkeypatch) -> Non
     button.click.assert_called_once_with()
     page.wait_for_timeout.assert_called_once_with(1000)
     assert all(locator.click.call_count == 0 for locator in checkpoints.values())
+
+
+def test_submit_waits_through_loading_modal_until_authenticated(monkeypatch) -> None:
+    crawler, page, _, button, _, _ = _submit_fixture(
+        monkeypatch,
+        visible_checkpoint=".modal.show",
+    )
+    logged_in = Mock(side_effect=[False, True])
+    monkeypatch.setattr(crawler, "_logged_in", logged_in)
+
+    crawler.submit_credentials_once(page)
+
+    button.click.assert_called_once_with()
+    assert logged_in.call_count == 2
+    assert page.wait_for_timeout.call_count == 2
 
 
 def test_real_patchright_multi_modal_post_submit_wait_is_secret_safe(caplog) -> None:

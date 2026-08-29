@@ -442,7 +442,7 @@ class RakutenCrawler(BankCrawler):
                     _any_visible(page, selector)
                     for selector in (
                         "input[name='otpCode']",
-                        ".modal.show",
+                        ".modal.show:not(.modal_loading)",
                         "#ib_init_connect_error_popup",
                     )
                 ):
