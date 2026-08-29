@@ -28,6 +28,16 @@ NAME_PREFIX="${NAME_PREFIX:-thoth}"
 IMAGE_TAG="${IMAGE_TAG:-0.1.0}"
 IMAGE_NAME="${IMAGE_NAME:-thoth-backend}"
 SECRETS_FILE="${SECRETS_FILE:-deploy/.secrets.env}"
+SCHEDULER_DISABLED="${SCHEDULER_DISABLED:-true}"
+BOOTSTRAP_NETWORK_ONLY="${BOOTSTRAP_NETWORK_ONLY:-true}"
+
+for FLAG in SCHEDULER_DISABLED BOOTSTRAP_NETWORK_ONLY; do
+  VALUE="${!FLAG}"
+  if [[ "$VALUE" != "true" && "$VALUE" != "false" ]]; then
+    echo "ERROR: $FLAG must be true or false" >&2
+    exit 1
+  fi
+done
 
 # -------- 0. ensure secrets file exists --------
 if [[ ! -f "$SECRETS_FILE" ]]; then
@@ -126,7 +136,7 @@ echo "    Deployer IP allow: $DEPLOYER_IP_CIDR"
 # inputs explicitly (without echoing secret values).
 export NAME_PREFIX LOCATION ACR_LOGIN_SERVER IMAGE_REF \
   JWT_SECRET SERVER_FERNET_KEY SERVER_API_KEY ADMIN_API_KEY PG_ADMIN_PASSWORD DEPLOYER_OID \
-  SNAPTRADE_CLIENT_ID SNAPTRADE_CONSUMER_KEY DEPLOYER_IP_CIDR
+  SNAPTRADE_CLIENT_ID SNAPTRADE_CONSUMER_KEY DEPLOYER_IP_CIDR SCHEDULER_DISABLED BOOTSTRAP_NETWORK_ONLY
 
 PARAM_FILE=$(mktemp)
 trap 'rm -f "$PARAM_FILE"' EXIT
@@ -152,6 +162,8 @@ params = {
     "deployerObjectId": {"value": os.environ["DEPLOYER_OID"]},
     "kvPublicAccess": {"value": kv_public},
     "kvDeployerIpCidr": {"value": os.environ.get("DEPLOYER_IP_CIDR", "") if kv_public else ""},
+    "schedulerDisabled": {"value": os.environ["SCHEDULER_DISABLED"] == "true"},
+    "bootstrapNetworkOnly": {"value": os.environ["BOOTSTRAP_NETWORK_ONLY"] == "true"},
 }
 with open(sys.argv[1], "w") as f:
     json.dump({"parameters": params}, f)
@@ -192,10 +204,14 @@ echo "Health:         curl -H \"x-api-key: \$SERVER_API_KEY\" https://$APP_FQDN/
 echo "                (load \$SERVER_API_KEY from $SECRETS_FILE first)"
 echo ""
 echo "Follow logs - Ctrl+C to stop:"
-echo "  az containerapp logs show -n ${NAME_PREFIX}-backend -g $RG --follow --tail 50"
+echo "  az containerapp logs show -n ${NAME_PREFIX}-backend-public -g $RG --follow --tail 50"
 echo ""
 echo "Key Vault: managed via Bicep. Read a secret with:"
 echo "  az keyvault secret show --vault-name <kv-name> --name fernet-key --query value -o tsv"
 echo ""
-echo "Next: bootstrap + sync DBS:"
-echo "  APP_URL=https://$APP_FQDN ./deploy/bootstrap_and_sync.sh"
+if [[ "$BOOTSTRAP_NETWORK_ONLY" == "false" ]]; then
+  echo "Next: bootstrap + sync DBS:"
+  echo "  APP_URL=https://$APP_FQDN ./deploy/bootstrap_and_sync.sh"
+else
+  echo "Next: reconcile PostgreSQL firewall rules, restore data, then redeploy with BOOTSTRAP_NETWORK_ONLY=false."
+fi

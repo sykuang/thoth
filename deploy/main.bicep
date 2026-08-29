@@ -1,13 +1,12 @@
-// thoth backend — Azure Container Apps deployment (Key Vault edition)
+// thoth backend — low-cost Azure Container Apps deployment
 //
 // Phase 11 (2026-06-15) — 升級用 Azure Key Vault 集中管 secret。
 //
 // Architecture:
-//   - Bicep params 帶 secret 值 → 寫入 Key Vault（首次 deploy）
-//   - Container App secrets 改成 keyVaultUrl reference，用 Managed Identity 拉
-//   - DATABASE_URL 在 Bicep 內拼出真實值（含 pgAdminPassword），寫進 Key Vault
-//     (舊版用 `***` placeholder 然後手動補洞，這次內建)
-//   - 同一 Managed Identity 共用 ACR pull + Key Vault Secrets User
+//   - Default Azure network CAE, avoiding customer-VNet LB/public-IP charges
+//   - Public TLS PostgreSQL with default-deny firewall managed outside this template
+//   - Direct ACA secrets so startup does not require a Key Vault Private Endpoint
+//   - Existing Key Vault remains a locked backup copy, opened only during deploy
 //
 // 為何 Key Vault：
 //   - 集中 audit secret access (Log Analytics)
@@ -72,27 +71,24 @@ param kvPublicAccess bool = false
 @description('Optional IP address (CIDR ok) allowed to reach Key Vault from the public internet. Only honoured when kvPublicAccess=true. Leave empty to skip the IP allow list.')
 param kvDeployerIpCidr string = ''
 
+@description('Disable the in-process scheduler during database migration and cutover.')
+param schedulerDisabled bool = true
+
+@description('Start only HTTP ingress so outbound IP firewall rules can be bootstrapped before any DB access.')
+param bootstrapNetworkOnly bool = true
 
 
 // -------- naming (everything derived from namePrefix) --------
 var lawName = '${namePrefix}-law'
-// VNet-enabled Container Apps Environment cannot be retrofitted onto the old
-// default-network CAE. Use blue/green names so deploy can create the private
-// stack beside the current public stack, then cut over intentionally.
-var caeName = '${namePrefix}-cae-vnet'
+// Network type is immutable. Use blue/green names so the default-network
+// stack can be created beside the current VNet stack and cut over safely.
+var caeName = '${namePrefix}-cae-public'
 var miName = '${namePrefix}-mi'
-var appName = '${namePrefix}-backend-vnet'
+var appName = '${namePrefix}-backend-public'
 var kvName = '${namePrefix}-kv-${take(uniqueString(resourceGroup().id), 6)}'
-var pgServerName = '${namePrefix}-pg-vnet-${take(uniqueString(resourceGroup().id), 6)}'
+var pgServerName = '${namePrefix}-pg-public-${take(uniqueString(resourceGroup().id), 6)}'
 var pgAdminUser = 'thothadmin'
 var pgDbName = 'thoth'
-var vnetName = '${namePrefix}-vnet'
-var caeSubnetName = 'containerapps'
-var privateEndpointSubnetName = 'private-endpoints'
-var pgSubnetName = 'postgresql'
-var pgPrivateDnsZoneName = '${namePrefix}.private.postgres.database.azure.com'
-var kvPrivateEndpointName = '${namePrefix}-kv-pe'
-var kvPrivateDnsZoneName = 'privatelink.vaultcore.azure.net'
 
 // ACR is pre-created by deploy.sh
 var acrName = split(split(acrLoginServer, '.')[0], '/')[0]
@@ -108,71 +104,6 @@ resource law 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
     sku: { name: 'PerGB2018' }
     retentionInDays: 30
   }
-}
-
-// -------- Network (VNet for ACA egress + PG delegated subnet) --------
-resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
-  name: vnetName
-  location: location
-  properties: {
-    addressSpace: {
-      addressPrefixes: [
-        '10.42.0.0/16'
-      ]
-    }
-    subnets: [
-      {
-        name: caeSubnetName
-        properties: {
-          addressPrefix: '10.42.0.0/23'
-          delegations: [
-            {
-              name: 'Microsoft.App.environments'
-              properties: {
-                serviceName: 'Microsoft.App/environments'
-              }
-            }
-          ]
-        }
-      }
-      {
-        name: privateEndpointSubnetName
-        properties: {
-          addressPrefix: '10.42.2.0/24'
-          privateEndpointNetworkPolicies: 'Disabled'
-        }
-      }
-      {
-        name: pgSubnetName
-        properties: {
-          addressPrefix: '10.42.3.0/24'
-          delegations: [
-            {
-              name: 'Microsoft.DBforPostgreSQL.flexibleServers'
-              properties: {
-                serviceName: 'Microsoft.DBforPostgreSQL/flexibleServers'
-              }
-            }
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource caeSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
-  parent: vnet
-  name: caeSubnetName
-}
-
-resource privateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
-  parent: vnet
-  name: privateEndpointSubnetName
-}
-
-resource pgSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
-  parent: vnet
-  name: pgSubnetName
 }
 
 // -------- PostgreSQL Flexible Server (Burstable B1ms ~US$13/mo) --------
@@ -199,18 +130,13 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
       mode: 'Disabled'
     }
     network: {
-      delegatedSubnetResourceId: pgSubnet.id
-      privateDnsZoneArmResourceId: pgPrivateDnsZone.id
-      publicNetworkAccess: 'Disabled'
+      publicNetworkAccess: 'Enabled'
     }
     authConfig: {
       activeDirectoryAuth: 'Disabled'
       passwordAuth: 'Enabled'
     }
   }
-  dependsOn: [
-    pgPrivateDnsVnetLink
-  ]
 }
 
 resource pgDb 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = {
@@ -222,25 +148,7 @@ resource pgDb 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' =
   }
 }
 
-// -------- PostgreSQL Private access DNS --------
-resource pgPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: pgPrivateDnsZoneName
-  location: 'global'
-}
-
-resource pgPrivateDnsVnetLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: pgPrivateDnsZone
-  name: '${namePrefix}-pg-vnet-dns-link'
-  location: 'global'
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: vnet.id
-    }
-  }
-}
-
-// -------- Managed Identity (ACR pull + Key Vault Secrets User) --------
+// -------- Managed Identity (ACR pull) --------
 resource mi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: miName
   location: location
@@ -259,8 +167,8 @@ resource acrPullRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 
 // -------- Key Vault --------
 // RBAC mode (not access policies). Soft delete enabled by default (90d).
-// Default: publicNetworkAccess Disabled + Private Endpoint only — secrets are
-// only reachable from inside the VNet (ACA control plane reaches KV via PE).
+// Default: publicNetworkAccess Disabled. ACA receives direct secrets and does
+// not need network access to this backup copy.
 // During deploy.sh runs that need to write/rotate secrets from the deployer's
 // laptop, set kvPublicAccess=true and pass kvDeployerIpCidr=<your-ip>/32; the
 // firewall opens long enough for Bicep secret writes, then deploy.sh flips
@@ -292,59 +200,6 @@ resource kv 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-// -------- Key Vault Private DNS + Private Endpoint --------
-resource kvPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: kvPrivateDnsZoneName
-  location: 'global'
-}
-
-resource kvPrivateDnsVnetLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: kvPrivateDnsZone
-  name: '${namePrefix}-kvdns-vnet-link'
-  location: 'global'
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: vnet.id
-    }
-  }
-}
-
-resource kvPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: kvPrivateEndpointName
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'kv-conn'
-        properties: {
-          privateLinkServiceId: kv.id
-          groupIds: [
-            'vault'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource kvPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: kvPrivateEndpoint
-  name: 'kv-dns-zg'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'kv-zone-config'
-        properties: {
-          privateDnsZoneId: kvPrivateDnsZone.id
-        }
-      }
-    ]
-  }
-}
 
 // Grant deployer (e.g. az signed-in user) "Key Vault Secrets Officer" so Bicep
 // can write secrets during deploy. Role 必須在 secret 寫入之前生效。
@@ -359,18 +214,6 @@ resource deployerSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04
   }
 }
 
-// Grant Container App's MI "Key Vault Secrets User" so ACA can read secrets at runtime
-var secretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
-resource miSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: kv
-  name: guid(kv.id, mi.id, secretsUserRoleId)
-  properties: {
-    principalId: mi.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', secretsUserRoleId)
-  }
-}
-
 // -------- Seed secrets into Key Vault --------
 // DATABASE_URL 在 Bicep 內拼出真實 connection string（含 pgAdminPassword）。
 // pgAdminPassword 是 @secure() param，內插後仍保 secure flag 直到寫入 KV secret value。
@@ -378,7 +221,7 @@ resource miSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 var databaseUrl = format('postgresql://{0}:{1}@{2}:5432/{3}?sslmode=require', pgAdminUser, pgAdminPassword, pg.properties.fullyQualifiedDomainName, pgDbName)
 var snapTradeConfigured = !empty(snapTradeClientId) && !empty(snapTradeConsumerKey)
 
-resource kvSecretJwt 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource kvSecretJwt 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess) {
   parent: kv
   name: 'jwt-secret'
   properties: {
@@ -392,7 +235,7 @@ resource kvSecretJwt 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
-resource kvSecretFernet 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource kvSecretFernet 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess) {
   parent: kv
   name: 'fernet-key-v2'
   properties: {
@@ -406,7 +249,7 @@ resource kvSecretFernet 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
-resource kvSecretApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource kvSecretApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess) {
   parent: kv
   name: 'api-key'
   properties: {
@@ -420,7 +263,7 @@ resource kvSecretApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
-resource kvSecretAdminApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource kvSecretAdminApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess) {
   parent: kv
   name: 'admin-api-key'
   properties: {
@@ -434,9 +277,9 @@ resource kvSecretAdminApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
-resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess) {
   parent: kv
-  name: 'database-url-vnet-v2'
+  name: 'database-url-public'
   properties: {
     value: databaseUrl
     attributes: {
@@ -448,7 +291,7 @@ resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   ]
 }
 
-resource kvSecretSnapTradeClientId 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (snapTradeConfigured) {
+resource kvSecretSnapTradeClientId 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess && snapTradeConfigured) {
   parent: kv
   name: 'snaptrade-client-id'
   properties: {
@@ -462,7 +305,7 @@ resource kvSecretSnapTradeClientId 'Microsoft.KeyVault/vaults/secrets@2023-07-01
   ]
 }
 
-resource kvSecretSnapTradeConsumerKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (snapTradeConfigured) {
+resource kvSecretSnapTradeConsumerKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (kvPublicAccess && snapTradeConfigured) {
   parent: kv
   name: 'snaptrade-consumer-key'
   properties: {
@@ -481,10 +324,6 @@ resource cae 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: caeName
   location: location
   properties: {
-    vnetConfiguration: {
-      infrastructureSubnetId: caeSubnet.id
-      internal: false
-    }
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
@@ -536,44 +375,35 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           identity: mi.id
         }
       ]
-      // Key Vault reference 模式：value 改成 keyVaultUrl + identity
-      // ACA runtime 用指定的 MI 去 Key Vault 拉，注入成 env 給 container
       secrets: concat([
         {
           name: 'jwt-secret'
-          keyVaultUrl: kvSecretJwt.properties.secretUri
-          identity: mi.id
+          value: jwtSecret
         }
         {
           name: 'fernet-key-v2'
-          keyVaultUrl: kvSecretFernet.properties.secretUri
-          identity: mi.id
+          value: serverFernetKey
         }
         {
           name: 'api-key'
-          keyVaultUrl: kvSecretApiKey.properties.secretUri
-          identity: mi.id
+          value: serverApiKey
         }
         {
           name: 'admin-api-key'
-          keyVaultUrl: kvSecretAdminApiKey.properties.secretUri
-          identity: mi.id
+          value: adminApiKey
         }
         {
-          name: 'database-url-vnet-v2'
-          keyVaultUrl: kvSecretDatabaseUrl.properties.secretUri
-          identity: mi.id
+          name: 'database-url-public'
+          value: databaseUrl
         }
       ], snapTradeConfigured ? [
         {
           name: 'snaptrade-client-id'
-          keyVaultUrl: kvSecretSnapTradeClientId!.properties.secretUri
-          identity: mi.id
+          value: snapTradeClientId
         }
         {
           name: 'snaptrade-key'
-          keyVaultUrl: kvSecretSnapTradeConsumerKey!.properties.secretUri
-          identity: mi.id
+          value: snapTradeConsumerKey
         }
       ] : [])
     }
@@ -592,11 +422,13 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'SERVER_API_KEY', secretRef: 'api-key' }
             { name: 'ADMIN_API_KEY', secretRef: 'admin-api-key' }
             { name: 'DB_BACKEND', value: 'postgres' }
+            { name: 'THOTH_DISABLE_SCHEDULER', value: schedulerDisabled ? '1' : '0' }
+            { name: 'THOTH_BOOTSTRAP_NETWORK_ONLY', value: bootstrapNetworkOnly ? '1' : '0' }
             // Production frontend registers Expo push tokens by default. Keep
             // backend provider aligned; otherwise scheduler/payment reminders
             // use NoOpNotifier and silently deliver 0 notifications.
             { name: 'PUSH_PROVIDER', value: 'expo' }
-            { name: 'DATABASE_URL', secretRef: 'database-url-vnet-v2' }
+            { name: 'DATABASE_URL', secretRef: 'database-url-public' }
             { name: 'CORS_ORIGINS', value: effectiveCorsOrigins }
             { name: 'PYTHONUNBUFFERED', value: '1' }
           ], snapTradeConfigured ? [
@@ -634,8 +466,6 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
   }
   dependsOn: [
     pgDb
-    miSecretsUser  // MUST exist before ACA tries to read from Key Vault
-    // kvSecret* dependencies are implicit via keyVaultUrl: kvSecretX.properties.secretUri
   ]
 }
 

@@ -14,6 +14,7 @@ import { createJSONStorage, persist } from 'zustand/middleware';
 
 import { activateReplicaOwner, clearReplicaOwner, makeReplicaOwnerKey } from '@/lib/replica';
 import { replicaStore } from '@/lib/replicaStore';
+import { migrateServerUrl } from '@/lib/serverUrlMigration';
 
 type AuthState = {
   token: string | null;
@@ -138,6 +139,10 @@ export const useAuthStore = create<AuthState>()(
         biometricEnabled: state.biometricEnabled,
       }),
       onRehydrateStorage: () => (state, error) => {
+        if (state) {
+          const migratedServerUrl = migrateServerUrl(state.serverUrl);
+          if (migratedServerUrl !== state.serverUrl) state.setServerUrl(migratedServerUrl);
+        }
         // 即使 SecureStore 讀失敗也要把 hydrated 設 true，否則整個 UI
         // 永遠卡在 <ActivityIndicator />（fresh install on iOS、keychain
         // 不可用、simulator 等情境都會中招）。

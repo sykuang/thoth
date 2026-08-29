@@ -51,6 +51,18 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
+        bootstrap_only = os.environ.get("THOTH_BOOTSTRAP_NETWORK_ONLY", "").strip() in (
+            "1",
+            "true",
+            "True",
+        )
+        if bootstrap_only and request.url.path not in _API_KEY_EXEMPT_PATHS:
+            return Response(
+                content='{"detail":"network bootstrap in progress"}',
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                media_type="application/json",
+            )
+
         api_key = os.environ.get("SERVER_API_KEY", "").strip()
         if not api_key:
             return await call_next(request)

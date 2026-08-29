@@ -101,19 +101,25 @@ def _scheduler_disabled() -> bool:
     return os.environ.get("THOTH_DISABLE_SCHEDULER", "").strip() in ("1", "true", "True")
 
 
+def _network_bootstrap_only() -> bool:
+    return os.environ.get("THOTH_BOOTSTRAP_NETWORK_ONLY", "").strip() in ("1", "true", "True")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     from backend.core import bank_data
     from backend.core.store import migrate_existing_bank_stores
 
-    migrate_existing_bank_stores(bank_data.KNOWN_BANKS)
-    if not _scheduler_disabled():
+    bootstrap_only = _network_bootstrap_only()
+    if not bootstrap_only:
+        migrate_existing_bank_stores(bank_data.KNOWN_BANKS)
+    if not bootstrap_only and not _scheduler_disabled():
         from backend.server import scheduler
         scheduler.start()
     try:
         yield
     finally:
-        if not _scheduler_disabled():
+        if not bootstrap_only and not _scheduler_disabled():
             from backend.server import scheduler
             scheduler.shutdown(wait=False)
 
@@ -225,7 +231,7 @@ from backend.server.routers.sync_ws import router as sync_ws_router
 from backend.server.routers.transactions import router as transactions_router
 
 for _r in (
-    auth_router, creds_router, sync_router, sync_preference_router, sync_ws_router,
+    auth_router, creds_router, sync_router, sync_preference_router,
     fx_router, rules_router,
     accounts_router, cache_router, transactions_router,
     # auto_debit 必須在 cards 之前 — /cards/auto-debit/* 是 specific path，
@@ -234,6 +240,9 @@ for _r in (
     portfolio_router, push_router, replica_router, snaptrade_router,
 ):
     app.include_router(_r, prefix=_API_PREFIX)
+
+if not _network_bootstrap_only():
+    app.include_router(sync_ws_router, prefix=_API_PREFIX)
 
 
 _frontend_dist_raw = os.environ.get("THOTH_FRONTEND_DIST", "").strip()
