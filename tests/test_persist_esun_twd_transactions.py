@@ -32,11 +32,16 @@ def test_parse_esun_twd_snapshot_table_rows() -> None:
             "account_no": "0900000087022",
             "selected_text": "0900000087022 臺幣綜存",
             "snapshot": {
+                "hasGrid": True,
                 "gridText": (
                     "交易日 帳務日 摘要 支出 存入 餘額 備註\n"
                     "2026/06/29 2026/06/30 跨行轉帳 80  4 台新卡費\n"
                     "2026/06/01 2026/06/01 利息  2 84 活存利息\n"
                 ),
+                "gridRows": [
+                    ["2026/06/29", "2026/06/30", "跨行轉帳", "80", "", "4", "台新卡費"],
+                    ["2026/06/01", "2026/06/01", "利息", "", "2", "84", "活存利息"],
+                ],
             },
         }
     ])
@@ -91,7 +96,20 @@ def test_parse_esun_twd_user_copied_multiline_rows() -> None:
 """
 
     rows = _parse_esun_twd_txn_results([
-        {"account_no": "0900000087022", "text": raw, "snapshot": {"gridText": raw}}
+        {
+            "account_no": "0900000087022",
+            "snapshot": {
+                "hasGrid": True,
+                "gridText": raw,
+                "gridRows": [
+                    ["*2026/06/21", "00:43:43", "利息", "", "3", "4", "T900***001"],
+                    ["2026/03/30", "06:12:14", "玉山卡款扣繳", "65,714", "", "1", "測＊試"],
+                    ["2026/03/28", "03:38:04", "ＡＴＭ跨行轉", "", "65,714", "65,715", "永豐銀行", "807/0090000000197014"],
+                    ["2026/03/06", "06:09:03", "玉山卡款扣繳", "12,792", "", "1", "測＊試"],
+                    ["2026/03/03", "12:39:55", "ＡＴＭ跨行轉", "", "12,792", "12,793", "永豐銀行", "807/0090000000197014"],
+                ],
+            },
+        }
     ])
 
     assert len(rows) == 5
@@ -128,7 +146,9 @@ def test_persist_esun_writes_twd_transaction_detail_rows(store_esun_twd) -> None
                 "account_no": "0900000087022",
                 "selected_text": "0900000087022 臺幣綜存",
                 "snapshot": {
+                    "hasGrid": True,
                     "gridText": "交易日 帳務日 摘要 支出 存入 餘額 備註\n2026/06/29 2026/06/30 跨行轉帳 80  4 台新卡費\n",
+                    "gridRows": [["2026/06/29", "2026/06/30", "跨行轉帳", "80", "", "4", "台新卡費"]],
                 },
             }
         ],
@@ -158,7 +178,7 @@ def test_persist_esun_empty_twd_query_does_not_create_rows(store_esun_twd) -> No
                 "selected_text": "0900000087022 臺幣綜存",
                 "clicked_period": {"via": "custom-one-year", "start": "2025/07/02", "end": "2026/07/01"},
                 "text": "存款交易明細查詢\n2025/07/022026/07/01TWD\n查詢時間：2026/07/01 00:39:53\n提醒您：本查詢保留近一年的交易明細。",
-                "snapshot": {"hasGrid": False, "gridText": "", "qryResult": [{"visible": False, "text": "查詢時間：2026/07/01 00:39:53"}]},
+                "snapshot": {"hasGrid": False, "gridText": "", "gridRows": [], "qryResult": [{"visible": False, "text": "查詢時間：2026/07/01 00:39:53"}]},
             }
         ],
     }

@@ -16,14 +16,17 @@
 from __future__ import annotations
 
 import contextlib
+import math
+import os
 import re
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import ApiHit, BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.core.creds import EsunCreds
 from backend.core.login_checkpoints import (
@@ -40,6 +43,26 @@ FIELD_NATIONAL_ID = "loginform:custid"   # text, maxlen=10
 FIELD_USER_CODE   = "loginform:name"     # password type, maxlen=15
 FIELD_PASSWORD    = "loginform:pxsswd"   # password type, maxlen=15 (注意是 pxsswd 不是 password)
 LOGIN_BTN_ID      = "loginform:linkCommand"  # <a class="login_btn">
+_ESUN_TWD_HISTORY_PATH = "/fco/fao01002/FAO01002.faces"
+_ESUN_TWD_FAILURE_RE = re.compile(
+    r"(?:錯誤|失敗|異常|逾時|逾期|失效|中斷|請稍後再試|重新登入|"
+    r"載入中|讀取中|處理中|查詢中|等待|等候|忙碌|請稍候|timeout|timed?\s*out|"
+    r"expired|error|failed|unavailable|loading|waiting|processing|querying|"
+    r"please\s+(?:wait|stand\s+by|be\s+patient))",
+    re.I,
+)
+
+
+def _esun_history_window(
+    crawler: "EsunCrawler",
+    identity: str,
+    end: date,
+) -> tuple[date, date]:
+    try:
+        floor = end.replace(year=end.year - 1) + timedelta(days=1)
+    except ValueError:
+        floor = end.replace(year=end.year - 1, day=28) + timedelta(days=1)
+    return crawler.transaction_window_start(identity, floor=floor), end
 
 
 def _log(*a):
@@ -81,6 +104,10 @@ def _esun_card_bill_fact(out: dict):
 
 class EsunCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+        "twd_transactions",
+    })
     CREDENTIAL_HOSTS = frozenset({"ebank.esunbank.com.tw"})
 
     def __init__(self):
@@ -322,6 +349,294 @@ class EsunCrawler(BankCrawler):
         except Exception:
             return
 
+    @staticmethod
+    def _unique_twd_query_frame(frames):
+        matches = []
+        for frame in frames:
+            try:
+                if frame.evaluate("""() => Boolean(
+                    document.querySelector('select[id="fao01002:dract"]') &&
+                    document.querySelector('input[name="fao01002:linkCommand"]')
+                )""") is True:
+                    matches.append(frame)
+            except Exception:
+                raise RuntimeError("esun-twd-history-form") from None
+        if len(matches) != 1:
+            raise RuntimeError("esun-twd-history-form")
+        return matches[0]
+
+    @staticmethod
+    def _validated_twd_options(options) -> list[dict]:
+        if not isinstance(options, list):
+            raise RuntimeError("esun-twd-history-inventory")
+        out = []
+        for option in options:
+            if not isinstance(option, dict):
+                raise RuntimeError("esun-twd-history-inventory")
+            index = option.get("index")
+            text = option.get("text")
+            value = option.get("value")
+            if (
+                type(index) is not int
+                or index < 0
+                or not isinstance(text, str)
+                or text != text.strip()
+            ):
+                raise RuntimeError("esun-twd-history-inventory")
+            if option == {"index": 0, "text": "===請選擇===", "value": ""}:
+                continue
+            if not any(marker in text for marker in ("臺幣", "台幣")):
+                raise RuntimeError("esun-twd-history-inventory")
+            matches = re.findall(r"(?<!\d)\d{13}(?!\d)", text or "")
+            if (
+                len(matches) != 1
+                or not isinstance(value, str)
+                or not value
+                or value != value.strip()
+            ):
+                raise RuntimeError("esun-twd-history-inventory")
+            out.append({**option, "identity": matches[0]})
+        identities = [row["identity"] for row in out]
+        if len(identities) != len(set(identities)):
+            raise RuntimeError("esun-twd-history-inventory")
+        if not identities:
+            raise RuntimeError("esun-twd-history-inventory")
+        return out
+
+    @staticmethod
+    def _capture_twd_response(response, hits: list[ApiHit]) -> None:
+        try:
+            request = response.request
+            current = urlparse(response.url or "")
+            if (
+                request.method != "POST"
+                or current.scheme != "https"
+                or current.hostname != "ebank.esunbank.com.tw"
+                or current.port not in (None, 443)
+                or current.username is not None
+                or current.password is not None
+                or current.path != _ESUN_TWD_HISTORY_PATH
+                or current.query
+                or current.fragment
+            ):
+                return
+            fields = parse_qs(request.post_data or "", keep_blank_values=True)
+            safe_fields = {
+                key: fields.get(key)
+                for key in (
+                    "fao01002:dract",
+                    "fao01002:startDate",
+                    "fao01002:endDate",
+                )
+            }
+            hits.append(ApiHit(
+                url=response.url,
+                method=request.method,
+                status=response.status,
+                req_body=safe_fields,
+                content_type=response.headers.get("content-type", ""),
+            ))
+        except Exception:
+            return
+
+    @staticmethod
+    def _validated_twd_transport(
+        hits,
+        *,
+        result_url: str,
+        account_value: str,
+        start: date,
+        end: date,
+    ) -> None:
+        parsed_result = urlparse(result_url)
+        if (
+            parsed_result.scheme != "https"
+            or parsed_result.hostname != "ebank.esunbank.com.tw"
+            or parsed_result.port not in (None, 443)
+            or parsed_result.username is not None
+            or parsed_result.password is not None
+            or parsed_result.path != _ESUN_TWD_HISTORY_PATH
+            or parsed_result.query
+            or parsed_result.fragment
+        ):
+            raise RuntimeError("esun-twd-history-transport")
+        expected_fields = {
+            "fao01002:dract": account_value,
+            "fao01002:startDate": start.strftime("%Y/%m/%d"),
+            "fao01002:endDate": end.strftime("%Y/%m/%d"),
+        }
+        matches = []
+        for hit in hits:
+            content_type = (
+                hit.content_type.split(";", 1)[0].strip().lower()
+                if isinstance(hit.content_type, str)
+                else ""
+            )
+            if (
+                hit.url == result_url
+                and hit.method == "POST"
+                and type(hit.status) is int
+                and 200 <= hit.status < 300
+                and content_type in {"text/html", "application/xhtml+xml", "text/xml", "application/xml"}
+                and isinstance(hit.req_body, dict)
+            ):
+                fields = hit.req_body
+                if all(fields.get(key) == [value] for key, value in expected_fields.items()):
+                    matches.append(hit)
+        if len(matches) != 1:
+            raise RuntimeError("esun-twd-history-transport")
+
+    @staticmethod
+    def _fresh_twd_result(candidates) -> dict:
+        if len(candidates) != 1:
+            raise RuntimeError("esun-twd-history-result")
+        result = candidates[0]
+        if not isinstance(result, dict) or result.get("evidenceFresh") is not True:
+            raise RuntimeError("esun-twd-history-stale-result")
+        return result
+
+    @staticmethod
+    def _validated_twd_history_result(
+        result,
+        *,
+        identity: str,
+        start: date,
+        end: date,
+    ) -> dict:
+        if not isinstance(result, dict):
+            raise RuntimeError("esun-twd-history-result")
+        period = result.get("clicked_period")
+        submit = result.get("submit")
+        snapshot = result.get("snapshot")
+        text = result.get("text")
+        current = urlparse(result.get("url") or "")
+        if (
+            result.get("account_no") != identity
+            or result.get("selected_identity") != identity
+            or not isinstance(period, dict)
+            or period.get("checked") is not True
+            or period.get("start") != start.strftime("%Y/%m/%d")
+            or period.get("end") != end.strftime("%Y/%m/%d")
+            or not isinstance(submit, dict)
+            or submit.get("clicked") != "visible-query"
+            or current.scheme != "https"
+            or current.hostname != "ebank.esunbank.com.tw"
+            or current.port not in (None, 443)
+            or current.username is not None
+            or current.password is not None
+            or current.path != _ESUN_TWD_HISTORY_PATH
+            or not isinstance(text, str)
+            or _ESUN_TWD_FAILURE_RE.search(text) is not None
+            or re.search(rf"(?<!\d){re.escape(identity)}(?!\d)", text) is None
+            or re.search(
+                rf"(?<!\d){re.escape(start.strftime('%Y/%m/%d'))}(?!\d)", text,
+            ) is None
+            or re.search(
+                rf"(?<!\d){re.escape(end.strftime('%Y/%m/%d'))}(?!\d)", text,
+            ) is None
+            or not isinstance(snapshot, dict)
+            or snapshot.get("busy") is not False
+        ):
+            raise RuntimeError("esun-twd-history-result")
+        pager = snapshot.get("pager")
+        if (
+            not isinstance(pager, dict)
+            or set(pager) != {"present", "actionableNext"}
+            or pager.get("present") is not False
+            or type(pager.get("actionableNext")) is not int
+            or pager["actionableNext"] != 0
+            or re.search(r"(?:下一頁|下頁)", text)
+        ):
+            raise RuntimeError("esun-twd-history-result")
+        total_count = snapshot.get("totalCount")
+        if type(total_count) is not int or total_count < 0:
+            raise RuntimeError("esun-twd-history-result")
+        has_grid = snapshot.get("hasGrid")
+        grid_candidate_count = snapshot.get("gridCandidateCount")
+        grid_text = snapshot.get("gridText")
+        if (
+            type(has_grid) is not bool
+            or type(grid_candidate_count) is not int
+            or grid_candidate_count != (1 if has_grid else 0)
+            or not isinstance(grid_text, str)
+        ):
+            raise RuntimeError("esun-twd-history-result")
+        if has_grid:
+            grid_rows = snapshot.get("gridRows")
+            if not isinstance(grid_rows, list):
+                raise RuntimeError("esun-twd-history-result")
+            try:
+                dates = [
+                    date.fromisoformat(match.group(1).replace("/", "-"))
+                    for cells in grid_rows
+                    for cell in cells
+                    if (match := re.fullmatch(r"\*?(20\d{2}/\d{2}/\d{2})", cell))
+                ]
+            except (TypeError, ValueError):
+                raise RuntimeError("esun-twd-history-result") from None
+            row_count = snapshot.get("gridRowCount")
+            if (
+                type(row_count) is not int
+                or row_count <= 0
+                or total_count != row_count
+                or not grid_text.strip()
+                or len(dates) != row_count
+                or snapshot.get("emptyMarker") is not None
+                or any(day < start or day > end for day in dates)
+            ):
+                raise RuntimeError("esun-twd-history-result")
+            from backend.core.persist.esun import _parse_esun_twd_txn_results
+
+            try:
+                rows = _parse_esun_twd_txn_results([result])
+            except (TypeError, ValueError):
+                raise RuntimeError("esun-twd-history-result") from None
+            if len(rows) != row_count:
+                raise RuntimeError("esun-twd-history-result")
+            for row in rows:
+                try:
+                    txn_day = date.fromisoformat(str(row["datetime"])[:10])
+                    account_day = date.fromisoformat(row["account_date"])
+                except (KeyError, TypeError, ValueError):
+                    raise RuntimeError("esun-twd-history-result") from None
+                money = (row.get("expend"), row.get("income"))
+                if (
+                    row.get("account_no") != identity
+                    or not start <= txn_day <= end
+                    or not start <= account_day <= end
+                    or not isinstance(row.get("desc"), str)
+                    or not row["desc"].strip()
+                    or not any(value is not None for value in money)
+                    or any(
+                        value is not None
+                        and (type(value) not in (int, float) or not math.isfinite(value) or value < 0)
+                        for value in money
+                    )
+                    or type(row.get("balance")) not in (int, float)
+                    or not math.isfinite(row["balance"])
+                ):
+                    raise RuntimeError("esun-twd-history-result")
+            status = "complete"
+        else:
+            if (
+                grid_text
+                or snapshot.get("gridRows") != []
+                or snapshot.get("gridRowCount") != 0
+                or total_count != 0
+                or snapshot.get("emptyMarker") not in {
+                    "查無交易資料", "查無資料", "無交易明細",
+                }
+            ):
+                raise RuntimeError("esun-twd-history-result")
+            status = "explicit_empty"
+        return {
+            "identity": identity,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "status": status,
+            "pages": 1,
+        }
+
     # ---------- 抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
@@ -357,8 +672,6 @@ class EsunCrawler(BankCrawler):
         out["accounts"] = self._parse_account_overview(frames_data)
         _log(f"[esun][collect] 解析到 {len(out['accounts'])} 個帳戶")
 
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "home.png"), full_page=True)
 
         # 第 1b 階段：navigate 臺幣「存款交易明細查詢」
         # 2026-06-30: 補 account drilldown 真正資料源。玉山 menu 裡 TWD / FX 都有
@@ -371,27 +684,35 @@ class EsunCrawler(BankCrawler):
                 fr.get("result", {}).get("clicked") for fr in twd_nav.get("frames", [])
             )
             if not twd_clicked:
-                out["twd_txn_frames"] = []
-                out["twd_txn_results"] = []
-                _log("[esun][collect] 存款交易明細查詢 menu 未點到，跳過")
+                raise RuntimeError("esun-twd-history-navigation")
             else:
                 # 對每個臺幣帳戶提交近一個月查詢。玉山 JSF combo 的 visible select
                 # 需要 select_option 讓前端 helper 更新 hidden JSON value；radio label click
                 # 比直接 checked 更穩，跟信用卡 FCM01004 pattern 一致。
                 twd_results = []
+                coverage_receipts = []
+                coverage_expected = []
+                expected_twd_identities: set[str] = set()
                 submitted_accounts: set[str] = set()
-                query_frame = None
-                for f in page.frames:
-                    try:
-                        has_form = f.evaluate("""() => Boolean(
-                            document.querySelector('select[id="fao01002:dract"]') &&
-                            document.querySelector('input[name="fao01002:linkCommand"]')
-                        )""")
-                        if has_form:
-                            query_frame = f
-                            break
-                    except Exception:
-                        pass
+                query_frame = self._unique_twd_query_frame(page.frames)
+                form_url = urlparse(query_frame.url or "")
+                if (
+                    form_url.scheme != "https"
+                    or form_url.hostname != "ebank.esunbank.com.tw"
+                    or form_url.port not in (None, 443)
+                    or form_url.username is not None
+                    or form_url.password is not None
+                    or form_url.path != _ESUN_TWD_HISTORY_PATH
+                ):
+                    raise RuntimeError("esun-twd-history-form")
+                bank_today_raw = query_frame.evaluate(r"""() =>
+                    (document.querySelector('#sysInfo')?.textContent || '')
+                        .match(/"today":"(\d{4}\/\d{2}\/\d{2})"/)?.[1] || ''
+                """)
+                try:
+                    bank_today = date.fromisoformat(bank_today_raw.replace("/", "-"))
+                except (AttributeError, ValueError):
+                    raise RuntimeError("esun-twd-history-bank-date") from None
                 if query_frame is not None:
                     try:
                         acct_options = query_frame.evaluate(r"""() => {
@@ -404,21 +725,43 @@ class EsunCrawler(BankCrawler):
                             }));
                         }""")
                     except Exception:
-                        acct_options = []
-                    for opt in acct_options:
-                        text = opt.get("text") or ""
-                        if "臺幣" not in text and "台幣" not in text:
-                            continue
-                        account_no = "".join(ch for ch in text if ch.isdigit())[:13]
-                        if not account_no or account_no in submitted_accounts:
-                            continue
+                        raise RuntimeError("esun-twd-history-inventory") from None
+                    validated_options = self._validated_twd_options(acct_options)
+                    expected_twd_identities = {
+                        option["identity"] for option in validated_options
+                    }
+                    for account_index, opt in enumerate(validated_options, start=1):
+                        text = opt["text"]
+                        account_no = opt["identity"]
                         submitted_accounts.add(account_no)
                         try:
                             query_frame.locator("select[id='fao01002:dract']").select_option(index=int(opt["index"]), timeout=8000)
                             page.wait_for_timeout(800)
-                            # 自訂近一年：使用者這個玉山帳戶有跨月卡款/轉入資料，account drilldown
-                            # 需要歷史明細。FAO01002 官方保留近一年，直接查最大可用窗口。
-                            clicked_period = query_frame.evaluate(r"""() => {
+                            selected = query_frame.evaluate(r"""() => {
+                                const s = document.querySelector('select[id="fao01002:dract"]');
+                                const o = s?.options[s.selectedIndex];
+                                return s && o ? {
+                                    index: s.selectedIndex,
+                                    value: s.value || '',
+                                    text: (o.textContent || '').trim(),
+                                } : null;
+                            }""")
+                            if selected != {
+                                "index": opt["index"],
+                                "value": opt["value"],
+                                "text": opt["text"],
+                            }:
+                                raise RuntimeError("esun-twd-history-selected-account")
+                            # FAO01002 retains the latest year. Incremental queries use the
+                            # account-scoped cursor with the shared seven-day overlap.
+                            history_start, history_end = _esun_history_window(
+                                self, account_no, bank_today,
+                            )
+                            expected_period = {
+                                "start": history_start.strftime("%Y/%m/%d"),
+                                "end": history_end.strftime("%Y/%m/%d"),
+                            }
+                            clicked_period = query_frame.evaluate(r"""(period) => {
                                 const r = document.querySelector('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]');
                                 if (!r) return {ok: false, error: 'no intervalrdo4'};
                                 const label = r.closest('label');
@@ -434,71 +777,189 @@ class EsunCrawler(BankCrawler):
                                 for (const lbl of document.querySelectorAll('.radiobutton-group label')) {
                                     lbl.classList.toggle('checked', lbl.contains(r));
                                 }
-                                const todayText = (document.querySelector('#sysInfo')?.textContent || '').match(/"today":"(\d{4}\/\d{2}\/\d{2})"/)?.[1] || '';
-                                const today = todayText ? new Date(todayText.replaceAll('/', '-') + 'T00:00:00') : new Date();
-                                const start = new Date(today);
-                                start.setFullYear(start.getFullYear() - 1);
-                                start.setDate(start.getDate() + 1); // minDate -1Y inclusive safety
-                                const fmt = (d) => `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
                                 const s = document.querySelector('input[id="fao01002:startDate"]');
                                 const e = document.querySelector('input[id="fao01002:endDate"]');
                                 if (s) {
-                                    s.value = fmt(start);
+                                    s.value = period.start;
                                     s.dispatchEvent(new Event('change', {bubbles: true}));
                                 }
                                 if (e) {
-                                    e.value = fmt(today);
+                                    e.value = period.end;
                                     e.dispatchEvent(new Event('change', {bubbles: true}));
                                 }
-                                return {ok: true, via: 'custom-one-year', checked: r.checked, start: s?.value || '', end: e?.value || ''};
-                            }""")
+                                return {ok: true, checked: r.checked, start: s?.value || '', end: e?.value || ''};
+                            }""", expected_period)
+                            if clicked_period != {"ok": True, "checked": True, **expected_period}:
+                                raise RuntimeError("esun-twd-history-period")
                             page.wait_for_timeout(500)
-                            query_frame.evaluate(r"""() => {
+                            sort_selected = query_frame.evaluate(r"""() => {
                                 const r = document.querySelector('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]');
-                                if (r) {
-                                    r.checked = true;
-                                    r.dispatchEvent(new Event('change', {bubbles: true}));
-                                }
+                                if (!r) return false;
+                                r.checked = true;
+                                r.dispatchEvent(new Event('change', {bubbles: true}));
+                                return r.checked;
                             }""")
-                            submit_info = query_frame.evaluate(r"""() => {
-                                // FAO01002 的 JSF linkCommand 是 hidden/text command target；
-                                // 直接 cmd.click() 只會留下預設「最近一星期」qryresult，不會送出
-                                // 畫面上的橘色「查詢」。必須優先點可見查詢按鈕/連結。
-                                const log = [];
-                                const visible = (el) => {
-                                    const r = el.getBoundingClientRect();
-                                    const st = window.getComputedStyle(el);
-                                    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
-                                };
-                                for (const el of document.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')) {
-                                    const t = (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim();
-                                    if (t === '查詢' && visible(el)) {
-                                        el.click();
-                                        return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: t};
+                            if sort_selected is not True:
+                                raise RuntimeError("esun-twd-history-sort")
+                            stale_evidence = query_frame.evaluate(r"""() => {
+                                const selector = '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]';
+                                const evidence = [...document.querySelectorAll(selector)];
+                                const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
+                                for (const el of document.querySelectorAll('*')) {
+                                    if (emptyLabels.has((el.textContent || '').trim()) && ![...el.children].some(
+                                        (child) => emptyLabels.has((child.textContent || '').trim())
+                                    )) evidence.push(el);
+                                }
+                                for (const el of new Set(evidence)) {
+                                    el.setAttribute('data-hermes-stale-evidence', '1');
+                                }
+                                return {ok: true, marked: new Set(evidence).size};
+                            }""")
+                            if (
+                                not isinstance(stale_evidence, dict)
+                                or stale_evidence.get("ok") is not True
+                                or type(stale_evidence.get("marked")) is not int
+                            ):
+                                raise RuntimeError("esun-twd-history-stale-result")
+                            operation_hits: list[ApiHit] = []
+                            response_listener = lambda response: self._capture_twd_response(
+                                response, operation_hits,
+                            )
+                            page.on("response", response_listener)
+                            try:
+                                submit_info = query_frame.evaluate(r"""() => {
+                                    const visible = (el) => {
+                                        const r = el.getBoundingClientRect();
+                                        const st = window.getComputedStyle(el);
+                                        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                                    };
+                                    for (const el of document.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')) {
+                                        const t = (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim();
+                                        if (t === '查詢' && visible(el)) {
+                                            el.click();
+                                            return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: t};
+                                        }
                                     }
-                                }
-                                // 退而求其次：有些 JSF 版面把 command target 做成 hidden/text input；
-                                // 這不是首選，但至少保留舊路徑並把 probe 寫進 raw。
-                                const cmd = document.querySelector('input[name="fao01002:linkCommand"]');
-                                if (!cmd) throw new Error('no fao01002:linkCommand');
-                                cmd.click();
-                                return {clicked: 'hidden-command-fallback', tag: cmd.tagName, id: cmd.id || '', name: cmd.name || '', type: cmd.type || ''};
-                            }""")
+                                    return {clicked: null};
+                                }""")
+                                if submit_info != {
+                                    "clicked": "visible-query",
+                                    "tag": submit_info.get("tag"),
+                                    "id": submit_info.get("id"),
+                                    "name": submit_info.get("name"),
+                                    "text": "查詢",
+                                }:
+                                    raise RuntimeError("esun-twd-history-submit")
+                                for _ in range(90):
+                                    if operation_hits:
+                                        break
+                                    page.wait_for_timeout(100)
+                                if not operation_hits:
+                                    raise RuntimeError("esun-twd-history-response-timeout")
+                            finally:
+                                page.remove_listener("response", response_listener)
+                            # The response event exposes headers before JSF finishes replacing the result DOM.
                             page.wait_for_timeout(9000)
-                            result_text = ""
-                            result_url = ""
-                            result_snapshot = {}
-                            for rf in page.frames:
+                            result_candidates = []
+                            for rf in (query_frame,):
                                 try:
-                                    snap = rf.evaluate(r"""() => {
-                                        const bodyText = document.body ? document.body.textContent.slice(0, 60000) : '';
-                                        const grid = document.querySelector('[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]');
+                                    snap = rf.evaluate(r"""(expected) => {
+                                        const exactToken = (text, token) => new RegExp(
+                                            `(^|\\D)${token}(?!\\d)`
+                                        ).test(text);
+                                        const visible = (el) => {
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width <= 0 || r.height <= 0) return false;
+                                            for (let node = el; node; node = node.parentElement) {
+                                                const st = window.getComputedStyle(node);
+                                                if (st.display === 'none'
+                                                    || st.visibility === 'hidden'
+                                                    || st.visibility === 'collapse'
+                                                    || Number(st.opacity) === 0
+                                                    || node.hidden
+                                                    || (node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
+                                            }
+                                            return true;
+                                        };
+                                        const scopes = [...document.querySelectorAll(
+                                            '.qryresult, [id^="fao01002:"][id*="qry" i]'
+                                        )].filter((el) => {
+                                            if (!visible(el)) return false;
+                                            const text = el.textContent || '';
+                                            return exactToken(text, expected.identity)
+                                                && exactToken(text, expected.start)
+                                                && exactToken(text, expected.end);
+                                        });
+                                        if (scopes.length !== 1) return {bound: false, scopeCount: scopes.length};
+                                        const resultScope = scopes[0];
+                                        const bodyText = resultScope.textContent || '';
+                                        const grids = [...resultScope.querySelectorAll(
+                                            '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]'
+                                        )].filter(visible);
+                                        const grid = grids.length === 1 ? grids[0] : null;
                                         const gridText = grid ? (grid.textContent || '') : '';
+                                        const gridRows = grid ? [...grid.querySelectorAll('tr')].map((row) => {
+                                            const cells = [...row.querySelectorAll(':scope > th, :scope > td')];
+                                            if (!visible(row) || cells.some((cell) => !visible(cell))) return [];
+                                            return cells.map((cell) => (cell.textContent || '').trim());
+                                        }).filter((cells) => cells.some(
+                                            (cell) => /(^|\D)20\d{2}\/\d{1,2}\/\d{1,2}(?!\d)/.test(cell)
+                                        )) : [];
+                                        const pagerRoots = [...resultScope.querySelectorAll(
+                                            '[id*="pager" i], [class*="pager" i], [id*="paginator" i], [class*="paginator" i]'
+                                        )];
+                                        const nextControls = [...resultScope.querySelectorAll('a,button,input')].filter((el) => {
+                                            const marker = [
+                                                el.textContent, el.value, el.title,
+                                                el.getAttribute('aria-label'), el.getAttribute('rel'),
+                                                el.id, el.className,
+                                            ].filter(Boolean).join(' ').replace(/\s+/g, '');
+                                            return /(?:下一頁|下頁|next|page-next|pagenext|>)/i.test(marker);
+                                        });
+                                        const hasNextText = /(?:下一頁|下頁)/.test(bodyText);
+                                        const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
+                                        const emptyMarkers = [resultScope, ...resultScope.querySelectorAll('*')].filter((el) => {
+                                            if (!visible(el)) return false;
+                                            const label = (el.textContent || '').trim();
+                                            return emptyLabels.has(label) && ![...el.children].some(
+                                                (child) => emptyLabels.has((child.textContent || '').trim())
+                                            );
+                                        });
+                                        const totals = [...bodyText.matchAll(
+                                            /(?:共|總計|總筆數|資料筆數)\s*(\d+)\s*筆/g
+                                        )].map((match) => Number(match[1]));
+                                        const uniqueTotals = [...new Set(totals)];
                                         return {
+                                            bound: true,
                                             href: location.href,
                                             bodyText,
+                                            busy: [document.documentElement, ...document.querySelectorAll('*')].some((el) =>
+                                                visible(el) && (
+                                                    (el.getAttribute('aria-busy') || '').toLowerCase() === 'true'
+                                                    || (el.getAttribute('role') || '').toLowerCase() === 'progressbar'
+                                                    || el.tagName.toLowerCase() === 'progress'
+                                                    || /(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([
+                                                        el.id, el.getAttribute('class'),
+                                                    ].filter(Boolean).join(' '))
+                                                )
+                                            ),
+                                            evidenceFresh: grid
+                                                ? !grid.hasAttribute('data-hermes-stale-evidence')
+                                                : emptyMarkers.length === 1
+                                                    && !emptyMarkers[0].hasAttribute('data-hermes-stale-evidence'),
                                             gridText,
+                                            gridRows,
                                             hasGrid: !!grid,
+                                            gridCandidateCount: grids.length,
+                                            gridRowCount: gridRows.length,
+                                            totalCount: uniqueTotals.length === 1 ? uniqueTotals[0] : null,
+                                            pager: {
+                                                present: pagerRoots.length > 0 || hasNextText,
+                                                actionableNext: nextControls.length,
+                                            },
+                                            emptyMarker: emptyMarkers.length === 1
+                                                ? (emptyMarkers[0].textContent || '').trim()
+                                                : null,
                                             gridHtml: grid ? grid.outerHTML.slice(0, 20000) : '',
                                             qryResult: [...document.querySelectorAll('.qryresult, [class*=qryresult], [id*=qry]')].map((el) => ({
                                                 id: el.id || '', cls: (el.className || '').toString(), visible: el.offsetParent !== null,
@@ -511,90 +972,81 @@ class EsunCrawler(BankCrawler):
                                                 html: t.outerHTML.slice(0, 12000),
                                             })).filter(t => /交易|日期|金額|餘額|摘要|明細|TWD|查詢/.test(t.text) || t.id.includes('fao01002')).slice(0, 30),
                                         };
-                                    }""")
-                                    txt = snap.get("bodyText") or ""
-                                    if "存款交易明細查詢" in txt and ("查詢時間" in txt or "交易" in txt):
-                                        result_text = txt
-                                        result_url = snap.get("href") or rf.url[:200]
-                                        result_snapshot = {k: v for k, v in snap.items() if k != "bodyText"}
-                                        break
+                                    }""", {"identity": account_no, **expected_period})
+                                    if snap.get("bound") is True:
+                                        result_candidates.append(snap)
                                 except Exception:
                                     pass
-                            twd_results.append({
+                            bound_result = self._fresh_twd_result(result_candidates)
+                            result_text = bound_result["bodyText"]
+                            result_url = bound_result["href"]
+                            result_snapshot = {
+                                key: bound_result[key]
+                                for key in (
+                                    "hasGrid", "gridCandidateCount", "gridText", "gridRowCount", "totalCount", "pager",
+                                    "busy", "evidenceFresh",
+                                    "emptyMarker", "gridRows",
+                                )
+                            }
+                            self._validated_twd_transport(
+                                operation_hits,
+                                result_url=result_url,
+                                account_value=opt["value"],
+                                start=history_start,
+                                end=history_end,
+                            )
+                            result = {
                                 "account_no": account_no,
+                                "selected_identity": account_no,
                                 "selected_text": text,
-                                "period": "近一年",
+                                "period": "custom",
                                 "clicked_period": clicked_period,
                                 "submit": submit_info,
                                 "url": result_url,
-                                "text": result_text[:50000],
+                                "text": result_text,
                                 "snapshot": result_snapshot,
+                            }
+                            receipt = self._validated_twd_history_result(
+                                result,
+                                identity=account_no,
+                                start=history_start,
+                                end=history_end,
+                            )
+                            coverage_receipts.append(receipt)
+                            coverage_expected.append({
+                                "identity": account_no,
+                                "start": history_start.isoformat(),
+                                "end": history_end.isoformat(),
                             })
-                            _log(f"[esun][collect][twd] {account_no[-4:]} 近一年 submit={submit_info.get('clicked')} text_len={len(result_text)}")
-                        except Exception as qe:
                             twd_results.append({
                                 "account_no": account_no,
-                                "selected_text": text,
-                                "period": "近一年",
-                                "error": str(qe),
+                                "start": receipt["start"],
+                                "end": receipt["end"],
+                                "status": receipt["status"],
+                                "snapshot": result_snapshot,
                             })
-                            _log(f"[esun][collect][twd] {account_no[-4:]} query failed: {qe}")
+                            _log(
+                                f"[esun][collect][twd] account {account_index}/{len(validated_options)} "
+                                f"submit={submit_info.get('clicked')} text_len={len(result_text)}"
+                            )
+                        except Exception:
+                            raise RuntimeError("esun-twd-history-account") from None
+                if submitted_accounts != expected_twd_identities:
+                    raise RuntimeError("esun-twd-history-inventory")
                 out["twd_txn_results"] = twd_results
-
-                twd_frames = []
-                for f in page.frames:
-                    try:
-                        txt = f.evaluate("() => document.body.textContent.slice(0, 50000)")
-                        if not txt or len(txt.strip()) < 30:
-                            continue
-                        # 只保留可能的交易明細 widget / form，而不是整個首頁 menu dump。
-                        if any(k in txt for k in ("交易明細", "查詢期間", "起訖日期", "交易日", "帳務日", "存入", "支出", "餘額")):
-                            twd_frames.append({
-                                "url": f.url[:200],
-                                "text_preview": txt[:40000],
-                                "page_url": page.url[:120],
-                                "txt_len": len(txt),
-                                "is_main": f == page.main_frame,
-                            })
-                    except Exception:
-                        pass
-                out["twd_txn_frames"] = twd_frames
-                out["twd_txn_form_controls"] = []
-                for f in page.frames:
-                    try:
-                        controls = f.evaluate(r"""() => ({
-                            url: location.href,
-                            selects: [...document.querySelectorAll('select')].map((s, si) => ({
-                                index: si, id: s.id, name: s.name, value: s.value,
-                                visible: s.offsetParent !== null,
-                                text: (s.closest('td,tr,div,label')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-                                options: [...s.options].map((o, oi) => ({index: oi, value: o.value || '', text: (o.textContent || '').trim()})).slice(0, 30),
-                            })),
-                            inputs: [...document.querySelectorAll('input')].map((i, ii) => ({
-                                index: ii, id: i.id, name: i.name, type: i.type, value: i.value,
-                                visible: i.offsetParent !== null,
-                                checked: i.checked,
-                                placeholder: i.placeholder || '',
-                                text: (i.closest('td,tr,div,label')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-                            })).slice(0, 120),
-                            buttons: [...document.querySelectorAll('button,a,input[type=button],input[type=submit]')].map((b, bi) => ({
-                                index: bi, tag: b.tagName, id: b.id, name: b.name || '', cls: (b.className || '').toString().slice(0, 80),
-                                value: b.value || '', text: (b.textContent || '').replace(/\s+/g, ' ').trim(),
-                                onclick: b.getAttribute('onclick') || '', visible: b.offsetParent !== null,
-                            })).filter(b => b.text || b.value || b.onclick).slice(0, 160),
-                        })""")
-                        if controls and (controls.get("selects") or controls.get("inputs") or controls.get("buttons")):
-                            out["twd_txn_form_controls"].append(controls)
-                    except Exception:
-                        pass
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(debug_dir / "twd_txn_probe.png"), full_page=True)
-                _log(f"[esun][collect] twd_txn_frames={len(twd_frames)} form_controls={len(out['twd_txn_form_controls'])}")
-        except Exception as e:
-            _log(f"[esun][collect] 存款交易明細 navigate 失敗: {e}")
-            out["twd_txn_frames"] = []
-            out["twd_txn_results"] = []
-            out["twd_txn_nav_probe"] = {"error": str(e)}
+                mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+                if mode not in {"full", "incremental"}:
+                    raise RuntimeError("esun-twd-history-mode")
+                out["history_coverage"] = {
+                    "mode": mode,
+                    "domains": [{
+                        "domain": "twd_transactions",
+                        "expected": coverage_expected,
+                        "windows": coverage_receipts,
+                    }],
+                }
+        except Exception:
+            raise RuntimeError("esun-twd-history") from None
 
         # 第 2 階段：navigate 信用卡帳單資訊（hover mega menu，禁用我的最愛）
         # 玉山是 widget 切換（_leftMenuLoadWidget），不是新分頁——點完後 iframe 內 widget 替換
@@ -734,8 +1186,6 @@ class EsunCrawler(BankCrawler):
                     })
                 out["card_bill_details"] = bill_details
                 _log(f"[esun][collect] card_bill_details={len(bill_details)}")
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(debug_dir / "card.png"), full_page=True)
             _log(f"[esun][collect] card_frames={len(card_frames)} (widget mode)")
         except Exception as e:
             _log(f"[esun][collect] 信用卡 navigate 失敗: {e}")
@@ -835,8 +1285,6 @@ class EsunCrawler(BankCrawler):
                     except Exception:
                         pass
                 out["card_txn_frames"] = card_txn_frames
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(debug_dir / "card_txn_results.png"), full_page=True)
                 _log(f"[esun][collect] card_txn_frames={len(card_txn_frames)} (widget mode, 累計)")
         except Exception as e:
             _log(f"[esun][collect] 信用卡消費明細 navigate 失敗: {e}")
@@ -900,8 +1348,6 @@ class EsunCrawler(BankCrawler):
                 else:
                     out["card_quota"] = {}
                     _log("[esun][collect] 信用卡額度查詢 frame 沒抓到 (已用額度+可用餘額+number)")
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(debug_dir / "card_quota_results.png"), full_page=True)
                 _log(f"[esun][collect] card_quota_frames={len(quota_frames)} (widget mode)")
         except Exception as e:
             _log(f"[esun][collect] 信用卡額度查詢 navigate 失敗: {e}")
@@ -958,10 +1404,6 @@ class EsunCrawler(BankCrawler):
                     f.get("text_preview", "") for f in pay_frames
                 )
                 out["card_pay_history"] = self._parse_card_pay_history(full_text)
-                with contextlib.suppress(Exception):
-                    page.screenshot(
-                        path=str(debug_dir / "card_pay_results.png"), full_page=True,
-                    )
                 _log(f"[esun][collect] card_pay_frames={len(pay_frames)} "
                      f"records={len(out['card_pay_history'].get('records', []))}")
         except Exception as e:
@@ -1426,9 +1868,6 @@ class EsunCrawler(BankCrawler):
                 probe_info["frames"].append({"url": f.url[:120], "result": result})
                 _log(f"[esun][collect][nav][{label}] {f.url[:50]} clicked={result and result.get('clicked')!r}")
                 if result and result.get("clicked"):
-                    if screenshot_name:
-                        with contextlib.suppress(Exception):
-                            page.screenshot(path=str(debug_dir / screenshot_name), full_page=True)
                     return probe_info
             except Exception as e:
                 _log(f"[esun][collect][nav][{label}] frame {f.url[:60]} 失敗: {e}")
@@ -1516,8 +1955,6 @@ class EsunCrawler(BankCrawler):
                 if result and result.get("periodSelected") and result.get("queryClicked"):
                     info["strategy"] = result
                     _log(f"[esun][collect][txn-form] {f.url[:60]} {result.get('log')}")
-                    with contextlib.suppress(Exception):
-                        page.screenshot(path=str(debug_dir / "card_txn_after_submit.png"), full_page=True)
                     return info
             except Exception as e:
                 info["errors"].append({"url": f.url[:80], "error": str(e)})

@@ -4,184 +4,280 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import re
 
 from backend.core import account_classify, classify
 from backend.core.store import BankStore
 from backend.core.persist._common import _num_real, _num_to_float, _roc_to_west
 
+_PG_INTEGER_MAX = 2_147_483_647
+_PG_INTEGER_MIN = -2_147_483_648
+_TWD_INTEGER_TOKEN = re.compile(r"-?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)")
+
+
+def _esun_twd_integer(raw, *, non_negative: bool) -> int | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, (str, int)) or isinstance(raw, bool):
+        raise ValueError("invalid E.SUN TWD transaction amount")
+    if isinstance(raw, str) and _TWD_INTEGER_TOKEN.fullmatch(raw) is None:
+        raise ValueError("invalid E.SUN TWD transaction amount")
+    try:
+        value = Decimal(str(raw).replace(",", ""))
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid E.SUN TWD transaction amount") from None
+    if (
+        not value.is_finite()
+        or value != value.to_integral_value()
+        or not _PG_INTEGER_MIN <= value <= _PG_INTEGER_MAX
+        or non_negative and value < 0
+    ):
+        raise ValueError("invalid E.SUN TWD transaction amount")
+    return int(value)
+
+
+def _validated_esun_twd_row(row: dict) -> dict:
+    account_no = row.get("account_no")
+    txn_datetime = row.get("datetime")
+    account_date = row.get("account_date")
+    if (
+        not isinstance(account_no, str)
+        or re.fullmatch(r"\d{13}", account_no) is None
+        or not isinstance(txn_datetime, str)
+        or not isinstance(account_date, str)
+        or not isinstance(row.get("desc"), str)
+        or not row["desc"].strip()
+    ):
+        raise ValueError("invalid E.SUN TWD transaction row")
+    txn_format = "%Y-%m-%d %H:%M:%S" if " " in txn_datetime else "%Y-%m-%d"
+    try:
+        parsed_txn = datetime.strptime(txn_datetime, txn_format)
+        parsed_account = datetime.strptime(account_date, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("invalid E.SUN TWD transaction date") from None
+    if (
+        parsed_txn.strftime(txn_format) != txn_datetime
+        or parsed_account.strftime("%Y-%m-%d") != account_date
+    ):
+        raise ValueError("noncanonical E.SUN TWD transaction date")
+    money = (row.get("expend"), row.get("income"))
+    if sum(value is not None for value in money) != 1:
+        raise ValueError("invalid E.SUN TWD transaction direction")
+    for field in ("expend", "income", "balance"):
+        value = row.get(field)
+        if value is None and field != "balance":
+            continue
+        row[field] = _esun_twd_integer(value, non_negative=field != "balance")
+    return row
+
 
 def _parse_esun_twd_txn_results(results: list[dict]) -> list[dict]:
-    """玉山 FAO01002「存款交易明細查詢」結果 → twd_transactions rows.
-
-    The real page only renders a result grid when rows exist. Empty queries still
-    contain query time / hints, so parser must only parse explicit grid/table text.
-    """
+    """Parse FAO01002 rows only when DOM cell boundaries were preserved."""
     out: list[dict] = []
+    date_token = r"\*?20\d{2}/\d{1,2}/\d{1,2}"
+    time_token = r"\d{1,2}:\d{2}:\d{2}"
     for result in results or []:
         if not isinstance(result, dict):
-            continue
+            raise ValueError("invalid E.SUN TWD transaction result")
         account_no = result.get("account_no")
-        if not account_no:
-            selected = result.get("selected_text") or ""
-            digits = re.sub(r"\D", "", selected)
-            account_no = digits[:13] if len(digits) >= 13 else None
-        if not account_no:
+        if not isinstance(account_no, str) or re.fullmatch(r"\d{13}", account_no) is None:
+            raise ValueError("invalid E.SUN TWD transaction account")
+        snapshot = result.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValueError("invalid E.SUN TWD transaction snapshot")
+        has_grid = snapshot.get("hasGrid")
+        grid_rows = snapshot.get("gridRows")
+        grid_text = snapshot.get("gridText")
+        if has_grid is False:
+            if grid_rows != [] or grid_text != "":
+                raise ValueError("inconsistent empty E.SUN TWD structured rows")
             continue
-        snapshot = result.get("snapshot") or {}
-        candidates: list[str] = []
-        grid_text = snapshot.get("gridText") if isinstance(snapshot, dict) else None
-        if grid_text:
-            candidates.append(str(grid_text))
-        if isinstance(snapshot, dict):
-            for table in snapshot.get("tables") or []:
-                if isinstance(table, dict) and table.get("text"):
-                    candidates.append(str(table.get("text")))
-            for q in snapshot.get("qryResult") or []:
-                if isinstance(q, dict) and q.get("text"):
-                    candidates.append(str(q.get("text")))
-        for text in candidates:
-            parsed_any = False
-            # Real FAO01002 result text can render the date+time either split
-            # (`2026/03/30\n06:12:14`) or compact (`2026/03/3006:12:14`).
-            # Parse row blocks line-by-line first; this preserves empty 提/存 columns
-            # better than one giant regex over the whole result shell.
-            date_line_pat = re.compile(r"^\*?(20\d{2}/\d{1,2}/\d{1,2})\s*(\d{1,2}:\d{2}:\d{2})\s*$")
-            raw_lines = text.splitlines()
-            i = 0
-            while i < len(raw_lines):
-                line = raw_lines[i].strip()
-                lm = date_line_pat.match(line)
-                if not lm:
-                    # alternate copied shape: date on one line, time at start of next line
-                    dm = re.match(r"^\*?(20\d{2}/\d{1,2}/\d{1,2})\s*$", line)
-                    if dm and i + 1 < len(raw_lines):
-                        tm = re.match(r"^\s*(\d{1,2}:\d{2}:\d{2})(?:\s+(.*))?$", raw_lines[i + 1].strip())
-                        if tm:
-                            date_s, time_s = dm.group(1), tm.group(1)
-                            first_tail = tm.group(2) or ""
-                            i += 2
-                        else:
-                            i += 1
-                            continue
-                    else:
-                        i += 1
-                        continue
-                else:
-                    date_s, time_s = lm.group(1), lm.group(2)
-                    first_tail = ""
-                    i += 1
-
-                block: list[str] = []
-                if first_tail:
-                    block.append(first_tail)
-                while i < len(raw_lines):
-                    nxt = raw_lines[i].strip()
-                    if date_line_pat.match(nxt) or re.match(r"^\*?20\d{2}/\d{1,2}/\d{1,2}\s*$", nxt):
-                        break
-                    block.append(raw_lines[i])
-                    i += 1
-
-                parts = [ln.strip() for ln in block if ln.strip()]
-                if not parts:
-                    continue
-                first_tokens = parts[0].split()
-                if len(first_tokens) >= 3 and any(re.fullmatch(r"-?[\d,]+(?:\.\d+)?", tok) for tok in first_tokens[1:]):
-                    # Copied/innerText shape may collapse desc + money columns into one line:
-                    # `06:12:14    玉山卡款扣繳    65,714        1    測＊試`.
-                    desc = first_tokens[0]
-                    nums = [tok for tok in first_tokens[1:] if re.fullmatch(r"-?[\d,]+(?:\.\d+)?", tok)]
-                    memos = [tok for tok in first_tokens[1:] if not re.fullmatch(r"-?[\d,]+(?:\.\d+)?", tok)]
-                    memos.extend(parts[1:])
-                else:
-                    desc = parts[0]
-                    nums = []
-                    memos = []
-                    for part in parts[1:]:
-                        if re.fullmatch(r"-?[\d,]+(?:\.\d+)?", part):
-                            nums.append(part)
-                        else:
-                            memos.append(part)
-                if len(nums) < 2:
-                    continue
-                balance = _num_to_float(nums[-1])
-                amount = _num_to_float(nums[-2])
-                expend = income = None
-                if amount is not None:
-                    income_words = ("利息", "轉入", "存入", "入金", "退費", "退款", "跨行轉")
-                    if any(k in desc for k in income_words) and "扣繳" not in desc:
-                        income = amount
-                    else:
-                        expend = amount
-                memo = " ".join(memos).strip() or None
-                counterparty_bank = None
-                counterparty_acct = None
-                if memo:
-                    bm = re.match(r"(.+?銀行)(.+)", memo)
-                    if bm:
-                        counterparty_bank = bm.group(1)
-                        counterparty_acct = bm.group(2).strip() or None
-                    elif "銀行" in memo:
-                        counterparty_bank = memo
-                    elif re.search(r"\d", memo) and "/" in memo:
-                        counterparty_acct = memo
-                out.append({
-                    "account_no": account_no,
-                    "datetime": f"{date_s.replace('/', '-')} {time_s}",
-                    "account_date": date_s.replace("/", "-"),
-                    "desc": desc,
-                    "expend": expend,
-                    "income": income,
-                    "balance": balance,
-                    "counterparty_bank": counterparty_bank,
-                    "counterparty_acct": counterparty_acct,
-                    "memo": memo,
-                })
-                parsed_any = True
-            if parsed_any:
-                continue
-
-            if not any(k in text for k in ("交易日", "交易日期", "摘要", "餘額", "支出", "存入")):
-                continue
-            # Common textContent shape from table rows:
-            # YYYY/MM/DD YYYY/MM/DD 摘要 支出 存入 餘額 備註
-            # Empty money columns can collapse into adjacent whitespace; parse with
-            # optional expend/income while keeping balance required.
-            pat = re.compile(
-                r"(?P<txn>20\d{2}/\d{1,2}/\d{1,2})\s+"
-                r"(?P<acct>20\d{2}/\d{1,2}/\d{1,2})\s+"
-                r"(?P<desc>[^\d\n][^\n]*?)\s+"
-                r"(?:(?P<expend>-?[\d,]+(?:\.\d+)?)\s+)?"
-                r"(?:(?P<income>-?[\d,]+(?:\.\d+)?)\s+)?"
-                r"(?P<balance>-?[\d,]+(?:\.\d+)?)"
-                r"(?:\s+(?P<memo>[^\n]+?))?(?=\n|20\d{2}/\d{1,2}/\d{1,2}|$)",
-                re.MULTILINE,
-            )
-            for m in pat.finditer(text):
-                desc = (m.group("desc") or "").strip()
-                if not desc or any(skip in desc for skip in ("交易日", "帳務日", "查詢時間")):
-                    continue
-                expend = _num_to_float(m.group("expend")) if m.group("expend") else None
-                income = _num_to_float(m.group("income")) if m.group("income") else None
-                if income is None and expend is not None and any(k in desc for k in ("利息", "存入", "轉入", "入金", "退費", "退款")):
-                    income = expend
-                    expend = None
-                balance = _num_to_float(m.group("balance"))
-                memo = (m.group("memo") or "").strip() or None
-                out.append({
-                    "account_no": account_no,
-                    "datetime": m.group("txn").replace("/", "-"),
-                    "account_date": m.group("acct").replace("/", "-"),
-                    "desc": desc,
-                    "expend": expend,
-                    "income": income,
-                    "balance": balance,
-                    "counterparty_bank": None,
-                    "counterparty_acct": None,
-                    "memo": memo,
-                })
+        if has_grid is not True or not isinstance(grid_rows, list) or not grid_rows:
+            raise ValueError("invalid E.SUN TWD structured rows")
+        for cells in grid_rows:
+            if (
+                not isinstance(cells, list)
+                or not all(isinstance(cell, str) and cell == cell.strip() for cell in cells)
+            ):
+                raise ValueError("invalid E.SUN TWD structured row")
+            combined = re.fullmatch(rf"({date_token})\s+({time_token})", cells[0]) if cells else None
+            if combined:
+                txn_date, txn_time = combined.groups()
+                account_date = txn_date
+                desc_index = 1
+            elif len(cells) >= 6 and re.fullmatch(date_token, cells[0]) and re.fullmatch(time_token, cells[1]):
+                txn_date, txn_time = cells[0], cells[1]
+                account_date = txn_date
+                desc_index = 2
+            elif len(cells) >= 6 and re.fullmatch(date_token, cells[0]) and re.fullmatch(date_token, cells[1]):
+                txn_date, txn_time = cells[0], None
+                account_date = cells[1]
+                desc_index = 2
+            else:
+                raise ValueError("invalid E.SUN TWD structured date columns")
+            if len(cells) < desc_index + 4:
+                raise ValueError("invalid E.SUN TWD structured columns")
+            desc = cells[desc_index]
+            expend_raw = cells[desc_index + 1] or None
+            income_raw = cells[desc_index + 2] or None
+            balance_raw = cells[desc_index + 3]
+            if not desc or (expend_raw is None) == (income_raw is None) or not balance_raw:
+                raise ValueError("invalid E.SUN TWD structured money columns")
+            parsed_date = datetime.strptime(txn_date.removeprefix("*"), "%Y/%m/%d")
+            parsed_account_date = datetime.strptime(account_date.removeprefix("*"), "%Y/%m/%d")
+            if txn_time is not None:
+                parsed_time = datetime.strptime(txn_time, "%H:%M:%S")
+                txn_datetime = f"{parsed_date:%Y-%m-%d} {parsed_time:%H:%M:%S}"
+            else:
+                txn_datetime = f"{parsed_date:%Y-%m-%d}"
+            memo = " ".join(cell for cell in cells[desc_index + 4:] if cell).strip() or None
+            counterparty_bank = None
+            counterparty_acct = None
+            if memo:
+                bank_match = re.match(r"(.+?銀行)(.*)", memo)
+                if bank_match:
+                    counterparty_bank = bank_match.group(1)
+                    counterparty_acct = bank_match.group(2).strip() or None
+                elif re.search(r"\d", memo) and "/" in memo:
+                    counterparty_acct = memo
+            out.append(_validated_esun_twd_row({
+                "account_no": account_no,
+                "datetime": txn_datetime,
+                "account_date": f"{parsed_account_date:%Y-%m-%d}",
+                "desc": desc,
+                "expend": _esun_twd_integer(expend_raw, non_negative=True),
+                "income": _esun_twd_integer(income_raw, non_negative=True),
+                "balance": _esun_twd_integer(balance_raw, non_negative=False),
+                "counterparty_bank": counterparty_bank,
+                "counterparty_acct": counterparty_acct,
+                "memo": memo,
+            }))
     return out
+
+
+def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
+    coverage = data.get("history_coverage")
+    results = data.get("twd_txn_results")
+    if not isinstance(coverage, dict) or not isinstance(results, list):
+        raise ValueError("invalid E.SUN TWD history result coverage")
+    domains = coverage.get("domains")
+    if not isinstance(domains, list) or len(domains) != 1:
+        raise ValueError("invalid E.SUN TWD history result coverage")
+    domain = domains[0]
+    if not isinstance(domain, dict) or domain.get("domain") != "twd_transactions":
+        raise ValueError("invalid E.SUN TWD history result coverage")
+    expected = domain.get("expected")
+    windows = domain.get("windows")
+    if not isinstance(expected, list) or not isinstance(windows, list):
+        raise ValueError("invalid E.SUN TWD history result coverage")
+    expected_ids = [item.get("identity") for item in expected if isinstance(item, dict)]
+    window_ids = [item.get("identity") for item in windows if isinstance(item, dict)]
+    result_ids = [item.get("account_no") for item in results if isinstance(item, dict)]
+    if not expected_ids:
+        empty_window = domain.get("empty_window")
+        if (
+            expected != []
+            or windows != []
+            or results != []
+            or not isinstance(empty_window, dict)
+            or empty_window.get("status") != "explicit_empty"
+            or empty_window.get("pages") != 1
+        ):
+            raise ValueError("invalid E.SUN TWD zero-identity coverage")
+        return []
+    if (
+        len(expected_ids) != len(expected)
+        or len(set(expected_ids)) != len(expected_ids)
+        or len(window_ids) != len(windows)
+        or len(set(window_ids)) != len(window_ids)
+        or len(result_ids) != len(results)
+        or len(set(result_ids)) != len(result_ids)
+        or set(expected_ids) != set(window_ids)
+        or set(expected_ids) != set(result_ids)
+    ):
+        raise ValueError("mismatched E.SUN TWD history identities")
+    expected_by_id = {item["identity"]: item for item in expected}
+    result_by_id = {item["account_no"]: item for item in results}
+    parsed: list[dict] = []
+    for window in windows:
+        identity = window["identity"]
+        result = result_by_id[identity]
+        snapshot = result.get("snapshot")
+        expected_window = expected_by_id[identity]
+        if (
+            not isinstance(snapshot, dict)
+            or window.get("pages") != 1
+            or window.get("start") != expected_window.get("start")
+            or window.get("end") != expected_window.get("end")
+            or result.get("start") != window.get("start")
+            or result.get("end") != window.get("end")
+            or result.get("status") != window.get("status")
+        ):
+            raise ValueError("invalid E.SUN TWD history result coverage")
+        if snapshot.get("busy") is not False or snapshot.get("evidenceFresh") is not True:
+            raise ValueError("invalid E.SUN TWD result state")
+        pager = snapshot.get("pager")
+        if (
+            not isinstance(pager, dict)
+            or set(pager) != {"present", "actionableNext"}
+            or pager.get("present") is not False
+            or type(pager.get("actionableNext")) is not int
+            or pager["actionableNext"] != 0
+        ):
+            raise ValueError("invalid E.SUN TWD history pagination")
+        status = window.get("status")
+        window_start = date.fromisoformat(window["start"])
+        window_end = date.fromisoformat(window["end"])
+        if status == "complete":
+            rows = _parse_esun_twd_txn_results([result])
+            row_count = snapshot.get("gridRowCount")
+            total_count = snapshot.get("totalCount")
+            grid_candidate_count = snapshot.get("gridCandidateCount")
+            grid_rows = snapshot.get("gridRows")
+            if (
+                type(row_count) is not int
+                or row_count <= 0
+                or type(total_count) is not int
+                or total_count != row_count
+                or type(grid_candidate_count) is not int
+                or grid_candidate_count != 1
+                or snapshot.get("emptyMarker") is not None
+                or not isinstance(grid_rows, list)
+                or len(grid_rows) != row_count
+                or len(rows) != row_count
+                or any(
+                    not (
+                        window_start <= date.fromisoformat(row["datetime"][:10]) <= window_end
+                        and window_start <= date.fromisoformat(row["account_date"]) <= window_end
+                    )
+                    for row in rows
+                )
+            ):
+                raise ValueError("invalid E.SUN TWD complete result coverage")
+            parsed.extend(rows)
+        elif status == "explicit_empty":
+            grid_candidate_count = snapshot.get("gridCandidateCount")
+            if (
+                snapshot.get("hasGrid") is not False
+                or type(grid_candidate_count) is not int
+                or grid_candidate_count != 0
+                or snapshot.get("gridText") != ""
+                or snapshot.get("gridRows") != []
+                or type(snapshot.get("gridRowCount")) is not int
+                or snapshot["gridRowCount"] != 0
+                or type(snapshot.get("totalCount")) is not int
+                or snapshot["totalCount"] != 0
+                or snapshot.get("emptyMarker") not in {
+                    "查無交易資料", "查無資料", "無交易明細",
+                }
+                or _parse_esun_twd_txn_results([result]) != []
+            ):
+                raise ValueError("invalid E.SUN TWD empty result coverage")
+        else:
+            raise ValueError("invalid E.SUN TWD history status")
+    return parsed
 
 
 def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
@@ -196,6 +292,10 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {"bank": "esun"}
     delta["scope"] = "structured"
+    if data.get("history_coverage") is not None:
+        twd_rows = _validated_esun_twd_results_for_coverage(data)
+    else:
+        twd_rows = _parse_esun_twd_txn_results(data.get("twd_txn_results") or [])
 
     # --- accounts ---
     raw_accounts = data.get("accounts") or []
@@ -243,7 +343,6 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
         }, today)
 
     # --- TWD deposit transactions (FAO01002 存款交易明細查詢) ---
-    twd_rows = _parse_esun_twd_txn_results(data.get("twd_txn_results") or [])
     if twd_rows:
         delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules)
 

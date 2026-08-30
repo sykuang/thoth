@@ -741,5 +741,5 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     ).encode()
 
     assert hashlib.sha256(payload).hexdigest() == (
-        "70cecc251be6aa98914b9d71b7d9ad01b5973f23a19fd4b600e7cc16cdc9099f"
+        "e1603c148b587bfd392d1ac226bf5094fb2a81c687869e9b1a07ca965fdbdaad"
     )
