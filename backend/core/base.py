@@ -12,10 +12,11 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, NotRequired, Required, TypedDict
 from urllib.parse import urlparse
@@ -275,6 +276,152 @@ def validate_card_bill_facts(facts: list[NormalizedCardBillFact], *, facts_ok: b
         raise ValueError("card_bill_facts must be one bank fact or card-scoped facts")
 
 
+HISTORY_DOMAINS = frozenset({"twd_transactions", "card_billed_transactions"})
+
+
+def _history_date(value: Any, error: str) -> date:
+    if not isinstance(value, str) or not _ISO_DATE_RE.fullmatch(value):
+        raise ValueError(error)
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(error) from None
+
+
+def validate_history_coverage(
+    coverage: Any,
+    *,
+    expected_mode: str,
+    expected_domains: frozenset[str],
+) -> dict[str, Any]:
+    """Validate complete, contiguous, non-sensitive history evidence."""
+    error = "invalid history coverage"
+    if (
+        expected_mode not in {"full", "incremental"}
+        or not isinstance(expected_domains, frozenset)
+        or not expected_domains
+        or not expected_domains <= HISTORY_DOMAINS
+    ):
+        raise ValueError(error)
+    if not isinstance(coverage, dict) or coverage.get("mode") != expected_mode:
+        raise ValueError(error)
+    domains = coverage.get("domains")
+    if not isinstance(domains, list) or not domains:
+        raise ValueError(error)
+
+    domain_names: list[str] = []
+    identity_count = 0
+    window_count = 0
+    starts: list[date] = []
+    ends: list[date] = []
+    for domain in domains:
+        if not isinstance(domain, dict):
+            raise ValueError(error)
+        name = domain.get("domain")
+        expected = domain.get("expected")
+        windows = domain.get("windows")
+        if (
+            name not in HISTORY_DOMAINS
+            or not isinstance(expected, list)
+            or not isinstance(windows, list)
+        ):
+            raise ValueError(error)
+
+        if not expected:
+            empty_window = domain.get("empty_window")
+            if not isinstance(empty_window, dict) or windows:
+                raise ValueError(error)
+            try:
+                empty_start = _history_date(empty_window["start"], error)
+                empty_end = _history_date(empty_window["end"], error)
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(error) from None
+            if (
+                empty_start > empty_end
+                or empty_window.get("status") != "explicit_empty"
+                or type(empty_window.get("pages")) is not int
+                or empty_window["pages"] < 1
+            ):
+                raise ValueError(error)
+            domain_names.append(name)
+            window_count += 1
+            starts.append(empty_start)
+            ends.append(empty_end)
+            continue
+
+        expected_ranges: dict[str, tuple[date, date]] = {}
+        for item in expected:
+            if not isinstance(item, dict):
+                raise ValueError(error)
+            identity = item.get("identity")
+            try:
+                expected_start = _history_date(item["start"], error)
+                expected_end = _history_date(item["end"], error)
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(error) from None
+            if (
+                not isinstance(identity, str) or not identity.strip()
+                or identity in expected_ranges
+                or expected_start > expected_end
+            ):
+                raise ValueError(error)
+            expected_ranges[identity] = (expected_start, expected_end)
+
+        by_identity: dict[str, list[tuple[date, date]]] = {
+            identity: [] for identity in expected_ranges
+        }
+        for window in windows:
+            if not isinstance(window, dict):
+                raise ValueError(error)
+            identity = window.get("identity")
+            if identity not in by_identity:
+                raise ValueError(error)
+            try:
+                start = _history_date(window["start"], error)
+                end = _history_date(window["end"], error)
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(error) from None
+            if (
+                start > end
+                or window.get("status") not in {"complete", "explicit_empty"}
+                or type(window.get("pages")) is not int
+                or window["pages"] < 1
+            ):
+                raise ValueError(error)
+            by_identity[identity].append((start, end))
+
+        for identity, (expected_start, expected_end) in expected_ranges.items():
+            identity_windows = sorted(by_identity[identity])
+            if not identity_windows or identity_windows[0][0] != expected_start:
+                raise ValueError(error)
+            covered_end = identity_windows[0][1]
+            for start, end in identity_windows[1:]:
+                if start != covered_end + timedelta(days=1):
+                    raise ValueError(error)
+                covered_end = end
+            if covered_end != expected_end:
+                raise ValueError(error)
+            starts.append(expected_start)
+            ends.append(expected_end)
+
+        domain_names.append(name)
+        identity_count += len(expected_ranges)
+        window_count += len(windows)
+
+    if len(domain_names) != len(set(domain_names)) or set(domain_names) != expected_domains:
+        raise ValueError(error)
+
+    return {
+        "ok": True,
+        "mode": expected_mode,
+        "domains": domain_names,
+        "identities": identity_count,
+        "windows": window_count,
+        "start": min(starts).isoformat(),
+        "end": max(ends).isoformat(),
+    }
+
+
 @dataclass(kw_only=True)
 class BankCollectResult:
     """Shared return contract for every `BankCrawler.collect()`.
@@ -296,6 +443,7 @@ class BankCollectResult:
     balance_history: list[NormalizedBalanceHistory] = field(default_factory=list)
     daily_metrics: list[DailyMetric] = field(default_factory=list)
     telemetry: dict[str, Any] = field(default_factory=dict)
+    history_coverage: dict[str, Any] | None = None
 
     # Explicit transitional collect fields consumed by existing persist_<bank>()
     # adapters. These replace the previous opaque `raw` escape hatch: every key
@@ -563,6 +711,55 @@ class BankCrawler(ABC):
     name: str
     session_dir: Path = field(init=False)
     collector: ResponseCollector | None = field(init=False, default=None)
+    transaction_cursors: dict[str, dict[str, date]] = field(
+        init=False, default_factory=dict,
+    )
+
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = False
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset()
+
+    def configure_transaction_cursor(
+        self,
+        domain: str,
+        cursor: dict[str, date],
+    ) -> None:
+        if (
+            domain not in HISTORY_DOMAINS
+            or any(
+                not isinstance(identity, str) or not identity.strip() or type(value) is not date
+                for identity, value in cursor.items()
+            )
+        ):
+            raise ValueError("transaction cursor must map non-empty identities to dates")
+        self.transaction_cursors[domain] = dict(cursor)
+
+    def transaction_start_for(
+        self,
+        identity: str,
+        *,
+        domain: str = "twd_transactions",
+    ) -> date | None:
+        return getattr(self, "transaction_cursors", {}).get(domain, {}).get(identity)
+
+    def transaction_window_start(
+        self,
+        identity: str,
+        *,
+        floor: date,
+        overlap_days: int = 7,
+        domain: str = "twd_transactions",
+    ) -> date:
+        if type(overlap_days) is not int or not 0 <= overlap_days <= 31:
+            raise ValueError("overlap_days must be an integer from 0 through 31")
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        if mode == "full":
+            return floor
+        cursor = self.transaction_start_for(identity, domain=domain)
+        if cursor is None:
+            return floor
+        return max(floor, cursor - timedelta(days=overlap_days))
 
     # 一個 user_data_dir 持久化 session 可信的最長秒數。
     # 預設 3 分鐘（使用者指示 2026-06-17）— 為什麼這麼短：

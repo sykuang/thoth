@@ -24,6 +24,7 @@ from backend.server.sync_runner import (
     list_recent_jobs,
     run_sync_job,
     run_sync_job_for_account,
+    supports_attested_history,
 )
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -50,10 +51,10 @@ def force_full_history_sync(account_id: int) -> dict:
     acct = AccountsRepo().get(account_id)
     if acct is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此帳號")
-    if acct.bank != "scsb":
+    if not supports_attested_history(acct.bank):
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "full-history sync is currently supported only for scsb",
+            status.HTTP_409_CONFLICT,
+            "此銀行尚未支援可驗證的完整歷史同步",
         )
     job_id = run_sync_job_for_account(
         account_id=account_id,

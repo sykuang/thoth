@@ -14,10 +14,59 @@ OOM crash 期間正在跑的 job 因為沒人走到 mark_done/mark_failed, sync_
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from backend.server.db import get_conn, now_iso
+
+_HISTORY_DOMAINS = frozenset({"twd_transactions", "card_billed_transactions"})
+
+
+def _canonical_date(value: Any) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _is_full_history_attestation(
+    value: Any,
+    *,
+    expected_domains: frozenset[str],
+) -> bool:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(expected_domains, frozenset)
+        or not expected_domains
+        or not expected_domains <= _HISTORY_DOMAINS
+    ):
+        return False
+    domains = value.get("domains")
+    start = _canonical_date(value.get("start"))
+    end = _canonical_date(value.get("end"))
+    return (
+        value.get("ok") is True
+        and value.get("mode") == "full"
+        and isinstance(domains, list)
+        and bool(domains)
+        and all(
+            isinstance(domain, str) and domain in _HISTORY_DOMAINS
+            for domain in domains
+        )
+        and len(domains) == len(set(domains))
+        and set(domains) == expected_domains
+        and type(value.get("identities")) is int
+        and value["identities"] >= 0
+        and type(value.get("windows")) is int
+        and value["windows"] >= max(value["identities"], 1)
+        and start is not None
+        and end is not None
+        and start <= end
+    )
 
 _COLS = (
     "id, user_id, bank, account_id, status, created_at, started_at, "
@@ -107,6 +156,32 @@ def has_completed_for_account(account_id: int) -> bool:
             (account_id,),
         ).fetchone()
     return row is not None
+
+
+def has_completed_full_history_for_account(
+    account_id: int,
+    *,
+    expected_domains: frozenset[str],
+) -> bool:
+    """Only an attested full-history job unlocks later incremental syncs."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT result_summary FROM sync_jobs "
+            "WHERE account_id=? AND status='done' AND history_mode='full'",
+            (account_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            summary = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+        if _is_full_history_attestation(
+            summary.get("history_coverage"), expected_domains=expected_domains,
+        ):
+            return True
+    return False
 
 
 def sweep_stale_running() -> int:

@@ -25,7 +25,7 @@ import sqlite3  # only allowed here + bank_pg.py + server/db.py (the 3 db layer 
 from collections import Counter
 from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import datetime, UTC
+from datetime import date, datetime, UTC
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
 
@@ -70,6 +70,49 @@ def _data_root() -> Path:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+_CURSOR_DATE_RE = re.compile(
+    r"^\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?$",
+)
+
+
+def _cursor_date(value) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if type(value) is date:
+        return value
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not _CURSOR_DATE_RE.fullmatch(raw):
+        return None
+    canonical = raw[:10].replace("/", "-")
+    try:
+        parsed = date.fromisoformat(canonical)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == canonical else None
+
+
+def _latest_cursor_dates(
+    rows,
+    identity_key: str,
+    date_keys: tuple[str, ...],
+) -> dict[str, date]:
+    result: dict[str, date] = {}
+    for row in rows:
+        identity = row[identity_key]
+        if not isinstance(identity, str) or not identity.strip():
+            continue
+        parsed = next(
+            (value for key in date_keys if (value := _cursor_date(row[key])) is not None),
+            None,
+        )
+        if parsed is not None and parsed > result.get(identity, date.min):
+            result[identity] = parsed
+    return result
 
 
 def _pending_billed_identity(row) -> tuple | None:
@@ -370,6 +413,17 @@ CREATE TABLE IF NOT EXISTS card_billed_txns (
 -- 2026-06-17 C: 同上, 複合 unique 由 _migrate 升級
 CREATE UNIQUE INDEX IF NOT EXISTS ux_card_billed_dedup ON card_billed_txns(dedup_key);
 
+-- Account-scoped cursor provenance. Transaction tables predate credential accounts,
+-- so this sidecar records which account actually observed each identity/date.
+CREATE TABLE IF NOT EXISTS history_transaction_cursors (
+    user_id           INTEGER NOT NULL,
+    source_account_id INTEGER NOT NULL,
+    domain            TEXT NOT NULL,
+    identity          TEXT NOT NULL,
+    latest_date       TEXT NOT NULL,
+    PRIMARY KEY (user_id, source_account_id, domain, identity)
+);
+
 -- 3. 信用卡未出帳 / 即時消費（refresh-by-scope，每次 replace）
 CREATE TABLE IF NOT EXISTS card_pending_txns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -485,7 +539,13 @@ CREATE TABLE IF NOT EXISTS sync_log (
 
 
 class BankStore:
-    def __init__(self, bank: str, user_id: int | None = None):
+    def __init__(
+        self,
+        bank: str,
+        user_id: int | None = None,
+        *,
+        source_account_id: int | None = None,
+    ):
         """Open per-bank store for one user.
 
         Phase C (2026-06-17): user_id required for multi-tenant row isolation.
@@ -507,6 +567,11 @@ class BankStore:
             user_id = 1
         self.bank = bank
         self.user_id = user_id
+        if source_account_id is not None and (
+            type(source_account_id) is not int or source_account_id < 1
+        ):
+            raise ValueError("source_account_id must be a positive integer")
+        self.source_account_id = source_account_id
         # 每次 persist run 內剛 INSERT 成功的 billed id。消失比對只可看這批，
         # 不能拿 pending 去配歷史同卡同額交易。BankStore 一個 sync request 用一次。
         self._new_billed_ids: list[int] = []
@@ -763,6 +828,50 @@ class BankStore:
     def close(self):
         self.conn.close()
 
+    def _record_transaction_cursor(self, domain: str, identity, *raw_dates) -> None:
+        if self.source_account_id is None:
+            return
+        identity = identity.strip() if isinstance(identity, str) else ""
+        latest = next(
+            (value for raw in raw_dates if (value := _cursor_date(raw)) is not None),
+            None,
+        )
+        if not identity or latest is None:
+            return
+        self.conn.execute(
+            """INSERT INTO history_transaction_cursors
+               (user_id, source_account_id, domain, identity, latest_date)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, source_account_id, domain, identity) DO UPDATE SET
+                 latest_date = CASE
+                   WHEN excluded.latest_date > history_transaction_cursors.latest_date
+                   THEN excluded.latest_date
+                   ELSE history_transaction_cursors.latest_date
+                 END""",
+            (
+                self.user_id, self.source_account_id, domain, identity,
+                latest.isoformat(),
+            ),
+        )
+
+    def _transaction_cursor_dates(self, domain: str) -> dict[str, date]:
+        if self.source_account_id is None:
+            return {}
+        rows = self.conn.execute(
+            """SELECT identity, latest_date FROM history_transaction_cursors
+               WHERE user_id = ? AND source_account_id = ? AND domain = ?""",
+            (self.user_id, self.source_account_id, domain),
+        ).fetchall()
+        return _latest_cursor_dates(rows, "identity", ("latest_date",))
+
+    def latest_twd_transaction_dates(self) -> dict[str, date]:
+        """Return account-scoped latest persisted TWD transaction dates."""
+        return self._transaction_cursor_dates("twd_transactions")
+
+    def latest_card_transaction_dates(self) -> dict[str, date]:
+        """Return account-scoped latest persisted billed-card transaction dates."""
+        return self._transaction_cursor_dates("card_billed_transactions")
+
     def _pending_user_metadata(self, scope: str | None = None) -> dict[tuple, list[tuple]]:
         """Snapshot user-edited fields before pending rows are replaced or promoted."""
         sql = (
@@ -817,7 +926,7 @@ class BankStore:
                         commit: bool = True) -> int:
         """寫入台幣交易。若 `rules` 提供，每筆 desc 跑 categorize → 寫 category + subcategory + auto_excluded 欄。"""
         from backend.server.categorizer import categorize_with_excluded  # 延遲 import 避免 cli 依賴
-        before = self.conn.total_changes
+        inserted_count = 0
         now = _now()
         # 先算每筆的 content key（含 balance 當 running-balance tie-breaker），
         # 再附加同鍵出現序號 → 真實重複交易也能各自留存、重抓又能去重
@@ -835,6 +944,7 @@ class BankStore:
             # 台幣: amount 方向可信 (income - expend), 給 _flow_fields 當 fallback
             net = (t.get("income") or 0) - (t.get("expend") or 0)
             flow, income_cat = _flow_fields(cat, sub, net)
+            before_insert = self.conn.total_changes
             self.conn.execute(
                 """INSERT INTO twd_transactions
                    (user_id, account_no, txn_datetime, account_date, description, raw_description,
@@ -850,9 +960,13 @@ class BankStore:
                  now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
                  1 if _is_subscription(sub) else 0),
             )
+            inserted_count += self.conn.total_changes - before_insert
+            self._record_transaction_cursor(
+                "twd_transactions", t.get("account_no"), t.get("datetime"),
+            )
         if commit:
             self.conn.commit()
-        return self.conn.total_changes - before
+        return inserted_count
 
     # ---- 2. 信用卡已出帳明細：append-only ----
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None) -> int:
@@ -994,6 +1108,13 @@ class BankStore:
                             "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
                             (existing["id"],),
                         )
+            self._record_transaction_cursor(
+                "card_billed_transactions",
+                t.get("card_no"),
+                post_date,
+                t.get("date"),
+                t.get("bill_date"),
+            )
         # 不在此 commit：billed INSERT、overlay adoption、pending refresh 必須同一 transaction。
         # 各 persist 最後由 refresh_card_pending／log_sync commit；中途 crash 會整批 rollback，
         # 避免下一輪 ON CONFLICT 後失去「本次新增 billed」candidate。

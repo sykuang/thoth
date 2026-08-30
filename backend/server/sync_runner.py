@@ -36,6 +36,42 @@ SUPPORTED_BANKS = frozenset({
     "dbs", "scb", "linebank", "rakuten",
 })
 
+_CRAWLER_MODULE_MAP = {
+    "cathay": ("backend.banks.cathay", "CathayCrawler"),
+    "ubot": ("backend.banks.ubot", "UbotCrawler"),
+    "hsbc": ("backend.banks.hsbc", "HsbcCrawler"),
+    "ctbc": ("backend.banks.ctbc", "CtbcCrawler"),
+    "sinopac": ("backend.banks.sinopac", "SinopacCrawler"),
+    "scsb": ("backend.banks.scsb", "ScsbCrawler"),
+    "esun": ("backend.banks.esun", "EsunCrawler"),
+    "taishin": ("backend.banks.taishin", "TaishinCrawler"),
+    "fubon": ("backend.banks.fubon", "FubonCrawler"),
+    "dbs": ("backend.banks.dbs", "DbsCrawler"),
+    "scb": ("backend.banks.scb", "ScbCrawler"),
+    "linebank": ("backend.banks.linebank", "LinebankCrawler"),
+    "rakuten": ("backend.banks.rakuten", "RakutenCrawler"),
+}
+
+
+def _load_crawler(bank: str):
+    try:
+        mod_name, cls_name = _CRAWLER_MODULE_MAP[bank]
+    except KeyError:
+        raise ValueError(f"unknown bank: {bank!r}") from None
+    mod = __import__(mod_name, fromlist=[cls_name, "BASE"])
+    return mod, getattr(mod, cls_name)
+
+
+def _required_history_domains(bank: str) -> frozenset[str]:
+    _, crawler_cls = _load_crawler(bank)
+    if not crawler_cls.HISTORY_COVERAGE_REQUIRED:
+        return frozenset()
+    return crawler_cls.HISTORY_COVERAGE_DOMAINS
+
+
+def supports_attested_history(bank: str) -> bool:
+    return bool(_required_history_domains(bank))
+
 # Phase 1 全域 dispatch lock — 同一時刻只跑一個 job（Scrapling 並非真 thread-safe）
 _dispatch_lock = threading.Lock()
 
@@ -58,7 +94,12 @@ def run_sync_job(user_id: int, bank: str, headless: bool = True, *, batch_id: in
     bank = bank.lower()
     if bank not in SUPPORTED_BANKS:
         raise ValueError(f"unknown bank: {bank!r}; supported: {sorted(SUPPORTED_BANKS)}")
-    job_id = sync_jobs_repo.queue(user_id=user_id, bank=bank, batch_id=batch_id)
+    # Legacy jobs have no account_id, so they cannot prove a prior complete
+    # account-scoped backfill. Conservatively run full rather than silently
+    # treating an unverified account as incremental.
+    job_id = sync_jobs_repo.queue(
+        user_id=user_id, bank=bank, batch_id=batch_id, history_mode="full",
+    )
 
     t = threading.Thread(target=_exec_sync, args=(job_id,), daemon=True)
     t.start()
@@ -88,10 +129,16 @@ def run_sync_job_for_account(
         raise ValueError(f"account_id {account_id} not found")
     if acct.bank not in SUPPORTED_BANKS:
         raise ValueError(f"unknown bank: {acct.bank!r}; supported: {sorted(SUPPORTED_BANKS)}")
+    required_domains = _required_history_domains(acct.bank)
     history_mode = (
         "full"
-        if acct.bank == "scsb" and (
-            force_full_history or not sync_jobs_repo.has_completed_for_account(account_id)
+        if force_full_history
+        or (
+            not sync_jobs_repo.has_completed_full_history_for_account(
+                account_id, expected_domains=required_domains,
+            )
+            if required_domains
+            else not sync_jobs_repo.has_completed_for_account(account_id)
         )
         else "incremental"
     )
@@ -154,13 +201,13 @@ def _exec_sync(job_id: int) -> None:
     # scheduler / sync-all 會一次排多個 daemon thread，但 Scrapling dispatch 只能串行；
     # 若排隊等 lock 的 job 先標 running，/sync/jobs 的 stale sweep 會把後段銀行
     # （常見是永豐 sinopac）誤判為 stuck >15min 而 failed。單獨 sync 不會排隊，所以不踩。
-    old_user_id = os.environ.get("BANK_CRAWLER_USER_ID")
-    old_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
-    old_history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
     summary: dict | None = None
     error: str | None = None
     try:
         with _dispatch_lock:
+            old_user_id = os.environ.get("BANK_CRAWLER_USER_ID")
+            old_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
+            old_history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
             sync_jobs_repo.mark_running(job_id)
             if history_mode not in {"full", "incremental"}:
                 raise ValueError(f"invalid history_mode: {history_mode!r}")
@@ -591,40 +638,42 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
     except Exception:
         rules = None
 
-    crawler_module_map = {
-        "cathay":  ("backend.banks.cathay",  "CathayCrawler",  None),
-        "ubot":    ("backend.banks.ubot",    "UbotCrawler",    None),
-        "hsbc":    ("backend.banks.hsbc",    "HsbcCrawler",    None),
-        "ctbc":    ("backend.banks.ctbc",    "CtbcCrawler",    None),
-        "sinopac": ("backend.banks.sinopac", "SinopacCrawler", None),
-        "scsb":    ("backend.banks.scsb",    "ScsbCrawler",    None),
-        "esun":    ("backend.banks.esun",    "EsunCrawler",    None),
-        "taishin": ("backend.banks.taishin", "TaishinCrawler", None),
-        "fubon":   ("backend.banks.fubon",   "FubonCrawler",   None),
-        "dbs":     ("backend.banks.dbs",     "DbsCrawler",     None),
-        "scb":     ("backend.banks.scb",     "ScbCrawler",     None),
-        "linebank": ("backend.banks.linebank", "LinebankCrawler", None),
-        "rakuten":  ("backend.banks.rakuten",  "RakutenCrawler",  None),
-    }
-    if bank not in crawler_module_map:
-        raise ValueError(f"unknown bank: {bank!r}")
-
-    mod_name, cls_name, _ = crawler_module_map[bank]
-    mod = __import__(mod_name, fromlist=[cls_name, "BASE"])
-    crawler_cls = getattr(mod, cls_name)
+    mod, crawler_cls = _load_crawler(bank)
     base_url = mod.BASE
 
     crawler = crawler_cls()
     # cathay 特例（cli 也是這樣寫）
     login_url = f"{base_url}/mybank/" if bank == "cathay" else base_url
 
-    result = crawler.run(login_url=login_url, headless=headless)
-    if result.get("error"):
-        raise RuntimeError(f"crawler error: {result['error']} (url={result.get('final_url')})")
-    data = result.get("data", {})
-
-    store = BankStore(bank, user_id=user_id)
+    source_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
+    store = BankStore(
+        bank,
+        user_id=user_id,
+        source_account_id=int(source_account_id) if source_account_id else None,
+    )
     try:
+        crawler.configure_transaction_cursor(
+            "twd_transactions", store.latest_twd_transaction_dates(),
+        )
+        crawler.configure_transaction_cursor(
+            "card_billed_transactions", store.latest_card_transaction_dates(),
+        )
+        result = crawler.run(login_url=login_url, headless=headless)
+        if result.get("error"):
+            raise RuntimeError(
+                f"crawler error: {result['error']} (url={result.get('final_url')})",
+            )
+        data = result.get("data", {})
+        coverage_summary = None
+        if crawler.HISTORY_COVERAGE_REQUIRED:
+            from backend.core.base import validate_history_coverage
+
+            coverage_summary = validate_history_coverage(
+                data.get("history_coverage"),
+                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "incremental"),
+                expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
+            )
+
         from backend.core.persist import persist_collected
 
         delta = persist_collected(bank, data, store, rules=rules)
@@ -636,4 +685,5 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
         "delta": delta,
         "stats": stats,
         "card_bill_cycle_coverage": _summarize_card_bill_cycle_coverage(data),
+        "history_coverage": coverage_summary,
     }

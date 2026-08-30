@@ -82,7 +82,10 @@ def _extract_crawler_module_map(tree: ast.AST) -> dict[str, tuple[str, str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
-                if isinstance(tgt, ast.Name) and tgt.id == "crawler_module_map":
+                if (
+                    isinstance(tgt, ast.Name)
+                    and tgt.id in {"crawler_module_map", "_CRAWLER_MODULE_MAP"}
+                ):
                     if isinstance(node.value, ast.Dict):
                         out = {}
                         for k, v in zip(node.value.keys, node.value.values):

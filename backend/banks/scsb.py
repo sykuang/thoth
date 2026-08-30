@@ -73,6 +73,10 @@ class ScsbLoginError(RuntimeError):
 
 class ScsbCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+        "twd_transactions",
+    })
     CREDENTIAL_HOSTS = frozenset({"ibank.scsb.com.tw", "ebank.scsb.com.tw"})
 
     def __init__(self):
@@ -541,6 +545,10 @@ class ScsbCrawler(BankCrawler):
             out.pop(raw_text_key, None)
 
         publish_card_bill_facts(out, [])
+        out["history_coverage"] = self._twd_history_coverage(
+            out["twd_inquiry"],
+            mode="full" if self.full_history else "incremental",
+        )
         return BankCollectResult(**out)
 
     @staticmethod
@@ -698,11 +706,13 @@ class ScsbCrawler(BankCrawler):
     @staticmethod
     def _twd_inquiry_period_script(
         *, full_history: bool = True, end_date: date | None = None,
+        start_date: date | None = None,
     ) -> str:
         """JS: 首次/強制回補查全量；既有帳號只查最近一個曆月。"""
         script = r"""() => {
             const fullHistory = __FULL_HISTORY__;
             const configuredEndRaw = __END_DATE__;
+            const configuredStartRaw = __START_DATE__;
             const visible = (el) => el && el.offsetParent !== null;
             const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const inputs = [...document.querySelectorAll('input')].filter(visible);
@@ -744,22 +754,17 @@ class ScsbCrawler(BankCrawler):
             let start;
             let period;
             if (fullHistory) {
-                start = systemMin;
-                period = 'system-limit';
-                if (!start) {
-                    const year = end.getFullYear() - 1;
-                    const day = Math.min(end.getDate(), new Date(year, end.getMonth() + 1, 0).getDate());
-                    start = new Date(year, end.getMonth(), day);
-                    start.setDate(start.getDate() + 1);
-                    period = 'one-year';
-                }
+                const year = end.getFullYear() - 1;
+                const day = Math.min(end.getDate(), new Date(year, end.getMonth() + 1, 0).getDate());
+                const oneYearFloor = new Date(year, end.getMonth(), day);
+                oneYearFloor.setDate(oneYearFloor.getDate() + 1);
+                start = systemMin && systemMin > oneYearFloor ? systemMin : oneYearFloor;
+                period = systemMin && systemMin > oneYearFloor ? 'system-limit' : 'one-year';
             } else {
-                const year = end.getMonth() === 0 ? end.getFullYear() - 1 : end.getFullYear();
-                const month = (end.getMonth() + 11) % 12;
-                const day = Math.min(end.getDate(), new Date(year, month + 1, 0).getDate());
-                start = new Date(year, month, day);
+                start = parseDate(configuredStartRaw);
+                if (!start) return {ok: false, error: 'incremental-start-unavailable'};
                 if (systemMin && start < systemMin) start = systemMin;
-                period = 'one-month';
+                period = 'cursor';
             }
             if (start > end) return {ok: false, error: 'invalid-period-limit'};
 
@@ -784,7 +789,50 @@ class ScsbCrawler(BankCrawler):
                 "__END_DATE__",
                 json.dumps(end_date.isoformat() if end_date else None),
             )
+            .replace(
+                "__START_DATE__",
+                json.dumps(start_date.isoformat() if start_date else None),
+            )
         )
+
+    @staticmethod
+    def _one_year_floor(end: date) -> date:
+        previous_year = end.year - 1
+        day = min(end.day, monthrange(previous_year, end.month)[1])
+        return date(previous_year, end.month, day) + timedelta(days=1)
+
+    @classmethod
+    def _twd_history_coverage(
+        cls,
+        inquiry: dict,
+        *,
+        mode: str,
+        as_of: date | None = None,
+    ) -> dict:
+        accounts = inquiry.get("accounts") or []
+        domain = {
+            "domain": "twd_transactions",
+            "expected": [],
+            "windows": [],
+        }
+        if accounts:
+            for account in accounts:
+                period = account["period"]
+                domain["expected"].append({
+                    "identity": account["account_no"],
+                    "start": period["start"].replace("/", "-"),
+                    "end": period["end"].replace("/", "-"),
+                })
+                domain["windows"].extend(account["windows"])
+        else:
+            end = as_of or date.today()
+            domain["empty_window"] = {
+                "start": cls._one_year_floor(end).isoformat(),
+                "end": end.isoformat(),
+                "status": "explicit_empty",
+                "pages": 1,
+            }
+        return {"mode": mode, "domains": [domain]}
 
     @staticmethod
     def _apply_twd_period_controls(page, period: dict) -> None:
@@ -1530,10 +1578,19 @@ class ScsbCrawler(BankCrawler):
         ):
             raise RuntimeError("account-control-unavailable")
         full_history = getattr(self, "full_history", True)
+        as_of = date.today()
+        cursor_start = None
+        if not full_history:
+            cursor_start = self.transaction_window_start(
+                account_no,
+                floor=self._one_year_floor(as_of),
+                domain="twd_transactions",
+            )
         period = page.evaluate(
             self._twd_inquiry_period_script(
                 full_history=full_history,
-                end_date=date.today(),
+                end_date=as_of,
+                start_date=cursor_start,
             ),
         )
         _log(f"[twd_inq] period → {period}")
@@ -1541,6 +1598,7 @@ class ScsbCrawler(BankCrawler):
             raise RuntimeError(period.get("error") or "lookback-period-unavailable")
 
         all_records: list[dict] = []
+        coverage_windows: list[dict] = []
         query_windows = self._six_month_windows(period["start"], period["end"])
         for index, (start, end) in enumerate(query_windows, start=1):
             window = {**period, "start": start, "end": end}
@@ -1549,6 +1607,13 @@ class ScsbCrawler(BankCrawler):
                 page, selector, selected_index, selected_value, account_no, window,
             )
             all_records.extend(records)
+            coverage_windows.append({
+                "identity": account_no,
+                "start": start.replace("/", "-"),
+                "end": end.replace("/", "-"),
+                "status": "complete" if records else "explicit_empty",
+                "pages": 1,
+            })
             if not records:
                 self._close_twd_empty_result(page)
 
@@ -1556,6 +1621,7 @@ class ScsbCrawler(BankCrawler):
             "account_no": account_no,
             "period": period,
             "records": all_records,
+            "windows": coverage_windows,
         }
 
     def _collect_twd_inquiry(

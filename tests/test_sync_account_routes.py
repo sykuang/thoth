@@ -133,19 +133,21 @@ def test_admin_can_force_full_history_for_existing_account(client, monkeypatch):
     }
 
 
-def test_admin_full_history_rejects_bank_without_full_history_support(client, monkeypatch):
-    token = _register(client, "admin-unsupported-history@palace.example")
+def test_admin_full_history_rejects_bank_without_attested_adapter(client, monkeypatch):
+    token = _register(client, "admin-cross-bank-history@palace.example")
     created = client.post(
         "/accounts", json={"bank": "ctbc", "label": "主帳"}, headers=_auth(token),
     )
+    account_id = created.json()["id"]
     monkeypatch.setenv("ADMIN_API_KEY", "admin-test-key")
 
     response = client.post(
-        f"/sync/admin/account/{created.json()['id']}/full-history",
+        f"/sync/admin/account/{account_id}/full-history",
         headers={"X-Admin-Key": "admin-test-key"},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 409
+    assert "尚未支援" in response.json()["detail"]
 
 
 def test_sync_account_sets_account_id_env_in_dispatch(client, monkeypatch):
@@ -156,10 +158,25 @@ def test_sync_account_sets_account_id_env_in_dispatch(client, monkeypatch):
         seen_env["account_id"] = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
         seen_env["user_id"] = os.environ.get("BANK_CRAWLER_USER_ID")
         seen_env["history_mode"] = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
-        return {"delta": {}, "stats": {}}
+        return {
+            "delta": {},
+            "stats": {},
+            "history_coverage": {
+                "ok": True,
+                "mode": seen_env["history_mode"],
+                "domains": ["twd_transactions"],
+                "identities": 1,
+                "windows": 1,
+                "start": "2025-08-31",
+                "end": "2026-08-30",
+            },
+        }
 
     import backend.server.sync_runner as sr
     monkeypatch.setattr(sr, "_dispatch_crawler_and_persist", _fake_dispatch)
+    monkeypatch.setattr(
+        sr, "_required_history_domains", lambda bank: frozenset({"twd_transactions"}),
+    )
     token = _register(client)
 
     r = client.post("/accounts", json={"bank": "scsb", "label": "x"}, headers=_auth(token))

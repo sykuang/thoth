@@ -10,6 +10,7 @@ import backend.banks.scsb as scsb_module
 import backend.core.persist.scsb as scsb_persist_module
 import pytest
 from backend.banks.scsb import ScsbCrawler, _safe_select_inventory
+from backend.core.base import validate_history_coverage
 from backend.core.persist import persist_scsb
 from backend.core.store import BankStore
 
@@ -170,6 +171,7 @@ def test_scsb_twd_inquiry_does_not_collapse_an_already_open_top_level():
 
 def _run_twd_period_script(
     start_min: str = "", *, shared_parent: bool = False, full_history: bool = True,
+    cursor_start: date | None = None,
 ) -> dict:
     from patchright.sync_api import sync_playwright
 
@@ -200,6 +202,7 @@ def _run_twd_period_script(
                 ScsbCrawler._twd_inquiry_period_script(
                     full_history=full_history,
                     end_date=date(2026, 8, 22),
+                    start_date=cursor_start,
                 ),
             )
             ScsbCrawler._apply_twd_period_controls(page, result)
@@ -211,16 +214,16 @@ def _run_twd_period_script(
             browser.close()
 
 
-def test_scsb_twd_period_uses_system_earliest_date_when_exposed():
+def test_scsb_twd_period_never_exceeds_one_year_when_system_allows_more():
     result = _run_twd_period_script("2024-01-01")
 
     assert result == {
         "ok": True,
-        "period": "system-limit",
-        "start": "2024/01/01",
+        "period": "one-year",
+        "start": "2025/08/23",
         "end": "2026/08/22",
         "custom_checked": True,
-        "actual_start": "2024/01/01",
+        "actual_start": "2025/08/23",
         "actual_end": "2026/08/22",
     }
 
@@ -239,28 +242,89 @@ def test_scsb_twd_period_falls_back_to_one_calendar_year():
     }
 
 
-def test_scsb_existing_account_period_uses_one_calendar_month():
-    result = _run_twd_period_script(
-        "2024-01-01",
-        full_history=False,
-    )
-
-    assert result == {
-        "ok": True,
-        "period": "one-month",
-        "start": "2026/07/22",
-        "end": "2026/08/22",
-        "custom_checked": True,
-        "actual_start": "2026/07/22",
-        "actual_end": "2026/08/22",
-    }
+def test_scsb_incremental_period_requires_shared_cursor_start():
+    with pytest.raises(RuntimeError, match="incremental-start-unavailable"):
+        _run_twd_period_script("2024-01-01", full_history=False)
 
 
 def test_scsb_incremental_respects_a_later_system_minimum():
-    result = _run_twd_period_script("2026-08-02", full_history=False)
+    result = _run_twd_period_script(
+        "2026-08-02", full_history=False, cursor_start=date(2026, 7, 1),
+    )
 
-    assert result["period"] == "one-month"
+    assert result["period"] == "cursor"
     assert result["start"] == "2026/08/02"
+
+
+def test_scsb_incremental_period_uses_persisted_cursor_overlap():
+    result = _run_twd_period_script(
+        "2024-01-01",
+        full_history=False,
+        cursor_start=date(2026, 8, 13),
+    )
+
+    assert result["period"] == "cursor"
+    assert result["start"] == "2026/08/13"
+    assert result["end"] == "2026/08/22"
+
+
+def test_scsb_declares_twd_history_contract():
+    assert ScsbCrawler.HISTORY_COVERAGE_REQUIRED is True
+    assert frozenset({"twd_transactions"}) == ScsbCrawler.HISTORY_COVERAGE_DOMAINS
+
+
+def test_scsb_twd_coverage_attests_each_account_and_empty_window():
+    coverage = ScsbCrawler._twd_history_coverage(
+        {
+            "accounts": [{
+                "account_no": "90000000123456",
+                "period": {"start": "2025/08/31", "end": "2026/08/30"},
+                "windows": [
+                    {
+                        "identity": "90000000123456",
+                        "start": "2025-08-31", "end": "2026-02-28",
+                        "status": "explicit_empty", "pages": 1,
+                    },
+                    {
+                        "identity": "90000000123456",
+                        "start": "2026-03-01", "end": "2026-08-30",
+                        "status": "complete", "pages": 1,
+                    },
+                ],
+            }],
+        },
+        mode="full",
+        as_of=date(2026, 8, 30),
+    )
+
+    assert coverage["mode"] == "full"
+    assert coverage["domains"][0]["expected"] == [{
+        "identity": "90000000123456",
+        "start": "2025-08-31",
+        "end": "2026-08-30",
+    }]
+    summary = validate_history_coverage(
+        coverage,
+        expected_mode="full",
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    assert "90000000123456" not in repr(summary)
+
+
+def test_scsb_twd_coverage_attests_authoritative_no_accounts():
+    coverage = ScsbCrawler._twd_history_coverage(
+        {"accounts": []}, mode="full", as_of=date(2026, 8, 30),
+    )
+
+    domain = coverage["domains"][0]
+    assert domain["expected"] == []
+    assert domain["windows"] == []
+    assert domain["empty_window"] == {
+        "start": "2025-08-31",
+        "end": "2026-08-30",
+        "status": "explicit_empty",
+        "pages": 1,
+    }
 
 
 def test_scsb_splits_a_one_year_query_into_six_month_windows():
@@ -1284,6 +1348,7 @@ def test_scsb_twd_collector_parses_full_dom_beyond_preview(tmp_path):
         ScsbCrawler._twd_inquiry_period_script(
             full_history=False,
             end_date=date.today(),
+            start_date=ScsbCrawler._one_year_floor(date.today()),
         )
     )
     assert "text" not in result
@@ -1349,6 +1414,18 @@ def test_scsb_empty_window_closes_bound_result_and_continues_history():
     result = crawler._collect_twd_account(page, "#account", "90000000123456")
 
     assert result["records"] == []
+    assert result["windows"] == [
+        {
+            "identity": "90000000123456",
+            "start": "2026-02-27", "end": "2026-08-26",
+            "status": "explicit_empty", "pages": 1,
+        },
+        {
+            "identity": "90000000123456",
+            "start": "2025-08-27", "end": "2026-02-26",
+            "status": "explicit_empty", "pages": 1,
+        },
+    ]
     assert crawler._collect_twd_period.call_count == 2
     assert close.first.click.call_count == 2
     assert page.wait_for_function.call_count == 2

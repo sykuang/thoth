@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
 
 BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank", "rakuten"}
@@ -71,35 +73,48 @@ def _get_crawler(bank: str):
 def cmd_sync(args):
     crawler, login_url = _get_crawler(args.bank)
     print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
-    result = crawler.run(login_url=login_url, headless=args.headless)
-    if result.get("error"):
-        print(f"[sync] 失敗: {result['error']} (url={result.get('final_url')})")
-        return 1
-    data = result.get("data", {})
-
-    # 存原始 JSON 備份
-    # cli/cli.py → parents[0]=cli, parents[1]=專案根 → backend/data/
-    raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
-    raw.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # 增量入庫
     store = BankStore(args.bank)
-    # 2026-07-28: CLI 原本 13 個分支全都沒傳 rules → category/subcategory 永遠 NULL,
-    # 連帶 flow_type/income_category 也拿不到分類訊號 (樂天「存款利息」只能落到
-    # income/other 而非 interest_dividend)。server sync_runner 一直有傳 (見
-    # sync_runner.py:547), 只有 CLI 漏掉。user_id=1 對齊 BankStore 預設單人模式。
-    # server.sqlite 尚未 seed 過該 user 時 fallback 到 DEFAULT_RULES —— CLI 是單人
-    # 工具, 沒 rule 就等於整個 taxonomy 失效, 不該靜默降級。
-    from backend.server import rules_repo
-    from backend.server.seed_rules import DEFAULT_RULES
-    rules = rules_repo.list_rules(user_id=1, enabled_only=True)
-    if not rules:
-        rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
-    from backend.core.persist import persist_collected
+    try:
+        crawler.configure_transaction_cursor(
+            "twd_transactions", store.latest_twd_transaction_dates(),
+        )
+        crawler.configure_transaction_cursor(
+            "card_billed_transactions", store.latest_card_transaction_dates(),
+        )
+        result = crawler.run(login_url=login_url, headless=args.headless)
+        if result.get("error"):
+            print(f"[sync] 失敗: {result['error']} (url={result.get('final_url')})")
+            return 1
+        data = result.get("data", {})
+        if crawler.HISTORY_COVERAGE_REQUIRED:
+            validate_history_coverage(
+                data.get("history_coverage"),
+                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
+                expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
+            )
 
-    delta = persist_collected(args.bank, data, store, rules=rules)
-    stats = store.stats()
-    store.close()
+        # 存原始 JSON 備份
+        # cli/cli.py → parents[0]=cli, parents[1]=專案根 → backend/data/
+        raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
+        raw.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 2026-07-28: CLI 原本 13 個分支全都沒傳 rules → category/subcategory 永遠 NULL,
+        # 連帶 flow_type/income_category 也拿不到分類訊號 (樂天「存款利息」只能落到
+        # income/other 而非 interest_dividend)。server sync_runner 一直有傳 (見
+        # sync_runner.py:547), 只有 CLI 漏掉。user_id=1 對齊 BankStore 預設單人模式。
+        # server.sqlite 尚未 seed 過該 user 時 fallback 到 DEFAULT_RULES —— CLI 是單人
+        # 工具, 沒 rule 就等於整個 taxonomy 失效, 不該靜默降級。
+        from backend.server import rules_repo
+        from backend.server.seed_rules import DEFAULT_RULES
+        rules = rules_repo.list_rules(user_id=1, enabled_only=True)
+        if not rules:
+            rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
+        from backend.core.persist import persist_collected
+
+        delta = persist_collected(args.bank, data, store, rules=rules)
+        stats = store.stats()
+    finally:
+        store.close()
 
     print("\n===== 增量同步結果 =====")
     print(f"  台幣交易    本次新增 {delta.get('twd_txn_new', 0)} 筆")
