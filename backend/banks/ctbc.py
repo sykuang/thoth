@@ -14,11 +14,16 @@ session 持久化（user_data_dir）→ 首次綁定裝置後免 OTP（實測首
 from __future__ import annotations
 import contextlib
 import json
+import os
 import re
 import sys
+from calendar import monthrange
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
@@ -111,7 +116,12 @@ def _log(*a):
     print(*a, file=sys.stderr)
 
 
-def _filter_valid_ctbc_details(detail_list_raw: list) -> tuple[list[dict], int]:
+def _filter_valid_ctbc_details(
+    detail_list_raw: list,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+) -> tuple[list[dict], int]:
     """CTBC qu002/011 detailList raw → (filtered, skipped_count).
 
     Schema validate: 每筆合法 detail 必有 actDtTm (persist 算 txn_datetime 的唯一
@@ -129,6 +139,12 @@ def _filter_valid_ctbc_details(detail_list_raw: list) -> tuple[list[dict], int]:
         if not (d.get("actDtTm") or "").strip():
             skipped += 1
             continue
+        if start is not None and end is not None:
+            try:
+                d = _validated_ctbc_detail(d, start=start, end=end)
+            except ValueError:
+                skipped += 1
+                continue
         out.append(d)
     return out, skipped
 
@@ -138,6 +154,86 @@ def _filter_valid_ctbc_details(detail_list_raw: list) -> tuple[list[dict], int]:
 # (v5 註解實證). 但 ResponseCollector.auth_token 已攔到 SPA 第一次 auto-fire 的 Bearer
 # → 直接帶 Bearer + 從 SPA 已 fire 的 qu002/011 hit 抄 URL/req body 結構, 改 rqData 重打.
 _CTBC_MONTHS = ("m0", "m1", "m2", "m3", "m4", "m5")
+_CTBC_EBMW_PATH = "/IB/api/adapters/IB_Adapter/resource/ebmwResource"
+_CTBC_AMOUNT_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.0+)?$")
+_PG_INTEGER_MAX = 2_147_483_647
+
+
+def _valid_bearer(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"Bearer [^\s]+", value) is not None
+
+
+def _ctbc_month_windows(as_of: date) -> list[tuple[str, date, date]]:
+    """Return CTBC's six exposed calendar-month windows, oldest first."""
+    windows = []
+    for offset in range(5, -1, -1):
+        absolute_month = as_of.year * 12 + as_of.month - 1 - offset
+        year, zero_based_month = divmod(absolute_month, 12)
+        month = zero_based_month + 1
+        start = date(year, month, 1)
+        end = min(as_of, date(year, month, monthrange(year, month)[1]))
+        windows.append((f"m{offset}", start, end))
+    return windows
+
+
+def _ctbc_amount(value, *, non_negative: bool = False) -> int:
+    if isinstance(value, bool):
+        raise ValueError("invalid amount")
+    raw = str(value).strip()
+    if not _CTBC_AMOUNT_RE.fullmatch(raw):
+        raise ValueError("invalid amount")
+    try:
+        amount = Decimal(raw.replace(",", ""))
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid amount") from None
+    if (
+        not amount.is_finite()
+        or amount != amount.to_integral_value()
+        or not -_PG_INTEGER_MAX <= amount <= _PG_INTEGER_MAX
+        or non_negative and amount < 0
+    ):
+        raise ValueError("invalid amount")
+    return int(amount)
+
+
+def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
+    raw_datetime = row.get("actDtTm")
+    if not isinstance(raw_datetime, str) or raw_datetime != raw_datetime.strip():
+        raise ValueError("invalid row")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?", raw_datetime):
+        raise ValueError("invalid row")
+    try:
+        txn_date = datetime.strptime(raw_datetime[:19], "%Y-%m-%d-%H.%M.%S").date()
+    except ValueError:
+        raise ValueError("invalid row") from None
+    if not start <= txn_date <= end:
+        raise ValueError("invalid row")
+    raw_account_date = row.get("trnDtRaw")
+    if raw_account_date is not None:
+        if not isinstance(raw_account_date, str) or not re.fullmatch(r"\d{8}", raw_account_date):
+            raise ValueError("invalid row")
+        try:
+            account_date = datetime.strptime(raw_account_date, "%Y%m%d").date()
+        except ValueError:
+            raise ValueError("invalid row") from None
+        if not start <= account_date <= end:
+            raise ValueError("invalid row")
+    if row.get("dbAmt") is None and row.get("crAmt") is None:
+        raise ValueError("invalid row")
+    normalized = dict(row)
+    for field in ("dbAmt", "crAmt", "balanceAmt"):
+        value = row.get(field)
+        if value is not None:
+            normalized[field] = _ctbc_amount(value, non_negative=field != "balanceAmt")
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (
+            row.get("memo1"), row.get("memo2"), row.get("bankId"),
+            row.get("trfAcct"), row.get("memoCode"),
+        )
+    ):
+        raise ValueError("invalid row")
+    return normalized
 
 
 def _build_qu002_011_post_body(account_id: str, month_type: str, template_body: dict) -> dict:
@@ -165,6 +261,10 @@ def _build_qu002_011_post_body(account_id: str, month_type: str, template_body: 
 
 class CtbcCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+        "twd_transactions",
+    })
     CREDENTIAL_HOSTS = frozenset({"www.ctbcbank.com"})
 
     def __init__(self):
@@ -380,6 +480,53 @@ class CtbcCrawler(BankCrawler):
         print("[ctbc][logout] ⚠️ 已點確認但頁面仍像登入狀態（best-effort）", file=_sys.stderr)
         return True
 
+    @classmethod
+    def _validated_twd_inventory(
+        cls, collector: ResponseCollector,
+    ) -> tuple[dict, set[str]]:
+        hit = next((
+            item for item in reversed(collector.hits)
+            if isinstance(item.req_body, dict)
+            and item.req_body.get("resource") == "/twrbc-deposit/qu001/010"
+        ), None)
+        parsed = urlparse(hit.url) if hit else None
+        response = hit.resp_json if hit else None
+        if (
+            hit is None
+            or hit.method != "POST"
+            or type(hit.status) is not int
+            or not 200 <= hit.status < 300
+            or parsed is None
+            or parsed.scheme != "https"
+            or parsed.hostname != "www.ctbcbank.com"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != _CTBC_EBMW_PATH
+            or not isinstance(response, dict)
+            or response.get("code") != "0000"
+            or not isinstance(response.get("rsData"), dict)
+        ):
+            raise RuntimeError("ctbc-twd-history-inventory")
+        deposit = response["rsData"].get("twdAcctSummaryResponse")
+        summary = deposit.get("demDepBalSummaryResponse") if isinstance(deposit, dict) else None
+        rows = summary.get("infoList") if isinstance(summary, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError("ctbc-twd-history-inventory")
+        identities = []
+        for row in rows:
+            identity = row.get("accountId")
+            if (
+                not isinstance(identity, str)
+                or not identity
+                or identity != identity.strip()
+            ):
+                raise RuntimeError("ctbc-twd-history-inventory")
+            identities.append(identity)
+        if len(identities) != len(set(identities)):
+            raise RuntimeError("ctbc-twd-history-inventory")
+        return deposit, set(identities)
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """登入後抓帳戶彙總 + 台幣帳戶明細。
 
@@ -406,15 +553,17 @@ class CtbcCrawler(BankCrawler):
         # 2) 台幣存款帳戶（點臺幣存款 link 觸發，或直接複用攔到的）
         self._goto_twd_deposit(page)
         page.wait_for_timeout(3000)
-        dep = self._latest_rsdata(collector, "/twrbc-deposit/qu001/010")
-        out["twd_deposit"] = (dep or {}).get("twdAcctSummaryResponse") if isinstance(dep, dict) else None
+        out["twd_deposit"], twd_identities = self._validated_twd_inventory(collector)
 
         # 2.5) 台幣逐筆交易明細 (2026-06-20: known TODO 補上)
         # SPA route: /twrbc/twrbc-deposit/qu002/010 (date range picker) → fires qu002/011
         # qu002/011 rqData = {accountId, type:"m0"|"m1"|...} (m0=本月, m1=上月, ...)
         # 設計：先 goto qu002/010 載 dateRanges，再 _post_ebmw 各 type
-        # gracefully handle: 某月 fail 不擋整個 sync, 累積最多歷史
-        out["twd_history"] = self._collect_twd_deposit_history(page, collector, out["twd_deposit"])
+        twd_history = self._collect_twd_deposit_history(
+            page, collector, out["twd_deposit"], expected_identities=twd_identities,
+        )
+        out["twd_history"] = twd_history["accounts"]
+        out["history_coverage"] = twd_history["coverage"]
 
         # 3) 信用卡明細 (2026-06-13 升級：分 pending + billed 兩段抓)
         # CTBC 信用卡 mega menu 子選單：
@@ -528,154 +677,298 @@ class CtbcCrawler(BankCrawler):
             return hits[-1].resp_json.get("rsData")
         return None
 
-    def _collect_twd_deposit_history(self, page, collector: ResponseCollector, twd_deposit) -> list:
-        """抓台幣交易明細 (qu002/011, m0~m5 × all accounts).
+    def _collect_twd_deposit_history(
+        self,
+        page,
+        collector: ResponseCollector,
+        twd_deposit,
+        *,
+        as_of: date | None = None,
+        expected_identities: set[str],
+    ) -> dict:
+        """Collect every bank-exposed month for every authoritative TWD account."""
+        end = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
+        capability = _ctbc_month_windows(end)
+        floor = capability[0][1]
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise RuntimeError("ctbc-twd-history-mode")
+        info_list = (twd_deposit or {}).get("demDepBalSummaryResponse", {}).get("infoList")
+        if not isinstance(info_list, list):
+            raise RuntimeError("ctbc-twd-history-inventory")
+        identities: list[str] = []
+        for row in info_list:
+            identity = row.get("accountId") if isinstance(row, dict) else None
+            if (
+                not isinstance(identity, str)
+                or not identity
+                or identity != identity.strip()
+            ):
+                raise RuntimeError("ctbc-twd-history-inventory")
+            identities.append(identity)
+        if len(identities) != len(set(identities)) or set(identities) != expected_identities:
+            raise RuntimeError("ctbc-twd-history-inventory")
+        if not identities:
+            return {
+                "accounts": [],
+                "coverage": {
+                    "mode": mode,
+                    "domains": [{
+                        "domain": "twd_transactions",
+                        "expected": [],
+                        "windows": [],
+                        "empty_window": {
+                            "start": floor.isoformat(), "end": end.isoformat(),
+                            "status": "explicit_empty", "pages": 1,
+                        },
+                    }],
+                },
+            }
 
-        2026-06-22 升級 (多帳號 + m1~m5):
-          1) page.goto qu002/010 → SPA auto-fire qu002/011(accountId=info_list[0], type='m0')
-             → collector 撈 m0 hit 當 template (拿 URL 完整路徑 + req_body shape +
-                Bearer token)
-          2) 對 info_list 每個 account × m0~m5 12 組組合, 用 page.evaluate(fetch)
-             帶 collector.auth_token + template URL POST 重打
-          3) 同樣套 _filter_valid_ctbc_details schema validate
-          4) 每月 detail dedup 由下游 store.upsert_twd_txns 處理 (m0~m5 overlap 必然)
-
-        為何不點月份 button: button selector 變動性高 (Angular SPA 動態 class),
-        直接走 HttpClient layer 模仿 SPA 自己的 POST 比 DOM 互動穩定.
-
-        為何不純 fetch(): SPA 用 Angular HttpClient + interceptor 加 Bearer token,
-        純 page.evaluate(fetch) 沒過 interceptor 拿 redirect HTML (v5 實證).
-        現在我們從 collector.auth_token 取 SPA 攔到的 Bearer 直接帶 → 成功.
-
-        2026-06-22 (root cause fix): collector 是 raw 結構守門員 — 每個 (account, month)
-        都過 `_filter_valid_ctbc_details` schema validate. CTBC API 偶有 detail row
-        缺 actDtTm (prod 06-22 04:00 job#152 NotNullViolation 實證). 純函式邏輯抽到
-        module-level 方便 test.
-
-        回傳 [{account_no, months: {m0: [...], m1: [...], ...}, errors: {...}}].
-        """
-        history = []
-        info_list = (twd_deposit or {}).get("demDepBalSummaryResponse", {}).get("infoList") or []
-        if not info_list:
-            return history
-
-        # Step 1: 進 SPA route 觸發 auto-fire qu002/011 (with default accountId=info_list[0], type=m0)
-        with contextlib.suppress(Exception):
-            page.goto("https://www.ctbcbank.com/twrbc/twrbc-deposit/qu002/010",
-                      wait_until="domcontentloaded", timeout=15000)
-        # SPA bootstrap + HttpClient call 完整 round trip ~3-5s
+        try:
+            page.goto(
+                "https://www.ctbcbank.com/twrbc/twrbc-deposit/qu002/010",
+                wait_until="domcontentloaded", timeout=15000,
+            )
+        except Exception:
+            raise RuntimeError("ctbc-twd-history-template") from None
+        try:
+            current = urlparse(page.url)
+        except Exception:
+            raise RuntimeError("ctbc-twd-history-template") from None
+        if (
+            current.scheme != "https"
+            or current.hostname != "www.ctbcbank.com"
+            or current.port not in (None, 443)
+            or current.username is not None
+            or current.password is not None
+        ):
+            raise RuntimeError("ctbc-twd-history-template")
         page.wait_for_timeout(5000)
-
-        # 從 collector 撈 SPA auto-fire 的 qu002/011 hit, 拿來當之後 POST 的 template
         template_hit = self._latest_qu002_011_hit(collector)
         if template_hit is None:
-            _log("[twd-history] qu002/011 template hit 找不到 (SPA 沒 fire?)")
-            return history
-        template_body = template_hit.req_body if isinstance(template_hit.req_body, dict) else {}
-        template_url = template_hit.url  # 完整 URL: https://www.ctbcbank.com/.../ebmwResource
+            raise RuntimeError("ctbc-twd-history-template")
+        template_body = template_hit.req_body
+        template_url = template_hit.url
+        bearer = collector.auth_token
+        if not _valid_bearer(bearer):
+            raise RuntimeError("ctbc-twd-history-template")
 
-        # Step 2: 對每個 (account, month) 組合迴圈 fetch
-        bearer = collector.auth_token  # SPA 攔到的 'Bearer eyJ...'
-        if not bearer:
-            _log("[twd-history] collector.auth_token 沒攔到 Bearer, 無法主動 POST")
-            return history
-
-        for account_index, acct in enumerate(info_list, start=1):
-            account_id = acct.get("accountId")
-            if not account_id:
-                continue
+        accounts = []
+        expected = []
+        receipts = []
+        for account_index, account_id in enumerate(identities, start=1):
+            desired_start = self.transaction_window_start(account_id, floor=floor)
+            selected = [window for window in capability if window[2] >= desired_start]
+            if not selected:
+                raise RuntimeError("ctbc-twd-history-range")
             months_data: dict[str, list[dict]] = {}
-            errors: dict[str, str] = {}
-            for month in _CTBC_MONTHS:
+            for month, window_start, window_end in selected:
                 try:
-                    detail_list_raw = self._fetch_qu002_011(
+                    raw_rows = self._fetch_qu002_011(
                         page, template_url, template_body, account_id, month, bearer,
                     )
-                except Exception as e:
-                    errors[month] = f"fetch_error: {e!r}"[:200]
-                    continue
-                if not isinstance(detail_list_raw, list):
-                    errors[month] = "non_list_response"
-                    continue
-                detail_list, skipped = _filter_valid_ctbc_details(detail_list_raw)
-                if skipped > 0:
-                    _log(f"[twd-history] account_index={account_index} {month} "
-                         f"skipped {skipped} raw detail rows missing actDtTm")
-                if detail_list:
-                    months_data[month] = detail_list
-                else:
-                    errors[month] = "empty_detail_list"
-
-            total = sum(len(v) for v in months_data.values())
-            history.append({
+                except Exception:
+                    raise RuntimeError("ctbc-twd-history-fetch") from None
+                detail_list, skipped = _filter_valid_ctbc_details(
+                    raw_rows, start=window_start, end=window_end,
+                )
+                if skipped:
+                    raise RuntimeError("ctbc-twd-history-row")
+                months_data[month] = detail_list
+                receipts.append({
+                    "identity": account_id,
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "status": "complete" if detail_list else "explicit_empty",
+                    "pages": 1,
+                })
+            actual_start = selected[0][1]
+            accounts.append({
                 "account_no": account_id,
                 "months": months_data,
-                "errors": errors,
+                "errors": {},
             })
-            _log(f"[twd-history] account_index={account_index} "
-                 f"total={total} months={list(months_data.keys())} errors={list(errors.keys())}")
-
-        return history
+            expected.append({
+                "identity": account_id,
+                "start": actual_start.isoformat(),
+                "end": end.isoformat(),
+            })
+            _log(
+                f"[twd-history] account_index={account_index} "
+                f"total={sum(len(rows) for rows in months_data.values())} "
+                f"months={list(months_data)}",
+            )
+        return {
+            "accounts": accounts,
+            "coverage": {
+                "mode": mode,
+                "domains": [{
+                    "domain": "twd_transactions",
+                    "expected": expected,
+                    "windows": receipts,
+                }],
+            },
+        }
 
     @staticmethod
     def _latest_qu002_011_hit(collector: ResponseCollector):
-        """從 collector 撈最近一次成功的 /twrbc-deposit/qu002/011 ApiHit (含 URL + req_body)."""
-        for h in reversed(collector.hits):
-            if ("ebmwResource" not in h.url
-                or not isinstance(h.req_body, dict)
-                or h.req_body.get("resource") != "/twrbc-deposit/qu002/011"
-                or not isinstance(h.resp_json, dict)
-                or h.resp_json.get("code") != "0000"):
-                continue
-            return h
+        """Return the newest exact, successful owned history seed request."""
+        for hit in reversed(collector.hits):
+            parsed = urlparse(hit.url)
+            body = hit.req_body
+            response = hit.resp_json
+            request_data = body.get("rqData") if isinstance(body, dict) else None
+            response_data = response.get("rsData") if isinstance(response, dict) else None
+            if (
+                hit.method == "POST"
+                and type(hit.status) is int
+                and 200 <= hit.status < 300
+                and parsed.scheme == "https"
+                and parsed.hostname == "www.ctbcbank.com"
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path == _CTBC_EBMW_PATH
+                and isinstance(body, dict)
+                and body.get("resource") == "/twrbc-deposit/qu002/011"
+                and isinstance(request_data, dict)
+                and isinstance(request_data.get("accountId"), str)
+                and bool(request_data["accountId"])
+                and request_data["accountId"] == request_data["accountId"].strip()
+                and request_data.get("type") in _CTBC_MONTHS
+                and isinstance(response, dict)
+                and response.get("code") == "0000"
+                and isinstance(response_data, dict)
+                and isinstance(response_data.get("detailList"), list)
+            ):
+                return hit
         return None
 
     @staticmethod
-    def _fetch_qu002_011(page, template_url: str, template_body: dict,
-                         account_id: str, month_type: str, bearer: str) -> list:
-        """主動 POST qu002/011 (帶 Bearer + 套新 accountId/type) → 回 detailList.
-
-        page.evaluate 內 fetch() 走的是 page context, cookies 自帶 (SPA 同 origin),
-        Bearer 從 collector 攔到的 auth_token 帶上 → 過 interceptor 成功拿 JSON.
-
-        失敗 (HTTP 非 200 / 非 JSON / code != "0000" / 無 detailList) 一律 raise,
-        caller 接 except 寫進 errors[month].
-        """
+    def _fetch_qu002_011(
+        page,
+        template_url: str,
+        template_body: dict,
+        account_id: str,
+        month_type: str,
+        bearer: str,
+    ) -> list:
+        """Replay one owned CTBC month request with a bounded same-origin fetch."""
+        parsed = urlparse(template_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "www.ctbcbank.com"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != _CTBC_EBMW_PATH
+            or not isinstance(template_body, dict)
+            or template_body.get("resource") != "/twrbc-deposit/qu002/011"
+            or not isinstance(template_body.get("rqData"), dict)
+            or not isinstance(account_id, str)
+            or not account_id
+            or account_id != account_id.strip()
+            or not _valid_bearer(bearer)
+        ):
+            raise RuntimeError("invalid-request")
         post_body = _build_qu002_011_post_body(account_id, month_type, template_body)
-        # 用 JSON.stringify 在 JS 端建 body, 避免 Python f-string 對 JSON 內字串引號轉義踩雷
-        # post_body 用 json.dumps 轉成 str, 在 JS 端 JSON.parse 還原為 object
-        body_json = json.dumps(post_body)
-        url_json = json.dumps(template_url)
-        bearer_json = json.dumps(bearer)
-        js = f"""
-        (async () => {{
-            const url = {url_json};
-            const body = {body_json};
-            const bearer = {bearer_json};
-            const resp = await fetch(url, {{
-                method: 'POST',
-                headers: {{
-                    'content-type': 'application/json',
-                    'authorization': bearer,
-                }},
-                credentials: 'include',
-                body: JSON.stringify(body),
-            }});
-            if (!resp.ok) return {{__error__: 'http_' + resp.status}};
-            const ct = resp.headers.get('content-type') || '';
-            if (!ct.includes('json')) return {{__error__: 'non_json'}};
-            const data = await resp.json();
-            if (data.code !== '0000') return {{__error__: 'code_' + data.code}};
-            const rs = data.rsData || {{}};
-            return rs.detailList || [];
-        }})()
-        """
-        result = page.evaluate(js)
-        if isinstance(result, dict) and result.get("__error__"):
-            raise RuntimeError(str(result["__error__"]))
-        if not isinstance(result, list):
-            raise RuntimeError(f"unexpected_result_type_{type(result).__name__}")
-        return result
+        script = """async (payload) => {
+          if (location.protocol !== 'https:' || location.hostname !== 'www.ctbcbank.com'
+              || !['', '443'].includes(location.port)) {
+            throw new Error('ctbc-origin-mismatch');
+          }
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 30000);
+          try {
+            const response = await fetch(payload.url, {
+              method: 'POST', credentials: 'include', redirect: 'error',
+              signal: controller.signal,
+              headers: {
+                'content-type': 'application/json',
+                'authorization': payload.bearer,
+              },
+              body: JSON.stringify(payload.body),
+            });
+            let json = null;
+            try { json = await response.json(); } catch (_) {}
+            return {
+              status: response.status,
+              url: response.url,
+              redirected: response.redirected,
+              contentType: response.headers.get('content-type') || '',
+              json,
+            };
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        }"""
+        result = page.evaluate(script, {
+            "url": template_url,
+            "body": post_body,
+            "bearer": bearer,
+        })
+        response = result.get("json") if isinstance(result, dict) else None
+        raw_content_type = result.get("contentType") if isinstance(result, dict) else None
+        media_type = (
+            raw_content_type.split(";", 1)[0].strip().lower()
+            if isinstance(raw_content_type, str)
+            else ""
+        )
+        if (
+            not isinstance(result, dict)
+            or type(result.get("status")) is not int
+            or not 200 <= result["status"] < 300
+            or result.get("url") != template_url
+            or result.get("redirected") is not False
+            or not (
+                media_type == "application/json"
+                or re.fullmatch(
+                    r"application/[!#$%&'*+.^_`|~0-9A-Za-z-]+\+json",
+                    media_type,
+                ) is not None
+            )
+            or not isinstance(response, dict)
+            or response.get("code") != "0000"
+            or not isinstance(response.get("rsData"), dict)
+            or not isinstance(response["rsData"].get("detailList"), list)
+        ):
+            raise RuntimeError("invalid-response")
+        response_data = response["rsData"]
+        detail_list = response_data["detailList"]
+        if (
+            response_data.get("accountId") != account_id
+            or response_data.get("type") != month_type
+        ):
+            raise RuntimeError("ownership-mismatch")
+        for key in ("hasNext", "hasMore", "moreData", "nextPage", "nextToken"):
+            if response_data.get(key) not in (None, False, "", 0, "0"):
+                raise RuntimeError("pagination-detected")
+        page_values = [
+            response_data[key] for key in ("totalPages", "pageCount")
+            if key in response_data
+        ]
+        no_next_values = [
+            response_data[key] for key in ("hasNext", "hasMore", "moreData")
+            if key in response_data
+        ]
+        if not page_values and not no_next_values:
+            raise RuntimeError("missing-pagination-proof")
+        if any(
+            type(value) is not int or value != 1
+            for value in page_values
+        ) or any(value is not False for value in no_next_values):
+            raise RuntimeError("pagination-detected")
+        count_values = [
+            response_data[key] for key in ("count", "totalCount")
+            if key in response_data
+        ]
+        if not count_values or any(
+            type(value) is not int or value != len(detail_list)
+            for value in count_values
+        ):
+            raise RuntimeError("count-mismatch")
+        return detail_list
 
     def _goto_twd_deposit(self, page):
         """點首頁「臺幣存款」A.link 進存款頁（觸發 /twrbc-deposit/qu001/010）。"""
