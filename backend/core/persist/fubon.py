@@ -5,11 +5,36 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 from backend.core import classify
 from backend.core.store import BankStore
 from backend.core.persist._common import _num_to_float, _slash_date_to_iso
+
+
+_FUBON_MONEY_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$")
+
+
+def _strict_fubon_money(value: str, *, optional: bool, non_negative: bool) -> int | None:
+    raw = value.strip()
+    if optional and raw in {"", "-"}:
+        return None
+    if not _FUBON_MONEY_RE.fullmatch(raw):
+        raise ValueError("invalid Fubon TWD amount")
+    try:
+        amount = Decimal(raw.replace(",", ""))
+    except InvalidOperation:
+        raise ValueError("invalid Fubon TWD amount") from None
+    if (
+        not amount.is_finite()
+        or amount != amount.to_integral_value()
+        or amount < Decimal("-2147483648")
+        or amount > Decimal("2147483647")
+        or non_negative and amount < 0
+    ):
+        raise ValueError("invalid Fubon TWD amount")
+    return int(amount)
 
 
 def _fubon_date(value: str | None) -> str | None:
@@ -156,7 +181,50 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
     for result in results or []:
         if not isinstance(result, dict):
             continue
-        text = result.get("text") or ""
+        snapshot = result.get("snapshot")
+        if isinstance(snapshot, dict) and "gridRows" in snapshot:
+            grid_rows = snapshot.get("gridRows")
+            if not isinstance(grid_rows, list) or any(
+                not isinstance(cells, list)
+                or any(not isinstance(cell, str) for cell in cells)
+                for cells in grid_rows
+            ):
+                raise ValueError("invalid Fubon TWD structured rows")
+            for cells in grid_rows:
+                if len(cells) != 7:
+                    raise ValueError("invalid Fubon TWD structured row")
+                account_date = _slash_date_to_iso(cells[0].lstrip("*"))
+                try:
+                    txn_datetime = datetime.strptime(cells[1], "%Y/%m/%d %H:%M:%S")
+                except ValueError:
+                    raise ValueError("invalid Fubon TWD structured row") from None
+                desc = cells[2].strip()
+                expend = _strict_fubon_money(cells[3], optional=True, non_negative=True)
+                income = _strict_fubon_money(cells[4], optional=True, non_negative=True)
+                balance = _strict_fubon_money(cells[5], optional=False, non_negative=False)
+                if (
+                    account_date is None
+                    or not desc
+                    or (expend is None) == (income is None)
+                    or any(not isinstance(cell, str) for cell in cells[6:])
+                ):
+                    raise ValueError("invalid Fubon TWD structured row")
+                memo = cells[6].strip() if len(cells) > 6 and cells[6].strip() else None
+                rows.append({
+                    "account_no": result.get("account_no"),
+                    "datetime": txn_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                    "account_date": account_date,
+                    "desc": desc,
+                    "expend": expend,
+                    "income": income,
+                    "balance": balance,
+                    "counterparty_bank": None,
+                    "counterparty_acct": memo[:30] if memo else None,
+                    "memo": memo,
+                })
+            continue
+        else:
+            text = result.get("text") or ""
         if not text or "查無" in text and not re.search(r"\d{4}/\d{1,2}/\d{1,2}", text):
             continue
         account_no = result.get("account_no")
@@ -258,6 +326,118 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
                 "memo": memo,
             })
     return rows
+
+
+def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
+    coverage = data.get("history_coverage")
+    if coverage is None:
+        return None
+    domains = coverage.get("domains")
+    if not isinstance(domains, list) or len(domains) != 1:
+        raise ValueError("invalid Fubon TWD history coverage")
+    domain = domains[0]
+    if not isinstance(domain, dict) or domain.get("domain") != "twd_transactions":
+        raise ValueError("invalid Fubon TWD history coverage")
+    expected = domain.get("expected")
+    windows = domain.get("windows")
+    results = data.get("deposit_txn_results")
+    if (
+        not isinstance(expected, list)
+        or not isinstance(windows, list)
+        or not isinstance(results, list)
+    ):
+        raise ValueError("invalid Fubon TWD history coverage")
+    expected_ids = [item.get("identity") for item in expected if isinstance(item, dict)]
+    if not expected or len(expected_ids) != len(expected) or len(set(expected_ids)) != len(expected_ids):
+        raise ValueError("invalid Fubon TWD history identities")
+    accounts = data.get("accounts")
+    if not isinstance(accounts, list):
+        raise ValueError("invalid Fubon TWD inventory")
+    account_ids = set()
+    for account in accounts:
+        if (
+            not isinstance(account, dict)
+            or set(account) != {"account_no", "currency", "type", "name"}
+            or not isinstance(account.get("account_no"), str)
+            or not re.fullmatch(r"\d{14}", account["account_no"])
+            or account.get("currency") != "TWD"
+            or account.get("type") != "deposit"
+            or account.get("name") != "台幣存款"
+            or account["account_no"] in account_ids
+        ):
+            raise ValueError("invalid Fubon TWD inventory")
+        account_ids.add(account["account_no"])
+    if account_ids != set(expected_ids):
+        raise ValueError("Fubon TWD inventory does not match coverage")
+    result_by_key = {}
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("invalid Fubon TWD history result")
+        key = (result.get("account_no"), result.get("start"), result.get("end"))
+        if key in result_by_key:
+            raise ValueError("duplicate Fubon TWD history result")
+        result_by_key[key] = result
+    window_keys = []
+    parsed = []
+    from backend.banks.fubon import FubonCrawler, _fubon_history_windows
+
+    for window in windows:
+        if not isinstance(window, dict):
+            raise ValueError("invalid Fubon TWD history window")
+        key = (window.get("identity"), window.get("start"), window.get("end"))
+        window_keys.append(key)
+        result = result_by_key.get(key)
+        if result is None:
+            raise ValueError("missing Fubon TWD history result")
+        try:
+            receipt = FubonCrawler._validated_twd_history_result(result)
+        except RuntimeError:
+            raise ValueError("invalid Fubon TWD history result") from None
+        if receipt != window:
+            raise ValueError("Fubon TWD result does not match coverage")
+        rows = _parse_fubon_deposit_txn_results([result])
+        if len(rows) != result["snapshot"]["gridRowCount"]:
+            raise ValueError("incomplete Fubon TWD history result")
+        start = date.fromisoformat(window["start"])
+        end = date.fromisoformat(window["end"])
+        try:
+            valid_rows = all(
+                row.get("account_no") == window["identity"]
+                and start <= date.fromisoformat(row["datetime"][:10]) <= end
+                and start <= date.fromisoformat(row["account_date"]) <= end
+                for row in rows
+            )
+        except (TypeError, ValueError):
+            valid_rows = False
+        if not valid_rows:
+            raise ValueError("invalid Fubon TWD history row provenance")
+        parsed.extend(rows)
+    if len(window_keys) != len(set(window_keys)) or set(window_keys) != set(result_by_key):
+        raise ValueError("mismatched Fubon TWD history windows")
+    mode = coverage.get("mode")
+    for identity in expected_ids:
+        identity_keys = sorted(key for key in window_keys if key[0] == identity)
+        presets = [result_by_key[key].get("preset") for key in identity_keys]
+        if presets == ["rdoDay180_365", "rdoDay180"]:
+            try:
+                native = _fubon_history_windows(date.fromisoformat(identity_keys[-1][2]))
+            except (TypeError, ValueError):
+                raise ValueError("invalid Fubon TWD native windows") from None
+            if [
+                (item["start"], item["end"], item["preset"])
+                for item in native
+            ] != [
+                (key[1], key[2], result_by_key[key].get("preset"))
+                for key in identity_keys
+            ]:
+                raise ValueError("invalid Fubon TWD native windows")
+            continue
+        if mode == "incremental" and presets == ["rdoDay180"]:
+            native = _fubon_history_windows(date.fromisoformat(identity_keys[0][2]))[1]
+            if (identity_keys[0][1], identity_keys[0][2]) == (native["start"], native["end"]):
+                continue
+        raise ValueError("Fubon TWD presets do not match coverage")
+    return parsed
 
 
 def _parse_fubon_credit_card(data: dict) -> dict:
@@ -528,6 +708,7 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         card_pending_txns (未出帳單消費明細, scope='realtime')
         daily_metrics × 4 (limits/billing_summary/points/endpoints)
     """
+    validated_twd_rows = _validated_fubon_twd_results_for_coverage(data)
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {"bank": "fubon", "scope": "structured"}
 
@@ -537,19 +718,28 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
     deposit_audit = data.get("deposit_menu_audit") or []
     delta["telemetry"] = {
         "deposit_menu_audit_count": len(deposit_audit),
-        "deposit_menu_audit_sample": deposit_audit[:20],  # 上限避免 row 爆
         "cards_page_text_len": len(data.get("cards_page_text") or ""),
         "amount_page_text_len": len(data.get("amount_page_text") or ""),
         "deposit_page_text_len": len(data.get("deposit_page_text") or ""),
-        "deposit_page_url": data.get("deposit_page_url"),
-        "initial_url": data.get("initial_url"),
-        "final_url": data.get("final_url"),
     }
 
     # Step 7 (2026-06-18): parse 我的存款 (CBOQU003_Home.faces) 帳戶 row → accounts.
     # 之前 collector 完全沒走 deposit path, accounts:0 是 by-design gap.
     # 修法 commit 後 collect Step 7 dump deposit_page_text, 這裡 parse 後 upsert.
     deposit_accounts = _parse_fubon_deposit_accounts(data.get("deposit_page_text") or "")
+    if validated_twd_rows is not None:
+        authoritative = {item["account_no"]: item for item in data["accounts"]}
+        parsed_by_number = {
+            item["account_no"]: item
+            for item in deposit_accounts
+            if item.get("currency") != "TWD" or item.get("account_no") in authoritative
+        }
+        for account_no, account in authoritative.items():
+            legacy = parsed_by_number.get(account_no, {})
+            if legacy.get("currency") != "TWD":
+                legacy = {}
+            parsed_by_number[account_no] = {**legacy, **account}
+        deposit_accounts = list(parsed_by_number.values())
     if deposit_accounts:
         # account_classify 補 product_type (跟 cathay 同 pattern)
         from backend.core import account_classify
@@ -650,7 +840,11 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         fetch_ok=bool(parsed.get("pending_page_ok")))
 
     # 富邦存款交易明細（CDSQU001）— collector 對每個帳戶送近 1 個月查詢。
-    twd_txn_rows = _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])
+    twd_txn_rows = (
+        validated_twd_rows
+        if validated_twd_rows is not None
+        else _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])
+    )
     twd_new = store.upsert_twd_txns(twd_txn_rows, rules=rules) if twd_txn_rows else 0
 
     # daily_metrics 多段

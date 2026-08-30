@@ -30,16 +30,20 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import sys
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
+from zoneinfo import ZoneInfo
 
 from scrapling.fetchers import StealthySession
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector, validate_history_coverage
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import TaipeiFubonCreds
@@ -52,6 +56,7 @@ from backend.core.login_checkpoints import (
 )
 
 BASE = "https://ebank.taipeifubon.com.tw/B2C/common/Index.faces"
+TWD_HISTORY_URL = "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
 PRE_LOGIN_HINT = "PreLogin.faces"
 HEADER_LOGIN_BTN_ID = "header_form:header_login"  # 在 frame1，右上「登入」開 modal
 GENERAL_LOGIN_TAB = "一般登入"
@@ -60,10 +65,55 @@ LOGIN_BTN_ID = "btnLogin2"  # 一般登入 form 的登入鈕（txnFrame 內）
 FIELD_M1_CAPTCHA     = "m1_userCaptcha"  # 6 碼純數字
 CAPTCHA_IMG_ID       = "m1_captchaImage"  # 158×30 captcha img
 _DYNAMIC_LOGIN_FIELD_ID = re.compile(r"^m1_[A-Z]{10}$")
+_FUBON_OPTION_VALUE_RE = re.compile(r"^012-\d{3}-(\d{14})-[A-Z]-TW$")
+
+
+def _fubon_one_year_floor(end: date) -> date:
+    year = end.year - 1
+    return date(year, end.month, min(end.day, monthrange(year, end.month)[1]))
+
+
+def _fubon_history_windows(as_of: date) -> list[dict]:
+    recent_start = as_of - timedelta(days=180)
+    return [
+        {"preset": "rdoDay180_365", "start": _fubon_one_year_floor(as_of).isoformat(), "end": (recent_start - timedelta(days=1)).isoformat()},
+        {"preset": "rdoDay180", "start": recent_start.isoformat(), "end": as_of.isoformat()},
+    ]
+
+
+def _validated_fubon_twd_options(options) -> list[dict]:
+    if not isinstance(options, list) or not options:
+        raise ValueError("invalid Fubon TWD inventory")
+    validated, seen_identities, seen_values = [], set(), set()
+    for position, option in enumerate(options):
+        if not isinstance(option, dict):
+            raise ValueError("invalid Fubon TWD inventory")
+        text, value, index = option.get("text"), option.get("value"), option.get("index")
+        if position == 0 and index == 0 and text == "==請選擇==" and value in {"none", "_none"}:
+            continue
+        identities = re.findall(r"(?<!\d)\d{10,16}(?!\d)", text or "")
+        value_match = _FUBON_OPTION_VALUE_RE.fullmatch(value) if isinstance(value, str) else None
+        canonical_value = len(identities) == 1 and value_match is not None and identities[0] == value_match.group(1)
+        if (type(index) is not int or index != position or not isinstance(text, str)
+                or not canonical_value or value in seen_values
+                or identities[0] in seen_identities):
+            raise ValueError("invalid Fubon TWD inventory")
+        seen_identities.add(identities[0])
+        seen_values.add(value)
+        validated.append({**option, "identity": identities[0]})
+    if not validated:
+        raise ValueError("invalid Fubon TWD inventory")
+    return validated
 
 
 def _log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def bounded_evaluate(scope, expression: str, arg=None):
+    return getattr(scope.locator("html"), "evaluate")(
+        f"(root, arg) => ({expression})(arg)", arg, timeout=5000,
+    )
 
 
 def _safe_url(value: object) -> str:
@@ -114,11 +164,156 @@ def _fubon_card_bill_fact(amount_text: str):
 
 class FubonCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     CREDENTIAL_HOSTS = frozenset({"ebank.taipeifubon.com.tw"})
 
     def __init__(self):
         super().__init__(name="fubon")
         self.creds = TaipeiFubonCreds.load()
+
+    def _history_windows(self, identity: str, as_of: date) -> list[dict]:
+        full = _fubon_history_windows(as_of)
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        cursor = self.transaction_start_for(identity, domain="twd_transactions")
+        if mode == "full" or cursor is None:
+            return full
+        return full[1:] if cursor >= date.fromisoformat(full[1]["start"]) else full
+
+    @staticmethod
+    def _validated_twd_history_result(result: dict) -> dict:
+        if not isinstance(result, dict):
+            raise RuntimeError("fubon-twd-history-result")
+        identity, account_value = result.get("account_no"), result.get("account_value")
+        preset, start, end = result.get("preset"), result.get("start"), result.get("end")
+        status, snapshot, transport = result.get("status"), result.get("snapshot"), result.get("transport")
+        if not isinstance(start, str) or not isinstance(end, str):
+            raise RuntimeError("fubon-twd-history-result")
+        try:
+            start_day, end_day = date.fromisoformat(start), date.fromisoformat(end)
+            parsed_url = urlsplit(result.get("url") or "")
+        except (TypeError, ValueError):
+            raise RuntimeError("fubon-twd-history-result") from None
+        if (
+            not isinstance(identity, str)
+            or not re.fullmatch(r"\d{10,16}", identity)
+            or not isinstance(account_value, str)
+            or (value_match := _FUBON_OPTION_VALUE_RE.fullmatch(account_value)) is None
+            or value_match.group(1) != identity
+            or preset not in {"rdoDay180_365", "rdoDay180"}
+            or start_day > end_day
+            or status not in {"complete", "explicit_empty"}
+            or parsed_url.scheme != "https"
+            or parsed_url.hostname != "ebank.taipeifubon.com.tw"
+            or parsed_url.port not in (None, 443)
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+            or parsed_url.path != "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+            or not isinstance(transport, dict)
+            or set(transport) != {
+                "status", "contentType", "responseCount", "frameBound", "presetBound",
+                "fieldsBound", "viewStateBound", "actionBound", "formBound",
+            }
+            or type(transport.get("status")) is not int
+            or transport.get("status") != 200
+            or transport.get("contentType") != "text/plain"
+            or type(transport.get("responseCount")) is not int
+            or transport.get("responseCount") != 1
+            or transport.get("frameBound") is not True
+            or transport.get("presetBound") is not True
+            or transport.get("fieldsBound") is not True
+            or transport.get("viewStateBound") is not True
+            or transport.get("actionBound") is not True
+            or transport.get("formBound") is not True
+            or not isinstance(snapshot, dict)
+            or snapshot.get("evidenceFresh") is not True
+            or snapshot.get("busy") is not False
+            or snapshot.get("failed") is not False
+            or snapshot.get("selectedValue") != account_value
+            or snapshot.get("selectedIdentity") != identity
+            or snapshot.get("selectedPreset") != preset
+            or snapshot.get("windowBound") is not True
+            or snapshot.get("resultContainerBound") is not True
+            or snapshot.get("displayedStart") != start
+            or snapshot.get("displayedEnd") != end
+        ):
+            raise RuntimeError("fubon-twd-history-result")
+        pager = snapshot.get("pager")
+        if (
+            not isinstance(pager, dict)
+            or set(pager) != {"present", "actionableNext"}
+            or pager.get("present") is not False
+            or type(pager.get("actionableNext")) is not int
+            or pager["actionableNext"] != 0
+        ):
+            raise RuntimeError("fubon-twd-history-result")
+        rows, row_count = snapshot.get("gridRows"), snapshot.get("gridRowCount")
+        total_count, raw_count = snapshot.get("totalCount"), snapshot.get("rawDataRowCount")
+        grid_count = snapshot.get("gridCandidateCount")
+        if (
+            not isinstance(rows, list)
+            or type(row_count) is not int
+            or type(total_count) is not int
+            or type(raw_count) is not int
+            or type(grid_count) is not int
+            or type(snapshot.get("hiddenGridCount")) is not int
+            or snapshot.get("hiddenGridCount") != 0
+            or type(snapshot.get("pagerNodeCount")) is not int
+            or snapshot.get("pagerNodeCount") != 0
+            or type(snapshot.get("structuralErrorCount")) is not int
+            or snapshot.get("structuralErrorCount") != 0
+            or type(snapshot.get("nativeTotalMarkerCount")) is not int
+            or len(rows) != row_count
+            or total_count != raw_count
+            or raw_count != row_count
+            or type(snapshot.get("malformedRowCount")) is not int
+            or snapshot.get("malformedRowCount") != 0
+            or type(snapshot.get("hiddenRowCount")) is not int
+            or snapshot.get("hiddenRowCount") != 0
+            or type(snapshot.get("hiddenCellCount")) is not int
+            or snapshot.get("hiddenCellCount") != 0
+        ):
+            raise RuntimeError("fubon-twd-history-result")
+        if status == "complete":
+            dates = []
+            try:
+                for cells in rows:
+                    if not isinstance(cells, list):
+                        raise ValueError
+                    matched = [
+                        match.group(1)
+                        for cell in cells
+                        if isinstance(cell, str)
+                        if (match := re.fullmatch(r"\*?(20\d{2}/\d{1,2}/\d{1,2})", cell))
+                    ]
+                    if len(matched) != 1:
+                        raise ValueError
+                    dates.append(date.fromisoformat(matched[0].replace("/", "-")))
+            except (TypeError, ValueError):
+                raise RuntimeError("fubon-twd-history-result") from None
+            if (
+                snapshot.get("hasGrid") is not True
+                or snapshot.get("nativeTotalFound") is not True
+                or snapshot.get("nativeTotalMarkerCount") != 1
+                or grid_count != 1
+                or row_count <= 0
+                or snapshot.get("emptyMarker") is not None
+                or any(day < start_day or day > end_day for day in dates)
+            ):
+                raise RuntimeError("fubon-twd-history-result")
+        elif (
+            snapshot.get("hasGrid") is not False
+            or snapshot.get("nativeTotalMarkerCount") != 0
+            or grid_count != 0
+            or rows != []
+            or row_count != 0
+            or snapshot.get("gridText") != ""
+            or snapshot.get("emptyMarker") not in {"查無相關資料", "查無交易資料"}
+        ):
+            raise RuntimeError("fubon-twd-history-result")
+        return {"identity": identity, "start": start, "end": end, "status": status, "pages": 1}
 
     def _execute_browser_flow(
         self,
@@ -510,6 +705,291 @@ class FubonCrawler(BankCrawler):
         except Exception:
             raise FubonLoginError("登入後狀態無法安全確認；禁止自動重試") from None
 
+    def _fubon_content_frame(self, page, *routes):
+        matches = {}
+        for candidate in page.frames:
+            parsed = urlsplit(candidate.url or "")
+            path = parsed.path
+            if (
+                self._is_owned_frame(page, candidate)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and any(path == route for route in routes)
+            ):
+                matches[id(candidate)] = candidate
+        if len(matches) != 1:
+            raise RuntimeError("fubon-twd-history-frame")
+        return next(iter(matches.values()))
+
+    def _open_twd_query(self, page):
+        page.goto(
+            "https://ebank.taipeifubon.com.tw/B2C/cgequ/cgequ001/CGEQU001_Home.faces",
+            wait_until="domcontentloaded", timeout=15000,
+        )
+        page.wait_for_timeout(5000)
+        frame = self._fubon_content_frame(page, "/B2C/cgequ/cgequ001/CGEQU001_Home.faces")
+        clicked = bounded_evaluate(frame, r"""() => {
+            const links = [...document.querySelectorAll('a.task_CDSQU001.menu_CDS0401')]
+                .filter((a) => (a.textContent || '').trim() === '臺外幣交易明細查詢');
+            if (links.length !== 1) return {ok:false, count:links.length};
+            links[0].click(); return {ok:true};
+        }""")
+        if clicked != {"ok": True}:
+            raise RuntimeError("fubon-twd-history-navigation")
+        page.wait_for_timeout(8000)
+        return self._fubon_content_frame(page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces")
+
+    @staticmethod
+    def _capture_twd_response(
+        response, hits: list[dict], expected_frame, preset: str,
+        expected_view_state: str, expected_action: str, form_bound: bool,
+    ) -> None:
+        try:
+            parsed = urlsplit(response.url or "")
+            request = response.request
+            fields = parse_qsl(request.post_data or "", keep_blank_values=True)
+            names = [key for key, _value in fields]
+            preset_values = [value for key, value in fields if key == "checkedConvenientPeriod"]
+            view_states = [value for key, value in fields if key == "javax.faces.ViewState"]
+            actions = [value for key, value in fields if key == "ajaxAction"]
+            if (
+                parsed.scheme == "https"
+                and parsed.hostname == "ebank.taipeifubon.com.tw"
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and parsed.path == "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+                and request.method == "POST"
+            ):
+                hits.append({
+                    "status": response.status,
+                    "contentType": (response.headers.get("content-type") or "").split(";", 1)[0].lower(),
+                    "frameBound": request.frame is expected_frame,
+                    "presetBound": preset_values == [preset],
+                    "fieldsBound": sorted(names) == ["ajaxAction", "checkedConvenientPeriod", "javax.faces.ViewState"],
+                    "viewStateBound": view_states == [expected_view_state],
+                    "actionBound": actions == [expected_action],
+                    "formBound": form_bound is True,
+                })
+        except Exception:
+            return
+
+    def _bound_twd_result_frame(self, page, submit_frame):
+        result_frame = self._fubon_content_frame(
+            page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces",
+        )
+        if result_frame is not submit_frame:
+            raise RuntimeError("fubon-twd-history-result-frame")
+        return result_frame
+
+    def _collect_twd_window(self, page, frame, option: dict, window: dict) -> tuple[dict, dict]:
+        controls = bounded_evaluate(frame, r"""(args) => {
+            const forms=[...document.querySelectorAll('form#form1')];
+            if(forms.length!==1)return {ok:false};
+            const form=forms[0];
+            const one = (s) => { const xs=[...document.querySelectorAll(s)]; return xs.length===1&&form.contains(xs[0]) ? xs[0] : null; };
+            const account=one('#form1\\:comboAccount'), detail=one('#form1\\:rdoTxDetail');
+            const fast=one('#form1\\:rdoFast');
+            const preset=one(`#form1\\:${CSS.escape(args.preset)}`);
+            const states=[...document.querySelectorAll('[name="javax.faces.ViewState"]')];
+            const actions=[...document.querySelectorAll('[name="ajaxAction"]')];
+            const submit=one('#form1\\:doValidateAndSubmit');
+            let formAction='';
+            try{formAction=new URL(form.getAttribute('action')||form.action,location.href).href;}catch(_e){}
+            const formBound=form.method.toUpperCase()==='POST'&&formAction===args.formAction
+                &&states.length===1&&form.contains(states[0])&&actions.length===1&&form.contains(actions[0]);
+            if (!account || !detail || !fast || !preset
+                || !submit || !formBound || !states[0].value || !actions[0].value) return {ok:false};
+            account.value=args.value;
+            for (const n of ['input','change']) account['dispatch' + 'Event'](new Event(n,{bubbles:true}));
+            if (typeof comboAccountChange==='function') comboAccountChange();
+            if (typeof checkAccountType==='function') checkAccountType();
+            account['dispatch' + 'Event'](new Event('blur',{bubbles:true})); detail.click();
+            fast.click(); preset.click();
+            const selected=account.options[account.selectedIndex];
+            return {ok:true,value:selected?.value||'',text:(selected?.textContent||'').trim(),detail:detail.checked,
+                fast:fast.checked,preset:preset.checked,
+                viewState:states[0].value,ajaxAction:actions[0].value,formBound};
+        }""", {**window, "value": option["value"], "formAction": TWD_HISTORY_URL})
+        if (
+            not isinstance(controls, dict)
+            or controls.get("ok") is not True
+            or controls.get("value") != option["value"]
+            or re.findall(r"(?<!\d)\d{10,16}(?!\d)", controls.get("text") or "") != [option["identity"]]
+            or controls.get("detail") is not True
+            or controls.get("preset") is not True
+            or not isinstance(controls.get("viewState"), str)
+            or not controls["viewState"]
+            or not isinstance(controls.get("ajaxAction"), str)
+            or not controls["ajaxAction"]
+            or controls.get("formBound") is not True
+            or controls.get("fast") is not True
+        ):
+            raise RuntimeError("fubon-twd-history-controls")
+        marked = bounded_evaluate(frame, r"""() => {
+            const labels=new Set(['查無相關資料','查無交易資料']), evidence=[];
+            for (const table of document.querySelectorAll('table')) if (/帳務日期/.test(table.textContent||'') && /交易時間/.test(table.textContent||'')) evidence.push(table);
+            for (const el of document.querySelectorAll('*')) if (labels.has((el.textContent||'').trim())) evidence.push(el);
+            for (const el of new Set(evidence)) el.setAttribute('data-hermes-stale-evidence','1');
+            return new Set(evidence).size;
+        }""")
+        if type(marked) is not int:
+            raise RuntimeError("fubon-twd-history-stale-result")
+        hits = []
+        listener = lambda response: self._capture_twd_response(
+            response, hits, frame, window["preset"], controls["viewState"], controls["ajaxAction"],
+            controls["formBound"],
+        )
+        page.on("response", listener)
+        try:
+            frame.click("#form1\\:doValidateAndSubmit", timeout=8000)
+            page.wait_for_timeout(9000)
+            stable_ticks = 0
+            prior_count = len(hits)
+            for _ in range(120):
+                page.wait_for_timeout(100)
+                if not hits:
+                    continue
+                if len(hits) == prior_count:
+                    stable_ticks += 1
+                else:
+                    prior_count = len(hits)
+                    stable_ticks = 0
+                if stable_ticks >= 5:
+                    break
+            if len(hits) != 1 or stable_ticks < 5:
+                raise RuntimeError("fubon-twd-history-transport")
+        finally:
+            page.remove_listener("response", listener)
+        transport = {**hits[0], "responseCount": len(hits)}
+        if (
+            transport["status"] != 200
+            or transport["contentType"] != "text/plain"
+            or transport["frameBound"] is not True
+            or transport["presetBound"] is not True
+            or transport["fieldsBound"] is not True
+            or transport["viewStateBound"] is not True
+            or transport["actionBound"] is not True
+            or transport["formBound"] is not True
+        ):
+            raise RuntimeError("fubon-twd-history-transport")
+        result_frame = self._bound_twd_result_frame(page, frame)
+        snapshot = bounded_evaluate(result_frame, r"""(args) => {
+            const visible=(el)=>{const r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
+                for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0||n.hidden||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true')return false;}return true;};
+            const labels=new Set(['查無相關資料','查無交易資料']);
+            const empty=[...document.querySelectorAll('*')].filter(el=>visible(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
+            const headers=['帳務日期','交易時間','摘要','支出金額','存入金額','即時餘額','附註'];
+            const directRows=(table)=>[...table.querySelectorAll(':scope > tr,:scope > thead > tr,:scope > tbody > tr,:scope > tfoot > tr')];
+            const directCells=(row)=>[...row.querySelectorAll(':scope > th,:scope > td')];
+            const cellTexts=(row)=>directCells(row).map(c=>(c.textContent||'').trim().replaceAll('\u3000',''));
+            const isHeader=(row)=>{const values=cellTexts(row);return values.length===headers.length&&values.every((value,index)=>value===headers[index]);};
+            const allCandidates=[...document.querySelectorAll('table')].filter(table=>directRows(table).some(isHeader));
+            const candidates=allCandidates.filter(table=>{const header=directRows(table).find(isHeader);return visible(table)&&visible(header)&&directCells(header).every(visible);});
+            const hiddenGridCount=allCandidates.length-candidates.length;
+            const grid=candidates.length===1?candidates[0]:null, projected=[];
+            let rawDataRowCount=0, malformedRowCount=0, hiddenRowCount=0, hiddenCellCount=0;
+            if(grid){const rows=directRows(grid), headerAt=rows.findIndex(isHeader);
+                for(const row of rows.slice(headerAt+1)){const cells=[...row.querySelectorAll(':scope > th,:scope > td')], values=cellTexts(row);
+                    if(!values.some(Boolean))continue; rawDataRowCount++;
+                    if(!visible(row)){hiddenRowCount++;continue;} const hidden=cells.filter(c=>!visible(c)).length; hiddenCellCount+=hidden;
+                    const dates=values.filter(value=>/^\*?20\d{2}\/\d{1,2}\/\d{1,2}$/.test(value));
+                    if(hidden||values.length!==7||dates.length!==1){malformedRowCount++;continue;} projected.push(values);
+                }}
+            const pagerControls=[...document.querySelectorAll('a,button,input,select,[role="button"]')].filter(el=>{
+                const raw=(el.textContent||el.value||'').trim();
+                const pageNumber=/^\d{1,3}$/.test(raw)&&Number(raw)>1;
+                const meta=[el.textContent,el.value,el.title,el.getAttribute('aria-label'),el.getAttribute('rel'),el.getAttribute('href'),el.getAttribute('onclick'),el.id,el.getAttribute('class'),el.getAttribute('data-page')].filter(Boolean).join(' ');
+                return pageNumber||/(?:下一頁|下頁|next\s*page|page[-_: ]?next|pagenext|rel[=: ]?next|[?&]page=[2-9]\d*)/i.test(meta);
+            });
+            const pagerStructures=[...document.querySelectorAll('[class*="pagination" i],[class*="paginator" i],[id*="pagination" i],[id*="paginator" i],[aria-label*="pagination" i],[rel="next" i],[data-page]:not([data-page="1"])')];
+            const pagerNodes=[...new Set([...pagerControls,...pagerStructures])];
+            const account=[...document.querySelectorAll('select#form1\\:comboAccount')], selected=account.length===1?account[0].options[account[0].selectedIndex]:null;
+            const selectedIds=selected?(selected.textContent||'').match(/(?<!\d)\d{10,16}(?!\d)/g)||[]:[];
+            const preset=[...document.querySelectorAll(`#form1\\:${CSS.escape(args.preset)}`)];
+            const own=(el)=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE).map(n=>n.textContent||'').join(' ');
+            const periodContainers=[...new Set([...document.querySelectorAll('td,th,label,span,div,p')].filter(el=>visible(el)&&/查詢期間/.test(own(el))).map(el=>el.closest('tr')||el.parentElement||el))];
+            const period=periodContainers.length===1?(periodContainers[0].innerText||''):'';
+            const evidence=grid||(empty.length===1?empty[0]:null);
+            let resultContainer=periodContainers.length===1?evidence:null;
+            while(resultContainer&&!resultContainer.contains(periodContainers[0]))resultContainer=resultContainer.parentElement;
+            const resultContainerBound=!!resultContainer&&!['HTML','BODY','FORM'].includes(resultContainer.tagName);
+            const canonical=(raw)=>{const parts=raw.replaceAll('-','/').split('/').map(Number);return `${parts[0]}-${String(parts[1]).padStart(2,'0')}-${String(parts[2]).padStart(2,'0')}`;};
+            const displayed=(period.match(/20\d{2}[\/-]\d{1,2}[\/-]\d{1,2}/g)||[]).map(canonical);
+            const displayedStart=displayed.length===2?displayed[0]:'';
+            const displayedEnd=displayed.length===2?displayed[1]:'';
+            const windowBound=displayedStart===args.start&&displayedEnd===args.end;
+            const text=document.body?.innerText||'';
+            const totalAdjacentToGrid=(el)=>{
+                if(!grid)return false;
+                let node=el;
+                while(node.parentElement&&node.parentElement!==grid.parentElement)node=node.parentElement;
+                if(node.parentElement!==grid.parentElement)return false;
+                const siblings=[...grid.parentElement.children];
+                return Math.abs(siblings.indexOf(node)-siblings.indexOf(grid))===1;
+            };
+            const nativeTotalMarkers=resultContainerBound?[resultContainer,...resultContainer.querySelectorAll('td,th,label,span,div,p')].map(el=>({el,match:visible(el)?own(el).match(/^\s*共\s*([\d,]+)\s*筆\s*$/):null})).filter(item=>item.match):[];
+            const nativeTotals=nativeTotalMarkers.length===1&&totalAdjacentToGrid(nativeTotalMarkers[0].el)?[Number(nativeTotalMarkers[0].match[1].replaceAll(',',''))].filter(Number.isSafeInteger):[];
+            const nativeTotalFound=nativeTotals.length===1;
+            const totalCount=nativeTotalFound?nativeTotals[0]:(empty.length===1?0:-1);
+            const busyText=/(?:資料(?:載入|查詢|處理)中|載入中|查詢中|處理中|請稍候|請稍待|系統忙碌|system is busy|loading|processing|querying|waiting|\bbusy\b)/i.test(text);
+            const busy=busyText||[document.documentElement,...document.querySelectorAll('*')].some(el=>visible(el)&&((el.getAttribute('aria-busy')||'').toLowerCase()==='true'||(el.getAttribute('role')||'').toLowerCase()==='progressbar'||el.tagName.toLowerCase()==='progress'||/(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([el.id,el.getAttribute('class')].filter(Boolean).join(' '))));
+            const structuralErrors=[...document.querySelectorAll('.error,.errorMessage,.alert,.ui-message-error,.ui-messages-error,[role="alert"],dialog,[role="dialog"],[aria-invalid="true"]')].filter(visible);
+            const failed=structuralErrors.length>0||/(?:錯誤|失敗|異常|逾時|失效|重新登入|請重新查詢|請稍後再試|連線中斷|連線失敗|無法處理|system error|\berror\b|timeout|expired|failed|retry|try again|disconnected)/i.test(text);
+            return {href:location.href,failed,busy,selectedValue:selected?.value||'',selectedIdentity:selectedIds.length===1?selectedIds[0]:'',selectedPreset:preset.length===1&&preset[0].checked?args.preset:'',windowBound,resultContainerBound,displayedStart,displayedEnd,evidenceFresh:grid?!grid.hasAttribute('data-hermes-stale-evidence'):empty.length===1&&!empty[0].hasAttribute('data-hermes-stale-evidence'),hasGrid:!!grid,gridCandidateCount:candidates.length,hiddenGridCount,pagerNodeCount:pagerNodes.length,structuralErrorCount:structuralErrors.length,gridRows:projected,gridRowCount:projected.length,rawDataRowCount,malformedRowCount,hiddenRowCount,hiddenCellCount,totalCount,nativeTotalFound,nativeTotalMarkerCount:nativeTotalMarkers.length,gridText:grid?'structured':'',emptyMarker:empty.length===1?(empty[0].textContent||'').trim():null,pager:{present:pagerNodes.length>0,actionableNext:pagerNodes.length}};
+        }""", {"identity": option["identity"], "preset": window["preset"], "start": window["start"], "end": window["end"]})
+        if not isinstance(snapshot, dict) or snapshot.get("failed") is not False:
+            raise RuntimeError("fubon-twd-history-result")
+        result = {
+            "account_no": option["identity"],
+            "account_value": option["value"],
+            "preset": window["preset"],
+            "start": window["start"],
+            "end": window["end"],
+            "status": "complete" if snapshot.get("hasGrid") else "explicit_empty",
+            "url": snapshot.pop("href", ""),
+            "transport": transport,
+            "snapshot": snapshot,
+        }
+        return result, self._validated_twd_history_result(result)
+
+    def _collect_attested_twd_history(self, page) -> dict:
+        query_frame = self._open_twd_query(page)
+        raw_options = bounded_evaluate(query_frame, r"""() => {
+            const forms=[...document.querySelectorAll('form#form1')];
+            const xs=[...document.querySelectorAll('select#form1\\:comboAccount')];
+            if(forms.length!==1||xs.length!==1||!forms[0].contains(xs[0]))return null;
+            return [...xs[0].options].map((option,index)=>({index,value:option.value||'',text:(option.textContent||'').trim()}));
+        }""")
+        try:
+            options = _validated_fubon_twd_options(raw_options)
+        except ValueError:
+            raise RuntimeError("fubon-twd-history-inventory") from None
+        as_of = datetime.now(ZoneInfo("Asia/Taipei")).date()
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        expected, receipts, results = [], [], []
+        for option in options:
+            windows = self._history_windows(option["identity"], as_of)
+            expected.append({"identity": option["identity"], "start": windows[0]["start"], "end": windows[-1]["end"]})
+            for window in windows:
+                result, receipt = self._collect_twd_window(page, self._open_twd_query(page), option, window)
+                results.append(result); receipts.append(receipt)
+        coverage = {"version": 1, "mode": mode, "domains": [{"domain": "twd_transactions", "expected": expected, "windows": receipts}]}
+        validate_history_coverage(coverage, expected_mode=mode, expected_domains=self.HISTORY_COVERAGE_DOMAINS)
+        accounts = [
+            {"account_no": option["identity"], "currency": "TWD", "type": "deposit", "name": "台幣存款"}
+            for option in options
+        ]
+        return {
+            "accounts": accounts,
+            "deposit_txn_results": results,
+            "history_coverage": coverage,
+        }
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """富邦 collect：信用卡 menu 在 txnFrame (CGEQU001_Home) carousel 全渲染。
 
@@ -527,14 +1007,19 @@ class FubonCrawler(BankCrawler):
             )
 
         out: dict = {}
-        page.wait_for_timeout(8000)
+        def finish() -> BankCollectResult:
+            out["final_url"] = page.url
+            out["_all_endpoints"] = sorted({hit.endpoint for hit in collector.hits if hit.resp_json})
+            publish_card_bill_facts(out, [_fubon_card_bill_fact(out.get("amount_page_text") or "")])
+            return BankCollectResult(**out)
 
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "fubon_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
+        out.update(self._collect_attested_twd_history(page))
+        page.goto(
+            "https://ebank.taipeifubon.com.tw/B2C/cgequ/cgequ001/CGEQU001_Home.faces",
+            wait_until="domcontentloaded", timeout=15000,
+        )
+        page.wait_for_timeout(5000)
 
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "00_home.png"), full_page=True)
         out["initial_url"] = page.url
 
         # === Step 1: 找 txnFrame (內容區，含 carousel mega menu) ===
@@ -547,8 +1032,7 @@ class FubonCrawler(BankCrawler):
                 break
         _log(f"[fubon][collect] content_frame={'OK' if content_frame else 'MISS'}")
         if not content_frame:
-            out["error"] = "txnFrame_not_found"
-            return BankCollectResult(**out)
+            return finish()
 
         # === Step 2: 在 txnFrame 找信用卡相關子項 (carousel 全渲染，offscreen 也存在) ===
         # 優先序：直接走「我的信用卡」進信用卡頁，或「帳務/繳款」進帳單查詢
@@ -607,8 +1091,7 @@ class FubonCrawler(BankCrawler):
         _log(f"[fubon][collect] [TELEMETRY] 存款相關 menu 候選 {len(deposit_audit)} 條")
 
         if not candidates:
-            out["error"] = "no_credit_card_items"
-            return BankCollectResult(**out)
+            return finish()
 
         # === Step 3: 選最優先且 visible 的目標 ===
         # 富邦 menu 元素三種 tag: A (真正連結 href) / DIV (裝飾) / SPAN (icon)
@@ -692,8 +1175,6 @@ class FubonCrawler(BankCrawler):
             f"ok={bool(isinstance(click_result, dict) and click_result.get('ok'))}"
         )
         page.wait_for_timeout(6000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "02_after_click.png"), full_page=True)
 
         # === Step 4.5: txnFrame 切換後重新抓 frame（URL 已換）===
         # 點完 <A> 後 txnFrame 會 navigate 到 CCCQU001_Home.faces
@@ -749,8 +1230,6 @@ class FubonCrawler(BankCrawler):
             f"ok={bool(isinstance(bill_click, dict) and bill_click.get('ok'))}"
         )
         page.wait_for_timeout(6000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "03_after_bill_click.png"), full_page=True)
 
         # === Step 4.7: 再切回 txnFrame 確認 URL ===
         page.wait_for_timeout(2000)
@@ -788,8 +1267,6 @@ class FubonCrawler(BankCrawler):
             f"ok={bool(isinstance(billed_click, dict) and billed_click.get('ok'))}"
         )
         page.wait_for_timeout(6000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "04_after_billed.png"), full_page=True)
 
         # 切回 txnFrame 抓帳單明細頁 text
         page.wait_for_timeout(2000)
@@ -825,8 +1302,7 @@ class FubonCrawler(BankCrawler):
             f"ok={bool(isinstance(pending_click, dict) and pending_click.get('ok'))}"
         )
         page.wait_for_timeout(6000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "05_after_pending.png"), full_page=True)
+
         # 切回 txnFrame
         page.wait_for_timeout(2000)
         for f in page.frames:
@@ -924,8 +1400,6 @@ class FubonCrawler(BankCrawler):
                 f"ok={bool(isinstance(deposit_click, dict) and deposit_click.get('ok'))}"
             )
             page.wait_for_timeout(8000)
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(debug_dir / "06_after_deposit.png"), full_page=True)
 
             # 重新找 txnFrame (URL 應該換到 CBOQU003_Home.faces)
             page.wait_for_timeout(2000)
@@ -945,194 +1419,7 @@ class FubonCrawler(BankCrawler):
             out["deposit_page_text"] = ""
             out["deposit_page_url"] = ""
 
-        # === Step 8 (2026-06-30): 點「存款交易查詢」(CDSQU001 / menu_CDS04) dump 存款交易表 ===
-        # 使用者指出帳戶 drilldown 應該有交易明細；README 標示 Fubon TWD Txns ❌。
-        # 已知 home menu anchor: <A class="task_CDSQU001 menu_CDS04">存款交易查詢</A>。
-        # 先 dump query form/page raw text + response endpoints；persist parser 依真 raw shape 寫。
-        try:
-            page.goto(
-                "https://ebank.taipeifubon.com.tw/B2C/cgequ/cgequ001/CGEQU001_Home.faces",
-                wait_until="domcontentloaded", timeout=15000,
-            )
-            page.wait_for_timeout(5000)
-            _log("[fubon][collect] 回 home 準備點 存款交易查詢")
-        except Exception as e:
-            _log(f"[fubon][collect] 回 home(交易查詢前) 失敗: {type(e).__name__}")
-
-        txn_query_frame = None
-        page.wait_for_timeout(2000)
-        for f in page.frames:
-            url = f.url or ""
-            name = f.name or ""
-            if "CGEQU001" in url or name == "txnFrame":
-                txn_query_frame = f
-                break
-
-        if txn_query_frame:
-            txn_click = bounded_evaluate(txn_query_frame, r"""() => {
-                const selectors = [
-                    'a.task_CDSQU001', 'a.menu_CDS04',
-                    'a.task_CDSQU004', 'a.menu_CDS0103',
-                ];
-                for (const sel of selectors) {
-                    const a = document.querySelector(sel);
-                    if (!a) continue;
-                    try {
-                        a.click();
-                        return {ok: true, selector: sel, href: a.href || '', text: (a.textContent || '').trim()};
-                    } catch (e) {
-                        return {ok: false, selector: sel, error: String(e)};
-                    }
-                }
-                for (const a of document.querySelectorAll('a')) {
-                    const t = (a.textContent || '').trim();
-                    if (t.includes('存款交易查詢') || t.includes('帳戶明細')) {
-                        try {
-                            a.click();
-                            return {ok: true, selector: 'text-fallback', href: a.href || '', text: t};
-                        } catch (e) {
-                            return {ok: false, selector: 'text-fallback', error: String(e)};
-                        }
-                    }
-                }
-                return {ok: false, error: 'no_deposit_txn_anchor'};
-            }""")
-            out["deposit_txn_click"] = txn_click
-            _log(
-                f"[fubon][collect] 存款交易查詢 click: "
-                f"ok={bool(isinstance(txn_click, dict) and txn_click.get('ok'))}"
-            )
-            page.wait_for_timeout(8000)
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(debug_dir / "07_after_deposit_txn_query.png"), full_page=True)
-
-            page.wait_for_timeout(2000)
-            for f in page.frames:
-                if (f.name or "") == "txnFrame":
-                    txn_query_frame = f
-                    break
-            txn_query_text = ""
-            with contextlib.suppress(Exception):
-                txn_query_text = bounded_evaluate(txn_query_frame, "() => document.body.innerText.slice(0, 30000)") or ""
-            out["deposit_txn_page_text"] = txn_query_text
-            out["deposit_txn_page_url"] = txn_query_frame.url
-            _log(f"[fubon][collect] deposit txn 頁 url={_safe_url(txn_query_frame.url)} text_len={len(txn_query_text)}")
-
-            # 真正補交易明細: 富邦 CDSQU001 query form 是 native select + radio/buttons。
-            # 對每個帳戶選「近1個月」並按「開始查詢」，結果頁 text 用 persist parser 入庫。
-            deposit_txn_results = []
-            acct_options = []
-            with contextlib.suppress(Exception):
-                acct_options = bounded_evaluate(txn_query_frame, r"""() => {
-                    const sel = [...document.querySelectorAll('select')].find(s =>
-                        [...s.options].some(o => /\d{10,16}/.test(o.textContent || o.value || ''))
-                    );
-                    if (!sel) return [];
-                    return [...sel.options]
-                        .map((o, index) => ({index, value: o.value || '', text: (o.textContent || '').trim()}))
-                        .filter(o => /\d{10,16}/.test(o.text || o.value || ''));
-                }""") or []
-            _log(f"[fubon][collect] deposit txn 帳號選項數={len(acct_options)}")
-
-            for acct_idx, opt in enumerate(acct_options[:10], start=1):
-                account_no_match = re.search(r"\d{10,16}", (opt.get("text") or "") + " " + (opt.get("value") or ""))
-                account_no = account_no_match.group(0) if account_no_match else None
-                try:
-                    # JSF/富邦用客製下拉，native <select> 本身 hidden；必須直接設值並呼叫
-                    # comboAccountChange/checkAccountType，不能用 Playwright select_option。
-                    selected_text = None
-                    try:
-                        selected_text = bounded_evaluate(txn_query_frame, r"""(opt) => {
-                            const s = document.getElementById('form1:comboAccount') || document.querySelector('[name="form1:comboAccount"]');
-                            if (!s) return null;
-                            if (opt.value) s.value = opt.value;
-                            else s.selectedIndex = opt.index;
-                            s.dispatchEvent(new Event('input', {bubbles: true}));
-                            s.dispatchEvent(new Event('change', {bubbles: true}));
-                            if (typeof window.comboAccountChange === 'function') window.comboAccountChange();
-                            if (typeof window.checkAccountType === 'function') window.checkAccountType();
-                            s.dispatchEvent(new Event('blur', {bubbles: true}));
-                            return s.options[s.selectedIndex]?.textContent?.trim() || null;
-                        }""", opt)
-                        page.wait_for_timeout(1200)
-                    except Exception as e:
-                        _log(f"[fubon][collect] deposit txn select evaluate 失敗: {type(e).__name__}")
-
-                    with contextlib.suppress(Exception):
-                        txn_query_frame.check("#form1\\:rdoTxDetail", force=True)
-                    with contextlib.suppress(Exception):
-                        txn_query_frame.check("#form1\\:rdoFast", force=True)
-                    try:
-                        txn_query_frame.check("#form1\\:rdoDay30", force=True)
-                        picked_period = True
-                    except Exception:
-                        picked_period = False
-                    page.wait_for_timeout(600)
-
-                    try:
-                        txn_query_frame.click("#form1\\:doValidateAndSubmit", timeout=8000, force=True)
-                        query_result = {"ok": True, "selectedText": selected_text, "pickedPeriod": picked_period}
-                    except Exception as e:
-                        query_result = {"ok": False, "selectedText": selected_text, "pickedPeriod": picked_period, "error": str(e)}
-                    _log(
-                        f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢: "
-                        f"ok={query_result['ok']} picked_period={picked_period}"
-                    )
-                    page.wait_for_timeout(9000)
-                    page.wait_for_timeout(1000)
-                    for f in page.frames:
-                        if (f.name or "") == "txnFrame":
-                            txn_query_frame = f
-                            break
-                    result_text = bounded_evaluate(txn_query_frame, "() => document.body.innerText.slice(0, 50000)") or ""
-                    result_url = txn_query_frame.url
-                    deposit_txn_results.append({
-                        "account_no": account_no,
-                        "selected_text": opt.get("text"),
-                        "query_result": query_result,
-                        "url": result_url,
-                        "text": result_text,
-                    })
-                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} result url={_safe_url(result_url)} text_len={len(result_text)}")
-                    with contextlib.suppress(Exception):
-                        page.screenshot(path=str(debug_dir / f"08_deposit_txn_result_{acct_idx}.png"), full_page=True)
-
-                    # 回 query form 查下一個帳號。若回不去就重新開 CDSQU001。
-                    with contextlib.suppress(Exception):
-                        bounded_evaluate(txn_query_frame, r"""() => {
-                            const back = [...document.querySelectorAll('a,button,input[type=button]')]
-                                .find(b => /回上一頁|重新查詢|回查詢頁|返回/.test((b.textContent || b.value || '').trim()));
-                            if (back) back.click();
-                        }""")
-                        page.wait_for_timeout(2500)
-                    if acct_idx < len(acct_options[:10]):
-                        try:
-                            page.goto(
-                                "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces?menuId=CDS04&",
-                                wait_until="domcontentloaded", timeout=15000,
-                            )
-                            page.wait_for_timeout(5000)
-                            for f in page.frames:
-                                if (f.name or "") == "txnFrame":
-                                    txn_query_frame = f
-                                    break
-                        except Exception as e:
-                            _log(f"[fubon][collect] deposit txn 回查詢頁失敗: {type(e).__name__}")
-                except Exception as e:
-                    _log(f"[fubon][collect] deposit txn 帳號#{acct_idx} 查詢例外: {type(e).__name__}")
-                    deposit_txn_results.append({"account_no": account_no, "selected_text": opt.get("text"), "error": str(e)})
-            out["deposit_txn_results"] = deposit_txn_results
-        else:
-            _log("[fubon][collect] ⚠️ 回 home 後找不到 txnFrame, 跳過 deposit txn query step")
-            out["deposit_txn_page_text"] = ""
-            out["deposit_txn_page_url"] = ""
-            out["deposit_txn_results"] = []
-
-        out["final_url"] = page.url
-        out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
-        publish_card_bill_facts(out, [_fubon_card_bill_fact(out.get("amount_page_text") or "")])
-        _log(f"[fubon][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
-        return BankCollectResult(**out)
+        return finish()
 
 
 if __name__ == "__main__":

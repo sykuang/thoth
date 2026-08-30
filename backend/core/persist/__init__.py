@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.core.base import validate_history_coverage
+from backend.core.base import validate_card_bill_facts, validate_history_coverage
 from backend.core.persist.cathay import persist_cathay
 from backend.core.persist.ctbc import persist_ctbc
 from backend.core.persist.dbs import persist_dbs
@@ -70,16 +70,19 @@ def persist_collected(bank, data, store, rules=None):
     except KeyError as exc:
         raise ValueError(f"unknown bank persist: {bank!r}") from exc
     coverage = data.get("history_coverage")
-    if bank == "esun" and coverage is None:
-        raise ValueError("E.SUN persistence requires history coverage")
+    if bank in {"esun", "fubon"} and coverage is None:
+        raise ValueError(f"{bank} persistence requires history coverage")
     _validate_history_coverage_before_persist(coverage)
+    facts_ok = data.get("card_bill_facts_ok")
+    facts = data.get("card_bill_facts") or []
+    validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
     delta = persist(data, barrier, rules=rules)
     applied = apply_card_bill_facts(
         store,
-        facts_ok=data.get("card_bill_facts_ok"),
-        facts=data.get("card_bill_facts") or [],
+        facts_ok=facts_ok,
+        facts=facts,
     )
     if data.get("card_bill_facts_ok") is not None:
         delta["card_bill_facts_applied"] = applied
