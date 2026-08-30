@@ -56,6 +56,7 @@ def persist_collected(bank, data, store, rules=None):
     )
     if data.get("card_bill_facts_ok") is not None:
         delta["card_bill_facts_applied"] = applied
+    store.record_history_coverage_cursors(data.get("history_coverage"))
     return delta
 
 __all__ = [

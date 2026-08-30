@@ -854,6 +854,38 @@ class BankStore:
             ),
         )
 
+    def record_history_coverage_cursors(self, coverage) -> None:
+        """Advance account-scoped cursors through validated complete/empty windows."""
+        if coverage is None:
+            return
+        if not isinstance(coverage, dict):
+            raise ValueError("invalid history coverage")
+        domains = coverage.get("domains")
+        if not isinstance(domains, list):
+            raise ValueError("invalid history coverage")
+        mode = coverage.get("mode")
+        if not isinstance(mode, str):
+            raise ValueError("invalid history coverage")
+        domain_names = frozenset(
+            name
+            for domain in domains
+            if isinstance(domain, dict)
+            if isinstance(name := domain.get("domain"), str)
+        )
+        from backend.core.base import validate_history_coverage
+
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=domain_names,
+        )
+        for domain in domains:
+            for expected in domain["expected"]:
+                self._record_transaction_cursor(
+                    domain["domain"], expected["identity"], expected["end"],
+                )
+        self.conn.commit()
+
     def _transaction_cursor_dates(self, domain: str) -> dict[str, date]:
         if self.source_account_id is None:
             return {}

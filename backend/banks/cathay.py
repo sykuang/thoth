@@ -6,7 +6,12 @@ parse 成結構化 dict。需互動的明細頁（台幣交易、刷卡明細）
 """
 from __future__ import annotations
 
+import copy
+import os
+import re
 import sys
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlparse
@@ -33,6 +38,18 @@ SEL_PWD = "#PasswordKeyin"
 SEL_LOGIN_BTN = "button.js-login"
 
 BASE = "https://www.cathaybk.com.tw"
+_ACCOUNT_INVENTORY_PATH = (
+    "/OnlineBankingApi/Common/Api/ClientCommon/G_CUST_Q_TransAccountList"
+)
+_TWD_HISTORY_PATH = (
+    "/OnlineBankingApi/ClientBank/Api/ClientBank/B_ACCT_Q_TransferDetail"
+)
+_TWD_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?$",
+)
+_TWD_AMOUNT_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.0+)?$")
+_PG_INTEGER_MAX = 2_147_483_647
 
 # 各功能頁：造訪後等 React 打 API
 FEATURE_PAGES = {
@@ -171,6 +188,10 @@ def _cathay_card_bill_fact(out: dict):
 
 class CathayCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+        "twd_transactions",
+    })
     CREDENTIAL_HOSTS = frozenset({"www.cathaybk.com.tw"})
 
     def __init__(self):
@@ -267,9 +288,8 @@ class CathayCrawler(BankCrawler):
         page.wait_for_timeout(9000)
 
     # ---------- 互動觸發：台幣交易明細 ----------
-    def _trigger_twd_txn_query(self, page):
-        """B0103 react-select：選帳號(第1個) + 期間(近30天) + 按查詢，觸發 B_ACCT_Q_TransferDetail。
-        對每個帳號都查一次。"""
+    def _seed_twd_query_templates(self, page, collector: ResponseCollector):
+        """Use one native query per dropdown entry to obtain safe request templates."""
         page.wait_for_timeout(3000)
 
         def pick(label, downs=1):
@@ -301,15 +321,388 @@ class CathayCrawler(BankCrawler):
         n_accts = max(1, min(int(n_accts or 1), 10))
         _log(f"[twd_txn] 帳號選項數: {n_accts}")
 
+        templates = []
         for idx in range(n_accts):
-            pick("帳號", downs=idx + 1)
-            pick("查詢期間", downs=2)  # 跳過「自行輸入」，選「近30天」
+            if pick("帳號", downs=idx + 1) != "ok":
+                raise RuntimeError("cathay-twd-history-account-control")
+            if pick("查詢期間", downs=2) != "ok":  # native near-30-day seed
+                raise RuntimeError("cathay-twd-history-period-control")
+            before = len(collector.by_endpoint("B_ACCT_Q_TransferDetail"))
             clicked = page.evaluate(
                 "(() => { const b=[...document.querySelectorAll('button')].filter(x=>x.offsetParent!==null)"
                 ".find(x=>x.textContent.trim()==='查詢'); if(b){b.click(); return true;} return false; })()",
             )
-            _log(f"[twd_txn] 帳號#{idx+1} 查詢: {clicked}")
+            if clicked is not True:
+                raise RuntimeError("cathay-twd-history-query-control")
+            _log(f"[twd_txn] account_index={idx + 1}/{n_accts} seed query sent")
             page.wait_for_timeout(6000)
+            new_hits = collector.by_endpoint("B_ACCT_Q_TransferDetail")[before:]
+            if len(new_hits) != 1:
+                raise RuntimeError("cathay-twd-history-seed-response")
+            self._twd_template_account(new_hits[0])
+            templates.append(new_hits[0])
+        return templates
+
+    @staticmethod
+    def _canonical_twd_identity(value) -> str:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise RuntimeError("cathay-twd-history-account-inventory")
+        raw = value
+        return raw.lstrip("0") or raw
+
+    @classmethod
+    def _twd_account_inventory(cls, collector: ResponseCollector) -> set[str]:
+        hit = collector.latest("G_CUST_Q_TransAccountList")
+        response = hit.resp_json if hit else None
+        parsed = urlparse(hit.url) if hit else None
+        request_content = (
+            hit.req_body.get("content")
+            if hit and isinstance(hit.req_body, dict)
+            else None
+        )
+        if (
+            hit is None
+            or hit.method != "POST"
+            or type(hit.status) is not int
+            or not 200 <= hit.status < 300
+            or parsed is None
+            or parsed.scheme != "https"
+            or parsed.hostname != "www.cathaybk.com.tw"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != _ACCOUNT_INVENTORY_PATH
+            or not isinstance(request_content, dict)
+            or request_content.get("queryType") != "TWD"
+            or not isinstance(response, dict)
+            or not (response.get("success") is True or response.get("success") == "true")
+            or response.get("returnCode") != "0000"
+        ):
+            raise RuntimeError("cathay-twd-history-account-inventory")
+        content = response.get("content")
+        rows = content.get("datas") if isinstance(content, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError("cathay-twd-history-account-inventory")
+        currencies = [row.get("currency") for row in rows]
+        if any(
+            not isinstance(currency, str)
+            or not currency
+            or currency != currency.strip()
+            for currency in currencies
+        ):
+            raise RuntimeError("cathay-twd-history-account-inventory")
+        twd_rows = [
+            row for row, currency in zip(rows, currencies, strict=True)
+            if currency.upper() == "TWD"
+        ]
+        identities = {
+            cls._canonical_twd_identity(row.get("accountNo")) for row in twd_rows
+        }
+        if len(identities) != len(twd_rows):
+            raise RuntimeError("cathay-twd-history-account-inventory")
+        return identities
+
+    @staticmethod
+    def _history_floor(end: date) -> date:
+        try:
+            return end.replace(year=end.year - 1) + timedelta(days=1)
+        except ValueError:  # February 29
+            return end.replace(year=end.year - 1, day=28) + timedelta(days=1)
+
+    @staticmethod
+    def _history_windows(start: date, end: date) -> list[tuple[date, date]]:
+        if start > end:
+            raise RuntimeError("cathay-twd-history-invalid-range")
+        windows = []
+        cursor = start
+        while cursor <= end:
+            window_end = min(end, cursor + timedelta(days=29))
+            windows.append((cursor, window_end))
+            cursor = window_end + timedelta(days=1)
+        return windows
+
+    @classmethod
+    def _twd_template_account(cls, hit) -> str:
+        parsed = urlparse(hit.url)
+        body = hit.req_body
+        content = body.get("content") if isinstance(body, dict) else None
+        filters = content.get("queryFilters") if isinstance(content, dict) else None
+        if (
+            hit.method != "POST"
+            or type(hit.status) is not int
+            or not 200 <= hit.status < 300
+            or parsed.scheme != "https"
+            or parsed.hostname != "www.cathaybk.com.tw"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != _TWD_HISTORY_PATH
+            or not isinstance(filters, list)
+            or len(filters) != 1
+            or not isinstance(filters[0], dict)
+            or not isinstance(content, dict)
+            or not isinstance(content.get("customerId"), str)
+            or not content["customerId"]
+            or content["customerId"] != content["customerId"].strip()
+        ):
+            raise RuntimeError("cathay-twd-history-template")
+        cls._canonical_twd_identity(filters[0].get("accountNumber"))
+        return str(filters[0]["accountNumber"])
+
+    @classmethod
+    def _validated_twd_account(
+        cls,
+        response: dict,
+        raw_account: str,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> dict:
+        if not isinstance(response, dict) or not (
+            response.get("success") is True or response.get("success") == "true"
+        ) or response.get("returnCode") != "0000":
+            raise RuntimeError("cathay-twd-history-response")
+        content = response.get("content")
+        rows = content.get("datas") if isinstance(content, dict) else None
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError("cathay-twd-history-response")
+        account = rows[0]
+        if (
+            account.get("queryStatus") != "SUCCESS"
+            or account.get("accountNumber") != raw_account
+            or start is not None
+            and account.get("startDate") != start.isoformat()
+            or end is not None
+            and account.get("endDate") != end.isoformat()
+        ):
+            raise RuntimeError("cathay-twd-history-account-mismatch")
+        details = account.get("details")
+        raw_count = account.get("count")
+        if type(raw_count) is not int or raw_count < 0:
+            raise RuntimeError("cathay-twd-history-count")
+        count = raw_count
+        if (
+            not isinstance(details, list)
+            or any(not isinstance(row, dict) for row in details)
+            or count != len(details)
+        ):
+            raise RuntimeError("cathay-twd-history-count")
+        if start is not None and end is not None:
+            for row in details:
+                try:
+                    normalized_datetime = cls._normalize_twd_datetime(
+                        row.get("txnDateTime"),
+                    )
+                except ValueError:
+                    raise RuntimeError("cathay-twd-history-transaction-date")
+                transaction_date = datetime.fromisoformat(
+                    normalized_datetime.replace("Z", "+00:00"),
+                ).date()
+                if not start <= transaction_date <= end:
+                    raise RuntimeError("cathay-twd-history-transaction-range")
+                account_date = row.get("accountDate")
+                if account_date is not None:
+                    if (
+                        not isinstance(account_date, str)
+                        or cls._normalize_iso_date(account_date) != account_date
+                    ):
+                        raise RuntimeError("cathay-twd-history-transaction-date")
+                    try:
+                        parsed_account_date = date.fromisoformat(account_date)
+                    except ValueError:
+                        raise RuntimeError("cathay-twd-history-transaction-date") from None
+                    if not start <= parsed_account_date <= end:
+                        raise RuntimeError("cathay-twd-history-transaction-range")
+                if any(
+                    value is not None and not isinstance(value, str)
+                    for value in (
+                        row.get("description"), row.get("expendBankId"),
+                        row.get("expendAcctNo"), row.get("memo"),
+                    )
+                ):
+                    raise RuntimeError("cathay-twd-history-transaction-text")
+                if row.get("expendAmt") is None and row.get("incomeAmt") is None:
+                    raise RuntimeError("cathay-twd-history-transaction-amount")
+                for field in ("expendAmt", "incomeAmt", "balance"):
+                    value = row.get(field)
+                    if value is None:
+                        continue
+                    try:
+                        cls._normalize_twd_amount(
+                            value, non_negative=field != "balance",
+                        )
+                    except ValueError:
+                        raise RuntimeError("cathay-twd-history-transaction-amount")
+        return account
+
+    @staticmethod
+    def _normalize_twd_amount(value, *, non_negative: bool = False):
+        if isinstance(value, bool):
+            raise ValueError("invalid amount")
+        raw = str(value).strip()
+        if not _TWD_AMOUNT_RE.fullmatch(raw):
+            raise ValueError("invalid amount")
+        try:
+            amount = Decimal(raw.replace(",", ""))
+        except (InvalidOperation, ValueError):
+            raise ValueError("invalid amount") from None
+        if (
+            not amount.is_finite()
+            or amount != amount.to_integral_value()
+            or not -_PG_INTEGER_MAX <= amount <= _PG_INTEGER_MAX
+            or non_negative and amount < 0
+        ):
+            raise ValueError("invalid amount")
+        return int(amount)
+
+    @staticmethod
+    def _normalize_twd_datetime(value) -> str:
+        if not isinstance(value, str):
+            raise ValueError("invalid datetime")
+        normalized = value.strip()
+        if not _TWD_DATETIME_RE.fullmatch(normalized):
+            raise ValueError("invalid datetime")
+        try:
+            datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("invalid datetime") from None
+        return normalized
+
+    @staticmethod
+    def _twd_fetch_script() -> str:
+        return """async (payload) => {
+          const headers = {'Content-Type': 'application/json'};
+          if (payload.authorization) headers.Authorization = payload.authorization;
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 30000);
+          try {
+            const response = await fetch(payload.url, {
+              method: 'POST', credentials: 'include', headers,
+              redirect: 'error', signal: controller.signal,
+              body: JSON.stringify(payload.body),
+            });
+            let json = null;
+            try { json = await response.json(); } catch (_) {}
+            return {
+              status: response.status,
+              url: response.url,
+              redirected: response.redirected,
+              json,
+            };
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        }"""
+
+    def _collect_twd_history(
+        self,
+        page,
+        collector: ResponseCollector,
+        *,
+        as_of: date | None = None,
+        expected_identities: set[str] | None = None,
+    ) -> dict:
+        end = as_of or date.today()
+        floor = self._history_floor(end)
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise RuntimeError("cathay-twd-history-mode")
+        if expected_identities == set():
+            return {
+                "accounts": [],
+                "coverage": {
+                    "mode": mode,
+                    "domains": [{
+                        "domain": "twd_transactions",
+                        "expected": [],
+                        "windows": [],
+                        "empty_window": {
+                            "start": floor.isoformat(), "end": end.isoformat(),
+                            "status": "explicit_empty", "pages": 1,
+                        },
+                    }],
+                },
+            }
+
+        templates = self._seed_twd_query_templates(page, collector)
+        template_identities = [
+            self._canonical_twd_identity(self._twd_template_account(hit))
+            for hit in templates
+        ]
+        if (
+            len(template_identities) != len(set(template_identities))
+            or expected_identities is not None
+            and set(template_identities) != expected_identities
+        ):
+            raise RuntimeError("cathay-twd-history-account-inventory")
+
+        accounts = []
+        expected = []
+        receipts = []
+        for hit, identity in zip(templates, template_identities):
+            raw_account = self._twd_template_account(hit)
+            start = self.transaction_window_start(identity, floor=floor)
+            transactions = []
+            for window_start, window_end in self._history_windows(start, end):
+                body = copy.deepcopy(hit.req_body)
+                query = body["content"]["queryFilters"][0]
+                query.update({
+                    "accountNumber": raw_account,
+                    "startDate": window_start.isoformat(),
+                    "endDate": window_end.isoformat(),
+                })
+                fetched = page.evaluate(self._twd_fetch_script(), {
+                    "url": hit.url,
+                    "authorization": collector.auth_token,
+                    "body": body,
+                })
+                status = fetched.get("status") if isinstance(fetched, dict) else None
+                if (
+                    type(status) is not int
+                    or not 200 <= status < 300
+                    or fetched.get("redirected") is not False
+                    or fetched.get("url") != hit.url
+                ):
+                    raise RuntimeError("cathay-twd-history-fetch")
+                response = fetched.get("json")
+                if not isinstance(response, dict):
+                    raise RuntimeError("cathay-twd-history-response")
+                account = self._validated_twd_account(
+                    response, raw_account, start=window_start, end=window_end,
+                )
+                details = account["details"]
+                transactions.extend(self._normalize_twd_transactions(details))
+                receipt = {
+                    "identity": identity,
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "status": "complete" if details else "explicit_empty",
+                    "pages": 1,
+                }
+                receipts.append(receipt)
+            accounts.append({
+                "account": raw_account,
+                "count": len(transactions),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "transactions": transactions,
+            })
+            expected.append({
+                "identity": identity,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            })
+        return {
+            "accounts": accounts,
+            "coverage": {
+                "mode": mode,
+                "domains": [{
+                    "domain": "twd_transactions",
+                    "expected": expected,
+                    "windows": receipts,
+                }],
+            },
+        }
 
     # ---------- 互動觸發：信用卡逐筆明細 ----------
     def _collect_card_details(self, page):
@@ -345,6 +738,7 @@ class CathayCrawler(BankCrawler):
     # ---------- 主抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         # 逐頁造訪，讓 React 自動打 API
+        twd_history = None
         for key, path in FEATURE_PAGES.items():
             _log(f"\n[collect] {key}: {path}")
             try:
@@ -353,11 +747,20 @@ class CathayCrawler(BankCrawler):
                 _log(f"  [warn] goto: {str(e)[:80]}")
             page.wait_for_timeout(6500)
             if key == "twd_txn":
-                self._trigger_twd_txn_query(page)
+                twd_history = self._collect_twd_history(
+                    page,
+                    collector,
+                    expected_identities=self._twd_account_inventory(collector),
+                )
         # 信用卡逐筆明細（三種）
         self._collect_card_details(page)
 
-        return BankCollectResult(**self._parse(collector))
+        out = self._parse(collector)
+        if twd_history is None:
+            raise RuntimeError("cathay-twd-history-missing")
+        out["twd_transactions"] = twd_history["accounts"]
+        out["history_coverage"] = twd_history["coverage"]
+        return BankCollectResult(**out)
 
     # ---------- Parse ----------
     def _c(self, hit):
@@ -397,6 +800,35 @@ class CathayCrawler(BankCrawler):
             if key in normalized:
                 normalized[key] = self._normalize_iso_date(normalized[key])
         return normalized
+
+    def _normalize_twd_transactions(self, details: list[dict]) -> list[dict]:
+        return [
+            {
+                "datetime": self._normalize_twd_datetime(t.get("txnDateTime")),
+                "account_date": t.get("accountDate"),
+                "desc": t.get("description"),
+                "expend": (
+                    self._normalize_twd_amount(t["expendAmt"], non_negative=True)
+                    if t.get("expendAmt") is not None else None
+                ),
+                "income": (
+                    self._normalize_twd_amount(t["incomeAmt"], non_negative=True)
+                    if t.get("incomeAmt") is not None else None
+                ),
+                "balance": (
+                    self._normalize_twd_amount(t["balance"])
+                    if t.get("balance") is not None else None
+                ),
+                "counterparty_bank": t.get("expendBankId"),
+                "counterparty_acct": (
+                    self.mask_card(str(t.get("expendAcctNo")))
+                    if t.get("expendAcctNo") else None
+                ),
+                "memo": t.get("memo"),
+            }
+            for t in details
+            if isinstance(t, dict)
+        ]
 
     def _parse(self, col: ResponseCollector) -> dict:
         out: dict = {}
@@ -603,20 +1035,7 @@ class CathayCrawler(BankCrawler):
                     "count": acct.get("count"),
                     "start": acct.get("startDate"),
                     "end": acct.get("endDate"),
-                    "transactions": [
-                        {
-                            "datetime": t.get("txnDateTime"),
-                            "account_date": t.get("accountDate"),
-                            "desc": t.get("description"),
-                            "expend": t.get("expendAmt"),
-                            "income": t.get("incomeAmt"),
-                            "balance": t.get("balance"),
-                            "counterparty_bank": t.get("expendBankId"),
-                            "counterparty_acct": self.mask_card(t.get("expendAcctNo")) if t.get("expendAcctNo") else None,
-                            "memo": t.get("memo"),
-                        }
-                        for t in details
-                    ],
+                    "transactions": self._normalize_twd_transactions(details),
                 })
         if twd_txns:
             out["twd_transactions"] = twd_txns
