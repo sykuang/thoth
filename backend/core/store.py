@@ -854,7 +854,7 @@ class BankStore:
             ),
         )
 
-    def record_history_coverage_cursors(self, coverage) -> None:
+    def record_history_coverage_cursors(self, coverage, *, commit: bool = True) -> None:
         """Advance account-scoped cursors through validated complete/empty windows."""
         if coverage is None:
             return
@@ -884,7 +884,8 @@ class BankStore:
                 self._record_transaction_cursor(
                     domain["domain"], expected["identity"], expected["end"],
                 )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def _transaction_cursor_dates(self, domain: str) -> dict[str, date]:
         if self.source_account_id is None:
@@ -1780,7 +1781,7 @@ class BankStore:
             self.conn.commit()
         return len(cards)
 
-    def update_card_bill_facts(self, facts: list[dict]) -> int:
+    def update_card_bill_facts(self, facts: list[dict], *, commit: bool = True) -> int:
         """Atomically apply canonical bill facts without regressing a newer payment pair."""
         updated = 0
         now = _now()
@@ -1845,7 +1846,8 @@ class BankStore:
                 ),
             )
             updated += cursor.rowcount
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return updated
 
     # ---- 7. 每日數值快照：同日同 category 覆蓋 ----

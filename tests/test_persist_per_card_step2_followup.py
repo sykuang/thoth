@@ -207,28 +207,60 @@ def store_hsbc(tmp_path: Path, monkeypatch):
     s.close()
 
 
+def _hsbc_attested_payload(card: dict, details: list[dict]) -> dict:
+    masked = card["maskedCardNumber"]
+    card = {**card, "id": "id-7059"}
+    receipt = {
+        "identity": masked,
+        "start": "2025-09-01",
+        "end": "2026-08-31",
+        "status": "explicit_empty",
+        "pages": 1,
+        "rows": 0,
+    }
+    return {
+        "cards": [card],
+        "card_detail": {
+            masked: {
+                "card_id": card["id"],
+                "masked": masked,
+                "detail": {"details": details},
+                "posted": [],
+                "posted_receipt": receipt.copy(),
+                "unposted": [],
+                "unposted_ok": True,
+            },
+        },
+        "history_coverage": {
+            "version": 1,
+            "mode": "full",
+            "domains": [{
+                "domain": "card_billed_transactions",
+                "expected": [{
+                    "identity": masked,
+                    "start": receipt["start"],
+                    "end": receipt["end"],
+                }],
+                "windows": [receipt.copy()],
+            }],
+        },
+    }
+
+
 def test_hsbc_credit_limit_extracted_from_details(store_hsbc):
     """card_detail[tail].detail.details[] key='Credit Limit' → cards.credit_limit。"""
     from backend.core.persist import persist_hsbc
-    data = {
-        "cards": [
-            {"maskedCardNumber": "9059-****-****-7059", "name": "滙豐Live+卡",
-             "cardType": "信用卡", "outstandingBalance": "18,198",
-             "paymentDueDate": "05-06-2026", "cardStatusDisplay": "ACTIVATED"},
-        ],
-        "card_detail": {
-            "7059": {
-                "masked": "9059-****-****-7059",
-                "detail": {
-                    "details": [
-                        {"key": "Credit Limit", "value": "1,500,000 TWD"},
-                        {"key": "Available Credit Limit", "value": "1,354,324 TWD"},
-                        {"key": "Last Statement Date", "value": "18 May 2026"},
-                    ],
-                },
-            },
-        },
+    card = {
+        "maskedCardNumber": "9059-****-****-7059", "name": "滙豐Live+卡",
+        "cardType": "信用卡", "outstandingBalance": "18,198",
+        "paymentDueDate": "05-06-2026", "cardStatusDisplay": "ACTIVATED",
     }
+    details = [
+        {"key": "Credit Limit", "value": "1,500,000 TWD"},
+        {"key": "Available Credit Limit", "value": "1,354,324 TWD"},
+        {"key": "Last Statement Date", "value": "18 May 2026"},
+    ]
+    data = _hsbc_attested_payload(card, details)
     persist_hsbc(data, store_hsbc)
     rows = list(store_hsbc.conn.execute(
         "SELECT card_no, credit_limit, statement_close_date FROM cards"
@@ -241,30 +273,21 @@ def test_hsbc_credit_limit_extracted_from_details(store_hsbc):
 def test_hsbc_details_missing_fields_safe(store_hsbc):
     """details[] 沒 Credit Limit/Statement Date 時不 crash, credit_limit=None。"""
     from backend.core.persist import persist_hsbc
-    data = {
-        "cards": [
-            {"maskedCardNumber": "9059-****-****-7059", "name": "滙豐卡",
-             "cardType": "信用卡", "outstandingBalance": "0",
-             "paymentDueDate": "05-06-2026", "cardStatusDisplay": "ACTIVATED"},
-        ],
-        "card_detail": {
-            "7059": {
-                "masked": "9059-****-****-7059",
-                "detail": {
-                    "details": [
-                        {"key": "Auto Debit", "value": "Yes"},  # 不相關欄
-                    ],
-                },
-            },
-        },
+    card = {
+        "maskedCardNumber": "9059-****-****-7059", "name": "滙豐卡",
+        "cardType": "信用卡", "outstandingBalance": "0",
+        "paymentDueDate": "05-06-2026", "cardStatusDisplay": "ACTIVATED",
     }
+    data = _hsbc_attested_payload(
+        card, [{"key": "Auto Debit", "value": "Yes"}],
+    )
     persist_hsbc(data, store_hsbc)
     rows = list(store_hsbc.conn.execute("SELECT credit_limit FROM cards"))
     assert rows[0][0] is None  # 沒抓到 Credit Limit → None
 
 
-def test_hsbc_no_card_detail_block_safe(store_hsbc):
-    """card_detail 整段缺時不 crash, credit_limit=None。"""
+def test_hsbc_no_card_detail_block_is_rejected(store_hsbc):
+    """Attested HSBC history requires one bound detail entry per card."""
     from backend.core.persist import persist_hsbc
     data = {
         "cards": [
@@ -272,11 +295,10 @@ def test_hsbc_no_card_detail_block_safe(store_hsbc):
              "cardType": "信用卡", "outstandingBalance": "0",
              "paymentDueDate": "05-06-2026", "cardStatusDisplay": "ACTIVATED"},
         ],
-        # card_detail 整段沒提供
     }
-    persist_hsbc(data, store_hsbc)
-    rows = list(store_hsbc.conn.execute("SELECT credit_limit FROM cards"))
-    assert rows[0][0] is None
+    with pytest.raises(ValueError, match="HSBC history"):
+        persist_hsbc(data, store_hsbc)
+    assert store_hsbc.conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
 
 
 def test_hsbc_dmy_text_to_iso_helper():

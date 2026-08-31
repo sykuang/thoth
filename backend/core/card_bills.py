@@ -186,6 +186,7 @@ def apply_card_bill_facts(
     *,
     facts_ok: bool | None,
     facts: list[NormalizedCardBillFact],
+    commit: bool = True,
 ) -> int:
     """Apply authoritative bill facts to known card inventory, fail-closed."""
     validate_card_bill_facts(facts, facts_ok=facts_ok)
@@ -222,4 +223,4 @@ def apply_card_bill_facts(
             row["last_payment_amount"] = card_fact.get("last_payment_amount")
             row["last_payment_date"] = card_fact["last_payment_date"]
         rows.append(row)
-    return store.update_card_bill_facts(rows)
+    return store.update_card_bill_facts(rows, commit=commit)

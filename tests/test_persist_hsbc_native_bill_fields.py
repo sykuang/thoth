@@ -37,6 +37,14 @@ def store(tmp_path: Path, monkeypatch):
 def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) -> dict:
     """產一個極簡 HSBC collect() payload (cards + card_detail)."""
     masked = f"4029-****-****-{tail}"
+    receipt = {
+        "identity": masked,
+        "start": "2025-09-01",
+        "end": "2026-08-31",
+        "status": "explicit_empty",
+        "pages": 1,
+        "rows": 0,
+    }
     return {
         "cards": [
             {
@@ -53,10 +61,13 @@ def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) ->
             }
         ],
         "card_detail": {
-            tail: {
+            masked: {
+                "card_id": f"id-{tail}",
                 "masked": masked,
                 "posted": [],
+                "posted_receipt": receipt.copy(),
                 "unposted": [],
+                "unposted_ok": True,
                 "detail": {
                     "details": details
                     or [
@@ -68,6 +79,19 @@ def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) ->
                     ],
                 },
             }
+        },
+        "history_coverage": {
+            "version": 1,
+            "mode": "full",
+            "domains": [{
+                "domain": "card_billed_transactions",
+                "expected": [{
+                    "identity": masked,
+                    "start": receipt["start"],
+                    "end": receipt["end"],
+                }],
+                "windows": [receipt.copy()],
+            }],
         },
     }
 

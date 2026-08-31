@@ -92,6 +92,9 @@ class ApiHit:
     req_body: Any = None
     resp_json: Any = None
     content_type: str = ""
+    raw_url: str = ""
+    redirected: bool = False
+    body_size: int | None = None
 
     @property
     def endpoint(self) -> str:
@@ -111,23 +114,91 @@ class ResponseCollector:
         self.hits: list[ApiHit] = []
         self.host_filter = host_filter
         self.auth_token: str = ""  # 攔到的 Authorization 標頭（如 'Bearer eyJ...'），給直接 fetch 用
+        self.auth_token_url: str = ""
+        self.auth_token_events: list[dict[str, Any]] = []
+        self.hsbc_inventory_bytes = 0
+        self._auth_event_sequence = 0
+        self._auth_requests: dict[int, dict[str, Any]] = {}
+        self._latest_auth_request_sequence = 0
+        self._response_handler = self._on_response
+        self._request_handler = self._on_request
 
     def attach(self, page):
-        page.on("response", self._on_response)
+        page.on("request", self._request_handler)
+        page.on("response", self._response_handler)
+
+    def detach(self, page) -> None:
+        remove = getattr(page, "remove_listener", None)
+        if callable(remove):
+            remove("request", self._request_handler)
+            remove("response", self._response_handler)
+
+    def _on_request(self, req) -> None:
+        try:
+            auth = req.headers.get("authorization", "")
+            if re.fullmatch(r"Bearer [^\s\r\n]+", auth) is None:
+                return
+            parsed = urlparse(req.url)
+            expected = self.host_filter.lower().strip(".")
+            hostname = (parsed.hostname or "").lower()
+            if self.host_filter and (
+                parsed.scheme.lower() != "https"
+                or (hostname != expected and not hostname.endswith("." + expected))
+            ):
+                return
+            self._auth_event_sequence += 1
+            self._auth_requests[id(req)] = {
+                "token": auth,
+                "url": req.url,
+                "redirected": getattr(req, "redirected_from", None) is not None,
+                "sequence": self._auth_event_sequence,
+            }
+        except Exception:
+            return
 
     def _on_response(self, resp):
         try:
             url = resp.url
             if self.SKIP_RE.search(url):
                 return
-            if self.host_filter and self.host_filter not in url:
-                return
+            parsed = urlparse(url)
+            if self.host_filter:
+                expected = self.host_filter.lower().strip(".")
+                hostname = (parsed.hostname or "").lower()
+                if (
+                    parsed.scheme.lower() != "https"
+                    or (hostname != expected and not hostname.endswith("." + expected))
+                ):
+                    return
             req = resp.request
             ct = resp.headers.get("content-type", "")
+            content_length = resp.headers.get("content-length", "")
+            content_encoding = resp.headers.get("content-encoding", "")
+            is_bounded_hsbc_inventory = (
+                self.host_filter == "card.hsbc.com.tw"
+                and parsed.path in {"/ibk-bff/api/v1/cards", "/ibk-bff/api/v1/cards/suspend"}
+            )
+            body_size = int(content_length) if content_length.isdigit() else None
             auth = req.headers.get("authorization", "")
-            # 記下第一個看到的 Bearer token（前端打 API 時帶的，給 _fetch_json 直接 fetch 用）
-            if auth and not self.auth_token:
-                self.auth_token = auth
+            auth_event = self._auth_requests.pop(id(req), None)
+            # 只按 request 發出順序更新 token；response 亂序不得降回舊 token。
+            if (
+                auth_event is not None
+                and auth == auth_event["token"]
+                and 200 <= resp.status < 300
+                and re.fullmatch(r"Bearer [^\s\r\n]+", auth)
+            ):
+                event = {
+                    "token": auth_event["token"],
+                    "url": url,
+                    "redirected": auth_event["redirected"],
+                    "sequence": auth_event["sequence"],
+                }
+                self.auth_token_events.append(event)
+                if event["sequence"] > self._latest_auth_request_sequence:
+                    self._latest_auth_request_sequence = event["sequence"]
+                    self.auth_token = event["token"]
+                    self.auth_token_url = url
             is_data = ("json" in ct) or (req.method == "POST") or bool(auth)
             if not is_data:
                 return
@@ -142,12 +213,22 @@ class ResponseCollector:
             except Exception:
                 pass
             resp_json = None
-            if "json" in ct:
+            if "json" in ct and (
+                not is_bounded_hsbc_inventory
+                or (
+                    body_size is not None
+                    and body_size <= 5_000_000
+                    and content_encoding.lower() in {"", "identity"}
+                )
+            ):
                 with contextlib.suppress(Exception):
                     resp_json = resp.json()
             self.hits.append(ApiHit(
                 url=url.split("?")[0], method=req.method, status=resp.status,
                 req_body=req_body, resp_json=resp_json, content_type=ct,
+                raw_url=url,
+                redirected=getattr(req, "redirected_from", None) is not None,
+                body_size=body_size,
             ))
         except Exception:
             pass

@@ -86,20 +86,45 @@ def test_untrusted_structured_payload_never_clears_pending(store, persist, data)
 
 def test_hsbc_partial_card_unposted_fetch_never_clears_pending(store):
     cards = [
-        {"id": "a", "maskedCardNumber": "4029-****-****-1111"},
-        {"id": "b", "maskedCardNumber": "4029-****-****-2222"},
+        {"id": "a", "maskedCardNumber": "4029-****-****-1111", "cardStatusDisplay": "ACTIVATED"},
+        {"id": "b", "maskedCardNumber": "4029-****-****-2222", "cardStatusDisplay": "ACTIVATED"},
     ]
+    receipts = [{
+        "identity": card["maskedCardNumber"],
+        "start": "2025-09-01",
+        "end": "2026-08-31",
+        "status": "explicit_empty",
+        "pages": 1,
+        "rows": 0,
+    } for card in cards]
     persist_hsbc({
         "cards": cards,
         "card_detail": {
-            "1111": {
+            cards[0]["maskedCardNumber"]: {
+                "card_id": "a",
                 "masked": cards[0]["maskedCardNumber"],
-                "posted": [], "unposted": [], "unposted_ok": True,
+                "posted": [], "posted_receipt": receipts[0].copy(),
+                "unposted": [], "unposted_ok": True,
             },
-            "2222": {
+            cards[1]["maskedCardNumber"]: {
+                "card_id": "b",
                 "masked": cards[1]["maskedCardNumber"],
-                "posted": [], "unposted": [], "unposted_ok": False,
+                "posted": [], "posted_receipt": receipts[1].copy(),
+                "unposted": [], "unposted_ok": False,
             },
+        },
+        "history_coverage": {
+            "version": 1,
+            "mode": "full",
+            "domains": [{
+                "domain": "card_billed_transactions",
+                "expected": [{
+                    "identity": receipt["identity"],
+                    "start": receipt["start"],
+                    "end": receipt["end"],
+                } for receipt in receipts],
+                "windows": [receipt.copy() for receipt in receipts],
+            }],
         },
     }, store, rules=[])
     _assert_kept(store)

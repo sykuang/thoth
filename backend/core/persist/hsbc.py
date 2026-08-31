@@ -4,9 +4,12 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from backend.core import classify
+from backend.core.base import validate_history_coverage
 from backend.core.persist._common import _num_to_float
 from backend.core.store import BankStore
 
@@ -17,27 +20,284 @@ _HSBC_MONTH_MAP = {
     "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
 }
 
+_HSBC_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$"
+)
+_HSBC_MONEY_RE = re.compile(
+    r"^([+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})$"
+)
+_HSBC_SCALAR_RE = re.compile(
+    r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$"
+)
+_HSBC_MAX_MONEY = Decimal("100000000")
+
+
+def _hsbc_history_date(value) -> date:
+    if not isinstance(value, str) or _HSBC_DATETIME_RE.fullmatch(value) is None:
+        raise ValueError("invalid HSBC history transaction date")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except ValueError:
+        raise ValueError("invalid HSBC history transaction date") from None
+
+
+def _hsbc_history_floor(end: date) -> date:
+    try:
+        return end.replace(year=end.year - 1) + timedelta(days=1)
+    except ValueError:
+        return end.replace(year=end.year - 1, day=28) + timedelta(days=1)
+
+
+def _bounded_card_scalar(value, *, allow_negative: bool) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if isinstance(value, bool) or _HSBC_SCALAR_RE.fullmatch(text) is None:
+        return False
+    try:
+        amount = Decimal(text.replace(",", ""))
+    except (InvalidOperation, ValueError, AttributeError):
+        return False
+    return (
+        amount.is_finite()
+        and abs(amount) <= _HSBC_MAX_MONEY
+        and amount == amount.to_integral_value()
+        and (allow_negative or amount >= 0)
+    )
+
+
+def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> None:
+    if not isinstance(row, dict):
+        raise ValueError("invalid HSBC history transaction")
+    description = row.get("description")
+    transaction = _hsbc_history_date(row.get("transactionDate"))
+    posted_raw = row.get("postedDate")
+    if start is None and posted_raw != "0002-11-30T00:00":
+        raise ValueError("invalid HSBC history transaction")
+    posted = None
+    if posted_raw not in (None, "", "0002-11-30T00:00"):
+        posted = _hsbc_history_date(posted_raw)
+    amount, currency = _hsbc_amt(row.get("ntdAmount") or row.get("amount"))
+    is_foreign = row.get("isForeign")
+    if (
+        type(amount) is not int
+        or not 0 <= amount <= 100_000_000
+        or currency != "TWD"
+        or type(row.get("isPositive")) is not bool
+        or type(is_foreign) is not bool
+        or not isinstance(description, str)
+        or not 0 < len(description.strip()) <= 512
+        or transaction > end
+        or (posted is not None and (transaction > posted or posted > end))
+        or (start is not None and (posted is None or not start <= posted <= end))
+        or (not is_foreign and row.get("foreignAmount") not in (None, "", "-"))
+    ):
+        raise ValueError("invalid HSBC history transaction")
+    if is_foreign:
+        foreign_amount, foreign_currency = _hsbc_amt(row.get("foreignAmount"))
+        if (
+            isinstance(foreign_amount, bool)
+            or not isinstance(foreign_amount, (int, float))
+            or foreign_currency in (None, "TWD")
+        ):
+            raise ValueError("invalid HSBC history transaction")
+
+
+def _validate_hsbc_history(data: dict, store: BankStore) -> None:
+    coverage = data.get("history_coverage")
+    if coverage is None:
+        raise ValueError("invalid HSBC history coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError("invalid HSBC history coverage")
+    mode = coverage.get("mode")
+    if mode not in {"full", "incremental"}:
+        raise ValueError("invalid HSBC history coverage")
+    validate_history_coverage(
+        coverage,
+        expected_mode=mode,
+        expected_domains=frozenset({"card_billed_transactions"}),
+    )
+    domains = coverage["domains"]
+    if len(domains) != 1 or domains[0].get("domain") != "card_billed_transactions":
+        raise ValueError("invalid HSBC history coverage")
+    domain = domains[0]
+
+    cards = data.get("cards", [])
+    details = data.get("card_detail", {})
+    if not isinstance(cards, list) or not isinstance(details, dict):
+        raise ValueError("invalid HSBC history inventory")
+    existing_cursors = store.latest_card_transaction_dates()
+    identities = []
+    card_ids: set[str] = set()
+    inventory: dict[str, str] = {}
+    for card in cards:
+        identity = card.get("maskedCardNumber") if isinstance(card, dict) else None
+        card_id = card.get("id") if isinstance(card, dict) else None
+        if (
+            not isinstance(identity, str)
+            or re.fullmatch(r"[0-9]{4}-\*{4}-\*{4}-[0-9]{4}", identity) is None
+            or not isinstance(card_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", card_id) is None
+            or card.get("cardStatusDisplay") not in {
+                "ACTIVATED", "NOT_ACTIVATED", "CLOSED",
+            }
+            or identity in inventory
+            or card_id in card_ids
+            or not _bounded_card_scalar(
+                card.get("outstandingBalance"), allow_negative=True,
+            )
+            or not _bounded_card_scalar(
+                card.get("minimumPayableAmount"), allow_negative=False,
+            )
+            or any(
+                card.get(key) is not None and _dmy_to_iso(card.get(key)) is None
+                for key in ("paymentDueDate", "statementDate")
+            )
+        ):
+            raise ValueError("invalid HSBC history inventory")
+        identities.append(identity)
+        inventory[identity] = card_id
+        card_ids.add(card_id)
+
+    expected = domain.get("expected")
+    windows = domain.get("windows")
+    if not isinstance(expected, list) or not isinstance(windows, list):
+        raise ValueError("invalid HSBC history coverage")
+    if not identities:
+        if details or expected or windows or "empty_window" not in domain:
+            raise ValueError("invalid HSBC history inventory")
+        empty = domain["empty_window"]
+        try:
+            empty_start = date.fromisoformat(empty["start"])
+            empty_end = date.fromisoformat(empty["end"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid HSBC history empty window") from None
+        if (
+            set(empty) != {"start", "end", "status", "pages"}
+            or empty.get("status") != "explicit_empty"
+            or empty.get("pages") != 1
+            or empty_start > empty_end
+            or empty_end > date.today()
+            or any(cursor > empty_end for cursor in existing_cursors.values())
+            or (mode == "full" and empty_start != _hsbc_history_floor(empty_end))
+        ):
+            raise ValueError("invalid HSBC history empty window")
+        return
+
+    expected_by_identity = {
+        item.get("identity"): item for item in expected if isinstance(item, dict)
+    }
+    windows_by_identity = {
+        item.get("identity"): item for item in windows if isinstance(item, dict)
+    }
+    identity_set = set(identities)
+    if (
+        len(expected_by_identity) != len(expected)
+        or len(windows_by_identity) != len(windows)
+        or set(details) != identity_set
+        or set(expected_by_identity) != identity_set
+        or set(windows_by_identity) != identity_set
+    ):
+        raise ValueError("invalid HSBC history identity binding")
+
+    receipt_fields = {"identity", "start", "end", "status", "pages", "rows"}
+    for identity in identities:
+        entry = details[identity]
+        expected_item = expected_by_identity[identity]
+        window = windows_by_identity[identity]
+        if (
+            not isinstance(entry, dict)
+            or entry.get("masked") != identity
+            or entry.get("card_id") != inventory[identity]
+        ):
+            raise ValueError("invalid HSBC history identity binding")
+        receipt = entry.get("posted_receipt")
+        rows = entry.get("posted")
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != receipt_fields
+            or receipt != window
+            or receipt.get("start") != expected_item.get("start")
+            or receipt.get("end") != expected_item.get("end")
+            or not isinstance(rows, list)
+            or type(receipt.get("rows")) is not int
+            or receipt["rows"] != len(rows)
+            or (receipt.get("status") == "complete") != bool(rows)
+        ):
+            raise ValueError("invalid HSBC history receipt")
+        start = date.fromisoformat(receipt["start"])
+        end = date.fromisoformat(receipt["end"])
+        if (
+            type(receipt.get("pages")) is not int
+            or not 1 <= receipt["pages"] <= 500
+            or end > date.today()
+            or (mode == "full" and start != _hsbc_history_floor(end))
+        ):
+            raise ValueError("invalid HSBC history receipt")
+        cursor = existing_cursors.get(identity)
+        if isinstance(cursor, date) and cursor > end:
+            raise ValueError("invalid HSBC history cursor")
+        if mode == "incremental":
+            expected_start = _hsbc_history_floor(end)
+            if isinstance(cursor, date):
+                expected_start = max(expected_start, cursor - timedelta(days=7))
+            if start != expected_start:
+                raise ValueError("invalid HSBC history incremental start")
+        for row in rows:
+            _validate_hsbc_txn(row, start=start, end=end)
+        unposted = entry.get("unposted")
+        if not isinstance(unposted, list) or type(entry.get("unposted_ok")) is not bool:
+            raise ValueError("invalid HSBC history transaction")
+        for row in unposted:
+            _validate_hsbc_txn(row, end=end)
+        detail = entry.get("detail")
+        if detail is not None:
+            detail_rows = detail.get("details") if isinstance(detail, dict) else None
+            if not isinstance(detail_rows, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("key"), str)
+                or not isinstance(item.get("value"), str)
+                or len(item["key"]) > 128
+                or len(item["value"]) > 512
+                for item in detail_rows
+            ):
+                raise ValueError("invalid HSBC card detail")
+            keys = [item["key"].strip() for item in detail_rows]
+            if len(set(keys)) != len(keys):
+                raise ValueError("invalid HSBC card detail")
+            for item in detail_rows:
+                key = item["key"].strip()
+                value = item["value"].strip()
+                if key in {
+                    "Credit Limit", "Last Statement Amount", "Last Payment Amount",
+                }:
+                    amount, currency = _hsbc_amt(value)
+                    if type(amount) is not int or currency != "TWD":
+                        raise ValueError("invalid HSBC card detail")
+                elif key in {
+                    "Last Statement Date", "Last Payment Date", "Payment Due Date",
+                } and _hsbc_dmy_text_to_iso(value) is None:
+                    raise ValueError("invalid HSBC card detail")
 
 
 def _hsbc_amt(s):
-    """HSBC 金額字串 '21 TWD' / '2,754.53 CNY' / '12,781 TWD' → (數值, 幣別)。
-    回 (float|int, currency_str)。空/異常 → (None, None)。"""
+    """Parse one bounded HSBC money scalar without binary-float validation."""
     if s is None:
         return None, None
-    t = str(s).strip()
-    if not t or t in ("-",):
+    text = str(s).strip()
+    if not text or text == "-":
         return None, None
-    parts = t.rsplit(" ", 1)
-    num_str = parts[0].replace(",", "").strip()
-    cur = parts[1].strip() if len(parts) == 2 else None
+    match = _HSBC_MONEY_RE.fullmatch(text)
+    currency = match.group(2) if match else None
     try:
-        val = float(num_str)
-        # 無小數則轉 int（台幣多無小數；外幣保留 float）
-        if val == int(val):
-            val = int(val)
-        return val, cur
-    except (ValueError, TypeError):
-        return None, cur
+        amount = Decimal(match.group(1).replace(",", "")) if match else None
+    except InvalidOperation:
+        amount = None
+    if amount is None or not amount.is_finite() or not 0 <= amount <= _HSBC_MAX_MONEY:
+        return None, currency
+    if amount == amount.to_integral_value():
+        return int(amount), currency
+    return float(amount), currency
 
 def _hsbc_date(s):
     """HSBC 日期 '2026-05-18T00:00' → 'YYYY-MM-DD'。
@@ -45,8 +305,8 @@ def _hsbc_date(s):
     if not s:
         return None
     t = str(s).strip()
-    if t.startswith(("0002-", "0001-")):
-        return None  # 未入帳 placeholder
+    if t == "0002-11-30T00:00":
+        return None  # HSBC 未入帳唯一已知 placeholder
     return t.split("T", 1)[0]
 
 def _hsbc_dmy_text_to_iso(s: str | None) -> str | None:
@@ -65,7 +325,10 @@ def _hsbc_dmy_text_to_iso(s: str | None) -> str | None:
     mm = _HSBC_MONTH_MAP.get(mmm)
     if not mm or not yyyy.isdigit() or not dd.isdigit():
         return None
-    return f"{yyyy}-{mm}-{dd.zfill(2)}"
+    try:
+        return date(int(yyyy), int(mm), int(dd)).isoformat()
+    except ValueError:
+        return None
 
 def _hsbc_card_txn(t: dict) -> dict:
     """HSBC 一筆交易 → store.upsert_card_billed 的欄位格式。
@@ -110,11 +373,17 @@ def _dmy_to_iso(s: str | None) -> str | None:
         # 防呆: y 如果只 2 位 → 拒
         if y < 1000:
             return None
-        return f"{y:04d}-{mo:02d}-{d:02d}"
+        return date(y, mo, d).isoformat()
     except Exception:
         return None
 
-def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def persist_hsbc(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
     """HSBC collect() 結構 → store 表增量。
 
     映射：
@@ -124,6 +393,7 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
       card_detail[tail].detail   → daily_metric(額度/繳款/紅利)
     HSBC 是信用卡 only，無台幣存款帳戶。
     """
+    _validate_hsbc_history(data, store)
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {}
 
@@ -133,8 +403,8 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # cardStatusDisplay 已知值: 'ACTIVATED' = 有效; 其他 (NOT_ACTIVATED/CLOSED 等) = 失效.
     # 2026-06-14 升級：先從 card_detail[*].detail.details[] (key/value list) 抽
     # per-card creditLimit + lastStatementDate（卡片清單 endpoint 沒給）。
-    details_map: dict[str, dict] = {}  # {tail: {credit_limit, last_stmt_date}}
-    for tail, entry in (data.get("card_detail") or {}).items():
+    details_map: dict[str, dict] = {}
+    for detail_key, entry in (data.get("card_detail") or {}).items():
         det = entry.get("detail") or {}
         details_list = det.get("details") or []
         info: dict = {}
@@ -163,7 +433,7 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 # "11 Jun 2026" → "2026-06-11" (HSBC 官方「最近繳款日」)
                 info["last_payment_date"] = _hsbc_dmy_text_to_iso(v)
         if info:
-            details_map[tail] = info
+            details_map[entry.get("masked") or detail_key] = info
 
     cards = data.get("cards") or []
     card_rows = []
@@ -172,7 +442,7 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         tail = masked[-4:] if masked else ""
         status_display = (c.get("cardStatusDisplay") or "").upper()
         is_active = status_display == "ACTIVATED"
-        per_card_info = details_map.get(tail) or {}
+        per_card_info = details_map.get(masked) or {}
         card_rows.append({
             "number": masked,                       # 用 masked 當卡號（HSBC 不給明碼）
             "name": c.get("name"),
@@ -195,7 +465,7 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
             "active": is_active,
         })
     if card_rows:
-        store.upsert_cards(card_rows)
+        store.upsert_cards(card_rows, commit=False)
 
     # --- 逐卡明細 ---
     billed_new = 0
@@ -203,8 +473,9 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     detail_metrics = []
     card_detail_raw = data.get("card_detail")
     card_details = card_detail_raw if isinstance(card_detail_raw, dict) else {}
-    for tail, entry in card_details.items():
+    for entry in card_details.values():
         masked = entry.get("masked", "")
+        tail = masked[-4:]
         # 已出帳（append-only）
         posted = entry.get("posted") or []
         rows = []
@@ -230,25 +501,26 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         # 卡片詳情（額度/繳款/紅利）存每日快照
         det = entry.get("detail")
         if isinstance(det, dict):
-            detail_metrics.append((f"card_detail_{tail}", det))
+            detail_metrics.append((f"card_detail_{masked[:4]}_{tail}", det))
 
     delta["card_billed_new"] = billed_new
-    expected_tails = {
-        (c.get("maskedCardNumber") or "").replace("-", "")[-4:]
+    expected_identities = {
+        c.get("maskedCardNumber")
         for c in cards if c.get("id") and c.get("maskedCardNumber")
     }
-    fetch_ok = bool(expected_tails) and isinstance(card_detail_raw, dict) and all(
-        tail in card_details and card_details[tail].get("unposted_ok") is True
-        for tail in expected_tails
+    fetch_ok = bool(expected_identities) and isinstance(card_detail_raw, dict) and all(
+        identity in card_details and card_details[identity].get("unposted_ok") is True
+        for identity in expected_identities
     )
     # 每張有 id 的卡都必須帶 collector 明示 unposted_ok=True；aggregate 非空不代表完整。
     delta["card_unbilled"] = store.refresh_card_pending(
-        "unbilled", unbilled_rows_all, rules=rules, fetch_ok=fetch_ok)
+        "unbilled", unbilled_rows_all, rules=rules, fetch_ok=fetch_ok, commit=False,
+    )
     delta["card_current"] = 0
 
-    # 必須在 billed→pending atomic transition commit 後才寫 metrics（put_daily_metric 會 commit）。
+    # 同一交易內寫 metrics；由 persist_collected 在 facts/cursor 後一次 commit。
     for category, payload in detail_metrics:
-        store.put_daily_metric(category, payload, today)
+        store.put_daily_metric(category, payload, today, commit=False)
 
     # 卡片彙總快照（應繳/額度）
     if cards:
@@ -258,6 +530,8 @@ def persist_hsbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
             "min_payment": c.get("minimumPayableAmount"),
             "due_date": c.get("paymentDueDate"),
         } for c in cards]
-        store.put_daily_metric("card_summary", summary, today)
-    store.log_sync(delta)
+        store.put_daily_metric("card_summary", summary, today, commit=False)
+    store.log_sync(delta, commit=False)
+    if commit:
+        store.commit()
     return delta

@@ -7,33 +7,42 @@ never fetches per-card posted/unposted transactions.
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from backend.banks.hsbc import HsbcCrawler
-
-
-class DummyCollector:
-    def __init__(self, hits):
-        self.hits = hits
+from backend.core.base import ApiHit, ResponseCollector
 
 
 def _hit(endpoint: str, payload):
-    return SimpleNamespace(endpoint=endpoint, resp_json={"success": True, "payload": payload})
+    return ApiHit(
+        url=f"https://card.hsbc.com.tw/ibk-bff/api/v1/cards{endpoint}",
+        method="GET",
+        status=200,
+        content_type="application/json",
+        body_size=100,
+        resp_json={"success": True, "payload": payload, "error": None},
+    )
 
 
 def test_hsbc_card_list_payload_accepts_current_cards_endpoint() -> None:
-    cards = [{"id": "card-1", "maskedCardNumber": "9052-****-****-7002"}]
-    collector = DummyCollector([_hit("cards", cards)])
+    cards = [{
+        "id": "card-1", "maskedCardNumber": "9052-****-****-7002",
+        "cardStatusDisplay": "ACTIVATED",
+    }]
+    collector = ResponseCollector()
+    collector.hits = [_hit("", cards)]
 
-    got = HsbcCrawler._card_list_payload(collector)
+    got = HsbcCrawler._card_inventory(collector)
 
     assert got == cards
 
 
 def test_hsbc_card_list_payload_falls_back_to_legacy_suspend_endpoint() -> None:
-    legacy_cards = [{"id": "legacy-card", "maskedCardNumber": "9058-****-****-7003"}]
-    collector = DummyCollector([_hit("suspend", legacy_cards)])
+    legacy_cards = [{
+        "id": "legacy-card", "maskedCardNumber": "9058-****-****-7003",
+        "cardStatusDisplay": "ACTIVATED",
+    }]
+    collector = ResponseCollector()
+    collector.hits = [_hit("/suspend", legacy_cards)]
 
-    got = HsbcCrawler._card_list_payload(collector)
+    got = HsbcCrawler._card_inventory(collector)
 
     assert got == legacy_cards
