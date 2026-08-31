@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from backend.banks.sinopac import _sinopac_card_bill_fact
-from backend.core.persist import persist_sinopac
+from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.store import BankStore
 
 

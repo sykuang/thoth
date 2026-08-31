@@ -40,8 +40,11 @@ class MultiNotifier:
         for n in names:
             try:
                 self._children.append(_build_single(n))
-            except Exception as e:
-                logger.warning("[push:multi] provider %r 載入失敗, skip: %s", n, e)
+            except Exception as exc:
+                logger.warning(
+                    "[push:multi] provider load failed provider=%s error_type=%s",
+                    n, type(exc).__name__,
+                )
 
     def send_to_user(
         self, user_id: int, payload: NotificationPayload,
@@ -50,8 +53,11 @@ class MultiNotifier:
         for child in self._children:
             try:
                 r = child.send_to_user(user_id, payload)
-            except Exception as e:
-                logger.warning("[push:multi] %s.send_to_user 例外: %s", child.name, e)
+            except Exception as exc:
+                logger.warning(
+                    "[push:multi] child user dispatch failed provider=%s error_type=%s",
+                    child.name, type(exc).__name__,
+                )
                 continue
             _merge(merged, r)
         return merged
@@ -66,8 +72,11 @@ class MultiNotifier:
                 continue
             try:
                 r = child.send_to_token(target, payload)
-            except Exception as e:
-                logger.warning("[push:multi] %s.send_to_token 例外: %s", child.name, e)
+            except Exception as exc:
+                logger.warning(
+                    "[push:multi] child dispatch failed provider=%s error_type=%s",
+                    child.name, type(exc).__name__,
+                )
                 continue
             _merge(merged, r)
         return merged

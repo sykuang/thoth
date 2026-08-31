@@ -17,14 +17,27 @@
 """
 from __future__ import annotations
 
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+import html
+import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    validate_history_coverage,
+    write_private_json,
+)
 from backend.core.card_bills import (
     card_bill_date,
     card_bill_money,
@@ -40,6 +53,16 @@ from backend.core.login_checkpoints import (
 )
 
 BASE = "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
+
+
+def _taipei_today() -> date:
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+
+def _plain_text(value: str) -> str:
+    return html.unescape(re.sub(r"<[^>]*>", "", value)).replace("\xa0", " ").strip()
+
+
 LOAN_DETAIL_URL = "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_detail.aspx"
 SEL_CAP_IMG = "#imgCode"
 
@@ -92,6 +115,22 @@ class SinopacCrawler(BankCrawler):
     CAPTCHA_INVALID = "captcha_invalid"
     CREDENTIALS_INVALID = "credentials_invalid"
     LOGIN_FAILED = "login_failed"
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+        "twd_transactions",
+    })
+
+    _TWD_INVENTORY_PATH = "/ws/bank/transdetail/ws_debitacct.ashx"
+    _TWD_HISTORY_PATH = "/ws/bank/transdetail/ws_transdetailMerge.ashx"
+    _HISTORY_RESPONSE_KEYS = frozenset({
+        "BeginDate", "DefBeginDate", "DefEndDate", "EndDate", "HeadInfo",
+        "Header", "MaxMonth", "Message", "RecordCount", "SubInfo", "isOBU",
+    })
+    _HISTORY_ROW_KEYS = frozenset(f"DataText{i}" for i in range(1, 12))
+    _HISTORY_FORM_KEYS = frozenset({
+        "Acct", "AcctName", "AcctValue", "BusinessDate", "Curr", "CurrName",
+        "EndDate", "QueryType", "StartDate", "TextType",
+    })
 
     def __init__(self):
         super().__init__(name="sinopac")
@@ -447,6 +486,269 @@ class SinopacCrawler(BankCrawler):
             ) from None
 
     # ---------- 抓取 ----------
+    @staticmethod
+    def _history_floor(end: date) -> date:
+        try:
+            return end.replace(year=end.year - 1) + timedelta(days=1)
+        except ValueError:
+            return end.replace(year=end.year - 1, day=28) + timedelta(days=1)
+
+    @staticmethod
+    def _history_windows(start: date, end: date) -> list[tuple[date, date]]:
+        if start > end:
+            raise RuntimeError("sinopac-twd-history-range")
+        windows = []
+        cursor = start
+        while cursor <= end:
+            window_end = min(end, date(
+                cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1],
+            ))
+            windows.append((cursor, window_end))
+            cursor = window_end + timedelta(days=1)
+        return windows
+
+    def _history_range(
+        self, identity: str, *, end: date, mode: str,
+    ) -> tuple[date, date]:
+        floor = self._history_floor(end)
+        cursor = self.transaction_cursors.get("twd_transactions", {}).get(identity)
+        if isinstance(cursor, date) and cursor > end:
+            raise RuntimeError("sinopac-twd-history-cursor")
+        if mode == "full":
+            return floor, end
+        if mode != "incremental":
+            raise RuntimeError("sinopac-twd-history-mode")
+        start = max(floor, cursor - timedelta(days=7)) if isinstance(cursor, date) else floor
+        return start, end
+
+    @staticmethod
+    def _exact_hit_url(hit, path: str, *, numeric_query: bool) -> bool:
+        parsed = urlparse(hit.url)
+        raw = urlparse(hit.raw_url or hit.url)
+        return (
+            parsed.scheme == raw.scheme == "https"
+            and parsed.hostname == raw.hostname == "mma.sinopac.com"
+            and parsed.port in (None, 443)
+            and raw.port in (None, 443)
+            and parsed.username is parsed.password is raw.username is raw.password is None
+            and parsed.path == raw.path == path
+            and parsed.params == raw.params == ""
+            and parsed.fragment == raw.fragment == ""
+            and parsed.query == ""
+            and (not numeric_query or re.fullmatch(r"\d{10,16}", raw.query or "") is not None)
+        )
+
+    @classmethod
+    def _twd_inventory(
+        cls, collector: ResponseCollector, *, after_sequence: int = 0,
+    ) -> list[dict]:
+        candidates = [
+            candidate for candidate in collector.by_endpoint("ws_debitacct.ashx")
+            if type(candidate.request_sequence) is int
+            and candidate.request_sequence > after_sequence
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("sinopac-twd-history-inventory")
+        hit = candidates[0]
+        payload = hit.resp_json if hit else None
+        body = payload[0] if isinstance(payload, list) and len(payload) == 1 else None
+        rows = body.get("SubInfo") if isinstance(body, dict) else None
+        if (
+            hit is None
+            or type(hit.request_sequence) is not int
+            or hit.request_sequence <= after_sequence
+            or hit.main_frame_request is not True
+            or hit.method != "POST"
+            or hit.req_body not in (None, "")
+            or hit.status != 200
+            or hit.redirected
+            or type(hit.body_size) is not int
+            or not 0 <= hit.body_size <= 5_000_000
+            or hit.content_type.split(";", 1)[0].strip().lower() != "application/json"
+            or not cls._exact_hit_url(hit, cls._TWD_INVENTORY_PATH, numeric_query=True)
+            or not isinstance(body, dict)
+            or set(body) != {"Header", "Message", "SubInfo"}
+            or body.get("Header") != "SUCCESS"
+            or body.get("Message") not in (None, "")
+            or not isinstance(rows, list)
+        ):
+            raise RuntimeError("sinopac-twd-history-inventory")
+        inventory = []
+        seen_labels: set[str] = set()
+        seen_identities: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"DataText", "DataValue", "DisplayText"}:
+                raise RuntimeError("sinopac-twd-history-inventory")
+            label = row.get("DataText")
+            identity = row.get("DataValue")
+            currency = row.get("DisplayText")
+            if (
+                not isinstance(label, str) or not label or label != label.strip()
+                or not isinstance(identity, str) or re.fullmatch(r"\d{14}", identity) is None
+                or currency != "TWD"
+                or label in seen_labels or identity in seen_identities
+            ):
+                raise RuntimeError("sinopac-twd-history-inventory")
+            seen_labels.add(label)
+            seen_identities.add(identity)
+            inventory.append({"label": label, "identity": identity, "currency": currency})
+        return inventory
+
+    @staticmethod
+    def _yyyymmdd(value, error: str) -> date:
+        if not isinstance(value, str) or re.fullmatch(r"\d{8}", value) is None:
+            raise RuntimeError(error)
+        try:
+            return datetime.strptime(value, "%Y%m%d").date()
+        except ValueError:
+            raise RuntimeError(error) from None
+
+    @staticmethod
+    def _history_amount(value, error: str) -> Decimal:
+        if not isinstance(value, str):
+            raise RuntimeError(error)
+        text = re.sub(r"<[^>]*>", "", value).strip()
+        if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", text) is None:
+            raise RuntimeError(error)
+        try:
+            amount = Decimal(text.replace(",", ""))
+        except InvalidOperation:
+            raise RuntimeError(error) from None
+        if not amount.is_finite() or amount != amount.to_integral_value() or abs(amount) > Decimal("2147483647"):
+            raise RuntimeError(error)
+        return amount
+
+    @classmethod
+    def _validate_history_row(cls, row, *, start: date, end: date) -> None:
+        error = "sinopac-twd-history-row"
+        if not isinstance(row, dict) or set(row) != cls._HISTORY_ROW_KEYS:
+            raise RuntimeError(error)
+        if any(not isinstance(row[key], str) for key in cls._HISTORY_ROW_KEYS):
+            raise RuntimeError(error)
+        if (
+            not re.fullmatch(r"\d{4}/\d{2}/\d{2}<br />\d{2}:\d{2}", row["DataText1"])
+            or not re.fullmatch(r"\d{4}/\d{2}/\d{2}", row["DataText2"])
+        ):
+            raise RuntimeError(error)
+        raw_datetime = re.sub(
+            r"<br\s*/?>", " ", row["DataText1"], flags=re.IGNORECASE,
+        ).strip()
+        try:
+            transacted = datetime.strptime(raw_datetime, "%Y/%m/%d %H:%M")
+            account_date = datetime.strptime(row["DataText2"].strip(), "%Y/%m/%d").date()
+        except ValueError:
+            raise RuntimeError(error) from None
+        if not start <= transacted.date() <= end or not start <= account_date <= end:
+            raise RuntimeError(error)
+        description = _plain_text(row["DataText3"])
+        if not description or len(description) > 500:
+            raise RuntimeError(error)
+        cls._history_amount(row["DataText4"], error)
+        cls._history_amount(row["DataText5"], error)
+        if any(len(row[f"DataText{i}"]) > 2_000 for i in range(6, 12)):
+            raise RuntimeError(error)
+
+    @classmethod
+    def _validate_history_hit(
+        cls, hit, *, label: str, identity: str, currency: str, start: date, end: date,
+        business_date: str, as_of: date, after_sequence: int = 0,
+    ) -> dict:
+        error = "sinopac-twd-history-response"
+        params = parse_qs(hit.req_body, keep_blank_values=True) if isinstance(hit.req_body, str) else {}
+        payload = hit.resp_json
+        body = payload[0] if isinstance(payload, list) and len(payload) == 1 else None
+        if (
+            type(hit.request_sequence) is not int
+            or hit.request_sequence <= after_sequence
+            or hit.main_frame_request is not True
+            or hit.method != "POST"
+            or hit.status != 200
+            or hit.redirected
+            or type(hit.body_size) is not int
+            or not 0 <= hit.body_size <= 5_000_000
+            or hit.content_type.split(";", 1)[0].strip().lower() != "application/json"
+            or not cls._exact_hit_url(hit, cls._TWD_HISTORY_PATH, numeric_query=True)
+            or set(params) != cls._HISTORY_FORM_KEYS
+            or params.get("Acct") != [label]
+            or params.get("AcctName") != [""]
+            or params.get("AcctValue") != [identity]
+            or params.get("Curr") != [currency]
+            or params.get("CurrName") != [""]
+            or params.get("StartDate") != [start.strftime("%Y%m%d")]
+            or params.get("EndDate") != [end.strftime("%Y%m%d")]
+            or params.get("QueryType") != ["3"]
+            or params.get("TextType") != [""]
+            or params.get("BusinessDate") != [business_date]
+            or not isinstance(body, dict)
+            or set(body) != cls._HISTORY_RESPONSE_KEYS
+            or body.get("Header") != "SUCCESS"
+            or body.get("MaxMonth") != "3"
+        ):
+            raise RuntimeError(error)
+        parsed_business_date = cls._yyyymmdd(business_date, error)
+        begin = cls._yyyymmdd(body.get("BeginDate"), error)
+        response_end = cls._yyyymmdd(body.get("EndDate"), error)
+        default_begin = cls._yyyymmdd(body.get("DefBeginDate"), error)
+        default_end = cls._yyyymmdd(body.get("DefEndDate"), error)
+        if (
+            parsed_business_date > as_of
+            or begin > start
+            or response_end < end
+            or not begin <= default_begin <= default_end <= response_end
+            or body.get("isOBU") not in (None, "Y", "N")
+        ):
+            raise RuntimeError(error)
+        head_info = body.get("HeadInfo")
+        if (
+            not isinstance(head_info, list)
+            or len(head_info) != 9
+            or any(not isinstance(item, dict) for item in head_info)
+            or any(set(item) != {
+                "DataAlign", "DetailShow", "FieldKey", "FieldWidth", "HeadAlign",
+                "HeadText", "MainShow", "OrderIndex",
+            } for item in head_info)
+            or any(not all(isinstance(value, str) for value in item.values()) for item in head_info)
+            or [item.get("FieldKey") for item in head_info] != [
+                f"DataText{i}" for i in range(1, 10)
+            ]
+        ):
+            raise RuntimeError(error)
+        orders = [item["OrderIndex"] for item in head_info]
+        if orders not in (
+            [str(i) for i in range(9)],
+            [str(i) for i in range(1, 10)],
+        ):
+            raise RuntimeError(error)
+        for item in head_info:
+            if (
+                item["DataAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
+                or item["HeadAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
+                or item["MainShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
+                or item["DetailShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
+                or not item["FieldWidth"].isdigit()
+                or not 0 <= int(item["FieldWidth"]) <= 1000
+                or not item["HeadText"].strip()
+                or len(item["HeadText"]) > 50
+            ):
+                raise RuntimeError(error)
+        rows = body.get("SubInfo")
+        if not isinstance(rows, list) or len(rows) > 10_000:
+            raise RuntimeError(error)
+        if not rows:
+            if body.get("Message") != "查無資料" or body.get("RecordCount") is not None:
+                raise RuntimeError(error)
+            return {"records": [], "status": "explicit_empty", "rows": 0}
+        if body.get("Message") not in (None, "") or body.get("RecordCount") != "0":
+            raise RuntimeError(error)
+        seen_rows = set()
+        for row in rows:
+            cls._validate_history_row(row, start=start, end=end)
+            fingerprint = tuple(row[f"DataText{i}"] for i in range(1, 12))
+            if fingerprint in seen_rows:
+                raise RuntimeError(error)
+            seen_rows.add(fingerprint)
+        return {"records": rows, "status": "complete", "rows": len(rows)}
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """登入後抓帳戶餘額 / 貸款明細 / 信用卡彙總與帳單 / 全卡片 / 資產分析。
 
@@ -457,15 +759,6 @@ class SinopacCrawler(BankCrawler):
         out: dict = {}
         page.wait_for_timeout(5000)
 
-        # 關掉登入後可能的提醒 modal
-        page.evaluate(
-            "(() => { for(let i=0;i<6;i++){"
-            "  const b=[...document.querySelectorAll('button,a,div')].find(e=>e.offsetParent!==null"
-            "    && /^(Confirm|OK|確認|我知道了|關閉|稍後|下次|略過|確定|不再顯示|同意|繼續|下一步)$/i.test((e.textContent||'').trim()));"
-            "  if(b) b.click(); else break; } })()",
-        )
-        page.wait_for_timeout(3000)
-
         # 巡訪「資產分析 / 信用卡總覽」頁觸發更多 API
         for url in [
             "https://mma.sinopac.com/MyMMA/Myasset/mma_assets_analysis.aspx",
@@ -474,8 +767,8 @@ class SinopacCrawler(BankCrawler):
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 page.wait_for_timeout(6000)
-            except Exception as e:
-                _log(f"[collect] goto {url} 失敗: {e}")
+            except Exception:
+                _log("[collect] page_navigation_failed")
 
         # 從 collector 取已攔到的 API JSON
         out["bank_balance"] = self._latest_json(collector, "ws_bankbal.ashx")        # 銀行帳戶餘額 list
@@ -489,8 +782,11 @@ class SinopacCrawler(BankCrawler):
         # === 貸款明細：每個貸款帳號查本金餘額 / 利率 / 到期日 ===
         out["loan"] = self._collect_loans(page, collector)
 
-        # === 台幣交易明細（jQuery dropdown 破解後，每帳戶查 1 次）===
-        out["twd_transactions"] = self._collect_transactions(page, collector)
+        # === 台幣交易明細：權威帳戶 inventory + 月窗 coverage ===
+        twd_history = self._collect_transactions(page, collector)
+        out["twd_transactions"] = twd_history["results"]
+        out["debit_accounts"] = twd_history["inventory"]
+        out["history_coverage"] = twd_history["coverage"]
 
         # === 信用卡明細：帳單已請款（StatementInquiry HTML）+ 未請款（UnbilledTxInquiry API）===
         out["card_statements"] = self._collect_card_statements(page)
@@ -503,7 +799,6 @@ class SinopacCrawler(BankCrawler):
 
         publish_card_bill_facts(out, [_sinopac_card_bill_fact(out)])
 
-        out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
         return BankCollectResult(**out)
 
@@ -583,85 +878,383 @@ class SinopacCrawler(BankCrawler):
             })
         return {"details": details, "fetch_ok": True}
 
-    def _collect_transactions(self, page, collector) -> list:
-        """進往來明細頁、每個帳戶設 hidden inputs + 按 #btnQuery、攔 ws_transdetailMerge.ashx。
+    def _collect_transactions(self, page, collector: ResponseCollector) -> dict:
+        """Collect every authoritative TWD account across complete month windows."""
+        deadline = time.monotonic() + 600
 
-        永豐自家 jQuery dropdown #divDebitAccount 點不開（沒掛 click handler），
-        但 6 個 hidden inputs (Acct/AcctValue/AcctName/Curr/CurrName/QueryType) 設了
-        就生效。從 ws_debitacct.ashx 拿到的 DataValue 直接設進去即可。
-        """
+        def ensure_deadline() -> None:
+            if getattr(self, "_shared_dialog_blocked", False):
+                raise RuntimeError("sinopac-twd-history-dialog")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("sinopac-twd-history-deadline")
+
+        inventory_boundary = collector.request_sequence
+        inventory_issued_before = collector.issued_count("ws_debitacct.ashx")
+        inventory_response_before = len(collector.by_endpoint("ws_debitacct.ashx"))
+        history_issued_before = collector.issued_count("ws_transdetailMerge.ashx")
+        history_response_before = len(collector.by_endpoint("ws_transdetailMerge.ashx"))
+        page.goto(
+            "https://mma.sinopac.com/mma/bank/transdetail/mma_transdetail.aspx",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+        for _ in range(40):
+            ensure_deadline()
+            candidate = collector.latest("ws_debitacct.ashx")
+            if candidate is not None and candidate.request_sequence > inventory_boundary:
+                break
+            page.wait_for_timeout(500)
+        page.wait_for_timeout(500)
+        if collector.issued_count("ws_debitacct.ashx") - inventory_issued_before != 1:
+            raise RuntimeError("sinopac-twd-history-inventory")
+        inventory = self._twd_inventory(
+            collector, after_sequence=inventory_boundary,
+        )
+        inventory_hit = collector.latest("ws_debitacct.ashx")
+        inventory_body_size = getattr(inventory_hit, "body_size", None)
+        if type(inventory_body_size) is not int:
+            raise RuntimeError("sinopac-twd-history-byte-budget")
+        operation_bytes = inventory_body_size
+
+        handlers = page.evaluate(
+            """() => [...document.querySelectorAll('#divDebitAccount [onclick]')]
+              .map(e => e.getAttribute('onclick') || '')"""
+        )
+        if not isinstance(handlers, list) or len(handlers) != len(inventory):
+            raise RuntimeError("sinopac-twd-history-account-control")
+        pattern = re.compile(
+            r"^setDebitAccount\('([^'\r\n]*)',\s*'(\d{14})',\s*'([A-Z]{3})'\)\s*;?$"
+        )
+        for handler, item in zip(handlers, inventory, strict=True):
+            match = pattern.fullmatch(handler) if isinstance(handler, str) else None
+            if match is None or match.groups() != (
+                item["label"], item["identity"], item["currency"],
+            ):
+                raise RuntimeError("sinopac-twd-history-account-control")
+
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise RuntimeError("sinopac-twd-history-mode")
+        as_of = _taipei_today()
         results = []
-        # 先進往來明細頁觸發 ws_debitacct（assets_summary 沒打）
-        try:
-            page.goto("https://mma.sinopac.com/mma/bank/transdetail/mma_transdetail.aspx",
-                       wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(8000)
-        except Exception as e:
-            _log(f"[twd] goto 失敗: {e}")
-            return results
+        expected = []
+        windows_out = []
+        operation_rows = 0
+        for index, item in enumerate(inventory):
+            ensure_deadline()
+            toggle = page.locator("#spanDebitAccount")
+            if toggle.count() != 1 or not toggle.nth(0).is_visible():
+                raise RuntimeError("sinopac-twd-history-account-control")
+            toggle.nth(0).click(timeout=8_000)
+            page.wait_for_timeout(300)
+            options = page.locator("#divDebitAccount [onclick]")
+            visible = [
+                options.nth(i) for i in range(options.count()) if options.nth(i).is_visible()
+            ]
+            if len(visible) != len(inventory):
+                raise RuntimeError("sinopac-twd-history-account-control")
+            visible[index].click(timeout=8_000)
+            page.wait_for_timeout(300)
+            selected = page.evaluate(
+                """() => Object.fromEntries(['Acct','AcctValue','Curr','BusinessDate'].map(
+                  id => [id, document.getElementById(id)?.value ?? null]))"""
+            )
+            business_date = selected.get("BusinessDate") if isinstance(selected, dict) else None
+            if (
+                not isinstance(selected, dict)
+                or selected.get("Acct") != item["label"]
+                or selected.get("AcctValue") != item["identity"]
+                or selected.get("Curr") != item["currency"]
+                or not isinstance(business_date, str)
+                or re.fullmatch(r"\d{8}", business_date) is None
+            ):
+                raise RuntimeError("sinopac-twd-history-account-control")
 
-        # 進頁後 ws_debitacct 才會打
-        debit = self._latest_json(collector, "ws_debitacct.ashx")
-        if not (debit and isinstance(debit, list) and len(debit) > 0):
-            _log("[twd] ws_debitacct 沒攔到，跳過")
-            return results
-        sub = debit[0].get("SubInfo", []) if isinstance(debit[0], dict) else []
-        if not sub:
-            _log("[twd] ws_debitacct SubInfo 空，跳過")
-            return results
-        _log(f"[twd] 共 {len(sub)} 個帳戶")
-
-        for acct in sub:
-            dv = acct.get("DataValue", "")
-            dt = acct.get("DataText", "")
-            dt_short = (acct.get("DisplayText") or "TWD")
-            _log(f"[twd] 查帳戶 {dt[:40]}")
-
-            # 設 6 個 hidden inputs（從 probe 驗證有效）
-            set_js = """
-            ((args) => {
-              const dv = args.dv, dt = args.dt, cur = args.cur;
-              const out = [];
-              const span = document.querySelector('#spanDebitAccount');
-              if(span) { span.textContent = dt; }
-              const targets = ['Acct','AcctValue','AcctName','Curr','CurrName','QueryType','TextType'];
-              for(const tn of targets){
-                const el = document.getElementById(tn) || document.querySelector('[name='+tn+']');
-                if(el){
-                  let val = dv;
-                  if(tn === 'AcctName') val = dt;
-                  if(tn === 'Curr' || tn === 'CurrName') val = cur;
-                  if(tn === 'QueryType') val = '3';
-                  if(tn === 'TextType') val = '';
-                  el.value = val;
-                  el.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-              }
-              return 'set';
+            start, end = self._history_range(item["identity"], end=as_of, mode=mode)
+            expected.append({
+                "identity": item["identity"],
+                "start": start.isoformat(),
+                "end": end.isoformat(),
             })
-            """
-            try:
-                page.evaluate(set_js, {"dv": dv, "dt": dt, "cur": dt_short})
-                page.wait_for_timeout(800)
-                # 按 #btnQuery
-                page.evaluate("(() => { const b=document.querySelector('#btnQuery'); if(b) b.click(); })()")
-                page.wait_for_timeout(7000)
-                # 攔最新的 ws_transdetailMerge.ashx
-                hit = collector.latest("ws_transdetailMerge.ashx")
-                if hit and hit.resp_json:
-                    body = hit.resp_json[0] if isinstance(hit.resp_json, list) and hit.resp_json else hit.resp_json
-                    results.append({
-                        "account": dv,
-                        "account_name": dt,
-                        "currency": dt_short,
-                        "header": body.get("Header") if isinstance(body, dict) else None,
-                        "message": body.get("Message") if isinstance(body, dict) else None,
-                        "records": body.get("SubInfo", []) if isinstance(body, dict) else [],
-                    })
-                    _log(f"  → 抓到 {len(results[-1]['records'])} 筆")
-            except Exception as e:
-                _log(f"  [twd] 帳戶 {dv} 查詢失敗: {e}")
-        return results
+            for window_start, window_end in self._history_windows(start, end):
+                ensure_deadline()
+                start_control = page.locator("#StartDate")
+                end_control = page.locator("#EndDate")
+                button = page.locator("#btnQuery")
+                if any(
+                    control.count() != 1
+                    or not control.nth(0).is_visible()
+                    or not control.nth(0).is_enabled()
+                    for control in (start_control, end_control, button)
+                ):
+                    raise RuntimeError("sinopac-twd-history-query-control")
+                start_text = window_start.strftime("%Y%m%d")
+                end_text = window_end.strftime("%Y%m%d")
+                start_control.nth(0).fill(start_text)
+                end_control.nth(0).fill(end_text)
+                if (
+                    start_control.nth(0).input_value() != start_text
+                    or end_control.nth(0).input_value() != end_text
+                ):
+                    raise RuntimeError("sinopac-twd-history-query-control")
+
+                pre_dom_marker = page.evaluate(
+                    """() => { window.__hermesSinopacObserver?.disconnect();
+                      clearTimeout(window.__hermesSinopacObserverTimer);
+                      const isEmpty=e => e?.nodeType===1 && e.children.length===0 && (e.textContent||'').trim()==='查無資料';
+                      const stale=new WeakSet([...document.querySelectorAll('body *')].filter(isEmpty));
+                      const state={mutations:0,freshEmpty:false}; window.__hermesSinopacState=state;
+                      window.__hermesSinopacObserver=new MutationObserver(records => {
+                        state.mutations+=records.length;
+                        for(const record of records){
+                          const nodes=[...record.addedNodes];
+                          if(record.target.nodeType===1)nodes.push(record.target);
+                          else if(record.target.parentElement)nodes.push(record.target.parentElement);
+                          for(const node of nodes){
+                            if(node.nodeType!==1)continue;
+                            const candidates=[node,...node.querySelectorAll('*')];
+                            if(candidates.some(e => isEmpty(e) &&
+                              (record.type==='characterData' || !stale.has(e)))) state.freshEmpty=true;
+                          }
+                        }
+                      });
+                      window.__hermesSinopacObserver.observe(document.body,{subtree:true,childList:true,attributes:true,characterData:true});
+                      window.__hermesSinopacObserverTimer=setTimeout(() => {
+                        window.__hermesSinopacObserver?.disconnect();
+                        delete window.__hermesSinopacObserver; delete window.__hermesSinopacState;
+                        delete window.__hermesSinopacExpectedRows;
+                      },35000);
+                      const table=document.querySelector('#ListingTable');
+                      if(!table)return null; const value=table.innerHTML; let hash=2166136261;
+                      for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i);hash=Math.imul(hash,16777619);}
+                      return [value.length,hash>>>0]; }"""
+                )
+                before = len(collector.by_endpoint("ws_transdetailMerge.ashx"))
+                request_boundary = collector.request_sequence
+                issued_before = collector.issued_count("ws_transdetailMerge.ashx")
+                ensure_deadline()
+                button.nth(0).click(timeout=8_000)
+                for _ in range(60):
+                    ensure_deadline()
+                    if len(collector.by_endpoint("ws_transdetailMerge.ashx")) > before:
+                        break
+                    page.wait_for_timeout(500)
+                hits = collector.by_endpoint("ws_transdetailMerge.ashx")[before:]
+                if (
+                    len(hits) != 1
+                    or hits[0].request_sequence <= request_boundary
+                ):
+                    raise RuntimeError("sinopac-twd-history-response-cardinality")
+                validated = self._validate_history_hit(
+                    hits[0],
+                    label=item["label"],
+                    identity=item["identity"],
+                    currency=item["currency"],
+                    start=window_start,
+                    end=window_end,
+                    business_date=business_date,
+                    as_of=as_of,
+                    after_sequence=request_boundary,
+                )
+                operation_rows += validated["rows"]
+                if operation_rows > 50_000:
+                    raise RuntimeError("sinopac-twd-history-row-budget")
+                history_body_size = hits[0].body_size
+                if type(history_body_size) is not int:
+                    raise RuntimeError("sinopac-twd-history-byte-budget")
+                operation_bytes += history_body_size
+                if operation_bytes > 5_000_000:
+                    raise RuntimeError("sinopac-twd-history-byte-budget")
+                page.evaluate(
+                    "(rows) => { window.__hermesSinopacExpectedRows = rows; }",
+                    [
+                        [row[f"DataText{i}"] for i in range(1, 10)]
+                        for row in validated["records"]
+                    ],
+                )
+                dom_probe = r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                  const pagers=[...document.querySelectorAll(
+                    '.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')]
+                    .filter(e => e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
+                      /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
+                      (e.matches('input,select,option') && /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»])$/i.test((e.value||'').trim())) ||
+                      (e.matches('input[type=button],input[type=submit],select,option') && /^\d{1,3}$/.test((e.value||'').trim())) ||
+                      /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test(
+                        (e.textContent||'').replace(/\s+/g,' ').trim()) ||
+                      /page|下一|上一|next|previous|prev|first|last/i.test(e.getAttribute('aria-label')||'') ||
+                      /^(?:next|prev)$/i.test(e.getAttribute('rel')||'') ||
+                      /(?:page|next|prev|first|last|下一|上一)/i.test(e.getAttribute('onclick')||'') ||
+                      /(?:[?&](?:page|p)=|javascript:.*(?:page|next|prev))/i.test(e.getAttribute('href')||'')).length;
+                  const notices=[...document.querySelectorAll(
+                    '[role=alert],[role=dialog],[aria-modal=true],dialog[open],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay],.alert,.error,.loading,.busy,[aria-busy=true]')]
+                    .filter(visible);
+                  const emptyMarker=notices.some(e => (e.textContent||'').trim()==='查無資料') ||
+                    [...document.querySelectorAll('body *')].some(e => visible(e) && e.children.length===0 && (e.textContent||'').trim()==='查無資料');
+                  const textErrors=[...document.querySelectorAll('body *')].filter(e => visible(e) &&
+                    e.children.length===0 &&
+                    /系統錯誤|查詢失敗|請稍後|重試|重新整理|連線中斷|disconnected|retry|error|failed/i.test((e.textContent||'').trim())).length;
+                  const errors=notices.filter(e =>
+                    (e.textContent||'').trim()!=='查無資料' || e.matches('dialog,[role=dialog],[aria-modal=true],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay]')).length + textErrors;
+                  const expected=window.__hermesSinopacExpectedRows||[];
+                  const normalize=value => { const node=document.createElement('div'); node.innerHTML=String(value||'');
+                    return (node.textContent||'').replace(/\s+/g,' ').trim(); };
+                  const tables=[...document.querySelectorAll('#ListingTable')];
+                  if(tables.length!==1)return {tables:tables.length,rows:0,visibleRows:0,pagers,errors,visible:false,emptyMarker,freshEmpty:window.__hermesSinopacState?.freshEmpty===true,bound:expected.length===0,signature:null,mutations:window.__hermesSinopacState?.mutations||0};
+                  const table=tables[0]; const rows=[...table.querySelectorAll('tbody tr')];
+                  const bound=expected.length>0 && rows.length===expected.length*2 && expected.every((row,rowIndex) => {
+                    const cells=[...rows[rowIndex*2].querySelectorAll('td')].map(cell => normalize(cell.innerHTML));
+                    return cells.length===row.length && row.every((value,index) => {
+                      const text=normalize(value); return cells[index]===text; }); });
+                  const value=table.innerHTML; let hash=2166136261;
+                  for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i);hash=Math.imul(hash,16777619);}
+                  return {tables:1,rows:rows.length,visibleRows:rows.filter(visible).length,
+                    pagers,errors,visible:visible(table),emptyMarker,freshEmpty:window.__hermesSinopacState?.freshEmpty===true,bound,signature:[value.length,hash>>>0],mutations:window.__hermesSinopacState?.mutations||0}; }"""
+                stable_dom = None
+                stable_count = 0
+                for _ in range(10):
+                    ensure_deadline()
+                    page.wait_for_timeout(500)
+                    dom_state = page.evaluate(dom_probe)
+                    common_invalid = (
+                        not isinstance(dom_state, dict)
+                        or dom_state.get("pagers") != 0
+                        or dom_state.get("errors") != 0
+                        or dom_state.get("bound") is not True
+                        or type(dom_state.get("mutations")) is not int
+                        or dom_state["mutations"] <= 0
+                    )
+                    if validated["rows"]:
+                        invalid = (
+                            common_invalid
+                            or dom_state.get("tables") != 1
+                            or dom_state.get("visible") is not True
+                            or dom_state.get("emptyMarker") is not False
+                            or dom_state.get("freshEmpty") is not False
+                            or type(dom_state.get("rows")) is not int
+                            or dom_state["rows"] != validated["rows"] * 2
+                            or dom_state.get("visibleRows") != dom_state["rows"]
+                            or not isinstance(dom_state.get("signature"), list)
+                            or len(dom_state["signature"]) != 2
+                            or any(type(value) is not int for value in dom_state["signature"])
+                            or dom_state["signature"] == pre_dom_marker
+                        )
+                    else:
+                        invalid = (
+                            common_invalid
+                            or dom_state.get("tables") != 0
+                            or dom_state.get("rows") != 0
+                            or dom_state.get("visibleRows") != 0
+                            or dom_state.get("emptyMarker") is not True
+                            or dom_state.get("freshEmpty") is not True
+                            or dom_state.get("signature") is not None
+                        )
+                    if invalid:
+                        stable_dom = None
+                        stable_count = 0
+                        continue
+                    stable_count = stable_count + 1 if dom_state == stable_dom else 1
+                    stable_dom = dom_state
+                    if stable_count == 2:
+                        break
+                else:
+                    raise RuntimeError("sinopac-twd-history-result-table")
+                ensure_deadline()
+                final_dom = page.evaluate(
+                    "() => { const probe = " + dom_probe + "; const result=probe();"
+                    " window.__hermesSinopacObserver?.disconnect();"
+                    " clearTimeout(window.__hermesSinopacObserverTimer);"
+                    " delete window.__hermesSinopacObserverTimer;"
+                    " delete window.__hermesSinopacObserver;"
+                    " delete window.__hermesSinopacState;"
+                    " delete window.__hermesSinopacExpectedRows; return result; }"
+                )
+                if final_dom != stable_dom:
+                    raise RuntimeError("sinopac-twd-history-result-table")
+                ensure_deadline()
+                final_hits = collector.by_endpoint("ws_transdetailMerge.ashx")[before:]
+                if (
+                    len(final_hits) != 1
+                    or final_hits[0] is not hits[0]
+                    or collector.issued_count("ws_transdetailMerge.ashx") - issued_before != 1
+                ):
+                    raise RuntimeError("sinopac-twd-history-response-cardinality")
+                receipt = {
+                    "identity": item["identity"],
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "status": validated["status"],
+                    "pages": 1,
+                    "rows": validated["rows"],
+                }
+                results.append({
+                    "account": item["identity"],
+                    "account_name": item["label"],
+                    "currency": item["currency"],
+                    "records": validated["records"],
+                    "receipt": receipt,
+                })
+                windows_out.append({key: receipt[key] for key in (
+                    "identity", "start", "end", "status", "pages",
+                )})
+
+        ensure_deadline()
+        if not inventory:
+            blockers = page.evaluate(
+                r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                  const pagers=[...document.querySelectorAll('.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')].filter(e =>
+                    e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
+                    /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
+                    /next|previous|prev|first|last|下一|上一|page/i.test(e.getAttribute('aria-label')||'') ||
+                    /^(?:next|prev)$/i.test(e.getAttribute('rel')||'') ||
+                    /(?:page|next|prev|first|last|下一|上一)/i.test((e.getAttribute('onclick')||'')+(e.getAttribute('href')||'')) ||
+                    (e.matches('input,select,option') && /^(?:下一頁|上一頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test((e.value||'').trim())) ||
+                    /^(?:下一頁|上一頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test((e.textContent||'').trim())).length;
+                  const notices=[...document.querySelectorAll('dialog[open],[aria-modal=true],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay],[role=alert],[role=dialog],.alert,.error,.loading,.busy,[aria-busy=true]')].filter(visible).length;
+                  const textNotices=[...document.querySelectorAll('body *')].filter(e => visible(e) &&
+                    e.children.length===0 && /系統錯誤|查詢失敗|請稍後|重試|重新整理|連線中斷|disconnected|retry|error|failed/i.test((e.textContent||'').trim())).length;
+                  const tables=document.querySelectorAll('table').length;
+                  return pagers+notices+textNotices+tables; }"""
+            )
+            ensure_deadline()
+            if blockers != 0:
+                raise RuntimeError("sinopac-twd-history-empty-inventory-blocked")
+        final_inventory_hits = collector.by_endpoint("ws_debitacct.ashx")[inventory_response_before:]
+        final_history_hits = collector.by_endpoint("ws_transdetailMerge.ashx")[history_response_before:]
+        if (
+            collector.issued_count("ws_debitacct.ashx") - inventory_issued_before != 1
+            or collector.issued_count("ws_transdetailMerge.ashx") - history_issued_before != len(windows_out)
+            or len(final_inventory_hits) != 1
+            or len(final_history_hits) != len(windows_out)
+            or any(type(hit.body_size) is not int for hit in final_history_hits)
+            or operation_bytes != inventory_body_size + sum(
+                hit.body_size for hit in final_history_hits if type(hit.body_size) is int
+            )
+        ):
+            raise RuntimeError("sinopac-twd-history-operation-cardinality")
+
+        domain = {
+            "domain": "twd_transactions",
+            "expected": expected,
+            "windows": windows_out,
+        }
+        if not expected:
+            domain["empty_window"] = {
+                "start": self._history_floor(as_of).isoformat(),
+                "end": as_of.isoformat(),
+                "status": "explicit_empty",
+                "pages": 1,
+            }
+        coverage = {
+            "mode": mode,
+            "as_of": as_of.isoformat(),
+            "domains": [domain],
+        }
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=self.HISTORY_COVERAGE_DOMAINS,
+        )
+        return {"results": results, "inventory": inventory, "coverage": coverage}
 
     # ---------- 信用卡明細 ----------
     def _collect_card_statements(self, page) -> list:
@@ -675,8 +1268,8 @@ class SinopacCrawler(BankCrawler):
             page.goto("https://mma.sinopac.com/SinoCard/Account/StatementInquiry",
                       wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(5000)
-        except Exception as e:
-            _log(f"[card_stmt] goto 失敗: {e}")
+        except Exception:
+            _log("[card_stmt] page_navigation_failed")
             return results
 
         # 抓「快速查詢」3 個月按鈕——通常是當月與前兩月
@@ -752,8 +1345,8 @@ class SinopacCrawler(BankCrawler):
                 page.get_by_text(label, exact=True).first.click(timeout=4000)
                 page.wait_for_timeout(4500)
                 results.append(_grab_month(label))
-            except Exception as e:
-                _log(f"[card_stmt] 切換 {label} 失敗: {e}")
+            except Exception:
+                _log("[card_stmt] month_switch_failed")
 
         total = sum(r.get("record_count", 0) for r in results)
         _log(f"[card_stmt] 抓 {len(results)} 個月、共 {total} 筆消費紀錄")
@@ -769,8 +1362,8 @@ class SinopacCrawler(BankCrawler):
             page.goto("https://mma.sinopac.com/SinoCard/Account/UnbilledTxInquiry",
                       wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(7000)
-        except Exception as e:
-            _log(f"[card_unbilled] goto 失敗: {e}")
+        except Exception:
+            _log("[card_unbilled] page_navigation_failed")
             return {}
 
         latest = self._latest_json(collector, "LatestTx")
@@ -798,25 +1391,21 @@ class SinopacCrawler(BankCrawler):
 
 
 if __name__ == "__main__":
-    import json
     crawler = SinopacCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=True)
-    except SinopacLoginError as e:
-        result = {"error": "login_failed_stop", "detail": str(e)}
+    except SinopacLoginError:
+        result = {"error": "login_failed_stop"}
 
     out_file = Path(__file__).resolve().parents[1] / "data" / "sinopac_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_private_json(out_file, result)
     _log(f"\n[done] 已存: {out_file}")
 
     if result.get("error"):
-        _log(f"  ❌ error: {result['error']}")
-        if result.get("detail"):
-            _log(f"  detail: {result['detail'][:300]}")
+        _log("  ❌ error: crawler_failed")
     else:
         data = result.get("data", {})
         _log("\n===== 抓取摘要 =====")
-        _log(f"  最終 url: {data.get('_final_url')}")
         bb = data.get("bank_balance") or []
         n_acct = sum(len(s.get("SubInfo", [])) for s in bb if isinstance(s, dict))
         _log(f"  銀行帳戶: {n_acct} 個")
@@ -826,4 +1415,3 @@ if __name__ == "__main__":
         if isinstance(ac, dict):
             items = (ac.get("Result") or {}).get("Items", [])
             _log(f"  全卡片: {len(items)} 張")
-        _log(f"  攔到 endpoint: {data.get('_all_endpoints', [])}")

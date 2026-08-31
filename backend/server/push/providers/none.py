@@ -25,8 +25,8 @@ class NoOpNotifier:
     ) -> NotifyResult:
         # 不打 repo 不打網路 — 純 noop, 只 debug log 留痕跡
         logger.debug(
-            "[push:none] user_id=%s title=%r body=%r (PUSH_PROVIDER=none, skipped)",
-            user_id, payload.title, payload.body,
+            "[push:none] user_id=%s category=%s skipped",
+            user_id, payload.category,
         )
         return NotifyResult()
 
@@ -34,7 +34,7 @@ class NoOpNotifier:
         self, target: PushTarget, payload: NotificationPayload,
     ) -> NotifyResult:
         logger.debug(
-            "[push:none] target=%s/%s title=%r (skipped)",
-            target.provider, target.platform, payload.title,
+            "[push:none] target=%s/%s category=%s skipped",
+            target.provider, target.platform, payload.category,
         )
         return NotifyResult()

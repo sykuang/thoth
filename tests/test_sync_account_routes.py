@@ -136,7 +136,7 @@ def test_admin_can_force_full_history_for_existing_account(client, monkeypatch):
 def test_admin_full_history_rejects_bank_without_attested_adapter(client, monkeypatch):
     token = _register(client, "admin-cross-bank-history@palace.example")
     created = client.post(
-        "/accounts", json={"bank": "sinopac", "label": "主帳"}, headers=_auth(token),
+        "/accounts", json={"bank": "ubot", "label": "主帳"}, headers=_auth(token),
     )
     account_id = created.json()["id"]
     monkeypatch.setenv("ADMIN_API_KEY", "admin-test-key")

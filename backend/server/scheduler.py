@@ -93,10 +93,10 @@ def _run_sync_for_user(user_id: int) -> None:
                 )
                 if fields:
                     ready.append(a)
-            except Exception:
-                logger.exception(
-                    "[scheduler] list_fields_acct failed user_id=%s account_id=%s",
-                    user_id, a.id,
+            except Exception as exc:
+                logger.warning(
+                    "[scheduler] list_fields_acct failed user_id=%s account_id=%s error_type=%s",
+                    user_id, a.id, type(exc).__name__,
                 )
         logger.info(
             "[scheduler] user_id=%s fan-out: %d total, %d ready",
@@ -112,10 +112,10 @@ def _run_sync_for_user(user_id: int) -> None:
                     total_jobs=len(ready),
                     kind=sync_batches_repo.KIND_SCHEDULED_ALL,
                 )
-            except Exception:
-                logger.exception(
-                    "[scheduler] sync_batches.create failed user_id=%s — fall back to per-bank push",
-                    user_id,
+            except Exception as exc:
+                logger.warning(
+                    "[scheduler] sync_batches.create failed user_id=%s error_type=%s",
+                    user_id, type(exc).__name__,
                 )
                 batch_id = None
 
@@ -130,10 +130,10 @@ def _run_sync_for_user(user_id: int) -> None:
                     user_id, acct.id, job_id, batch_id,
                 )
                 queued += 1
-            except Exception:
-                logger.exception(
-                    "[scheduler] queue failed user_id=%s account_id=%s",
-                    user_id, acct.id,
+            except Exception as exc:
+                logger.warning(
+                    "[scheduler] queue failed user_id=%s account_id=%s error_type=%s",
+                    user_id, acct.id, type(exc).__name__,
                 )
 
         user_sync_pref_repo.mark_last_run(user_id=user_id)
@@ -141,10 +141,10 @@ def _run_sync_for_user(user_id: int) -> None:
             "[scheduler] fire complete user_id=%s queued=%d/%d batch_id=%s",
             user_id, queued, len(ready), batch_id,
         )
-    except Exception:
-        logger.exception(
-            "[scheduler] fire failed user_id=%s — fan-out not run",
-            user_id,
+    except Exception as exc:
+        logger.warning(
+            "[scheduler] fire failed user_id=%s error_type=%s",
+            user_id, type(exc).__name__,
         )
 
 
@@ -155,8 +155,11 @@ def _run_payment_reminders_for_all_users(tz: str = "Asia/Taipei") -> None:
 
         result = prn.dispatch_daily_payment_reminders_for_all_users(tz=tz)
         logger.info("[scheduler] payment reminders sweep result=%s", result)
-    except Exception:
-        logger.exception("[scheduler] payment reminders sweep failed")
+    except Exception as exc:
+        logger.warning(
+            "[scheduler] payment reminders sweep failed error_type=%s",
+            type(exc).__name__,
+        )
 
 
 def add_or_replace_for_user(pref: dict[str, Any]) -> None:
@@ -258,8 +261,8 @@ def start() -> None:
     try:
         s.start()
         logger.info("[scheduler] started")
-    except Exception:
-        logger.exception("[scheduler] start failed")
+    except Exception as exc:
+        logger.warning("[scheduler] start failed error_type=%s", type(exc).__name__)
         return
     reload_all_jobs()
 
@@ -272,8 +275,8 @@ def shutdown(wait: bool = False) -> None:
     try:
         _scheduler.shutdown(wait=wait)
         logger.info("[scheduler] shutdown (wait=%s)", wait)
-    except Exception:
-        logger.exception("[scheduler] shutdown failed")
+    except Exception as exc:
+        logger.warning("[scheduler] shutdown failed error_type=%s", type(exc).__name__)
     _scheduler = None
 
 

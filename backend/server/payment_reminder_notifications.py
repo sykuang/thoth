@@ -182,15 +182,16 @@ def dispatch_daily_payment_reminders(*, user_id: int, tz: str = "Asia/Taipei") -
         )
         result = notifier.send_to_user(user_id=user_id, payload=payload)
         logger.info(
-            "[payment-reminder] result user_id=%s delivered=%s failed=%s errors=%s invalid=%s",
+            "[payment-reminder] result user_id=%s delivered=%s failed=%s",
             user_id,
             getattr(result, "delivered_count", "?"),
             getattr(result, "failed_count", "?"),
-            getattr(result, "errors", "?"),
-            getattr(result, "invalid_tokens", "?"),
         )
-    except Exception:
-        logger.exception("[payment-reminder] dispatch failed user_id=%s", user_id)
+    except Exception as exc:
+        logger.warning(
+            "[payment-reminder] dispatch failed user_id=%s error_type=%s",
+            user_id, type(exc).__name__,
+        )
 
     return {"sent": len(claimed), "skipped": skipped, "total": len(reminders)}
 
@@ -216,6 +217,9 @@ def dispatch_daily_payment_reminders_for_all_users(tz: str = "Asia/Taipei") -> d
             totals["sent"] += result["sent"]
             totals["skipped"] += result["skipped"]
             totals["total"] += result["total"]
-        except Exception:
-            logger.exception("[payment-reminder] user sweep failed user_id=%s", user_id)
+        except Exception as exc:
+            logger.warning(
+                "[payment-reminder] user sweep failed user_id=%s error_type=%s",
+                user_id, type(exc).__name__,
+            )
     return totals

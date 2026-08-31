@@ -21,10 +21,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.core.base import validate_history_coverage
+from backend.core.base import validate_history_coverage, write_private_json
 from backend.core.store import BankStore
 
 BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank", "rakuten"}
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    write_private_json(path, payload)
 
 
 def _get_crawler(bank: str):
@@ -83,7 +87,7 @@ def cmd_sync(args):
         )
         result = crawler.run(login_url=login_url, headless=args.headless)
         if result.get("error"):
-            print(f"[sync] 失敗: {result['error']} (url={result.get('final_url')})")
+            print("[sync] 失敗: crawler_failed")
             return 1
         data = result.get("data", {})
         if crawler.HISTORY_COVERAGE_REQUIRED:
@@ -93,10 +97,6 @@ def cmd_sync(args):
                 expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
             )
 
-        # 存原始 JSON 備份
-        # cli/cli.py → parents[0]=cli, parents[1]=專案根 → backend/data/
-        raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
-        raw.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # 2026-07-28: CLI 原本 13 個分支全都沒傳 rules → category/subcategory 永遠 NULL,
         # 連帶 flow_type/income_category 也拿不到分類訊號 (樂天「存款利息」只能落到
@@ -112,6 +112,9 @@ def cmd_sync(args):
         from backend.core.persist import persist_collected
 
         delta = persist_collected(args.bank, data, store, rules=rules)
+        # 只有通過銀行特定 persistence barrier 後，才保存 0600 原始備份。
+        raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
+        _write_private_json(raw, result)
         stats = store.stats()
     finally:
         store.close()

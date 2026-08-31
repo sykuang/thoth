@@ -191,7 +191,7 @@ def test_sync_runner_records_error_on_failure(isolated, monkeypatch):
     job_id = sr.run_sync_job(user_id=1, bank="sinopac", headless=True)
     row = _wait_for_status(job_id, {"done", "failed"})
     assert row["status"] == "failed", f"unexpected: {row}"
-    assert "simulated login failure" in (row["error_msg"] or "")
+    assert row["error_msg"] == "sync_failed:RuntimeError"
 
 
 def test_unknown_bank_raises(isolated):
@@ -245,6 +245,40 @@ def test_dispatch_rejects_missing_coverage_for_opted_in_adapter(isolated, monkey
     assert set(FakeCrawler.cursor_domains) == {
         "twd_transactions", "card_billed_transactions",
     }
+
+
+def test_dispatch_defaults_coverage_validation_to_full(isolated, monkeypatch):
+    from backend.banks import sinopac
+    from backend.core import base, persist
+    import backend.server.sync_runner as sr
+
+    seen = []
+
+    class FakeCrawler:
+        HISTORY_COVERAGE_REQUIRED = True
+        HISTORY_COVERAGE_DOMAINS = frozenset({"twd_transactions"})
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def configure_transaction_cursor(self, _domain, _cursor):
+            pass
+
+        def run(self, *, login_url, headless):
+            return {"data": {"history_coverage": {}}}
+
+    def validate(_coverage, *, expected_mode, expected_domains):
+        seen.append((expected_mode, expected_domains))
+        return {}
+
+    monkeypatch.delenv("BANK_CRAWLER_HISTORY_MODE", raising=False)
+    monkeypatch.setattr(sinopac, "SinopacCrawler", FakeCrawler)
+    monkeypatch.setattr(base, "validate_history_coverage", validate)
+    monkeypatch.setattr(persist, "persist_collected", lambda *_args, **_kwargs: {})
+
+    sr._dispatch_crawler_and_persist("sinopac", user_id=1, headless=True)
+
+    assert seen == [("full", frozenset({"twd_transactions"}))]
 
 
 @pytest.mark.parametrize("legacy_summary", [

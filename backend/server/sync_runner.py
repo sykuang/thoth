@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import traceback
 
 from backend.server import sync_jobs_repo
 from backend.server.dashboard_cache import clear_dashboard_cache
@@ -238,7 +237,7 @@ def _exec_sync(job_id: int) -> None:
                 else:
                     os.environ["BANK_CRAWLER_HISTORY_MODE"] = old_history_mode
     except Exception as e:
-        error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        error = f"sync_failed:{type(e).__name__}"
 
     # 3. 寫回 DB
     if error is None:
@@ -263,11 +262,11 @@ def _exec_sync(job_id: int) -> None:
             events = diff_snapshots(cards_before, cards_after)
             for ev in events:
                 _send_card_event_notification(user_id=user_id, event=ev)
-        except Exception:
+        except Exception as exc:
             import logging
-            logging.getLogger("backend.sync.push").exception(
-                "[push] card event detection failed user_id=%s bank=%s",
-                user_id, bank,
+            logging.getLogger("backend.sync.push").warning(
+                "[push] card event detection failed user_id=%s bank=%s error_type=%s",
+                user_id, bank, type(exc).__name__,
             )
     else:
         sync_jobs_repo.mark_failed(job_id, error[:8000])
@@ -293,9 +292,7 @@ def _send_sync_notification(
 
     PUSH_PROVIDER=none (default) 時是 no-op,開源 user 不會受影響。
 
-    2026-06-22 (登入 OK 但通知沒收到 debug): 把整段 silent fail 換成 logger.info/warning,
-    這樣 prod log 可以追到「push 真的有被觸發了嗎」/「provider 噴什麼錯」。
-    任何例外仍吞 — 但會 logger.exception 記下來。
+    Log only dispatch/result counts. Provider errors and invalid token values are sensitive.
     """
     import logging
     logger = logging.getLogger("backend.sync.push")
@@ -321,16 +318,16 @@ def _send_sync_notification(
         )
         result = notifier.send_to_user(user_id=user_id, payload=payload)
         logger.info(
-            "[push] result user_id=%s bank=%s delivered=%s failed=%s errors=%s invalid=%s",
+            "[push] result user_id=%s bank=%s delivered=%s failed=%s",
             user_id, bank,
             getattr(result, "delivered_count", "?"),
             getattr(result, "failed_count", "?"),
-            getattr(result, "errors", "?"),
-            getattr(result, "invalid_tokens", "?"),
         )
-    except Exception:
-        # 任何 push 例外都吞 — 但 log 下來給後續 debug 用
-        logger.exception("[push] notification dispatch failed user_id=%s bank=%s", user_id, bank)
+    except Exception as exc:
+        logger.warning(
+            "[push] notification dispatch failed user_id=%s bank=%s error_type=%s",
+            user_id, bank, type(exc).__name__,
+        )
 
 
 def _maybe_send_batch_summary(*, batch_id: int, user_id: int) -> None:
@@ -422,15 +419,15 @@ def _maybe_send_batch_summary(*, batch_id: int, user_id: int) -> None:
                 "[push] post-sync payment reminders user_id=%s batch_id=%s result=%s",
                 user_id, batch_id, reminder_result,
             )
-        except Exception:
-            logger.exception(
-                "[push] post-sync payment reminders failed user_id=%s batch_id=%s",
-                user_id, batch_id,
+        except Exception as exc:
+            logger.warning(
+                "[push] post-sync payment reminders failed user_id=%s batch_id=%s error_type=%s",
+                user_id, batch_id, type(exc).__name__,
             )
-    except Exception:
-        logger.exception(
-            "[push] batch summary failed user_id=%s batch_id=%s",
-            user_id, batch_id,
+    except Exception as exc:
+        logger.warning(
+            "[push] batch summary failed user_id=%s batch_id=%s error_type=%s",
+            user_id, batch_id, type(exc).__name__,
         )
 
 
@@ -528,8 +525,8 @@ def _send_card_event_notification(*, user_id: int, event) -> None:
         payload = NotificationPayload(title=title, body=body, data=data, category=category)
         notifier = get_notifier()
         logger.info(
-            "[push] card event dispatch user_id=%s kind=%s bank=%s card=%s amount=%s",
-            user_id, event.kind, event.bank, event.card_no, event.amount,
+            "[push] card event dispatch user_id=%s kind=%s bank=%s",
+            user_id, event.kind, event.bank,
         )
         result = notifier.send_to_user(user_id=user_id, payload=payload)
         logger.info(
@@ -538,10 +535,10 @@ def _send_card_event_notification(*, user_id: int, event) -> None:
             getattr(result, "delivered_count", "?"),
             getattr(result, "failed_count", "?"),
         )
-    except Exception:
-        logger.exception(
-            "[push] card event notification failed user_id=%s kind=%s",
-            user_id, getattr(event, "kind", "?"),
+    except Exception as exc:
+        logger.warning(
+            "[push] card event notification failed user_id=%s kind=%s error_type=%s",
+            user_id, getattr(event, "kind", "?"), type(exc).__name__,
         )
 
 
@@ -660,9 +657,7 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
         )
         result = crawler.run(login_url=login_url, headless=headless)
         if result.get("error"):
-            raise RuntimeError(
-                f"crawler error: {result['error']} (url={result.get('final_url')})",
-            )
+            raise RuntimeError("crawler_failed")
         data = result.get("data", {})
         coverage_summary = None
         if crawler.HISTORY_COVERAGE_REQUIRED:
@@ -670,7 +665,7 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
 
             coverage_summary = validate_history_coverage(
                 data.get("history_coverage"),
-                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "incremental"),
+                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
                 expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
             )
 

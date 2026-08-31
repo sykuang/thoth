@@ -4,9 +4,16 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+import html
+import json
+import re
+from zoneinfo import ZoneInfo
 
 from backend.core import account_classify, classify
+from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
 from backend.core.persist._common import _num, _num_real, _num_to_float
 
@@ -22,12 +29,21 @@ def _sinopac_date(s) -> str | None:
         return f"{t[:4]}-{t[4:6]}-01"
     return None
 
+def _sinopac_datetime(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE).strip()
+    try:
+        return datetime.strptime(text, "%Y/%m/%d %H:%M").isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
 def _sinopac_strip_html(s) -> str:
     """永豐欄位含 HTML 標籤（如 '<font color="...">-2,000</font>'），全剝。"""
     if not s:
         return ""
-    import re as _re
-    return _re.sub(r"<[^>]*>", "", str(s)).strip()
+    return html.unescape(re.sub(r"<[^>]*>", "", str(s))).replace("\xa0", " ").strip()
 
 def _sinopac_split_amount(s):
     """永豐 DataText4 = '<font>+30</font>' / '<font>-2,000</font>'
@@ -70,7 +86,249 @@ def _mmyy_expired(s: str | None, today_yyyy_mm: str | None = None) -> bool:
     except Exception:
         return False
 
-def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _history_floor(end: date) -> date:
+    try:
+        return end.replace(year=end.year - 1) + timedelta(days=1)
+    except ValueError:
+        return end.replace(year=end.year - 1, day=28) + timedelta(days=1)
+
+
+def _today() -> date:
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+
+def _history_windows(start: date, end: date) -> list[tuple[date, date]]:
+    windows = []
+    cursor = start
+    while cursor <= end:
+        window_end = min(
+            end, date(cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1]),
+        )
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(days=1)
+    return windows
+
+
+def _strict_date(value, fmt: str, error: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(error)
+    try:
+        return datetime.strptime(value, fmt).date()
+    except ValueError:
+        raise ValueError(error) from None
+
+
+def _strict_amount(value, error: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(error)
+    text = re.sub(r"<[^>]*>", "", value).strip()
+    if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", text) is None:
+        raise ValueError(error)
+    try:
+        amount = Decimal(text.replace(",", ""))
+    except InvalidOperation:
+        raise ValueError(error) from None
+    if (
+        not amount.is_finite()
+        or amount != amount.to_integral_value()
+        or abs(amount) > Decimal("2147483647")
+    ):
+        raise ValueError(error)
+
+
+def _validate_sinopac_history(data: dict, store: BankStore) -> date:
+    error = "invalid SinoPac history coverage"
+    coverage = data.get("history_coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError(error)
+    mode = coverage.get("mode")
+    if mode not in {"full", "incremental"}:
+        raise ValueError(error)
+    as_of = _strict_date(coverage.get("as_of"), "%Y-%m-%d", error)
+    today = _today()
+    if as_of > today or (today - as_of).days > 1:
+        raise ValueError(error)
+    validate_history_coverage(
+        coverage,
+        expected_mode=mode,
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    domain = coverage["domains"][0]
+    expected = domain["expected"]
+    windows = domain["windows"]
+    encoded_bytes = 0
+    try:
+        history_payload = {
+            "history_coverage": coverage,
+            "debit_accounts": data.get("debit_accounts", []),
+            "twd_transactions": data.get("twd_transactions", []),
+        }
+        for chunk in json.JSONEncoder(
+            ensure_ascii=False, separators=(",", ":"),
+        ).iterencode(history_payload):
+            encoded_bytes += len(chunk.encode("utf-8"))
+            if encoded_bytes > 5_000_000:
+                raise ValueError(error)
+    except (TypeError, RecursionError):
+        raise ValueError(error) from None
+
+    for window in windows:
+        if type(window.get("pages")) is not int or window.get("pages") != 1:
+            raise ValueError(error)
+    if not expected:
+        empty = domain.get("empty_window")
+        inventory = data.get("debit_accounts", [])
+        results = data.get("twd_transactions", [])
+        if (
+            not isinstance(empty, dict)
+            or set(empty) != {"start", "end", "status", "pages"}
+            or empty.get("status") != "explicit_empty"
+            or type(empty.get("pages")) is not int
+            or empty.get("pages") != 1
+            or inventory != []
+            or results != []
+            or windows
+        ):
+            raise ValueError(error)
+        start = _strict_date(empty.get("start"), "%Y-%m-%d", error)
+        end = _strict_date(empty.get("end"), "%Y-%m-%d", error)
+        if start != _history_floor(end) or end != as_of:
+            raise ValueError(error)
+        return end
+    expected_by_identity = {item["identity"]: item for item in expected}
+    if len(expected_by_identity) != len(expected):
+        raise ValueError(error)
+    inventory = data.get("debit_accounts")
+    if not isinstance(inventory, list) or len(inventory) != len(expected):
+        raise ValueError(error)
+    inventory_by_identity = {}
+    inventory_labels = set()
+    for item in inventory:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"label", "identity", "currency"}
+            or not isinstance(item.get("label"), str)
+            or not item["label"]
+            or item["label"] != item["label"].strip()
+            or item["label"] in inventory_labels
+            or not isinstance(item.get("identity"), str)
+            or re.fullmatch(r"\d{14}", item["identity"]) is None
+            or item.get("currency") != "TWD"
+            or item["identity"] in inventory_by_identity
+        ):
+            raise ValueError(error)
+        inventory_labels.add(item["label"])
+        inventory_by_identity[item["identity"]] = item
+    if set(inventory_by_identity) != set(expected_by_identity):
+        raise ValueError(error)
+    results = data.get("twd_transactions")
+    if not isinstance(results, list) or len(results) != len(windows):
+        raise ValueError(error)
+    receipts = []
+    total_rows = 0
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError(error)
+        identity = result.get("account")
+        receipt = result.get("receipt")
+        rows = result.get("records")
+        if (
+            not isinstance(identity, str)
+            or re.fullmatch(r"\d{14}", identity) is None
+            or identity not in expected_by_identity
+            or result.get("currency") != "TWD"
+            or not isinstance(result.get("account_name"), str)
+            or result["account_name"] != inventory_by_identity[identity]["label"]
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"identity", "start", "end", "status", "pages", "rows"}
+            or receipt.get("identity") != identity
+            or type(receipt.get("pages")) is not int
+            or receipt.get("pages") != 1
+            or not isinstance(rows, list)
+            or len(rows) > 10_000
+            or type(receipt.get("rows")) is not int
+            or receipt.get("rows") != len(rows)
+            or receipt.get("status") != ("complete" if rows else "explicit_empty")
+        ):
+            raise ValueError(error)
+        total_rows += len(rows)
+        if total_rows > 50_000:
+            raise ValueError(error)
+        start = _strict_date(receipt["start"], "%Y-%m-%d", error)
+        end = _strict_date(receipt["end"], "%Y-%m-%d", error)
+        if start > end or (start.year, start.month) != (end.year, end.month):
+            raise ValueError(error)
+        seen_rows = set()
+        for row in rows:
+            keys = {f"DataText{i}" for i in range(1, 12)}
+            if not isinstance(row, dict) or set(row) != keys or any(
+                not isinstance(row[key], str) for key in keys
+            ):
+                raise ValueError(error)
+            fingerprint = tuple(row[f"DataText{i}"] for i in range(1, 12))
+            if fingerprint in seen_rows:
+                raise ValueError(error)
+            seen_rows.add(fingerprint)
+            if (
+                not re.fullmatch(r"\d{4}/\d{2}/\d{2}<br />\d{2}:\d{2}", row["DataText1"])
+                or not re.fullmatch(r"\d{4}/\d{2}/\d{2}", row["DataText2"])
+            ):
+                raise ValueError(error)
+            transacted = _strict_date(
+                re.sub(r"<br\s*/?>", " ", row["DataText1"], flags=re.IGNORECASE),
+                "%Y/%m/%d %H:%M",
+                error,
+            )
+            account_date = _strict_date(row["DataText2"], "%Y/%m/%d", error)
+            if not start <= transacted <= end or not start <= account_date <= end:
+                raise ValueError(error)
+            description = _sinopac_strip_html(row["DataText3"])
+            if not description or len(description) > 500:
+                raise ValueError(error)
+            if any(len(row[f"DataText{i}"]) > 2_000 for i in range(6, 12)):
+                raise ValueError(error)
+            _strict_amount(row["DataText4"], error)
+            _strict_amount(row["DataText5"], error)
+        receipts.append({key: receipt[key] for key in (
+            "identity", "start", "end", "status", "pages",
+        )})
+    if receipts != windows:
+        raise ValueError(error)
+
+    existing = store.latest_twd_transaction_dates()
+    expected_ends = set()
+    for item in expected:
+        identity = item["identity"]
+        start = _strict_date(item["start"], "%Y-%m-%d", error)
+        end = _strict_date(item["end"], "%Y-%m-%d", error)
+        expected_ends.add(end)
+        cursor = existing.get(identity)
+        if isinstance(cursor, date) and cursor > end:
+            raise ValueError(error)
+        expected_start = _history_floor(end)
+        if mode == "incremental" and isinstance(cursor, date):
+            expected_start = max(expected_start, cursor - timedelta(days=7))
+        if start != expected_start:
+            raise ValueError(error)
+        actual = [
+            (_strict_date(window["start"], "%Y-%m-%d", error),
+             _strict_date(window["end"], "%Y-%m-%d", error))
+            for window in windows if window["identity"] == identity
+        ]
+        if actual != _history_windows(start, end):
+            raise ValueError(error)
+    if len(expected_ends) != 1 or next(iter(expected_ends)) != as_of:
+        raise ValueError(error)
+    return next(iter(expected_ends))
+
+
+def _persist_sinopac(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    as_of: date | None = None,
+) -> dict:
     """永豐 collect() 結構 → store 各業務表增量。
 
     映射：
@@ -80,7 +338,8 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
       card_summary / asset_chart / card_billing / debit_accounts → daily_metrics
       twd_transactions / card_statements / card_unbilled → 交易明細表
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    as_of = as_of or _today()
+    today = as_of.isoformat()
     delta: dict = {}
 
     # --- 銀行帳戶（含 TWD/USD/JPY 各幣別行）---
@@ -155,17 +414,18 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
         if loan_balances:
             loan_total = round(sum(loan_balances))
     if accts:
-        store.upsert_accounts(accts)
+        store.upsert_accounts(accts, commit=False)
     if twd_total or fx_total or loan_total is not None:
         store.upsert_balance_history([{
             "snapshotDate": today,
             "twdBalance": twd_total if twd_total else None,
             "fxBalance": fx_total if fx_total else None,
             "loanBalance": loan_total,
-        }])
+        }], commit=False)
         delta["balance_days"] = 1
         store.put_daily_metric(
             "balance_latest", {"twd": twd_total, "fx_raw": fx_total, "loan": loan_total}, today,
+            commit=False,
         )
 
     # --- 信用卡清單（UPSERT）---
@@ -275,7 +535,7 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
              "type": it.get("CardTypeDesc"), "association": it.get("CardBrand"),
              "is_cube": False,
              # active: ExpDate 'MMYY' < 今月 → 過期
-             "active": not _mmyy_expired(it.get("ExpDate")),
+             "active": not _mmyy_expired(it.get("ExpDate"), as_of.strftime("%Y-%m")),
              # Step 2/3: 套整戶 limit/used/due/stmt
              "credit_limit": sinopac_limit,
              "used_credit": sinopac_used,
@@ -289,16 +549,16 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
             for it in items if it.get("CardNo")
         ]
         if cards:
-            store.upsert_cards(cards)
+            store.upsert_cards(cards, commit=False)
 
     # --- 每日快照：信用卡彙總 / 帳單 / 資產分析 / 扣款帳戶 / 貸款明細 ---
     for key, mtag in [("card_summary", "card_summary"), ("card_billing", "card_billing"),
                        ("asset_chart", "asset_chart"), ("debit_accounts", "debit_accounts")]:
         v = data.get(key)
         if v:
-            store.put_daily_metric(mtag, v, today)
+            store.put_daily_metric(mtag, v, today, commit=False)
     if loan_metric_records:
-        store.put_daily_metric("loan", {"records": loan_metric_records}, today)
+        store.put_daily_metric("loan", {"records": loan_metric_records}, today, commit=False)
 
     # --- 台幣交易明細（永豐 ws_transdetailMerge.ashx，欄位 DataText1~11）---
     # DataText 對應：
@@ -320,13 +580,10 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
         acct_no = body.get("account")
         rows = []
         for t in body.get("records", []) or []:
-            # DataText1 = '2026/06/09<br />19:13' → 交易日期 + 時間
-            dt_raw = _sinopac_strip_html(t.get("DataText1", "")).replace("\n", " ")
-            # 截 'YYYY/MM/DD' 和後面的 'HH:MM' 合一行
             expend, income = _sinopac_split_amount(t.get("DataText4"))
             rows.append({
                 "account_no": acct_no,
-                "datetime": dt_raw,  # 原 '2026/06/09 19:13' 留字串
+                "datetime": _sinopac_datetime(t.get("DataText1")),
                 "account_date": _sinopac_date(_sinopac_strip_html(t.get("DataText2"))),
                 "desc": _sinopac_strip_html(t.get("DataText3")),
                 "expend": expend,
@@ -336,7 +593,7 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
                 "counterparty_acct": _sinopac_strip_html(t.get("DataText8"))[:30] or None,
                 "memo": _sinopac_strip_html(t.get("DataText8")) or None,
             })
-        twd_new += store.upsert_twd_txns(rows, rules=rules)
+        twd_new += store.upsert_twd_txns(rows, rules=rules, commit=False)
     delta["twd_txn_new"] = twd_new
 
     # 預留位（dropdown 破完再補）
@@ -409,8 +666,28 @@ def persist_sinopac(data: dict, store: BankStore, rules: list[dict] | None = Non
                  and isinstance(latest_result, dict)
                  and isinstance(latest_result.get("Items"), list))
     delta["card_unbilled"] = store.refresh_card_pending(
-        "unbilled", unb_rows, rules=rules, fetch_ok=latest_ok)
+        "unbilled", unb_rows, rules=rules, fetch_ok=latest_ok, commit=False)
     delta["card_current"] = 0
 
-    store.log_sync(delta)
+    store.log_sync(delta, commit=False)
     return delta
+
+
+def persist_sinopac(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Persist SinoPac atomically while preserving direct-call durability."""
+    as_of = _validate_sinopac_history(data, store)
+    if not commit:
+        return _persist_sinopac(data, store, rules=rules, as_of=as_of)
+    try:
+        delta = _persist_sinopac(data, store, rules=rules, as_of=as_of)
+        store.commit()
+        return delta
+    except Exception:
+        store.conn.rollback()
+        raise

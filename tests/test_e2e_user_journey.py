@@ -142,7 +142,7 @@ def test_e2e_full_user_journey_happy_path(client, monkeypatch):
 # ============================================================
 
 def test_e2e_sync_failure_records_error_msg(client, monkeypatch):
-    """模擬爬蟲炸 → job status=failed + error_msg 含原因。
+    """模擬爬蟲炸 → job status=failed + error_msg 僅含安全類型碼。
 
     驗證錯誤 propagate 端到端正確：crawler raise → sync_runner catch →
     sync_jobs.error_msg 寫入 → GET /sync/jobs/{id} 看得到。
@@ -163,7 +163,7 @@ def test_e2e_sync_failure_records_error_msg(client, monkeypatch):
     job = wait_for_job(client, token, job_id)
     assert job["status"] == "failed"
     assert job["error_msg"] is not None
-    assert "simulated crawler failure" in job["error_msg"]
+    assert job["error_msg"] == "sync_failed:RuntimeError"
     # result_summary 不該被填（因為 except 之後沒寫 summary）
     # （sync_runner 寫法是 error 設了就走 error 分支，不寫 result_summary）
 

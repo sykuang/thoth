@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from backend.core.persist import persist_sinopac, persist_taishin
+from backend.core.persist import persist_taishin
+from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.store import BankStore
 
 

@@ -106,23 +106,22 @@ class ExpoPushProvider:
         body = [self._build_message(t, payload) for t in targets]
         headers = self._build_headers()
         logger.info(
-            "[expo] POST %s batch_size=%d title=%r body=%r",
-            EXPO_PUSH_ENDPOINT, len(targets), payload.title, payload.body,
+            "[expo] POST %s batch_size=%d category=%s",
+            EXPO_PUSH_ENDPOINT, len(targets), payload.category,
         )
         try:
             resp = client.post(EXPO_PUSH_ENDPOINT, headers=headers, json=body)
         except httpx.RequestError as e:
             # Transport 失敗 — 整 batch 算 failed,不 invalidate
-            logger.warning("[expo] httpx transport error: %s: %s", type(e).__name__, e)
+            logger.warning("[expo] transport failed error_type=%s", type(e).__name__)
             for t in targets:
                 _merge_one(result, NotifyResult(
                     failed_count=1,
-                    errors=[(_short(t.token), f"{type(e).__name__}: {e}")],
+                    errors=[(_short(t.token), type(e).__name__)],
                 ))
             return
 
-        logger.info("[expo] http %s %s body[:200]=%r",
-                    resp.status_code, EXPO_PUSH_ENDPOINT, _safe_text(resp))
+        logger.info("[expo] http %s %s", resp.status_code, EXPO_PUSH_ENDPOINT)
 
         # HTTP-level error (5xx Expo 自身爆)
         if resp.status_code >= 500:
@@ -135,11 +134,10 @@ class ExpoPushProvider:
 
         # 4xx 通常是 request shape 不對,但也可能是 401 (bad EXPO_ACCESS_TOKEN)
         if 400 <= resp.status_code < 500:
-            err_text = _safe_text(resp)
             for t in targets:
                 _merge_one(result, NotifyResult(
                     failed_count=1,
-                    errors=[(_short(t.token), f"HTTP {resp.status_code}: {err_text}")],
+                    errors=[(_short(t.token), f"HTTP {resp.status_code}")],
                 ))
             return
 
@@ -173,17 +171,16 @@ class ExpoPushProvider:
             # status == "error"
             details = item.get("details") or {}
             err_reason = details.get("error", "")
-            msg = item.get("message") or err_reason or "unknown"
             if err_reason in PERMANENT_FAILURES:
                 _merge_one(result, NotifyResult(
                     failed_count=1,
                     invalid_tokens=[t.token],
-                    errors=[(_short(t.token), f"{err_reason}: {msg}")],
+                    errors=[(_short(t.token), err_reason)],
                 ))
             else:
                 _merge_one(result, NotifyResult(
                     failed_count=1,
-                    errors=[(_short(t.token), f"{err_reason or 'error'}: {msg}")],
+                    errors=[(_short(t.token), err_reason or "error")],
                 ))
 
     def _build_message(
@@ -236,10 +233,3 @@ def _short(token: str) -> str:
     if len(token) <= 24:
         return token
     return token[:16] + "…" + token[-4:]
-
-
-def _safe_text(resp: httpx.Response) -> str:
-    try:
-        return resp.text[:200]
-    except Exception:
-        return "(no body)"

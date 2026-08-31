@@ -29,9 +29,9 @@ from backend.core.persist import (
     persist_dbs,
     persist_esun,
     persist_fubon,
-    persist_sinopac,
     persist_taishin,
 )
+from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.store import BankStore
 
 

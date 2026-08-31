@@ -14,6 +14,8 @@ import json
 import math
 import os
 import re
+import stat
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import date, datetime, timedelta
@@ -36,6 +38,45 @@ from backend.core.login_checkpoints import (
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
 )
+
+
+def write_private_json(path: Path, payload: dict) -> None:
+    """Atomically replace a private JSON file without following links."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(current.st_mode):
+            raise OSError("private JSON target must be a regular file")
+        if current.st_nlink != 1:
+            raise RuntimeError("private JSON target must be a single-link regular file")
+        path.chmod(0o600, follow_symlinks=False)
+
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError("private JSON temporary must be a single-link regular file")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        Path(temporary).replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            Path(temporary).unlink()
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
@@ -95,6 +136,8 @@ class ApiHit:
     raw_url: str = ""
     redirected: bool = False
     body_size: int | None = None
+    request_sequence: int = 0
+    main_frame_request: bool = False
 
     @property
     def endpoint(self) -> str:
@@ -118,25 +161,38 @@ class ResponseCollector:
         self.auth_token_events: list[dict[str, Any]] = []
         self.hsbc_inventory_bytes = 0
         self._auth_event_sequence = 0
+        self._request_sequence = 0
+        self._requests: dict[int, int] = {}
+        self._request_main_frame: dict[int, bool] = {}
+        self._issued_endpoint_counts: dict[str, int] = {}
         self._auth_requests: dict[int, dict[str, Any]] = {}
         self._latest_auth_request_sequence = 0
         self._response_handler = self._on_response
         self._request_handler = self._on_request
+        self._request_failed_handler = self._on_request_failed
 
     def attach(self, page):
         page.on("request", self._request_handler)
+        page.on("requestfailed", self._request_failed_handler)
         page.on("response", self._response_handler)
 
     def detach(self, page) -> None:
         remove = getattr(page, "remove_listener", None)
         if callable(remove):
             remove("request", self._request_handler)
+            remove("requestfailed", self._request_failed_handler)
             remove("response", self._response_handler)
+
+    @property
+    def request_sequence(self) -> int:
+        return self._request_sequence
+
+    def issued_count(self, endpoint: str) -> int:
+        return self._issued_endpoint_counts.get(endpoint, 0)
 
     def _on_request(self, req) -> None:
         try:
-            auth = req.headers.get("authorization", "")
-            if re.fullmatch(r"Bearer [^\s\r\n]+", auth) is None:
+            if self.SKIP_RE.search(req.url):
                 return
             parsed = urlparse(req.url)
             expected = self.host_filter.lower().strip(".")
@@ -145,6 +201,21 @@ class ResponseCollector:
                 parsed.scheme.lower() != "https"
                 or (hostname != expected and not hostname.endswith("." + expected))
             ):
+                return
+            frame = getattr(req, "frame", None)
+            page = getattr(frame, "page", None)
+            main_frame_request = (
+                frame is not None and frame is getattr(page, "main_frame", None)
+            )
+            self._request_sequence += 1
+            self._requests[id(req)] = self._request_sequence
+            self._request_main_frame[id(req)] = main_frame_request
+            endpoint = parsed.path.rsplit("/", 1)[-1]
+            self._issued_endpoint_counts[endpoint] = (
+                self._issued_endpoint_counts.get(endpoint, 0) + 1
+            )
+            auth = req.headers.get("authorization", "")
+            if re.fullmatch(r"Bearer [^\s\r\n]+", auth) is None:
                 return
             self._auth_event_sequence += 1
             self._auth_requests[id(req)] = {
@@ -155,6 +226,11 @@ class ResponseCollector:
             }
         except Exception:
             return
+
+    def _on_request_failed(self, req) -> None:
+        self._requests.pop(id(req), None)
+        self._request_main_frame.pop(id(req), None)
+        self._auth_requests.pop(id(req), None)
 
     def _on_response(self, resp):
         try:
@@ -171,12 +247,26 @@ class ResponseCollector:
                 ):
                     return
             req = resp.request
+            request_sequence = self._requests.pop(id(req), 0)
+            main_frame_request = self._request_main_frame.pop(id(req), False)
             ct = resp.headers.get("content-type", "")
             content_length = resp.headers.get("content-length", "")
             content_encoding = resp.headers.get("content-encoding", "")
-            is_bounded_hsbc_inventory = (
-                self.host_filter == "card.hsbc.com.tw"
-                and parsed.path in {"/ibk-bff/api/v1/cards", "/ibk-bff/api/v1/cards/suspend"}
+            is_bounded_json = (
+                (
+                    self.host_filter == "card.hsbc.com.tw"
+                    and parsed.path in {
+                        "/ibk-bff/api/v1/cards", "/ibk-bff/api/v1/cards/suspend",
+                    }
+                )
+                or (
+                    self.host_filter == "sinopac.com"
+                    and parsed.hostname == "mma.sinopac.com"
+                    and parsed.path in {
+                        "/ws/bank/transdetail/ws_debitacct.ashx",
+                        "/ws/bank/transdetail/ws_transdetailMerge.ashx",
+                    }
+                )
             )
             body_size = int(content_length) if content_length.isdigit() else None
             auth = req.headers.get("authorization", "")
@@ -206,29 +296,50 @@ class ResponseCollector:
             try:
                 pd = req.post_data
                 if pd:
-                    try:
-                        req_body = json.loads(pd)
-                    except Exception:
-                        req_body = pd[:500]
+                    if is_bounded_json:
+                        if len(pd.encode("utf-8")) > 16_384:
+                            req_body = {"__oversize__": True}
+                        else:
+                            try:
+                                parsed_body = json.loads(pd)
+                                req_body = (
+                                    {"__json_null__": True}
+                                    if parsed_body is None
+                                    else parsed_body
+                                )
+                            except Exception:
+                                req_body = pd
+                    else:
+                        try:
+                            req_body = json.loads(pd)
+                        except Exception:
+                            req_body = pd[:500]
             except Exception:
                 pass
             resp_json = None
-            if "json" in ct and (
-                not is_bounded_hsbc_inventory
-                or (
-                    body_size is not None
-                    and body_size <= 5_000_000
-                    and content_encoding.lower() in {"", "identity"}
-                )
-            ):
-                with contextlib.suppress(Exception):
-                    resp_json = resp.json()
+            if "json" in ct:
+                if is_bounded_json:
+                    if (
+                        content_encoding.lower() in {"", "identity"}
+                        and body_size is not None
+                        and body_size <= 5_000_000
+                    ):
+                        with contextlib.suppress(Exception):
+                            raw_body = resp.body()
+                            body_size = len(raw_body)
+                            if body_size <= 5_000_000:
+                                resp_json = json.loads(raw_body)
+                else:
+                    with contextlib.suppress(Exception):
+                        resp_json = resp.json()
             self.hits.append(ApiHit(
                 url=url.split("?")[0], method=req.method, status=resp.status,
                 req_body=req_body, resp_json=resp_json, content_type=ct,
                 raw_url=url,
                 redirected=getattr(req, "redirected_from", None) is not None,
                 body_size=body_size,
+                request_sequence=request_sequence,
+                main_frame_request=main_frame_request,
             ))
         except Exception:
             pass

@@ -10,7 +10,7 @@ from backend.core.persist.esun import persist_esun
 from backend.core.persist.fubon import persist_fubon
 from backend.core.persist.hsbc import persist_hsbc
 from backend.core.persist.scsb import persist_scsb
-from backend.core.persist.sinopac import persist_sinopac
+from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.persist.taishin import persist_taishin
 from backend.core.persist.ubot import persist_ubot
 from backend.core.store import BankStore
