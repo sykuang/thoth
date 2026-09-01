@@ -23,14 +23,13 @@ def test_production_topology_uses_default_azure_network_and_public_postgres() ->
     assert "Microsoft.Network/privateDnsZones" not in text
 
 
-def test_container_app_uses_direct_secrets_and_can_disable_scheduler_for_cutover() -> None:
+def test_container_app_uses_direct_secrets_and_external_sync_workers() -> None:
     text = _bicep()
 
-    assert "param schedulerDisabled bool = true" in text
     assert "param bootstrapNetworkOnly bool = true" in text
     assert "name: 'database-url-public'" in text
     assert "{ name: 'DATABASE_URL', secretRef: 'database-url-public' }" in text
-    assert "{ name: 'THOTH_DISABLE_SCHEDULER', value: schedulerDisabled ? '1' : '0' }" in text
+    assert "{ name: 'SYNC_EXECUTION_MODE', value: 'external' }" in text
     assert "{ name: 'THOTH_BOOTSTRAP_NETWORK_ONLY', value: bootstrapNetworkOnly ? '1' : '0' }" in text
     assert "keyVaultUrl:" not in text
     assert "value: jwtSecret" in text
@@ -39,11 +38,9 @@ def test_container_app_uses_direct_secrets_and_can_disable_scheduler_for_cutover
     assert "value: adminApiKey" in text
 
 
-def test_deploy_script_passes_cutover_scheduler_flag() -> None:
+def test_deploy_script_passes_network_bootstrap_flag() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
 
-    assert 'SCHEDULER_DISABLED="${SCHEDULER_DISABLED:-true}"' in text
     assert 'BOOTSTRAP_NETWORK_ONLY="${BOOTSTRAP_NETWORK_ONLY:-true}"' in text
-    assert '"schedulerDisabled": {"value": os.environ["SCHEDULER_DISABLED"] == "true"}' in text
     assert '"bootstrapNetworkOnly": {"value": os.environ["BOOTSTRAP_NETWORK_ONLY"] == "true"}' in text
     assert 'if [[ "$BOOTSTRAP_NETWORK_ONLY" == "false" ]]' in text

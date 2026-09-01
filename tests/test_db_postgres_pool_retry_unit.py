@@ -97,3 +97,21 @@ def test_pg_pool_created_lazy_with_expected_bounds(monkeypatch):
     assert calls[0][1]["min_size"] == db._PG_POOL_MIN_SIZE
     assert calls[0][1]["max_size"] == db._PG_POOL_MAX_SIZE
     assert calls[0][1]["check"] is DummyConnectionPool.check_connection
+
+
+def test_pg_schema_ensure_takes_cross_process_advisory_lock(monkeypatch):
+    db = _reload_pg_db(monkeypatch)
+    events: list[str] = []
+
+    class Connection:
+        def execute(self, sql, params=()):
+            events.append(sql)
+
+    monkeypatch.setattr(db, "_ensure_schema", lambda _conn: events.append("schema"))
+
+    db._ensure_schema_serialized(Connection())
+
+    assert events == [
+        "SELECT pg_advisory_xact_lock(hashtext('thoth-schema'))",
+        "schema",
+    ]

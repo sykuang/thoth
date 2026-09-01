@@ -2,11 +2,9 @@
 
 設計 (L13, 2026-06-23 使用者指示):
   * user_id PK = 1 user 1 schedule (取代 L12 per-account 設計)
-  * hour 0-23, minute 0-59 — 純 daily, 不支援 cron expression
-  * tz 必設, 預設 'Asia/Taipei' — APScheduler 用 user 設的 tz 算 next fire
+  * 固定 10:00 / 12:00 / 18:00 Asia/Taipei，不支援任意時間
   * enabled=0 vs 沒 row 兩種「停掉」, 前者保留時間值方便重啟
-  * Fire 時 scheduler 自己 fan-out 該 user 全部 has_creds account
-    (見 scheduler.py _run_sync_for_user)
+  * Azure scheduled job 在固定時段 fan-out 該 user 全部 has_creds account
 
 Plan B (2026-06-19): server-level repo, 允許 raw SQL (見 test_plan_b_sql_audit.py allowlist).
 
@@ -24,6 +22,8 @@ from backend.server.db import get_conn, now_iso
 _COLS = (
     "user_id, hour, minute, tz, enabled, last_run_at, created_at, updated_at"
 )
+ALLOWED_SYNC_SLOTS = frozenset({(10, 0), (12, 0), (18, 0)})
+_ALLOWED_SYNC_SLOTS_LABEL = "10:00, 12:00, 18:00"
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
@@ -32,7 +32,11 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         "hour": row[1],
         "minute": row[2],
         "tz": row[3],
-        "enabled": bool(row[4]),
+        "enabled": (
+            bool(row[4])
+            and (row[1], row[2]) in ALLOWED_SYNC_SLOTS
+            and row[3] == "Asia/Taipei"
+        ),
         "last_run_at": row[5],
         "created_at": row[6],
         "updated_at": row[7],
@@ -56,6 +60,10 @@ def upsert(
         raise ValueError(f"hour 必須 0-23, 收到 {hour}")
     if not 0 <= minute <= 59:
         raise ValueError(f"minute 必須 0-59, 收到 {minute}")
+    if (hour, minute) not in ALLOWED_SYNC_SLOTS:
+        raise ValueError(f"自動同步時間只能是 {_ALLOWED_SYNC_SLOTS_LABEL}")
+    if tz != "Asia/Taipei":
+        raise ValueError("自動同步時區只能是 Asia/Taipei")
 
     now = now_iso()
     enabled_int = 1 if enabled else 0
@@ -101,7 +109,8 @@ def list_all_enabled() -> list[dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
             f"SELECT {_COLS} FROM user_sync_preferences "
-            "WHERE enabled=1 ORDER BY user_id"
+            "WHERE enabled=1 AND minute=0 AND hour IN (10, 12, 18) "
+            "AND tz='Asia/Taipei' ORDER BY user_id"
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
 

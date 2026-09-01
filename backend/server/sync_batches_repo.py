@@ -27,7 +27,7 @@ from backend.server.db import get_conn, now_iso
 
 # Kind constants — sync_batches.kind 唯二合法值. 任何新 kind 都該明確列在這
 KIND_MANUAL_ALL = "manual_all"        # UI 按「同步全部」(POST /sync/all)
-KIND_SCHEDULED_ALL = "scheduled_all"  # APScheduler 排程 fire 自動 fan-out
+KIND_SCHEDULED_ALL = "scheduled_all"  # Azure scheduled job 自動 fan-out
 
 _VALID_KINDS = frozenset({KIND_MANUAL_ALL, KIND_SCHEDULED_ALL})
 
@@ -80,12 +80,30 @@ def get(batch_id: int) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+def set_total_jobs(batch_id: int, total_jobs: int) -> None:
+    if total_jobs <= 0:
+        raise ValueError("total_jobs must be positive; delete an empty batch")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE sync_batches SET total_jobs=? WHERE id=? AND notified_at IS NULL",
+            (total_jobs, batch_id),
+        )
+
+
+def delete(batch_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM sync_batches WHERE id=? AND notified_at IS NULL",
+            (batch_id,),
+        )
+
+
 def claim_for_notification(batch_id: int) -> dict[str, Any] | None:
     """收尾 atomic CAS — 拿到 row 的 caller 是唯一推 batch summary 的.
 
     兩階段:
-      (a) SELECT COUNT(*) sync_jobs WHERE batch_id=? AND status IN
-          ('queued','running') — 還有沒收完的 job 直接 return None.
+      (a) 確認 sync_jobs row 數已達 total_jobs，且沒有 queued/running；避免
+          fan-out 尚未排完時，第一個快完成的 job 提早 claim.
       (b) UPDATE sync_batches SET notified_at=now, finished_at=now
           WHERE id=? AND notified_at IS NULL RETURNING ...
           — race 輸的 (notified_at 已被別人寫) 拿不到 row return None.
@@ -98,14 +116,18 @@ def claim_for_notification(batch_id: int) -> dict[str, Any] | None:
     """
     now = now_iso()
     with get_conn() as conn:
-        # (a) 還有 in-flight job 就 return
+        # (a) batch membership 未齊或還有 in-flight job 就 return
         cur = conn.execute(
-            "SELECT COUNT(*) FROM sync_jobs "
-            "WHERE batch_id=? AND status IN ('queued', 'running')",
+            "SELECT b.total_jobs, COUNT(j.id), "
+            "COALESCE(SUM(CASE WHEN j.status IN ('queued', 'running') "
+            "THEN 1 ELSE 0 END), 0) "
+            "FROM sync_batches b "
+            "LEFT JOIN sync_jobs j ON j.batch_id=b.id "
+            "WHERE b.id=? GROUP BY b.total_jobs",
             (batch_id,),
         )
         row = cur.fetchone()
-        if row is not None and int(row[0]) > 0:
+        if row is None or int(row[1]) != int(row[0]) or int(row[2]) > 0:
             return None
 
         # (b) atomic CAS: 只有 notified_at 仍 NULL 才贏

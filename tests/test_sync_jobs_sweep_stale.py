@@ -62,7 +62,7 @@ def test_sweep_clears_running_job_older_than_threshold(server_db):
         started_at=_utc_iso(16 * 60),  # 16 分鐘前
     )
     swept = sync_jobs_repo.sweep_stale_running()
-    assert swept >= 1
+    assert swept.swept_count >= 1
     with get_conn() as conn:
         row = conn.execute(
             "SELECT status, error_msg FROM sync_jobs WHERE id=?", (job_id,)
@@ -83,6 +83,23 @@ def test_sweep_keeps_running_job_within_threshold(server_db):
             "SELECT status FROM sync_jobs WHERE id=?", (job_id,)
         ).fetchone()
     assert row[0] == "running", "5 分鐘前的 running 不該被誤殺"
+
+
+def test_external_worker_uses_seven_hour_running_threshold(server_db, monkeypatch):
+    monkeypatch.setenv("SYNC_EXECUTION_MODE", " External ")
+    job_id = _insert_job(
+        user_id=1,
+        bank="cathay",
+        status="running",
+        started_at=_utc_iso(16 * 60),
+    )
+
+    swept = sync_jobs_repo.sweep_stale_running()
+
+    assert swept.swept_count == 0
+    with get_conn() as conn:
+        row = conn.execute("SELECT status FROM sync_jobs WHERE id=?", (job_id,)).fetchone()
+    assert row[0] == "running"
 
 
 def test_sweep_ignores_already_done_or_failed(server_db):

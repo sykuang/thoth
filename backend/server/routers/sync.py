@@ -22,6 +22,7 @@ from backend.server.sync_runner import (
     SUPPORTED_BANKS,
     get_job,
     list_recent_jobs,
+    reconcile_batch_fanout,
     run_sync_job,
     run_sync_job_for_account,
     supports_attested_history,
@@ -119,17 +120,24 @@ def trigger_sync_all(
         )
 
     job_results: list[dict] = []
-    for acct in ready_accts:
-        job_id = run_sync_job_for_account(
-            account_id=acct.id, headless=headless, batch_id=batch_id,
+    try:
+        for acct in ready_accts:
+            job_id = run_sync_job_for_account(
+                account_id=acct.id, headless=headless, batch_id=batch_id,
+            )
+            job_results.append({
+                "job_id": job_id,
+                "account_id": acct.id,
+                "bank": acct.bank,
+                "label": acct.label,
+                "status": "queued",
+            })
+    finally:
+        reconcile_batch_fanout(
+            batch_id=batch_id,
+            user_id=user["id"],
+            job_ids=[item["job_id"] for item in job_results],
         )
-        job_results.append({
-            "job_id": job_id,
-            "account_id": acct.id,
-            "bank": acct.bank,
-            "label": acct.label,
-            "status": "queued",
-        })
 
     return {
         "queued": len(job_results),

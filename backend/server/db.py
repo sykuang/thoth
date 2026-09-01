@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
 -- 取代每家銀行各推一則 sync_done (12 家 = 12 則噪音).
 --   * user_id: 哪個 user 觸發
 --   * total_jobs: batch 內排了幾個 job (= 該 user has_creds 的 account 數)
---   * kind: 'manual_all' (UI POST /sync/all) | 'scheduled_all' (APScheduler 自動)
+--   * kind: 'manual_all' (UI POST /sync/all) | 'scheduled_all' (Azure Job 自動)
 --   * notified_at: atomic CAS sentinel — 最後一個 job 收尾時 UPDATE ... WHERE
 --     notified_at IS NULL RETURNING ..., race 輸的拿不到 row 就 skip 推播.
 --     SQLite ≥3.35 + PG 都吃 RETURNING.
@@ -722,6 +722,12 @@ def _ensure_schema(conn: Any) -> None:
     conn.commit()
 
 
+def _ensure_schema_serialized(conn: Any) -> None:
+    if DB_BACKEND == "postgres":
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext('thoth-schema'))")
+    _ensure_schema(conn)
+
+
 def _split_statements(script: str) -> list[str]:
     """切多 statement string 成 list（給 psycopg 用，跳過空行與註解）。
 
@@ -915,11 +921,11 @@ def get_conn() -> Iterator[Any]:
     #   bank_accounts 互卡 → 隨機 500 + frontend 顯示 Load failed）
     global _schema_ensured
     if DB_BACKEND == "sqlite":
-        _ensure_schema(conn)
+        _ensure_schema_serialized(conn)
     elif not _schema_ensured:
         with _schema_lock:
             if not _schema_ensured:
-                _ensure_schema(conn)
+                _ensure_schema_serialized(conn)
                 _schema_ensured = True
     try:
         yield conn

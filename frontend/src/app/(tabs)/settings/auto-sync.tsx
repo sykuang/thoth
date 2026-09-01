@@ -6,7 +6,7 @@
  *
  * UI:
  *   - 單一 enable toggle (整個 user 一個排程)
- *   - 單一時間 picker (HH × MM)
+ *   - 三個固定時段 (10:00 / 12:00 / 18:00 Asia/Taipei)
  *   - 列出當前 user 全部 has_creds account, 強調「都會在這個時間一起同步」
  *   - 顯示上次自動同步時間
  *
@@ -38,8 +38,11 @@ const BANK_LABEL: Record<string, string> = {
   dbs: '星展銀行', scb: '渣打銀行', linebank: 'LINE Bank', rakuten: '樂天國際銀行',
 };
 
-const HOURS = Array.from({ length: 24 }, (_, i) => i);
-const MINUTES = Array.from({ length: 12 }, (_, i) => i * 5); // 每 5 分鐘
+const SYNC_SLOTS = [
+  { hour: 10, minute: 0, label: '10:00' },
+  { hour: 12, minute: 0, label: '12:00' },
+  { hour: 18, minute: 0, label: '18:00' },
+] as const;
 
 export default function AutoSyncScreen() {
   const qc = useQueryClient();
@@ -73,9 +76,12 @@ function AutoSyncBody({
   accountsQ: { data?: BankAccount[]; isLoading: boolean };
   qc: ReturnType<typeof useQueryClient>;
 }) {
+  const initialSlot = SYNC_SLOTS.find(
+    (slot) => slot.hour === pref?.hour && slot.minute === pref?.minute,
+  ) ?? SYNC_SLOTS[0];
   const [enabled, setEnabled] = useState(pref?.enabled ?? false);
-  const [hour, setHour] = useState(pref?.hour ?? 9);
-  const [minute, setMinute] = useState(pref?.minute ?? 0);
+  const [hour, setHour] = useState(initialSlot.hour);
+  const minute = 0;
 
   const saveMut = useMutation({
     mutationFn: (vars: { hour: number; minute: number; enabled: boolean }) =>
@@ -115,7 +121,7 @@ function AutoSyncBody({
   const readyAccounts = (accountsQ.data ?? []).filter((a) => a.has_creds);
   const dirty =
     enabled !== (pref?.enabled ?? false) ||
-    hour !== (pref?.hour ?? 9) ||
+    hour !== (pref?.hour ?? SYNC_SLOTS[0].hour) ||
     minute !== (pref?.minute ?? 0);
 
   return (
@@ -141,7 +147,7 @@ function AutoSyncBody({
           </View>
         </View>
 
-        {/* 時間 picker */}
+        {/* 固定時段 */}
         <View
           className={`bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4 ${
             enabled ? '' : 'opacity-50'
@@ -150,25 +156,36 @@ function AutoSyncBody({
           <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-3">
             執行時間 (Asia/Taipei)
           </Text>
-          <View className="flex-row items-center justify-center gap-3 py-2">
-            <NumberPicker
-              value={hour}
-              options={HOURS}
-              onChange={setHour}
-              disabled={!enabled}
-              testID="auto-sync-hour"
-            />
-            <Text className="text-ink-900 dark:text-ink-50 text-display">:</Text>
-            <NumberPicker
-              value={minute}
-              options={MINUTES}
-              onChange={setMinute}
-              disabled={!enabled}
-              testID="auto-sync-minute"
-            />
+          <View className="flex-row flex-wrap items-center justify-center gap-3 py-2">
+            {SYNC_SLOTS.map((slot) => {
+              const selected = hour === slot.hour;
+              return (
+                <Pressable
+                  key={slot.label}
+                  accessibilityRole="radio"
+                  accessibilityState={{ selected, disabled: !enabled }}
+                  disabled={!enabled}
+                  onPress={() => setHour(slot.hour)}
+                  testID={`auto-sync-slot-${slot.label}`}
+                  className={`rounded-xl border px-5 py-3 ${
+                    selected
+                      ? 'border-brand-600 bg-brand-50 dark:border-brand-400 dark:bg-brand-950'
+                      : 'border-ink-200 bg-white dark:border-ink-700 dark:bg-ink-900'
+                  }`}
+                >
+                  <Text className={`text-h3 ${
+                    selected
+                      ? 'text-brand-700 dark:text-brand-300'
+                      : 'text-ink-700 dark:text-ink-200'
+                  }`}>
+                    {slot.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
           </View>
           <Text className="text-ink-400 dark:text-ink-500 text-caption text-center mt-2">
-            建議排在凌晨 (帳務都已 settle) 例如 03:00 或 06:00
+            請選擇每日固定同步時段
           </Text>
         </View>
 
@@ -250,65 +267,11 @@ function AutoSyncBody({
         )}
 
         <Text className="text-ink-400 dark:text-ink-500 text-micro text-center mt-6">
-          排程由 server 端 APScheduler 驅動, 即使 app 關閉也會執行。
+          排程由伺服器背景工作執行, 即使 app 關閉也會執行。
           {'\n'}失敗會推送通知 (不會自動重試)。
         </Text>
       </View>
     </ScrollView>
-  );
-}
-
-// ============================================================
-// NumberPicker — 簡易自製滾輪 (Platform-agnostic, 避免 expo-picker 額外依賴)
-// 點 ↑/↓ 移到下/上一個值; 中間直接顯示當前值大字
-// ============================================================
-function NumberPicker({
-  value,
-  options,
-  onChange,
-  disabled,
-  testID,
-}: {
-  value: number;
-  options: number[];
-  onChange: (v: number) => void;
-  disabled?: boolean;
-  testID?: string;
-}) {
-  const idx = options.indexOf(value);
-  const safeIdx = idx >= 0 ? idx : 0;
-
-  function step(delta: number) {
-    if (disabled) return;
-    const next = (safeIdx + delta + options.length) % options.length;
-    onChange(options[next]);
-  }
-
-  return (
-    <View className="items-center" testID={testID}>
-      <Pressable
-        onPress={() => step(-1)}
-        disabled={disabled}
-        className={`px-4 py-1 ${disabled ? 'opacity-30' : 'active:opacity-50'}`}
-        testID={testID ? `${testID}-up` : undefined}
-      >
-        <Text className="text-ink-500 dark:text-ink-400 text-h3">▲</Text>
-      </Pressable>
-      <Text
-        className="text-ink-900 dark:text-ink-50 font-bold"
-        style={{ fontSize: 36, lineHeight: 44, minWidth: 64, textAlign: 'center' }}
-      >
-        {pad(value)}
-      </Text>
-      <Pressable
-        onPress={() => step(1)}
-        disabled={disabled}
-        className={`px-4 py-1 ${disabled ? 'opacity-30' : 'active:opacity-50'}`}
-        testID={testID ? `${testID}-down` : undefined}
-      >
-        <Text className="text-ink-500 dark:text-ink-400 text-h3">▼</Text>
-      </Pressable>
-    </View>
   );
 }
 

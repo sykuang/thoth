@@ -67,6 +67,24 @@ def test_run_sync_job_creates_queued_row(isolated, monkeypatch):
     assert row["history_mode"] == "full"
 
 
+def test_external_execution_mode_is_normalized_before_launch(isolated, monkeypatch):
+    import backend.server.sync_runner as sr
+    from backend.server.creds_store import AccountsRepo
+
+    calls: list[int] = []
+    monkeypatch.setenv("SYNC_EXECUTION_MODE", " External ")
+    monkeypatch.setattr(sr, "_exec_sync", lambda job_id: calls.append(job_id))
+    account = AccountsRepo().create(1, "sinopac", "main")
+
+    job_id = sr.run_sync_job_for_account(account.id)
+    time.sleep(0.05)
+
+    assert calls == []
+    row = sr.get_job(job_id)
+    assert row is not None
+    assert row["status"] == "queued"
+
+
 @pytest.mark.parametrize("bank", sorted([
     "cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun",
     "taishin", "fubon", "dbs", "scb", "linebank", "rakuten",

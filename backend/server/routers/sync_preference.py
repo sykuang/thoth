@@ -7,13 +7,12 @@ Endpoints (per-user, ownership via current_user):
   GET    /me/sync-preference           → 取 current user 的 preference (或 null)
   PUT    /me/sync-preference           → upsert (hour/minute/tz/enabled)
   DELETE /me/sync-preference           → hard delete (回 null state)
-  GET    /me/sync-preference/_debug    → APScheduler in-memory jobs (debug)
+  GET    /me/sync-preference/_debug    → standalone in-memory jobs (debug)
 
 Design:
   * 1 user = 1 schedule (user_id PK).
-  * Daily HH:MM only; 沒 cron expression.
-  * 寫 DB + 同步呼 scheduler.add_or_replace_for_user / scheduler.remove_for_user
-    讓改動立刻生效 (不等下次 backend restart).
+  * Daily schedule is limited to 10:00, 12:00, or 18:00 Asia/Taipei.
+  * Azure Container Apps Jobs read the persisted preference at execution time.
 """
 from __future__ import annotations
 
@@ -72,8 +71,7 @@ def get_preference(user: dict = Depends(current_user)) -> dict | None:
 
 @router.get("/_debug", response_model=SchedulerDebugResponse)
 def debug_scheduler_jobs(user: dict = Depends(current_user)) -> dict:
-    """[Debug] Inspect APScheduler in-memory jobs (admin/debug)."""
-    jobs = scheduler.list_jobs()
+    jobs = scheduler.list_jobs() if scheduler.in_process_enabled() else []
     return {"items": jobs, "count": len(jobs)}
 
 
@@ -89,8 +87,8 @@ def upsert_preference(
     """Create or update the auto-sync preference for the current user.
 
     Validates the tz string BEFORE writing DB (so an invalid tz never sticks
-    around and breaks scheduler reload on next boot). Then writes the DB row
-    + immediately reflects in the in-process APScheduler.
+    around and breaks standalone scheduler reload on next boot). The persisted
+    row is read by Azure jobs or reflected immediately in the local scheduler.
     """
     # Validate timezone before DB write — invalid tz must NOT persist
     # (else next boot's reload_all_jobs() crashes on CronTrigger init).
@@ -103,21 +101,18 @@ def upsert_preference(
             f"無效時區: {req.tz}",
         ) from e
 
-    row = user_sync_pref_repo.upsert(
-        user_id=user["id"],
-        hour=req.hour,
-        minute=req.minute,
-        tz=req.tz,
-        enabled=req.enabled,
-    )
     try:
+        row = user_sync_pref_repo.upsert(
+            user_id=user["id"],
+            hour=req.hour,
+            minute=req.minute,
+            tz=req.tz,
+            enabled=req.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e)) from e
+    if scheduler.in_process_enabled():
         scheduler.add_or_replace_for_user(row)
-    except Exception as e:
-        # 已 validate tz 了, 這層 raise 應該很少見 — 保險還是擋
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"排程設定無效: {e}",
-        ) from e
     return row
 
 
@@ -134,4 +129,5 @@ def delete_preference(
     for future re-enable). DELETE wipes the row entirely.
     """
     user_sync_pref_repo.delete(user["id"])
-    scheduler.remove_for_user(user["id"])
+    if scheduler.in_process_enabled():
+        scheduler.remove_for_user(user["id"])

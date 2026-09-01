@@ -15,12 +15,18 @@ OOM crash 期間正在跑的 job 因為沒人走到 mark_done/mark_failed, sync_
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from backend.server.db import get_conn, now_iso
 
 _HISTORY_DOMAINS = frozenset({"twd_transactions", "card_billed_transactions"})
+
+
+class StaleSweep(NamedTuple):
+    swept_count: int
+    batches: tuple[tuple[int, int], ...]
 
 
 def _canonical_date(value: Any) -> date | None:
@@ -134,10 +140,16 @@ def get(job_id: int) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
-def list_recent_for_user(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+def list_recent_for_user(
+    user_id: int,
+    limit: int = 50,
+    *,
+    sweep: bool = True,
+) -> list[dict[str, Any]]:
     # 2026-06-22: sweep stale running jobs 才回 jobs list, 避免殭屍 job 卡 UI.
     # 不傳 user_id — sweep 是 global cleanup (殭屍 job 任何 user 撈到 jobs 都該清乾淨).
-    sweep_stale_running()
+    if sweep:
+        sweep_stale_running()
     with get_conn() as conn:
         rows = conn.execute(
             f"SELECT {_COLS} FROM sync_jobs WHERE user_id=? "
@@ -145,6 +157,15 @@ def list_recent_for_user(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
             (user_id, limit),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def list_queued_ids(limit: int = 1000) -> list[int]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id FROM sync_jobs WHERE status='queued' ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [int(row[0]) for row in rows]
 
 
 def has_completed_for_account(account_id: int) -> bool:
@@ -184,33 +205,74 @@ def has_completed_full_history_for_account(
     return False
 
 
-def sweep_stale_running() -> int:
-    """把 started_at 超過 _STALE_THRESHOLD_SECONDS 的 running job mark 成 failed.
+def sweep_stale_queued() -> StaleSweep:
+    mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
+    stale_hours = 7 if mode == "external" else 1
+    threshold = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat()
+    error = f"stale_queue: worker did not claim within {stale_hours} hour{'s' if stale_hours != 1 else ''}"
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE sync_jobs SET status='failed', finished_at=?, error_msg=? "
+            "WHERE status='queued' AND created_at < ? "
+            "AND (batch_id IS NULL OR batch_id IN "
+            "(SELECT id FROM sync_batches WHERE kind='manual_all')) "
+            "RETURNING batch_id, user_id",
+            (now_iso(), error, threshold),
+        )
+        rows = cur.fetchall()
+    batches = tuple(sorted({(int(row[0]), int(row[1])) for row in rows if row[0] is not None}))
+    return StaleSweep(len(rows), batches)
+
+
+def sweep_stale_scheduled_queued() -> StaleSweep:
+    threshold = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    error = "stale_queue: scheduled worker did not claim within 7 hours"
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE sync_jobs SET status='failed', finished_at=?, error_msg=? "
+            "WHERE status='queued' AND created_at < ? "
+            "AND batch_id IN "
+            "(SELECT id FROM sync_batches WHERE kind='scheduled_all') "
+            "RETURNING batch_id, user_id",
+            (now_iso(), error, threshold),
+        )
+        rows = cur.fetchall()
+    batches = tuple(sorted({(int(row[0]), int(row[1])) for row in rows if row[0] is not None}))
+    return StaleSweep(len(rows), batches)
+
+
+def sweep_stale_running() -> StaleSweep:
+    """Mark running jobs older than the active execution mode allows as failed.
 
     2026-06-22: container restart / OOM / thread crash 期間正在跑的 job 沒人走到
     mark_done/mark_failed, status='running' 永遠卡死, frontend `hasRunningJob`
     永遠 true → 顯示「同步中」即使通知早就收到.
 
     解法: GET /sync/jobs 路徑開頭一次性 sweep, 沒有 cron 也能自動清.
-    閾值 15 分鐘 (sync 最慢 ~10 分鐘 cathay/ctbc anti-bot 完整流程, margin 足).
+    Standalone uses 15 minutes; external Container Apps Jobs use 7 hours,
+    one hour beyond their six-hour replica timeout.
     error_msg 寫死 'stale_sweep: ...' 識別性高,
     debug 時 grep 一翻兩瞪眼.
 
-    回傳 swept count (test 用).
+    回傳 swept rows and affected batches so callers can finalize summaries.
     """
+    mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
+    stale_seconds = 7 * 60 * 60 if mode == "external" else _STALE_THRESHOLD_SECONDS
     threshold = (
-        datetime.now(timezone.utc) - timedelta(seconds=_STALE_THRESHOLD_SECONDS)
+        datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
     ).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE sync_jobs SET status='failed', finished_at=?, "
             "error_msg=? WHERE status='running' AND started_at IS NOT NULL "
-            "AND started_at < ?",
-            (now_iso(), f"stale_sweep: job stuck >{_STALE_THRESHOLD_SECONDS}s "
+            "AND started_at < ? RETURNING batch_id, user_id",
+            (now_iso(), f"stale_sweep: job stuck >{stale_seconds}s "
                         "without mark_done/mark_failed (container restart / crash?)",
              threshold),
         )
-        return cur.rowcount or 0
+        rows = cur.fetchall()
+    batches = tuple(sorted({(int(row[0]), int(row[1])) for row in rows if row[0] is not None}))
+    return StaleSweep(len(rows), batches)
 
 
 def list_by_batch(batch_id: int) -> list[dict[str, Any]]:
@@ -221,6 +283,17 @@ def list_by_batch(batch_id: int) -> list[dict[str, Any]]:
             (batch_id,),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def claim_queued(job_id: int) -> bool:
+    """Atomically claim one queued job across API and Container Apps Job processes."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE sync_jobs SET status='running', started_at=? "
+            "WHERE id=? AND status='queued'",
+            (now_iso(), job_id),
+        )
+        return (cur.rowcount or 0) == 1
 
 
 def mark_running(job_id: int) -> None:

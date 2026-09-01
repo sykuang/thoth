@@ -9,8 +9,8 @@
     (sync_runner.run_sync_job_for_account 自己開 daemon thread, 立刻回 job_id)
   * 失敗處理: APScheduler 跑 job 時自身 exception 不 retry; 每個 account 失敗
     走 sync_runner._send_sync_notification → push notification
-  * Container App scale-to-zero 鐵令: 設 minReplicas=1, 否則 sync 時段沒
-    request scheduler 連著 backend 一起被殺
+  * Azure 設 SYNC_EXECUTION_MODE=external 時不啟動本 scheduler，由 Container Apps
+    Jobs 接手；standalone/local 預設仍使用本 scheduler。
 
 ⚠️ APScheduler thread vs uvicorn lifecycle:
   - BackgroundScheduler.start() 開 daemon thread, uvicorn 接 SIGTERM 時必 shutdown
@@ -37,6 +37,12 @@ logger = logging.getLogger("backend.scheduler")
 # Singleton instance — 由 app.py lifespan 啟動 / 停止
 _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
+
+
+def in_process_enabled() -> bool:
+    disabled = os.environ.get("THOTH_DISABLE_SCHEDULER", "").strip().lower()
+    mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
+    return disabled not in {"1", "true"} and mode != "external"
 
 
 def get_scheduler() -> BackgroundScheduler:
@@ -78,7 +84,7 @@ def _run_sync_for_user(user_id: int) -> None:
         # 延後 import 避免循環依賴 (sync_runner 依賴 scheduler 反過來不行)
         from backend.server import sync_batches_repo
         from backend.server.creds_store import AccountsRepo, LocalFernetBackend
-        from backend.server.sync_runner import run_sync_job_for_account
+        from backend.server.sync_runner import reconcile_batch_fanout, run_sync_job_for_account
 
         logger.info("[scheduler] fire user_id=%s", user_id)
         accounts = AccountsRepo().list_for_user(user_id)
@@ -119,27 +125,34 @@ def _run_sync_for_user(user_id: int) -> None:
                 )
                 batch_id = None
 
-        queued = 0
-        for acct in ready:
-            try:
-                job_id = run_sync_job_for_account(
-                    account_id=acct.id, headless=True, batch_id=batch_id,
-                )
-                logger.info(
-                    "[scheduler] queued user_id=%s account_id=%s job_id=%s batch_id=%s",
-                    user_id, acct.id, job_id, batch_id,
-                )
-                queued += 1
-            except Exception as exc:
-                logger.warning(
-                    "[scheduler] queue failed user_id=%s account_id=%s error_type=%s",
-                    user_id, acct.id, type(exc).__name__,
-                )
+        job_ids: list[int] = []
+        try:
+            for acct in ready:
+                try:
+                    job_id = run_sync_job_for_account(
+                        account_id=acct.id, headless=True, batch_id=batch_id,
+                    )
+                    logger.info(
+                        "[scheduler] queued user_id=%s account_id=%s job_id=%s batch_id=%s",
+                        user_id, acct.id, job_id, batch_id,
+                    )
+                    job_ids.append(job_id)
+                except Exception as exc:
+                    logger.warning(
+                        "[scheduler] queue failed user_id=%s account_id=%s error_type=%s",
+                        user_id, acct.id, type(exc).__name__,
+                    )
+        finally:
+            reconcile_batch_fanout(
+                batch_id=batch_id,
+                user_id=user_id,
+                job_ids=job_ids,
+            )
 
         user_sync_pref_repo.mark_last_run(user_id=user_id)
         logger.info(
             "[scheduler] fire complete user_id=%s queued=%d/%d batch_id=%s",
-            user_id, queued, len(ready), batch_id,
+            user_id, len(job_ids), len(ready), batch_id,
         )
     except Exception as exc:
         logger.warning(

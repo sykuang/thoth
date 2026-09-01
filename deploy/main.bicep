@@ -71,9 +71,6 @@ param kvPublicAccess bool = false
 @description('Optional IP address (CIDR ok) allowed to reach Key Vault from the public internet. Only honoured when kvPublicAccess=true. Leave empty to skip the IP allow list.')
 param kvDeployerIpCidr string = ''
 
-@description('Disable the in-process scheduler during database migration and cutover.')
-param schedulerDisabled bool = true
-
 @description('Start only HTTP ingress so outbound IP firewall rules can be bootstrapped before any DB access.')
 param bootstrapNetworkOnly bool = true
 
@@ -85,6 +82,9 @@ var lawName = '${namePrefix}-law'
 var caeName = '${namePrefix}-cae-public'
 var miName = '${namePrefix}-mi'
 var appName = '${namePrefix}-backend-public'
+var scheduledJobName = '${namePrefix}-sync-scheduled'
+var queuedJobName = '${namePrefix}-sync-queued'
+var reminderJobName = '${namePrefix}-payment-reminders'
 var kvName = '${namePrefix}-kv-${take(uniqueString(resourceGroup().id), 6)}'
 var pgServerName = '${namePrefix}-pg-public-${take(uniqueString(resourceGroup().id), 6)}'
 var pgAdminUser = 'thothadmin'
@@ -348,6 +348,24 @@ resource cae 'Microsoft.App/managedEnvironments@2024-03-01' = {
 //   4. http://localhost:8081          — Expo dev server
 var defaultCorsOrigins = 'https://${appName}.${cae.properties.defaultDomain},tauri://localhost,https://tauri.localhost,http://localhost:8081'
 var effectiveCorsOrigins = empty(corsOrigins) ? defaultCorsOrigins : corsOrigins
+var workerSecrets = concat([
+  { name: 'fernet-key-v2', value: serverFernetKey }
+  { name: 'database-url-public', value: databaseUrl }
+], snapTradeConfigured ? [
+  { name: 'snaptrade-client-id', value: snapTradeClientId }
+  { name: 'snaptrade-key', value: snapTradeConsumerKey }
+] : [])
+var workerEnv = concat([
+  { name: 'SERVER_FERNET_KEY', secretRef: 'fernet-key-v2' }
+  { name: 'DB_BACKEND', value: 'postgres' }
+  { name: 'SYNC_EXECUTION_MODE', value: 'external' }
+  { name: 'PUSH_PROVIDER', value: 'expo' }
+  { name: 'DATABASE_URL', secretRef: 'database-url-public' }
+  { name: 'PYTHONUNBUFFERED', value: '1' }
+], snapTradeConfigured ? [
+  { name: 'SNAPTRADE_CLIENT_ID', secretRef: 'snaptrade-client-id' }
+  { name: 'SNAPTRADE_CONSUMER_KEY', secretRef: 'snaptrade-key' }
+] : [])
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
@@ -422,7 +440,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'SERVER_API_KEY', secretRef: 'api-key' }
             { name: 'ADMIN_API_KEY', secretRef: 'admin-api-key' }
             { name: 'DB_BACKEND', value: 'postgres' }
-            { name: 'THOTH_DISABLE_SCHEDULER', value: schedulerDisabled ? '1' : '0' }
+            { name: 'SYNC_EXECUTION_MODE', value: 'external' }
             { name: 'THOTH_BOOTSTRAP_NETWORK_ONLY', value: bootstrapNetworkOnly ? '1' : '0' }
             // Production frontend registers Expo push tokens by default. Keep
             // backend provider aligned; otherwise scheduler/payment reminders
@@ -459,9 +477,203 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
-        minReplicas: 1
+        minReplicas: 0
         maxReplicas: 1
       }
+    }
+  }
+  dependsOn: [
+    pgDb
+  ]
+}
+
+resource scheduledSyncJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: scheduledJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${mi.id}': {}
+    }
+  }
+  properties: {
+    environmentId: cae.id
+    workloadProfileName: 'Consumption'
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 900
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '0 2,4,10 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: mi.id
+        }
+      ]
+      secrets: workerSecrets
+    }
+    template: {
+      containers: [
+        {
+          name: 'scheduled-sync'
+          image: containerImage
+          command: [
+            'uv'
+            'run'
+            'python'
+            '-m'
+            'backend.server.sync_job_worker'
+          ]
+          args: [
+            'scheduled'
+          ]
+          resources: {
+            cpu: json('1.0')
+            memory: '2.0Gi'
+          }
+          env: workerEnv
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    pgDb
+  ]
+}
+
+resource queuedSyncJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: queuedJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${mi.id}': {}
+    }
+  }
+  properties: {
+    environmentId: cae.id
+    workloadProfileName: 'Consumption'
+    configuration: {
+      triggerType: 'Event'
+      replicaTimeout: 21600
+      replicaRetryLimit: 0
+      eventTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+        scale: {
+          pollingInterval: 30
+          minExecutions: 0
+          maxExecutions: 1
+          rules: [
+            {
+              name: 'queued-sync-jobs'
+              type: 'postgresql'
+              metadata: {
+                query: 'SELECT COUNT(*) FROM sync_jobs WHERE status=\'queued\' OR (status=\'running\' AND started_at IS NOT NULL AND started_at::timestamptz < NOW() - INTERVAL \'7 hours\')'
+                targetQueryValue: '1'
+              }
+              auth: [
+                {
+                  triggerParameter: 'connection'
+                  secretRef: 'database-url-public'
+                }
+              ]
+            }
+          ]
+        }
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: mi.id
+        }
+      ]
+      secrets: workerSecrets
+    }
+    template: {
+      containers: [
+        {
+          name: 'queued-sync'
+          image: containerImage
+          command: [
+            'uv'
+            'run'
+            'python'
+            '-m'
+            'backend.server.sync_job_worker'
+          ]
+          args: [
+            'queued'
+          ]
+          resources: {
+            cpu: json('1.0')
+            memory: '2.0Gi'
+          }
+          env: workerEnv
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    pgDb
+  ]
+}
+
+resource paymentReminderJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: reminderJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${mi.id}': {}
+    }
+  }
+  properties: {
+    environmentId: cae.id
+    workloadProfileName: 'Consumption'
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 900
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '0 1 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: mi.id
+        }
+      ]
+      secrets: workerSecrets
+    }
+    template: {
+      containers: [
+        {
+          name: 'payment-reminders'
+          image: containerImage
+          command: [
+            'uv'
+            'run'
+            'python'
+            '-m'
+            'backend.server.sync_job_worker'
+          ]
+          args: [
+            'reminders'
+          ]
+          resources: {
+            cpu: json('1.0')
+            memory: '2.0Gi'
+          }
+          env: workerEnv
+        }
+      ]
     }
   }
   dependsOn: [

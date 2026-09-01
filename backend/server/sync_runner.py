@@ -22,7 +22,7 @@ import json
 import os
 import threading
 
-from backend.server import sync_jobs_repo
+from backend.server import sync_batches_repo, sync_jobs_repo
 from backend.server.dashboard_cache import clear_dashboard_cache
 
 # Push notification taps must target Expo Router file-system routes, not stale
@@ -75,6 +75,13 @@ def supports_attested_history(bank: str) -> bool:
 _dispatch_lock = threading.Lock()
 
 
+def _launch_job(job_id: int) -> None:
+    mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
+    if mode == "external":
+        return
+    threading.Thread(target=_exec_sync, args=(job_id,), daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -100,8 +107,7 @@ def run_sync_job(user_id: int, bank: str, headless: bool = True, *, batch_id: in
         user_id=user_id, bank=bank, batch_id=batch_id, history_mode="full",
     )
 
-    t = threading.Thread(target=_exec_sync, args=(job_id,), daemon=True)
-    t.start()
+    _launch_job(job_id)
     return job_id
 
 
@@ -146,8 +152,7 @@ def run_sync_job_for_account(
         batch_id=batch_id, history_mode=history_mode,
     )
 
-    t = threading.Thread(target=_exec_sync, args=(job_id,), daemon=True)
-    t.start()
+    _launch_job(job_id)
     return job_id
 
 
@@ -158,14 +163,32 @@ def get_job(job_id: int) -> dict | None:
 
 def list_recent_jobs(user_id: int, limit: int = 50) -> list[dict]:
     """近 N 筆 job（per user）。"""
-    return sync_jobs_repo.list_recent_for_user(user_id, limit)
+    swept = sync_jobs_repo.sweep_stale_running()
+    for batch_id, batch_user_id in swept.batches:
+        _maybe_send_batch_summary(batch_id=batch_id, user_id=batch_user_id)
+    return sync_jobs_repo.list_recent_for_user(user_id, limit, sweep=False)
+
+
+def reconcile_batch_fanout(
+    *,
+    batch_id: int | None,
+    user_id: int,
+    job_ids: list[int],
+) -> None:
+    if batch_id is None:
+        return
+    if not job_ids:
+        sync_batches_repo.delete(batch_id)
+        return
+    sync_batches_repo.set_total_jobs(batch_id, len(job_ids))
+    _maybe_send_batch_summary(batch_id=batch_id, user_id=user_id)
 
 
 # ---------------------------------------------------------------------------
 # Internal: 跑在 daemon thread 裡
 # ---------------------------------------------------------------------------
 
-def _exec_sync(job_id: int) -> None:
+def _exec_sync(job_id: int) -> bool:
     """thread entry：UPDATE running → dispatch → UPDATE done|failed。
 
     所有 exception 都 catch；thread 不該炸到外面。
@@ -176,7 +199,7 @@ def _exec_sync(job_id: int) -> None:
     # 1. 撈 job & 標 running
     job = get_job(job_id)
     if job is None:
-        return  # job 不在了（被刪除？）—— silent return
+        return False  # job 不在了（被刪除？）—— silent return
     user_id = job["user_id"]
     bank = job["bank"]
     account_id = job.get("account_id")  # L5-1: 新欄, 老 job 為 None
@@ -204,10 +227,11 @@ def _exec_sync(job_id: int) -> None:
     error: str | None = None
     try:
         with _dispatch_lock:
+            if not sync_jobs_repo.claim_queued(job_id):
+                return False
             old_user_id = os.environ.get("BANK_CRAWLER_USER_ID")
             old_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
             old_history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE")
-            sync_jobs_repo.mark_running(job_id)
             if history_mode not in {"full", "incremental"}:
                 raise ValueError(f"invalid history_mode: {history_mode!r}")
             os.environ["BANK_CRAWLER_HISTORY_MODE"] = history_mode
@@ -279,6 +303,7 @@ def _exec_sync(job_id: int) -> None:
     # (若是 batch 內最後一個失敗 job, 沒人 trigger 就漏推; claim 是 atomic 的, 不會 double-fire).
     if batch_id is not None:
         _maybe_send_batch_summary(batch_id=batch_id, user_id=user_id)
+    return True
 
 
 def _send_sync_notification(

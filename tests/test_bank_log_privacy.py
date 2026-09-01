@@ -4,7 +4,7 @@ import inspect
 import re
 
 from backend.banks import ctbc, fubon, linebank, scsb, sinopac, ubot
-from backend.server import payment_reminder_notifications, scheduler, sync_runner
+from backend.server import payment_reminder_notifications, scheduler, sync_job_worker, sync_runner
 from backend.server.push.providers import expo, multi, none
 
 
@@ -59,6 +59,7 @@ def test_sync_push_logs_only_counts_without_tokens_or_tracebacks() -> None:
         payment_reminder_notifications.dispatch_daily_payment_reminders_for_all_users,
     )
     assert "logger.exception" not in inspect.getsource(scheduler)
+    assert "logger.exception" not in inspect.getsource(sync_job_worker)
 
 
 def test_touched_bank_logs_never_dump_raw_urls_or_endpoint_collections() -> None:

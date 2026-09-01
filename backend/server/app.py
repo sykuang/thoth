@@ -93,14 +93,6 @@ _backend_logger.setLevel(logging.INFO)
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
-# 2026-06-22 (L12, 0.3.17): APScheduler 啟動 / 停止 hook 進 FastAPI lifespan.
-# - startup: 啟 BackgroundScheduler + 從 DB reload 所有 enabled schedule
-# - shutdown: SIGTERM 時優雅停 (wait=False, 不等 in-flight sync job)
-# 2026-06-28: FastAPI deprecated @app.on_event; 改 lifespan 消 warning.
-def _scheduler_disabled() -> bool:
-    return os.environ.get("THOTH_DISABLE_SCHEDULER", "").strip() in ("1", "true", "True")
-
-
 def _network_bootstrap_only() -> bool:
     return os.environ.get("THOTH_BOOTSTRAP_NETWORK_ONLY", "").strip() in ("1", "true", "True")
 
@@ -113,15 +105,18 @@ async def lifespan(_app: FastAPI):
     bootstrap_only = _network_bootstrap_only()
     if not bootstrap_only:
         migrate_existing_bank_stores(bank_data.KNOWN_BANKS)
-    if not bootstrap_only and not _scheduler_disabled():
-        from backend.server import scheduler
-        scheduler.start()
+    scheduler_started = False
+    scheduler_module = None
+    if not bootstrap_only:
+        from backend.server import scheduler as scheduler_module
+        if scheduler_module.in_process_enabled():
+            scheduler_module.start()
+            scheduler_started = True
     try:
         yield
     finally:
-        if not bootstrap_only and not _scheduler_disabled():
-            from backend.server import scheduler
-            scheduler.shutdown(wait=False)
+        if scheduler_started and scheduler_module is not None:
+            scheduler_module.shutdown(wait=False)
 
 
 app = FastAPI(title="Bank Crawlers Server", version=_APP_VERSION, lifespan=lifespan)

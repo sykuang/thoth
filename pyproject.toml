@@ -1,6 +1,6 @@
 [project]
 name = "thoth"
-version = "0.3.120"
+version = "0.3.121"
 description = "Thoth — Taiwan bank account aggregator. Python crawlers + FastAPI server + Expo web/iOS frontend. Named after the Egyptian god of writing, accounting, and record-keeping."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,8 +23,7 @@ dependencies = [
     # 結果 PUSH_PROVIDER=expo 預設 image 一 import expo.py 就 ModuleNotFoundError.
     # httpx 已是 fastapi 生態幾乎人人裝 (TestClient 都用),搬主依賴成本可忽略.
     "httpx>=0.27",
-    # 2026-06-22 (L12, 0.3.17): APScheduler — daily auto-sync 排程引擎.
-    # Container App in-process scheduler, minReplicas=1 防 scale-to-zero 殺掉.
+    # Standalone/local keeps APScheduler; Azure sets SYNC_EXECUTION_MODE=external.
     "apscheduler>=3.10",
     # W1 (2026-06-17): real-timeout regex engine for ReDoS protection.
     # stdlib `re` 加 signal.SIGALRM 在 worker thread 失效，必須改用此 lib。

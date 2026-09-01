@@ -101,6 +101,38 @@ def test_claim_treats_running_as_in_flight(client):
     assert sync_batches_repo.claim_for_notification(bid) is not None
 
 
+def test_claim_waits_until_all_declared_batch_rows_exist(client):
+    user_id = _create_user_and_account(client)
+    bid = sync_batches_repo.create(
+        user_id=user_id,
+        total_jobs=2,
+        kind=sync_batches_repo.KIND_SCHEDULED_ALL,
+    )
+    first = sync_jobs_repo.queue(user_id=user_id, bank="cathay", batch_id=bid)
+    sync_jobs_repo.mark_done(first, "{}")
+
+    assert sync_batches_repo.claim_for_notification(bid) is None
+
+    second = sync_jobs_repo.queue(user_id=user_id, bank="ubot", batch_id=bid)
+    sync_jobs_repo.mark_done(second, "{}")
+    assert sync_batches_repo.claim_for_notification(bid) is not None
+
+
+def test_partial_fanout_can_reconcile_declared_total(client):
+    user_id = _create_user_and_account(client)
+    bid = sync_batches_repo.create(
+        user_id=user_id,
+        total_jobs=2,
+        kind=sync_batches_repo.KIND_SCHEDULED_ALL,
+    )
+    only_job = sync_jobs_repo.queue(user_id=user_id, bank="cathay", batch_id=bid)
+    sync_jobs_repo.mark_failed(only_job, "queue sibling failed")
+
+    sync_batches_repo.set_total_jobs(bid, 1)
+
+    assert sync_batches_repo.claim_for_notification(bid) is not None
+
+
 def test_claim_race_only_one_winner(client):
     """並發 claim 只有 1 個 thread 拿到 row (atomic CAS via UPDATE ... RETURNING)."""
     user_id = _create_user_and_account(client)
