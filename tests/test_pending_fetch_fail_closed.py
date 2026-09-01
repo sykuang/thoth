@@ -1,6 +1,8 @@
 """各銀行 pending fetch 失敗／部分成功時必須 fail-closed。"""
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from backend.banks.taishin import TaishinCrawler
@@ -13,6 +15,7 @@ from backend.core.persist.scsb import persist_scsb
 from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.persist.taishin import persist_taishin
 from backend.core.persist.ubot import persist_ubot
+from backend.core.persist import ubot as ubot_persist_module
 from backend.core.store import BankStore
 
 
@@ -24,6 +27,46 @@ STALE_ERROR_MESSAGES = (
     "Please log in again",
     "An unexpected error occurred",
 )
+
+
+@pytest.fixture(autouse=True)
+def _freeze_ubot_today(monkeypatch):
+    monkeypatch.setattr(ubot_persist_module, "_today", lambda: date(2026, 9, 1))
+
+
+def _ubot_with_history(data: dict) -> dict:
+    identity = "012345678901"
+    periods = (
+        ("2026-07-01", "2026-07-31"),
+        ("2026-08-01", "2026-08-31"),
+        ("2026-09-01", "2026-09-01"),
+    )
+    return {
+        **data,
+        "debit_accounts": [{
+            "label": "活期存款 012-34-5678901", "identity": identity, "currency": "TWD",
+        }],
+        "twd_txns": [{
+            "Account": identity, "NTDetailList": [], "NTTotal": {},
+            "receipt": {
+                "identity": identity, "start": start, "end": end,
+                "status": "explicit_empty", "pages": 1, "rows": 0,
+            },
+        } for start, end in periods],
+        "history_coverage": {
+            "mode": "full", "as_of": "2026-09-01",
+            "domains": [{
+                "domain": "twd_transactions",
+                "expected": [{
+                    "identity": identity, "start": periods[0][0], "end": periods[-1][1],
+                }],
+                "windows": [{
+                    "identity": identity, "start": start, "end": end,
+                    "status": "explicit_empty", "pages": 1,
+                } for start, end in periods],
+            }],
+        },
+    }
 
 
 @pytest.fixture
@@ -68,10 +111,10 @@ def _assert_kept(store):
             "error": "session expired", "twdCurrentConsumeDetail": [],
         },
     }}),
-    (persist_ubot, {"card_unbilled": None}),
-    (persist_ubot, {"card_unbilled": {
+    (persist_ubot, _ubot_with_history({"card_unbilled": None})),
+    (persist_ubot, _ubot_with_history({"card_unbilled": {
         "error": "session expired", "CardList": [],
-    }}),
+    }})),
     (persist_taishin, {"credit_card_parsed": None}),
     (persist_taishin, {"credit_card_parsed": {"pending_txns": []}}),
     (persist_sinopac, {"card_unbilled": {"latest_tx": {
@@ -328,7 +371,7 @@ def test_fubon_explicit_empty_sweeps_realtime_only(store):
     (persist_cathay, {"credit_card": {
         "unbilled_detail": {"twdUnbilledConsumeDetail": []},
     }}),
-    (persist_ubot, {"card_unbilled": {"CardList": []}}),
+    (persist_ubot, _ubot_with_history({"card_unbilled": {"CardList": []}})),
     (persist_sinopac, {"card_unbilled": {"latest_tx": {
         "ResultCode": "00", "Error": None, "Result": {"Items": []},
     }}}),

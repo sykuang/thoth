@@ -252,6 +252,11 @@ class ResponseCollector:
             ct = resp.headers.get("content-type", "")
             content_length = resp.headers.get("content-length", "")
             content_encoding = resp.headers.get("content-encoding", "")
+            is_ubot_history = (
+                self.host_filter == "ubot.com.tw"
+                and parsed.hostname == "www.ubot.com.tw"
+                and parsed.path == "/MyBank/IBKB010102"
+            )
             is_bounded_json = (
                 (
                     self.host_filter == "card.hsbc.com.tw"
@@ -259,6 +264,7 @@ class ResponseCollector:
                         "/ibk-bff/api/v1/cards", "/ibk-bff/api/v1/cards/suspend",
                     }
                 )
+                or is_ubot_history
                 or (
                     self.host_filter == "sinopac.com"
                     and parsed.hostname == "mma.sinopac.com"
@@ -319,15 +325,19 @@ class ResponseCollector:
             resp_json = None
             if "json" in ct:
                 if is_bounded_json:
+                    minimum_size = 64 if is_ubot_history else 0
                     if (
                         content_encoding.lower() in {"", "identity"}
                         and body_size is not None
-                        and body_size <= 5_000_000
+                        and minimum_size <= body_size <= 5_000_000
                     ):
                         with contextlib.suppress(Exception):
+                            declared_size = body_size
                             raw_body = resp.body()
                             body_size = len(raw_body)
-                            if body_size <= 5_000_000:
+                            if body_size <= 5_000_000 and (
+                                not is_ubot_history or body_size == declared_size
+                            ):
                                 resp_json = json.loads(raw_body)
                 else:
                     with contextlib.suppress(Exception):

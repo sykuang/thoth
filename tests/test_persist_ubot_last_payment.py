@@ -11,6 +11,7 @@ IBKF010001 card_limit raw 本來就有 lastPayAmt / lastPayDate / payAmt 三欄,
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.banks.ubot import _ubot_card_bill_fact
 from backend.core import persist as persist_mod
 from backend.core.persist import persist_ubot
+from backend.core.persist import ubot as ubot_persist_module
 from backend.core.persist._common import _ubot_date
 from backend.core.store import BankStore
 
@@ -36,6 +38,11 @@ def store(tmp_path, monkeypatch):
     s = BankStore("ubot", user_id=1)
     yield s
     s.close()
+
+
+@pytest.fixture(autouse=True)
+def _freeze_ubot_persistence_today(monkeypatch):
+    monkeypatch.setattr(ubot_persist_module, "_today", lambda: date(2026, 9, 1))
 
 
 def _base_data(card_no: str = "9000000000387027",
@@ -77,7 +84,48 @@ def _base_data(card_no: str = "9000000000387027",
         }],
         "card_unbilled": {"CardSum": "0", "DispStmtAmt": "0", "CardList": []},
         "investment": None,
-        "twd_txns": [],
+        "twd_txns": [
+            {
+                "Account": "012345678901", "NTDetailList": [], "NTTotal": {},
+                "receipt": {
+                    "identity": "012345678901", "start": start, "end": end,
+                    "status": "explicit_empty", "pages": 1, "rows": 0,
+                },
+            }
+            for start, end in (
+                ("2026-07-01", "2026-07-31"),
+                ("2026-08-01", "2026-08-31"),
+                ("2026-09-01", "2026-09-01"),
+            )
+        ],
+        "debit_accounts": [{
+            "label": "活期存款 012-34-5678901",
+            "identity": "012345678901",
+            "currency": "TWD",
+        }],
+        "history_coverage": {
+            "mode": "full",
+            "as_of": "2026-09-01",
+            "domains": [{
+                "domain": "twd_transactions",
+                "expected": [{
+                    "identity": "012345678901",
+                    "start": "2026-07-01",
+                    "end": "2026-09-01",
+                }],
+                "windows": [
+                    {
+                        "identity": "012345678901", "start": start, "end": end,
+                        "status": "explicit_empty", "pages": 1,
+                    }
+                    for start, end in (
+                        ("2026-07-01", "2026-07-31"),
+                        ("2026-08-01", "2026-08-31"),
+                        ("2026-09-01", "2026-09-01"),
+                    )
+                ],
+            }],
+        },
     }
 
 

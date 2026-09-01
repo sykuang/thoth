@@ -1405,7 +1405,8 @@ class BankStore:
         """Refresh 一個 scope 的未入帳/即時消費。
 
         fetch_ok 三態：
-          • True  = 這次抓取可信，允許本次新 billed 接手 overlay。
+          • True  = 這次抓取可信，允許本次新 billed，或時間戳可證明在
+                    pending 最後可信 refresh 之後才出現的同鍵 billed，接手 overlay。
           • False = 抓取失敗／回傳不全，不做 adoption 或 membership 修改。
           • None  = legacy caller；照舊 refresh，但不啟用 billed transition 合併。
         """
@@ -1420,6 +1421,16 @@ class BankStore:
             return int(row["n"] if row else 0)
         now = _now()
         pending_metadata = self._pending_user_metadata(scope)
+        pending_refreshed_at: dict[tuple, list[str]] = {}
+        for row in self.conn.execute(
+            "SELECT card_no, consume_date, amount, description, refreshed_at "
+            "FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id",
+            (self.user_id, scope),
+        ).fetchall():
+            exact_key = (
+                row["card_no"], row["consume_date"], row["amount"], row["description"],
+            )
+            pending_refreshed_at.setdefault(exact_key, []).append(row["refreshed_at"])
         previous_exact_counts = {
             exact_key: len(rows) for exact_key, rows in pending_metadata.items()
         }
@@ -1469,8 +1480,10 @@ class BankStore:
         if current_billed_ids:
             placeholders = ",".join("?" for _ in current_billed_ids)
             rows = self.conn.execute(
-                f"SELECT id, card_no, consume_date, amount, description, txn_type "
-                f"FROM card_billed_txns WHERE user_id = ? AND id IN ({placeholders})",
+                f"SELECT id, card_no, consume_date, amount, description, txn_type, first_seen, "
+                f"category, subcategory, description_overwrite, tags_overwrite, auto_excluded, "
+                f"splits_overwrite FROM card_billed_txns "
+                f"WHERE user_id = ? AND id IN ({placeholders})",
                 (self.user_id, *current_billed_ids),
             ).fetchall()
             for row in rows:
@@ -1478,7 +1491,16 @@ class BankStore:
                     row["card_no"], row["consume_date"], row["amount"], row["description"],
                 )
                 current_targets.setdefault(exact_key, []).append(row)
-                if row["id"] in new_billed_ids:
+                pending_seen = pending_refreshed_at.get(exact_key, [])
+                if (
+                    row["id"] in new_billed_ids
+                    or (
+                        len(pending_seen) == 1
+                        and isinstance(row["first_seen"], str)
+                        and isinstance(pending_seen[0], str)
+                        and row["first_seen"] > pending_seen[0]
+                    )
+                ):
                     transition_targets.setdefault(exact_key, []).append(row)
         planned_prune_counts: dict[tuple, int] = {}
         planned_transfer_keys: set[tuple] = set()
@@ -1519,6 +1541,19 @@ class BankStore:
             splits_overwrite = _rescale_splits(original_splits, target["amount"])
             if original_splits and splits_overwrite is None:
                 splits_overwrite = None
+            pending_signature = (
+                cat, sub, description_overwrite, tags_overwrite,
+                1 if auto_ex else 0, splits_overwrite,
+            )
+            target_signature = (
+                target["category"], target["subcategory"], target["description_overwrite"],
+                target["tags_overwrite"], target["auto_excluded"], target["splits_overwrite"],
+            )
+            if (
+                target["id"] not in new_billed_ids and any(target_signature)
+                and target_signature != pending_signature
+            ):
+                continue
             flow, income_cat = _flow_fields(cat, sub, None, target["txn_type"])
             self.conn.execute(
                 "UPDATE card_billed_txns SET category=?, subcategory=?, "

@@ -4,9 +4,14 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
+import json
+import re
+from zoneinfo import ZoneInfo
 
+from backend.banks.ubot import UbotCrawler
 from backend.core import account_classify, classify
+from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
 from backend.core.persist._common import _num, _num_real, _num_to_float, _ubot_date
 
@@ -29,7 +34,171 @@ def _yyyymmdd_to_iso(s: str | None) -> str | None:
     except Exception:
         return None
 
-def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _today() -> date:
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+
+def _iso_date(value, error: str) -> date:
+    if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise ValueError(error)
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(error) from None
+
+
+def _validate_ubot_history(data: dict, store: BankStore) -> date:
+    error = "invalid UBOT history coverage"
+    coverage = data.get("history_coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError(error)
+    mode = coverage.get("mode")
+    if mode not in {"full", "incremental"}:
+        raise ValueError(error)
+    as_of = _iso_date(coverage.get("as_of"), error)
+    today = _today()
+    if as_of > today or (today - as_of).days > 1:
+        raise ValueError(error)
+    validate_history_coverage(
+        coverage, expected_mode=mode,
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    try:
+        encoded = json.dumps(
+            {
+                "history_coverage": coverage,
+                "debit_accounts": data.get("debit_accounts"),
+                "twd_txns": data.get("twd_txns"),
+            },
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode()
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+    if len(encoded) > 5_000_000:
+        raise ValueError(error)
+
+    domain = coverage["domains"][0]
+    expected = domain["expected"]
+    windows = domain["windows"]
+    expected_by_identity = {item["identity"]: item for item in expected}
+    inventory = data.get("debit_accounts")
+    if (
+        not expected or len(expected_by_identity) != len(expected)
+        or not isinstance(inventory, list) or len(inventory) != len(expected)
+    ):
+        raise ValueError(error)
+    inventory_ids = set()
+    labels = set()
+    account_pattern = re.compile(r"(?<!\d)(\d{3})-(\d{2})-(\d{7})(?!\d)")
+    for item in inventory:
+        if not isinstance(item, dict) or set(item) != {"label", "identity", "currency"}:
+            raise ValueError(error)
+        label = item.get("label")
+        identity = item.get("identity")
+        matches = account_pattern.findall(label) if isinstance(label, str) else []
+        if (
+            not isinstance(label, str) or not label or label != label.strip()
+            or not isinstance(identity, str) or re.fullmatch(r"\d{12}", identity) is None
+            or len(matches) != 1 or "".join(matches[0]) != identity
+            or item.get("currency") != "TWD"
+            or identity in inventory_ids or label in labels
+        ):
+            raise ValueError(error)
+        inventory_ids.add(identity)
+        labels.add(label)
+    if inventory_ids != set(expected_by_identity):
+        raise ValueError(error)
+
+    results = data.get("twd_txns")
+    if not isinstance(results, list) or len(results) != len(windows):
+        raise ValueError(error)
+    receipts = []
+    total_rows = 0
+    row_keys = {
+        "AccountDate", "Balance", "Expenditure", "Income", "PS", "Summary",
+        "TraDate", "TraSum", "TraTime",
+    }
+    for result in results:
+        if not isinstance(result, dict) or set(result) != {
+            "Account", "NTDetailList", "NTTotal", "receipt",
+        }:
+            raise ValueError(error)
+        identity = result.get("Account")
+        rows = result.get("NTDetailList")
+        receipt = result.get("receipt")
+        if (
+            identity not in expected_by_identity or not isinstance(rows, list)
+            or not isinstance(result.get("NTTotal"), dict)
+            or UbotCrawler._nttotal_claims_more_pages(result["NTTotal"])
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"identity", "start", "end", "status", "pages", "rows"}
+            or receipt.get("identity") != identity
+            or type(receipt.get("pages")) is not int or receipt["pages"] != 1
+            or type(receipt.get("rows")) is not int or receipt["rows"] != len(rows)
+            or receipt.get("status") not in {"complete", "explicit_empty"}
+            or (receipt["status"] == "explicit_empty" and rows)
+            or (receipt["status"] == "complete" and not rows)
+        ):
+            raise ValueError(error)
+        start = _iso_date(receipt["start"], error)
+        end = _iso_date(receipt["end"], error)
+        if start > end or (start.year, start.month) != (end.year, end.month):
+            raise ValueError(error)
+        total_rows += len(rows)
+        if total_rows > 50_000:
+            raise ValueError(error)
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != row_keys:
+                raise ValueError(error)
+            try:
+                transacted = UbotCrawler._strict_slash_date(row["TraDate"], error)
+                UbotCrawler._strict_slash_date(row["AccountDate"], error)
+                if not start <= transacted <= end:
+                    raise RuntimeError(error)
+                if re.fullmatch(r"\d{2}:\d{2}:\d{2}", row["TraTime"]) is None:
+                    raise RuntimeError(error)
+                datetime.strptime(row["TraTime"], "%H:%M:%S")
+                if any(not isinstance(row[key], str) or len(row[key]) > 2_000
+                       for key in ("Summary", "TraSum", "PS")):
+                    raise RuntimeError(error)
+                for key in ("Expenditure", "Income", "Balance"):
+                    UbotCrawler._strict_twd_amount(row[key], error)
+                if row["Expenditure"] not in {"", "-"} and row["Income"] not in {"", "-"}:
+                    raise RuntimeError(error)
+            except (RuntimeError, ValueError):
+                raise ValueError(error) from None
+
+        receipts.append({key: receipt[key] for key in (
+            "identity", "start", "end", "status", "pages",
+        )})
+    if receipts != windows:
+        raise ValueError(error)
+
+    existing = store.latest_twd_transaction_dates()
+    floor = UbotCrawler._history_floor(as_of)
+    for identity, item in expected_by_identity.items():
+        start = _iso_date(item["start"], error)
+        end = _iso_date(item["end"], error)
+        cursor = existing.get(identity)
+        if isinstance(cursor, date) and cursor > as_of:
+            raise ValueError(error)
+        expected_start = floor
+        if mode == "incremental" and isinstance(cursor, date):
+            expected_start = max(floor, (cursor - timedelta(days=7)).replace(day=1))
+        if start != expected_start or end != as_of:
+            raise ValueError(error)
+        actual = [
+            (_iso_date(window["start"], error), _iso_date(window["end"], error))
+            for window in windows if window["identity"] == identity
+        ]
+        if actual != UbotCrawler._history_windows(start, end):
+            raise ValueError(error)
+    return as_of
+
+
+def _persist_ubot(
+    data: dict, store: BankStore, rules: list[dict] | None = None, *, as_of: date,
+) -> dict:
     """聯邦 collect() 結構 → store 7 表增量。
 
     映射：
@@ -39,7 +208,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
       card_billed[].CardList  → card_billed_txns(append-only)
       card_unbilled.CardList  → card_pending_txns(refresh 'unbilled')
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = as_of.isoformat()
     delta: dict = {}
 
     # --- 台幣存款帳戶（UPSERT）+ 餘額快照 ---
@@ -87,7 +256,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
         })
 
     if accts:
-        store.upsert_accounts(accts)
+        store.upsert_accounts(accts, commit=False)
     # 台幣總餘額 + 貸款餘額快照（同日覆蓋）
     if isinstance(dt, dict):
         td = dt.get("TotalData") or {}
@@ -99,7 +268,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "twdBalance": twd_total,
                 "fxBalance": None,
                 "loanBalance": loan_total if loan_total else None,
-            }])
+            }], commit=False)
             delta["balance_days"] = 1
 
     # --- 台幣交易明細（append-only）---
@@ -122,7 +291,7 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 "counterparty_acct": None,
                 "memo": (t.get("TraSum") or "").strip() or (t.get("PS") or "").strip() or None,
             })
-        twd_new += store.upsert_twd_txns(rows, rules=rules)
+        twd_new += store.upsert_twd_txns(rows, rules=rules, commit=False)
     delta["twd_txn_new"] = twd_new
 
     # --- 信用卡已出帳明細（append-only）---
@@ -175,7 +344,9 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
         "unbilled", unb_rows, rules=rules,
         fetch_ok=(isinstance(unb_raw, dict)
                   and not any(unb_raw.get(key) for key in ("error", "Error", "errorMessage"))
-                  and isinstance(unb_raw.get("CardList"), list)))
+                  and isinstance(unb_raw.get("CardList"), list)),
+        commit=False,
+    )
     delta["card_current"] = 0
 
     # --- cards 表 UPSERT（從 billed/unbilled 卡號推斷，設計規範）---
@@ -331,27 +502,49 @@ def persist_ubot(data: dict, store: BankStore, rules: list[dict] | None = None) 
             **shared_card_fields,
         }
     if seen_ubot_cards:
-        store.upsert_cards(list(seen_ubot_cards.values()))
+        store.upsert_cards(list(seen_ubot_cards.values()), commit=False)
 
     # --- 每日數值快照：信用卡彙總/額度、投資 ---
     cs = data.get("card_summary")
     if cs:
-        store.put_daily_metric("card_summary", cs, today)
+        store.put_daily_metric("card_summary", cs, today, commit=False)
     cl = data.get("card_limit")
     if cl:
-        store.put_daily_metric("card_limit", cl, today)
+        store.put_daily_metric("card_limit", cl, today, commit=False)
     # 2026-06-22 v3: F0801001 raw 留底, 明早 sync 後可從 daily_metrics 撈出來
     # 看真實 shape, 調 persist mapping. 即使上面 PayList parse 失敗也保得到.
     pay_hist = data.get("card_pay_history")
     if pay_hist:
-        store.put_daily_metric("card_pay_history", pay_hist, today)
+        store.put_daily_metric("card_pay_history", pay_hist, today, commit=False)
     if isinstance(dt, dict):
         twd_total_metric = _num((dt.get("TotalData") or {}).get("Deposit"))
         if twd_total_metric is not None:
-            store.put_daily_metric("balance_latest", {"twd": twd_total_metric}, today)
+            store.put_daily_metric(
+                "balance_latest", {"twd": twd_total_metric}, today, commit=False,
+            )
     inv = data.get("investment")
     if inv:
-        store.put_daily_metric("investment", inv, today)
+        store.put_daily_metric("investment", inv, today, commit=False)
 
-    store.log_sync(delta)
+    store.log_sync(delta, commit=False)
     return delta
+
+
+def persist_ubot(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Persist one validated UBOT collection atomically."""
+    as_of = _validate_ubot_history(data, store)
+    if not commit:
+        return _persist_ubot(data, store, rules=rules, as_of=as_of)
+    try:
+        delta = _persist_ubot(data, store, rules=rules, as_of=as_of)
+        store.commit()
+        return delta
+    except Exception:
+        store.conn.rollback()
+        raise

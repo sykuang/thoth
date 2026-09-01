@@ -15,13 +15,23 @@
 from __future__ import annotations
 
 import re
+import os
 import sys
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import parse_qsl, urlparse
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    validate_history_coverage,
+)
 from backend.core.card_bills import (
     card_bill_date,
     make_card_bill_fact,
@@ -295,6 +305,8 @@ def _ubot_card_bill_fact(out: dict):
 
 class UbotCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     CREDENTIAL_HOSTS = frozenset({"www.ubot.com.tw"})
 
     def __init__(self):
@@ -303,6 +315,550 @@ class UbotCrawler(BankCrawler):
 
     def _host_filter(self) -> str:
         return "ubot.com.tw"
+
+    @staticmethod
+    def _history_floor(end: date) -> date:
+        month = end.month - 2
+        year = end.year
+        if month <= 0:
+            month += 12
+            year -= 1
+        return date(year, month, 1)
+
+    @staticmethod
+    def _history_windows(start: date, end: date) -> list[tuple[date, date]]:
+        if start > end:
+            raise RuntimeError("ubot-twd-history-range")
+        windows = []
+        cursor = start
+        while cursor <= end:
+            window_end = min(end, date(
+                cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1],
+            ))
+            windows.append((cursor, window_end))
+            cursor = window_end + timedelta(days=1)
+        return windows
+
+    def _history_range(
+        self, identity: str, *, end: date, mode: str,
+    ) -> tuple[date, date]:
+        floor = self._history_floor(end)
+        cursor = self.transaction_start_for(identity)
+        if isinstance(cursor, date) and cursor > end:
+            raise RuntimeError("ubot-twd-history-cursor")
+        if mode == "full" or (mode == "incremental" and cursor is None):
+            return floor, end
+        if mode != "incremental" or not isinstance(cursor, date):
+            raise RuntimeError("ubot-twd-history-mode")
+        overlap = cursor - timedelta(days=7)
+        return max(floor, overlap.replace(day=1)), end
+
+    @classmethod
+    def _validate_twd_form(cls, snapshot, *, as_of: date) -> list[dict]:
+        error = "ubot-twd-history-form"
+        if not isinstance(snapshot, dict) or set(snapshot) != {"selects", "search_buttons"}:
+            raise RuntimeError(error)
+        selects = snapshot["selects"]
+        if (
+            not isinstance(selects, list) or len(selects) != 2
+            or type(snapshot["search_buttons"]) is not int
+            or snapshot["search_buttons"] != 1
+        ):
+            raise RuntimeError(error)
+        for select in selects:
+            if (
+                not isinstance(select, dict) or set(select) != {"enabled", "options"}
+                or select["enabled"] is not True
+            ):
+                raise RuntimeError(error)
+            if not isinstance(select["options"], list) or any(
+                not isinstance(option, dict) or set(option) != {"text", "value"}
+                or not isinstance(option["text"], str)
+                or not isinstance(option["value"], str)
+                for option in select["options"]
+            ):
+                raise RuntimeError(error)
+
+        period_labels = [option["text"] for option in selects[1]["options"]]
+        months = []
+        cursor = as_of.replace(day=1)
+        for _ in range(3):
+            months.append(f"{cursor.month}月份")
+            cursor = (cursor - timedelta(days=1)).replace(day=1)
+        if period_labels != ["當日", "最近一週", "最近一月", *months, "自選日期"]:
+            raise RuntimeError(error)
+
+        account_options = selects[0]["options"]
+        if len(account_options) < 2:
+            raise RuntimeError(error)
+        placeholder = account_options[0]
+        pattern = re.compile(r"(?<!\d)(\d{3})-(\d{2})-(\d{7})(?!\d)")
+        if placeholder != {"text": "請選擇帳號", "value": ""}:
+            raise RuntimeError(error)
+        inventory = []
+        identities: set[str] = set()
+        labels: set[str] = set()
+        for index, option in enumerate(account_options[1:], 1):
+            label = option["text"]
+            matches = pattern.findall(label)
+            identity = "".join(matches[0]) if len(matches) == 1 else ""
+            if (
+                not label or label != label.strip() or not option["value"]
+                or len(matches) != 1 or identity in identities or label in labels
+            ):
+                raise RuntimeError(error)
+            identities.add(identity)
+            labels.add(label)
+            inventory.append({
+                "label": label, "identity": identity, "currency": "TWD", "index": index,
+            })
+        return inventory
+
+    @staticmethod
+    def _strict_slash_date(value, error: str) -> date:
+        if not isinstance(value, str) or re.fullmatch(r"\d{4}/\d{2}/\d{2}", value) is None:
+            raise RuntimeError(error)
+        try:
+            return datetime.strptime(value, "%Y/%m/%d").date()
+        except ValueError:
+            raise RuntimeError(error) from None
+
+    @staticmethod
+    def _strict_twd_amount(value, error: str) -> None:
+        if not isinstance(value, str):
+            raise RuntimeError(error)
+        if value in {"", "-"}:
+            return
+        if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", value) is None:
+            raise RuntimeError(error)
+        try:
+            amount = Decimal(value.replace(",", ""))
+        except InvalidOperation:
+            raise RuntimeError(error) from None
+        if not amount.is_finite() or abs(amount) > Decimal("2147483647"):
+            raise RuntimeError(error)
+
+    @staticmethod
+    def _nttotal_claims_more_pages(total) -> bool:
+        stack = [total]
+        seen = 0
+        while stack:
+            value = stack.pop()
+            seen += 1
+            if seen > 1_000:
+                return True
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                    false_marker = (
+                        item is None or item is False or item == 0
+                        or (
+                            isinstance(item, str)
+                            and item.strip().casefold() in {"", "0", "false", "no", "n", "none", "null"}
+                        )
+                    )
+                    if re.fullmatch(r"has(?:next|more)(?:page|pages)?", normalized):
+                        if not false_marker:
+                            return True
+                    elif re.fullmatch(
+                        r"(?:(?:total|last|max)(?:page|pages)|page(?:count|total))", normalized,
+                    ):
+                        try:
+                            if Decimal(str(item)) != 1:
+                                return True
+                        except InvalidOperation:
+                            return True
+                    elif normalized == "pageindex":
+                        try:
+                            if Decimal(str(item)) != 0:
+                                return True
+                        except InvalidOperation:
+                            return True
+                    elif normalized in {"page", "currentpage", "pageno", "pagenumber"}:
+                        try:
+                            if Decimal(str(item)) != 1:
+                                return True
+                        except InvalidOperation:
+                            return True
+                    elif "page" in normalized and normalized not in {
+                        "pagesize", "perpage", "rowsperpage", "recordsperpage",
+                    } and not false_marker:
+                        return True
+                    stack.append(item)
+            elif isinstance(value, list):
+                stack.extend(value)
+        return False
+
+    @classmethod
+    def _validate_history_hit(
+        cls, hit, *, identity: str, start: date, end: date, after_sequence: int,
+    ) -> dict:
+        error = "ubot-twd-history-response"
+        parsed = urlparse(hit.url)
+        raw = urlparse(hit.raw_url or hit.url)
+        expected_path = "/MyBank/IBKB010102"
+        if (
+            parsed.scheme != "https" or raw.scheme != "https"
+            or parsed.hostname != "www.ubot.com.tw" or raw.hostname != "www.ubot.com.tw"
+            or parsed.port not in (None, 443) or raw.port not in (None, 443)
+            or any(value is not None for value in (
+                parsed.username, parsed.password, raw.username, raw.password,
+            ))
+            or parsed.path != expected_path or raw.path != expected_path
+            or parsed.params or raw.params or parsed.query or raw.query
+            or parsed.fragment or raw.fragment
+            or hit.method != "POST" or hit.status != 200 or hit.redirected
+            or hit.main_frame_request is not True
+            or type(hit.request_sequence) is not int or hit.request_sequence <= after_sequence
+            or type(hit.body_size) is not int or not 0 < hit.body_size <= 5_000_000
+            or hit.content_type.split(";", 1)[0].strip().lower() != "application/json"
+            or not isinstance(hit.req_body, str)
+        ):
+            raise RuntimeError(error)
+        try:
+            pairs = parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
+        except ValueError:
+            raise RuntimeError(error) from None
+        form: dict[str, list[str]] = {}
+        for key, value in pairs:
+            form.setdefault(key, []).append(value)
+        expected_form = {"acctNo", "beginDate", "endDate", "sessionId", "sid"}
+        if (
+            set(form) != expected_form or any(len(values) != 1 for values in form.values())
+            or form["acctNo"] != [identity]
+            or form["beginDate"] != [start.strftime("%Y%m%d")]
+            or form["endDate"] != [end.strftime("%Y%m%d")]
+            or not form["sessionId"][0] or not form["sid"][0]
+        ):
+            raise RuntimeError(error)
+
+        payload = hit.resp_json
+        if not isinstance(payload, dict) or set(payload) != {"RespCode", "RespBody"}:
+            raise RuntimeError(error)
+        code = payload["RespCode"]
+        body = payload["RespBody"]
+        if (
+            not isinstance(code, dict)
+            or set(code) != {"RtnCode", "RtnDesc", "SvcName", "Time"}
+            or any(not isinstance(value, str) for value in code.values())
+            or code.get("SvcName") != "IBKB010102"
+            or re.search(
+                r"(?:登入|失效|逾時|錯誤|error|timeout|session|expired|reauth|log\s*in)",
+                code.get("RtnDesc", ""), re.I,
+            )
+        ):
+            raise RuntimeError(error)
+        if code["RtnCode"] == "UB112":
+            if body != {}:
+                raise RuntimeError(error)
+            return {"records": [], "status": "explicit_empty", "rows": 0}
+        if (
+            code["RtnCode"] != "0000" or not isinstance(body, dict)
+            or set(body) != {"Account", "NTDetailList", "NTTotal"}
+            or body["Account"] != identity or not isinstance(body["NTDetailList"], list)
+            or not body["NTDetailList"]
+            or not isinstance(body["NTTotal"], dict)
+            or cls._nttotal_claims_more_pages(body["NTTotal"])
+        ):
+            raise RuntimeError(error)
+        row_keys = {
+            "AccountDate", "Balance", "Expenditure", "Income", "PS", "Summary",
+            "TraDate", "TraSum", "TraTime",
+        }
+        rows = body["NTDetailList"]
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != row_keys:
+                raise RuntimeError(error)
+            if any(not isinstance(row[key], str) for key in row_keys):
+                raise RuntimeError(error)
+            transacted = cls._strict_slash_date(row["TraDate"], error)
+            cls._strict_slash_date(row["AccountDate"], error)
+            if not start <= transacted <= end:
+                raise RuntimeError(error)
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", row["TraTime"]) is None:
+                raise RuntimeError(error)
+            try:
+                datetime.strptime(row["TraTime"], "%H:%M:%S")
+            except ValueError:
+                raise RuntimeError(error) from None
+            if any(len(row[key]) > 2_000 for key in ("Summary", "TraSum", "PS")):
+                raise RuntimeError(error)
+            for key in ("Expenditure", "Income", "Balance"):
+                cls._strict_twd_amount(row[key], error)
+            if row["Expenditure"] not in {"", "-"} and row["Income"] not in {"", "-"}:
+                raise RuntimeError(error)
+        return {"records": rows, "status": "complete", "rows": len(rows)}
+
+    @staticmethod
+    def _validate_twd_dom(state, *, status: str, rows: int) -> None:
+        error = "ubot-twd-history-result"
+        keys = {
+            "visible_tables", "visible_rows", "pagers", "busy", "dialogs",
+            "stale_tables", "quiet_ms",
+        }
+        if (
+            not isinstance(state, dict) or set(state) != keys
+            or any(type(state[key]) is not int or state[key] < 0 for key in keys)
+            or state["pagers"] or state["busy"] or state["dialogs"]
+            or state["stale_tables"] or state["quiet_ms"] < 2_000
+        ):
+            raise RuntimeError(error)
+        expected = (2, rows + 1) if status == "complete" else (0, 0)
+        if rows < 0 or (state["visible_tables"], state["visible_rows"]) != expected:
+            raise RuntimeError(error)
+
+    @staticmethod
+    def _twd_form_snapshot(page):
+        return page.evaluate(r"""() => {
+          const visible = e => {
+            if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) return false;
+            for (let node = e; node; node = node.parentElement) {
+              const style = getComputedStyle(node);
+              if (node.hidden || (node.getAttribute('aria-hidden') || '').toLowerCase() === 'true' ||
+                  style.display === 'none' || style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+            }
+            return true;
+          };
+          const selects = [...document.querySelectorAll('select')].filter(visible).map(select => ({
+            enabled: !select.disabled && (select.getAttribute('aria-disabled') || '').toLowerCase() !== 'true',
+            options: [...select.options].map(option => ({
+              text: (option.textContent || '').replace(/\s+/g, ' ').trim(),
+              value: option.value || '',
+            })),
+          }));
+          const search_buttons = [...document.querySelectorAll('button')].filter(button =>
+            visible(button) && !button.disabled &&
+            (button.textContent || '').replace(/\s+/g, ' ').trim() === '搜尋'
+          ).length;
+          return {selects, search_buttons};
+        }""")
+
+    @staticmethod
+    def _mark_twd_dom_boundary(page) -> None:
+        page.evaluate(r"""() => {
+          if (window.__thothUbotHistoryObserver) window.__thothUbotHistoryObserver.disconnect();
+          window.__thothUbotHistoryBoundary = new Map(
+            [...document.querySelectorAll('table')].map(table => [table, table.innerHTML])
+          );
+          window.__thothUbotHistoryLastMutation = performance.now();
+          window.__thothUbotHistoryObserver = new MutationObserver(() => {
+            window.__thothUbotHistoryLastMutation = performance.now();
+          });
+          window.__thothUbotHistoryObserver.observe(document.documentElement, {
+            subtree: true, childList: true, attributes: true, characterData: true,
+          });
+        }""")
+
+    @classmethod
+    def _wait_for_twd_dom_settle(cls, page):
+        state = None
+        for elapsed in range(500, 10_001, 500):
+            page.wait_for_timeout(500)
+            state = cls._twd_dom_snapshot(page)
+            if (
+                elapsed >= 5_000 and isinstance(state, dict)
+                and state.get("quiet_ms", 0) >= 2_000
+            ):
+                return state
+        return state
+
+    @staticmethod
+    def _twd_dom_snapshot(page):
+        return page.evaluate(r"""() => {
+          const visible = e => {
+            if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) return false;
+            for (let node = e; node; node = node.parentElement) {
+              const style = getComputedStyle(node);
+              if (node.hidden || (node.getAttribute('aria-hidden') || '').toLowerCase() === 'true' ||
+                  style.display === 'none' || style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+            }
+            return true;
+          };
+          const enabled = e => !e.disabled && (e.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+          const visibleTables = [...document.querySelectorAll('table')].filter(visible);
+          const visibleRows = [...document.querySelectorAll('tbody tr')].filter(visible);
+          const boundary = window.__thothUbotHistoryBoundary;
+          const staleTables = boundary instanceof Map
+            ? visibleTables.filter(table => boundary.has(table) && boundary.get(table) === table.innerHTML)
+            : [];
+          const interactivePagers = [...document.querySelectorAll('a,button,input,select,[role=button]')].filter(e => {
+            if (!visible(e) || !enabled(e)) return false;
+            const text = (e.textContent || e.value || '').replace(/\s+/g, ' ').trim();
+            const meta = [e.id, e.getAttribute('class'), e.getAttribute('aria-label'), e.getAttribute('rel'),
+              e.getAttribute('href'), e.getAttribute('onclick'), e.getAttribute('data-page')]
+              .filter(Boolean).join(' ');
+            return /^(?:下一頁|下頁|next|[>»]|[2-9]\d*)$/i.test(text) ||
+              /(?:pagination|paginator|page[-_: ]?next|rel[=: ]?next|[?&]page=[2-9]\d*)/i.test(meta);
+          });
+          const structuralPagers = [...document.querySelectorAll(
+            'nav,[class*=pagination i],[class*=paginator i],[aria-label*=pagination i],[aria-label*=pages i]'
+          )].filter(e => {
+            if (!visible(e)) return false;
+            const text = (e.textContent || '').replace(/\s+/g, ' ').trim();
+            return /(?:下一頁|下頁|next|[>»])/i.test(text) ||
+              (text.match(/\b(?:[2-9]|\d{2,})\b/g) || []).length > 0;
+          });
+          const activeContainer = e => {
+            for (let node = e.parentElement; node; node = node.parentElement) {
+              const style = getComputedStyle(node);
+              if (node.hidden || (node.getAttribute('aria-hidden') || '').toLowerCase() === 'true' ||
+                  style.display === 'none' || style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+            }
+            return true;
+          };
+          const hiddenPageMetadata = [...document.querySelectorAll('input[type=hidden]')].filter(e => {
+            const name = [e.name, e.id, e.getAttribute('data-page')].filter(Boolean).join(' ');
+            const value = e.value || e.getAttribute('data-page') || '';
+            return activeContainer(e) && /(?:page|頁)/i.test(name) && /^[2-9]\d*$/.test(value);
+          });
+          const pagers = interactivePagers.length + structuralPagers.length + hiddenPageMetadata.length;
+          const busy = [...document.querySelectorAll(
+            'progress,[role=progressbar],[aria-busy=true],[class*=loading i],[class*=spinner i],[class*=busy i]'
+          )].filter(visible).length;
+          const dialogs = [...document.querySelectorAll(
+            'dialog[open],[role=dialog],[aria-modal=true],.modal.show,.modal.in,[role=alert],.alert,.error'
+          )].filter(visible).length;
+          const lastMutation = window.__thothUbotHistoryLastMutation;
+          const quietMs = typeof lastMutation === 'number'
+            ? Math.max(0, Math.floor(performance.now() - lastMutation)) : 0;
+          return {visible_tables: visibleTables.length, visible_rows: visibleRows.length,
+            pagers, busy, dialogs, stale_tables: staleTables.length, quiet_ms: quietMs};
+        }""")
+
+    def _collect_twd_history(
+        self, page, collector: ResponseCollector, *, as_of: date | None = None,
+    ) -> dict:
+        as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
+        def ensure_no_dialog() -> None:
+            if getattr(self, "_shared_dialog_blocked", False):
+                raise RuntimeError("ubot-twd-history-dialog")
+
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise RuntimeError("ubot-twd-history-mode")
+        endpoint = "IBKB010102"
+        response_before = len(collector.by_endpoint(endpoint))
+        issued_before = collector.issued_count(endpoint)
+
+        self._goto(page, "/B0101001", wait=6500)
+        ensure_no_dialog()
+        inventory_with_index = self._validate_twd_form(
+            self._twd_form_snapshot(page), as_of=as_of,
+        )
+        inventory = [
+            {key: item[key] for key in ("label", "identity", "currency")}
+            for item in inventory_with_index
+        ]
+        expected = []
+        coverage_windows = []
+        results = []
+        operation_bytes = 0
+        expected_queries = 0
+
+        for item in inventory_with_index:
+            start, end = self._history_range(item["identity"], end=as_of, mode=mode)
+            windows = self._history_windows(start, end)
+            expected.append({
+                "identity": item["identity"], "start": start.isoformat(), "end": end.isoformat(),
+            })
+            for window_start, window_end in windows:
+                expected_queries += 1
+                self._goto(page, "/B0101001", wait=6500)
+                ensure_no_dialog()
+                current_inventory = self._validate_twd_form(
+                    self._twd_form_snapshot(page), as_of=as_of,
+                )
+                if current_inventory != inventory_with_index:
+                    raise RuntimeError("ubot-twd-history-inventory-changed")
+                selects = page.query_selector_all("select")
+                if len(selects) != 2:
+                    raise RuntimeError("ubot-twd-history-form")
+                selects[0].select_option(index=item["index"])
+                page.wait_for_timeout(500)
+                selects[1].select_option(label=f"{window_start.month}月份")
+                page.wait_for_timeout(500)
+                button = _unique_visible_enabled_exact(page, "button", "搜尋")
+                if button is None:
+                    raise RuntimeError("ubot-twd-history-form")
+
+                before = len(collector.by_endpoint(endpoint))
+                request_boundary = collector.request_sequence
+                window_issued_before = collector.issued_count(endpoint)
+                ensure_no_dialog()
+                self._mark_twd_dom_boundary(page)
+                button.click(timeout=8000)
+                for _ in range(60):
+                    if len(collector.by_endpoint(endpoint)) > before:
+                        break
+                    page.wait_for_timeout(500)
+                hits = collector.by_endpoint(endpoint)[before:]
+                if (
+                    len(hits) != 1
+                    or collector.issued_count(endpoint) - window_issued_before != 1
+                ):
+                    raise RuntimeError("ubot-twd-history-response-cardinality")
+                ensure_no_dialog()
+                validated = self._validate_history_hit(
+                    hits[0], identity=item["identity"], start=window_start,
+                    end=window_end, after_sequence=request_boundary,
+                )
+                body_size = hits[0].body_size
+                if type(body_size) is not int:
+                    raise RuntimeError("ubot-twd-history-byte-budget")
+                operation_bytes += body_size
+                if operation_bytes > 5_000_000:
+                    raise RuntimeError("ubot-twd-history-byte-budget")
+                ensure_no_dialog()
+                self._validate_twd_dom(
+                    self._wait_for_twd_dom_settle(page), status=validated["status"],
+                    rows=validated["rows"],
+                )
+                ensure_no_dialog()
+                receipt = {
+                    "identity": item["identity"],
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "status": validated["status"],
+                    "pages": 1,
+                    "rows": validated["rows"],
+                }
+                results.append({
+                    "Account": item["identity"],
+                    "NTDetailList": validated["records"],
+                    "NTTotal": hits[0].resp_json.get("RespBody", {}).get("NTTotal", {}),
+                    "receipt": receipt,
+                })
+                coverage_windows.append({
+                    key: receipt[key]
+                    for key in ("identity", "start", "end", "status", "pages")
+                })
+
+        fresh_hits = collector.by_endpoint(endpoint)[response_before:]
+        fresh_sizes = [hit.body_size for hit in fresh_hits if type(hit.body_size) is int]
+        if (
+            len(fresh_hits) != expected_queries
+            or collector.issued_count(endpoint) - issued_before != expected_queries
+            or len(fresh_sizes) != len(fresh_hits)
+            or operation_bytes != sum(fresh_sizes)
+        ):
+            raise RuntimeError("ubot-twd-history-operation-cardinality")
+        ensure_no_dialog()
+        coverage = {
+            "mode": mode,
+            "as_of": as_of.isoformat(),
+            "domains": [{
+                "domain": "twd_transactions",
+                "expected": expected,
+                "windows": coverage_windows,
+            }],
+        }
+        validate_history_coverage(
+            coverage, expected_mode=mode, expected_domains=self.HISTORY_COVERAGE_DOMAINS,
+        )
+        return {"results": results, "inventory": inventory, "coverage": coverage}
 
     def _logged_in(self, page) -> bool:
         """正向訊號：URL 在內銀區 + innerText >= 500 + 命中 >= 2 個菜單字 + 無 login form。
@@ -551,8 +1107,11 @@ class UbotCrawler(BankCrawler):
         out["card_summary"] = self._latest_body(collector, "IBKA010003")  # 信用卡 CardList
         out["investment"] = self._latest_body(collector, "IBKA010004")    # 投資 TNRWD
 
-        # 2) 台幣交易明細（B0101001）：選帳戶 + 期間(近一月) + Go → IBKB010102
-        out["twd_txns"] = self._collect_twd_txns(page, collector)
+        # 2) 台幣交易明細（B0101001）：逐帳戶查銀行原生三個月份
+        twd_history = self._collect_twd_history(page, collector)
+        out["twd_txns"] = twd_history["results"]
+        out["debit_accounts"] = twd_history["inventory"]
+        out["history_coverage"] = twd_history["coverage"]
 
         # 3) 信用卡：額度彙總(F0101001 → IBKF010001) + 已出帳逐筆(F0201001 → IBKF020102)
         self._goto(page, "/F0101001", wait=6000)
@@ -589,42 +1148,6 @@ class UbotCrawler(BankCrawler):
                 return hit.resp_json.get("RespBody")
         return None
 
-    def _collect_twd_txns(self, page, collector: ResponseCollector) -> list:
-        """台幣交易明細：對每個帳戶選 last month 查一次，收集 IBKB010102。"""
-        self._goto(page, "/B0101001", wait=6500)
-        results: list = []
-        try:
-            selects = page.query_selector_all("select")
-            if len(selects) < 2:
-                _log("[twd] 查詢表單 select 不足，跳過")
-                return results
-            # 帳戶下拉選項數（index 0=Choose Account）
-            acct_opts = page.evaluate(
-                "(() => { const s=document.querySelectorAll('select')[0];"
-                " return s ? s.options.length : 0; })()",
-            )
-            for idx in range(1, max(acct_opts, 1)):
-                selects = page.query_selector_all("select")
-                try:
-                    selects[0].select_option(index=idx)
-                    page.wait_for_timeout(700)
-                    selects[1].select_option(value="3")  # last month
-                    page.wait_for_timeout(700)
-                except Exception as e:
-                    _log(f"[twd] 選 index={idx} 失敗: {type(e).__name__}")
-                    continue
-                page.evaluate(
-                    "(() => { const b=[...document.querySelectorAll('button')].filter(e=>e.offsetParent!==null)"
-                    ".find(x=>/^(Go|查詢|Query|Search)$/i.test((x.textContent||'').trim())); if(b) b.click(); })()",
-                )
-                page.wait_for_timeout(6500)
-                body = self._latest_body(collector, "IBKB010102")
-                if body:
-                    results.append(body)
-        except Exception as e:
-            _log(f"[twd] 失敗: {type(e).__name__}")
-        return results
-
     def _collect_card_billed(self, page, collector: ResponseCollector) -> list:
         """信用卡已出帳逐筆：進 F0201001，對每個期別點一次，收集 IBKF020102。"""
         self._goto(page, "/F0201001", wait=6500)
@@ -660,30 +1183,3 @@ class UbotCrawler(BankCrawler):
             if body and body not in results:
                 results.append(body)
         return results
-
-
-if __name__ == "__main__":
-    import json
-    crawler = UbotCrawler()
-    result = crawler.run(login_url=BASE, headless=True)
-    out_file = Path(__file__).resolve().parents[1] / "data" / "ubot_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    _log(f"\n[done] 已存: {out_file}")
-    if result.get("error"):
-        _log(f"  error: {result['error']}")
-    data = result.get("data", {})
-    _log("\n===== 抓取摘要 =====")
-    dt = data.get("deposit_twd") or {}
-    if isinstance(dt, dict):
-        nt = dt.get("NTList", [])
-        _log(f"  台幣存款帳戶: {len(nt)} 個")
-    cs = data.get("card_summary") or {}
-    if isinstance(cs, dict):
-        _log(f"  信用卡彙總: {len(cs.get('CardList', []))} 筆")
-    twd = data.get("twd_txns") or []
-    n_twd = sum(len(b.get("NTDetailList", [])) for b in twd if isinstance(b, dict))
-    _log(f"  台幣交易明細: {n_twd} 筆（{len(twd)} 個帳戶）")
-    cb = data.get("card_billed") or []
-    n_cb = sum(len(b.get("CardList", [])) for b in cb if isinstance(b, dict))
-    _log(f"  信用卡已出帳明細: {n_cb} 筆（{len(cb)} 期）")
-    _log(f"\n  攔到的 endpoint: {len(data.get('_all_endpoints', []))}")
