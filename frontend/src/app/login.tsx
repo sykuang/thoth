@@ -39,6 +39,7 @@ import { useAuthStore } from '@/stores/auth';
 import type { LoginResponse, RegisterResponse } from '@/types/api';
 
 type Mode = 'login' | 'register';
+const CONNECTION_TEST_TIMEOUT_MS = 90_000;
 
 /** Allow http only for loopback/private LAN (RFC 1918); require https otherwise. */
 function validateServerUrl(raw: string): { ok: true; normalized: string } | { ok: false; error: string } {
@@ -121,7 +122,7 @@ export default function LoginScreen() {
     setPinging(true);
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
+      const t = setTimeout(() => ctrl.abort(), CONNECTION_TEST_TIMEOUT_MS);
       // healthz 是 GET, 不需 auth, 沒帳號也能打
       const resp = await fetch(`${v.normalized}/healthz`, {
         method: 'GET',

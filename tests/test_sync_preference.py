@@ -6,6 +6,7 @@ per-user single time (使用者「我要使用者設定一個時間給所有帳�
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from unittest.mock import patch
 
 import pytest
@@ -44,12 +45,16 @@ def _auth(token: str) -> dict[str, str]:
 
 def test_frontend_offers_only_fixed_sync_slots() -> None:
     source = Path("frontend/src/app/(tabs)/settings/auto-sync.tsx").read_text()
+    api_types = Path("frontend/src/types/api.ts").read_text()
 
     assert "const SYNC_SLOTS = [" in source
     assert source.count("label: '") == 3
     for label in ("10:00", "12:00", "18:00"):
         assert f"label: '{label}'" in source
     assert "NumberPicker" not in source
+    assert 'accessibilityRole="checkbox"' in source
+    assert "selectedSlots" in source
+    assert "slots: SyncSlot[]" in api_types
 
 
 # ============================================================
@@ -57,6 +62,79 @@ def test_frontend_offers_only_fixed_sync_slots() -> None:
 # ============================================================
 
 class TestRepo:
+    def test_malformed_legacy_slot_fails_closed(self) -> None:
+        row = (1, "bad", 0, "Asia/Taipei", 1, None, None, "created", "updated")
+
+        assert user_sync_pref_repo._row_to_dict(row)["slots"] == []
+
+    def test_schema_upgrade_adds_multi_slot_storage_to_legacy_table(self) -> None:
+        from backend.server import db
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE user_sync_preferences (
+                user_id INTEGER PRIMARY KEY,
+                hour INTEGER NOT NULL,
+                minute INTEGER NOT NULL,
+                tz TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                last_run_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        db._ensure_schema(conn)
+
+        assert "slots_json" in db._columns(conn, "user_sync_preferences")
+
+    def test_upsert_slots_accepts_any_subset_and_canonicalizes_order(
+        self, user_token: tuple[str, int],
+    ) -> None:
+        _, uid = user_token
+
+        row = user_sync_pref_repo.upsert_slots(
+            user_id=uid,
+            slots=["18:00", "10:00"],
+        )
+
+        assert row["slots"] == ["10:00", "18:00"]
+        assert row["enabled"] is True
+        assert row["hour"] == 10
+        assert [p["user_id"] for p in user_sync_pref_repo.list_all_enabled()] == [uid]
+
+    def test_upsert_slots_accepts_empty_selection_as_disabled(
+        self, user_token: tuple[str, int],
+    ) -> None:
+        _, uid = user_token
+
+        row = user_sync_pref_repo.upsert_slots(user_id=uid, slots=[])
+
+        assert row["slots"] == []
+        assert row["enabled"] is False
+        assert user_sync_pref_repo.get(uid) == row
+        assert user_sync_pref_repo.list_all_enabled() == []
+
+    @pytest.mark.parametrize(
+        "slots",
+        [
+            ["09:00"],
+            ["10:00", "10:00"],
+            ["10:00", "12:00", "18:00", "20:00"],
+        ],
+    )
+    def test_upsert_slots_rejects_invalid_selection(
+        self,
+        user_token: tuple[str, int],
+        slots: list[str],
+    ) -> None:
+        _, uid = user_token
+
+        with pytest.raises(ValueError, match="10:00, 12:00, 18:00"):
+            user_sync_pref_repo.upsert_slots(user_id=uid, slots=slots)
+
     def test_upsert_creates_new(self, user_token: tuple[str, int]) -> None:
         _, uid = user_token
         row = user_sync_pref_repo.upsert(
@@ -170,6 +248,89 @@ class TestRepo:
 # ============================================================
 
 class TestRouter:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"slots": None},
+            {"slots": ["10:00"], "enabled": None},
+            {"hour": 10, "minute": 0, "enabled": None},
+        ],
+    )
+    def test_put_rejects_explicit_null_contract_fields(
+        self,
+        client: TestClient,
+        user_token: tuple[str, int],
+        payload: dict[str, object],
+    ) -> None:
+        token, _ = user_token
+
+        response = client.put(
+            "/me/sync-preference",
+            json=payload,
+            headers=_auth(token),
+        )
+
+        assert response.status_code == 422
+
+    def test_put_rejects_mixed_multi_slot_and_legacy_payload(
+        self, client: TestClient, user_token: tuple[str, int],
+    ) -> None:
+        token, _ = user_token
+
+        response = client.put(
+            "/me/sync-preference",
+            json={"slots": ["10:00"], "hour": 10, "minute": 0},
+            headers=_auth(token),
+        )
+
+        assert response.status_code == 422
+
+    def test_put_round_trips_all_selected_slots(
+        self, client: TestClient, user_token: tuple[str, int],
+    ) -> None:
+        token, uid = user_token
+
+        response = client.put(
+            "/me/sync-preference",
+            json={"slots": ["10:00", "12:00", "18:00"], "tz": "Asia/Taipei"},
+            headers=_auth(token),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["user_id"] == uid
+        assert response.json()["slots"] == ["10:00", "12:00", "18:00"]
+        assert client.get(
+            "/me/sync-preference", headers=_auth(token),
+        ).json()["slots"] == ["10:00", "12:00", "18:00"]
+
+    def test_put_accepts_no_selected_slots(
+        self, client: TestClient, user_token: tuple[str, int],
+    ) -> None:
+        token, _ = user_token
+
+        response = client.put(
+            "/me/sync-preference",
+            json={"slots": [], "tz": "Asia/Taipei"},
+            headers=_auth(token),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["slots"] == []
+        assert response.json()["enabled"] is False
+
+    def test_put_rejects_duplicate_selected_slots(
+        self, client: TestClient, user_token: tuple[str, int],
+    ) -> None:
+        token, _ = user_token
+
+        response = client.put(
+            "/me/sync-preference",
+            json={"slots": ["10:00", "10:00"], "tz": "Asia/Taipei"},
+            headers=_auth(token),
+        )
+
+        assert response.status_code == 422
+
     def test_get_returns_null_when_never_set(
         self, client: TestClient, user_token: tuple[str, int],
     ) -> None:
@@ -264,6 +425,23 @@ class TestRouter:
 # ============================================================
 
 class TestSchedulerWiring:
+    def test_add_or_replace_supports_all_three_slots(
+        self, user_token: tuple[str, int],
+    ) -> None:
+        _, uid = user_token
+        scheduler.add_or_replace_for_user({
+            "user_id": uid,
+            "slots": ["10:00", "12:00", "18:00"],
+            "tz": "Asia/Taipei",
+            "enabled": True,
+        })
+        try:
+            job = scheduler.get_scheduler().get_job(f"user-{uid}")
+            assert job is not None
+            assert "hour='10,12,18'" in str(job.trigger)
+        finally:
+            scheduler.remove_for_user(uid)
+
     def test_add_or_replace_creates_job(self, user_token: tuple[str, int]) -> None:
         _, uid = user_token
         s = scheduler.get_scheduler()

@@ -59,15 +59,17 @@ export type BankAccount = {
   fields_set: string[];
 };
 
-// L13 (2026-06-23 使用者指示): 自動同步 — 每個 user 一個 daily 時間,
-// fire 時 fan-out 該 user 全部 has_creds account.
+// 自動同步 — 每個 user 可選 0-3 個固定時段；每次 fire fan-out 全部 ready accounts.
 // 取代 L12 per-account 設計 (使用者「我要使用者設定一個時間給所有帳號」).
+export type SyncSlot = '10:00' | '12:00' | '18:00';
+
 export type SyncPreference = {
   user_id: number;
   hour: number;       // 0-23
   minute: number;     // 0-59
   tz: string;         // 'Asia/Taipei'
   enabled: boolean;
+  slots: SyncSlot[];
   last_run_at: string | null;
   created_at: string;
   updated_at: string;

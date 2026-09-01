@@ -5,14 +5,13 @@
  *   使用者「我不是要每個銀行都有各自的時間 我要使用者設定一個時間給所有帳號」
  *
  * UI:
- *   - 單一 enable toggle (整個 user 一個排程)
- *   - 三個固定時段 (10:00 / 12:00 / 18:00 Asia/Taipei)
+ *   - 可選 0-3 個固定時段 (10:00 / 12:00 / 18:00 Asia/Taipei)
  *   - 列出當前 user 全部 has_creds account, 強調「都會在這個時間一起同步」
  *   - 顯示上次自動同步時間
  *
  * Endpoints:
  *   GET    /me/sync-preference     → SyncPreference | null
- *   PUT    /me/sync-preference     → upsert {hour, minute, tz?, enabled}
+ *   PUT    /me/sync-preference     → upsert {slots, tz?}
  *   DELETE /me/sync-preference     → 204
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -23,13 +22,12 @@ import {
   Platform,
   Pressable,
   ScrollView,
-  Switch,
   Text,
   View,
 } from 'react-native';
 
 import { api, ApiError } from '@/lib/api';
-import type { BankAccount, SyncPreference } from '@/types/api';
+import type { BankAccount, SyncPreference, SyncSlot } from '@/types/api';
 
 const BANK_LABEL: Record<string, string> = {
   cathay: '國泰世華', ubot: '聯邦銀行', hsbc: '匯豐銀行',
@@ -43,6 +41,13 @@ const SYNC_SLOTS = [
   { hour: 12, minute: 0, label: '12:00' },
   { hour: 18, minute: 0, label: '18:00' },
 ] as const;
+
+function slotsFromPreference(pref: SyncPreference | null): SyncSlot[] {
+  if (!pref) return [];
+  if (Array.isArray(pref.slots)) return pref.slots;
+  const legacy = `${pad(pref.hour)}:${pad(pref.minute)}` as SyncSlot;
+  return pref.enabled && SYNC_SLOTS.some((slot) => slot.label === legacy) ? [legacy] : [];
+}
 
 export default function AutoSyncScreen() {
   const qc = useQueryClient();
@@ -61,9 +66,7 @@ export default function AutoSyncScreen() {
   // 用 server snapshot 做 derived initial: 第一次有 prefQ.data 時直接設,
   // 之後 user 編輯;若 server 更新 (e.g. saveMut.onSuccess) 也覆寫一次.
   // (lint react-hooks/set-state-in-effect: 用 key-based re-mount 避免 setState in useEffect)
-  const dataKey = prefQ.data
-    ? `${prefQ.data.enabled}-${prefQ.data.hour}-${prefQ.data.minute}`
-    : 'empty';
+  const dataKey = slotsFromPreference(prefQ.data ?? null).join(',') || 'empty';
   return <AutoSyncBody key={dataKey} pref={prefQ.data ?? null} accountsQ={accountsQ} qc={qc} />;
 }
 
@@ -76,22 +79,23 @@ function AutoSyncBody({
   accountsQ: { data?: BankAccount[]; isLoading: boolean };
   qc: ReturnType<typeof useQueryClient>;
 }) {
-  const initialSlot = SYNC_SLOTS.find(
-    (slot) => slot.hour === pref?.hour && slot.minute === pref?.minute,
-  ) ?? SYNC_SLOTS[0];
-  const [enabled, setEnabled] = useState(pref?.enabled ?? false);
-  const [hour, setHour] = useState(initialSlot.hour);
-  const minute = 0;
+  const initialSlots = slotsFromPreference(pref);
+  const [selectedSlots, setSelectedSlots] = useState<SyncSlot[]>(initialSlots);
 
   const saveMut = useMutation({
-    mutationFn: (vars: { hour: number; minute: number; enabled: boolean }) =>
+    mutationFn: (slots: SyncSlot[]) =>
       api<SyncPreference>('/me/sync-preference', {
         method: 'PUT',
-        body: { hour: vars.hour, minute: vars.minute, tz: 'Asia/Taipei', enabled: vars.enabled },
+        body: { slots, tz: 'Asia/Taipei' },
       }),
     onSuccess: (data) => {
       qc.setQueryData(['sync-preference'], data);
-      Alert.alert('已儲存', `每天 ${pad(data.hour)}:${pad(data.minute)} 自動同步全部帳號`);
+      Alert.alert(
+        '已儲存',
+        data.slots.length
+          ? `每天 ${data.slots.join('、')} 自動同步全部帳號`
+          : '已停用自動同步',
+      );
     },
     onError: (e) => {
       const msg = e instanceof ApiError ? String(e.body ?? e.message) : String(e);
@@ -99,15 +103,6 @@ function AutoSyncBody({
     },
   });
 
-  const deleteMut = useMutation({
-    mutationFn: () =>
-      api<void>('/me/sync-preference', { method: 'DELETE', raw: true }),
-    onSuccess: () => {
-      qc.setQueryData(['sync-preference'], null);
-      setEnabled(false);
-      Alert.alert('已關閉', '已停用自動同步');
-    },
-  });
 
   const isLoading = accountsQ.isLoading;
   if (isLoading) {
@@ -119,53 +114,45 @@ function AutoSyncBody({
   }
 
   const readyAccounts = (accountsQ.data ?? []).filter((a) => a.has_creds);
-  const dirty =
-    enabled !== (pref?.enabled ?? false) ||
-    hour !== (pref?.hour ?? SYNC_SLOTS[0].hour) ||
-    minute !== (pref?.minute ?? 0);
+  const dirty = selectedSlots.join(',') !== initialSlots.join(',');
+
+  function toggleSlot(slot: SyncSlot) {
+    setSelectedSlots((current) => (
+      current.includes(slot)
+        ? current.filter((value) => value !== slot)
+        : SYNC_SLOTS.map((value) => value.label).filter(
+            (value): value is SyncSlot => current.includes(value) || value === slot,
+          )
+    ));
+  }
 
   return (
     <ScrollView className="flex-1 bg-ink-50 dark:bg-ink-950">
       <View className="px-6 py-6 max-w-[800px] w-full mx-auto">
         <Text className="text-ink-900 dark:text-ink-50 text-h1 mb-1">自動同步</Text>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
-          每天指定時間自動同步全部已綁定帳號, 完成後推送通知到手機
+          每天可選 0–3 個時段同步全部已綁定帳號, 完成後推送通知到手機
         </Text>
 
-        {/* 主開關卡 */}
-        <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
-          <View className="flex-row items-center mb-1">
-            <View className="flex-1">
-              <Text className="text-ink-900 dark:text-ink-50 text-h3">
-                啟用自動同步
-              </Text>
-              <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
-                每天 {pad(hour)}:{pad(minute)} 同步全部已綁定帳號 ({readyAccounts.length} 個)
-              </Text>
-            </View>
-            <Switch value={enabled} onValueChange={setEnabled} />
-          </View>
-        </View>
-
         {/* 固定時段 */}
-        <View
-          className={`bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4 ${
-            enabled ? '' : 'opacity-50'
-          }`}
-        >
-          <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider mb-3">
-            執行時間 (Asia/Taipei)
-          </Text>
+        <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
+          <View className="flex-row items-center justify-between mb-3">
+            <Text className="text-ink-500 dark:text-ink-400 text-micro font-semibold tracking-wider">
+              執行時間 (Asia/Taipei)
+            </Text>
+            <Text className="text-ink-500 dark:text-ink-400 text-small">
+              已選 {selectedSlots.length}/3
+            </Text>
+          </View>
           <View className="flex-row flex-wrap items-center justify-center gap-3 py-2">
             {SYNC_SLOTS.map((slot) => {
-              const selected = hour === slot.hour;
+              const selected = selectedSlots.includes(slot.label);
               return (
                 <Pressable
                   key={slot.label}
-                  accessibilityRole="radio"
-                  accessibilityState={{ selected, disabled: !enabled }}
-                  disabled={!enabled}
-                  onPress={() => setHour(slot.hour)}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: selected }}
+                  onPress={() => toggleSlot(slot.label)}
                   testID={`auto-sync-slot-${slot.label}`}
                   className={`rounded-xl border px-5 py-3 ${
                     selected
@@ -185,7 +172,7 @@ function AutoSyncBody({
             })}
           </View>
           <Text className="text-ink-400 dark:text-ink-500 text-caption text-center mt-2">
-            請選擇每日固定同步時段
+            可不選；不選即停用自動同步。將同步 {readyAccounts.length} 個已綁定帳號
           </Text>
         </View>
 
@@ -233,7 +220,7 @@ function AutoSyncBody({
               : 'bg-ink-300 dark:bg-ink-700'
           }`}
           disabled={!dirty || saveMut.isPending}
-          onPress={() => saveMut.mutate({ hour, minute, enabled })}
+          onPress={() => saveMut.mutate(selectedSlots)}
         >
           {saveMut.isPending ? (
             <ActivityIndicator color="#fff" />
@@ -242,29 +229,6 @@ function AutoSyncBody({
           )}
         </Pressable>
 
-        {pref && (
-          <Pressable
-            className="rounded-xl py-3 items-center mt-3"
-            onPress={() => {
-              Alert.alert(
-                '關閉自動同步?',
-                '會清除目前設定。下次想用要重新設時間。',
-                [
-                  { text: '取消', style: 'cancel' },
-                  {
-                    text: '關閉',
-                    style: 'destructive',
-                    onPress: () => deleteMut.mutate(),
-                  },
-                ],
-              );
-            }}
-          >
-            <Text className="text-error-600 dark:text-error-400 text-small">
-              關閉自動同步
-            </Text>
-          </Pressable>
-        )}
 
         <Text className="text-ink-400 dark:text-ink-500 text-micro text-center mt-6">
           排程由伺服器背景工作執行, 即使 app 關閉也會執行。

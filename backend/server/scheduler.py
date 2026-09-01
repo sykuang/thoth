@@ -4,7 +4,7 @@
   * In-process BackgroundScheduler (uvicorn worker 同 process)
   * MemoryJobStore — preference 在 user_sync_preferences table, scheduler 只是
     runtime view, restart 一律從 DB reload (詳 reload_all_jobs)
-  * Job id 命名: f"user-{user_id}" (user_id 是 PK, 一對一)
+  * Job id 命名: f"user-{user_id}" (一個 CronTrigger 可含 0-3 個 hour)
   * Fire 時 fan-out: 該 user 全部 has_creds=true 的 account 依序排同步
     (sync_runner.run_sync_job_for_account 自己開 daemon thread, 立刻回 job_id)
   * 失敗處理: APScheduler 跑 job 時自身 exception 不 retry; 每個 account 失敗
@@ -185,7 +185,14 @@ def add_or_replace_for_user(pref: dict[str, Any]) -> None:
     user_id = pref["user_id"]
     jid = _job_id(user_id)
 
-    if not pref.get("enabled", True):
+    slots = pref.get("slots")
+    if slots is None:
+        slots = (
+            [f"{pref['hour']:02d}:{pref['minute']:02d}"]
+            if pref.get("enabled", True)
+            else []
+        )
+    if not slots:
         try:
             s.remove_job(jid)
             logger.info("[scheduler] removed (disabled) user_id=%s", user_id)
@@ -193,9 +200,10 @@ def add_or_replace_for_user(pref: dict[str, Any]) -> None:
             pass
         return
 
+    hours = [int(slot.split(":", 1)[0]) for slot in slots]
     trigger = CronTrigger(
-        hour=pref["hour"],
-        minute=pref["minute"],
+        hour=",".join(str(hour) for hour in hours),
+        minute=0,
         timezone=pref.get("tz", "Asia/Taipei"),
     )
     s.add_job(
@@ -208,8 +216,8 @@ def add_or_replace_for_user(pref: dict[str, Any]) -> None:
     )
 
     logger.info(
-        "[scheduler] add/replace user_id=%s %02d:%02d %s",
-        user_id, pref["hour"], pref["minute"],
+        "[scheduler] add/replace user_id=%s slots=%s %s",
+        user_id, ",".join(slots),
         pref.get("tz", "Asia/Taipei"),
     )
 

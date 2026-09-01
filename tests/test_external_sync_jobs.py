@@ -373,7 +373,7 @@ def test_scheduled_slot_queues_entire_batch_for_worker(client, monkeypatch) -> N
         "/auth/register",
         json={"email": "slot-12@palace.example", "password": "SyntheticTestPassword02!"},
     ).json()["user_id"]
-    user_sync_pref_repo.upsert(user_id=first, hour=10, minute=0)
+    user_sync_pref_repo.upsert_slots(user_id=first, slots=["10:00", "12:00"])
     user_sync_pref_repo.upsert(user_id=second, hour=12, minute=0)
     account = AccountsRepo().create(first, "taishin", "main")
     second_account = AccountsRepo().create(first, "taishin", "secondary")
@@ -411,6 +411,7 @@ def test_scheduled_slot_queues_entire_batch_for_worker(client, monkeypatch) -> N
     second_pref = user_sync_pref_repo.get(second)
     assert first_pref is not None
     assert second_pref is not None
+    assert first_pref["slots"] == ["10:00", "12:00"]
     assert first_pref["last_run_at"] is not None
     assert second_pref["last_run_at"] is None
 

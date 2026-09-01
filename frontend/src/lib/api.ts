@@ -18,8 +18,8 @@ import { queryClient } from '@/lib/queryClient';
 import { useAuthStore } from '@/stores/auth';
 import type { LoginResponse } from '@/types/api';
 
-/** 預設 fetch timeout (ms)。可由 ApiInit.signal 覆寫。 */
-const DEFAULT_TIMEOUT_MS = 30_000;
+/** Azure scale-to-zero cold starts can exceed 50 seconds. */
+const DEFAULT_TIMEOUT_MS = 90_000;
 
 /**
  * Resolve current server URL from zustand store (live read each call).
@@ -167,7 +167,7 @@ export type ApiInit = Omit<RequestInit, 'body'> & {
   authRetryKey?: string;
   /** If true, returns void on 204 instead of attempting JSON parse. */
   raw?: boolean;
-  /** Request timeout in ms (default 30000). Set to 0 to disable. */
+  /** Request timeout in ms (default 90000). Set to 0 to disable. */
   timeoutMs?: number;
   /** Internal: prevent infinite recursion when a 401 retry itself 401s. */
   _retriedAfterRefresh?: boolean;
@@ -401,7 +401,7 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
         ? (body as BodyInit)
         : JSON.stringify(body);
 
-  // 臣妾代為預設 AbortController，30s timeout；caller 的 signal 仍取優先
+  // Default timeout covers Azure scale-to-zero cold starts; caller signal still wins.
   const timeoutMs = init.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = timeoutMs > 0 ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;

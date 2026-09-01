@@ -437,10 +437,10 @@ CREATE TABLE IF NOT EXISTS manual_liability_repayments (
 CREATE INDEX IF NOT EXISTS ix_manual_liability_repayments_account_date
     ON manual_liability_repayments(user_id, account_id, occurred_on DESC, id DESC);
 
--- 2026-06-23 (L13 使用者指示): 自動同步排程 — 每個 user 一個 daily schedule.
---   * user_id PK = 1 user 1 schedule (1:N to bank_accounts at fire-time)
+-- 自動同步排程 — 每個 user 一列，可選 0-3 個固定時段。
+--   * user_id PK = 1 user 1 preference (1:N to bank_accounts at fire-time)
 --   * Fire 時 fan-out 該 user 全部 has_creds=true 的 account
---   * hour 0-23, minute 0-59 — daily only
+--   * slots_json=NULL is legacy single-slot; [] disables scheduling
 --   * tz default Asia/Taipei
 --   * enabled=0 vs 沒 row 兩種「停掉」, 前者保留時間值方便重啟
 --   * last_run_at 給 UI 顯示「上次自動同步」, 細節點開看 sync_jobs
@@ -451,6 +451,7 @@ CREATE TABLE IF NOT EXISTS user_sync_preferences (
     minute      INTEGER NOT NULL,
     tz          TEXT NOT NULL DEFAULT 'Asia/Taipei',
     enabled     INTEGER NOT NULL DEFAULT 1,
+    slots_json  TEXT,
     last_run_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
@@ -603,6 +604,7 @@ def _add_column_if_missing(
             "repayment_revision",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+        ("user_sync_preferences", "slots_json", "TEXT"),
     }
     if (table, column, definition) not in allowed:
         raise ValueError("unsupported schema column")
@@ -662,6 +664,7 @@ def _ensure_schema(conn: Any) -> None:
         "repayment_revision",
         "INTEGER NOT NULL DEFAULT 0",
     )
+    _add_column_if_missing(conn, "user_sync_preferences", "slots_json", "TEXT")
     _drop_column_if_present(conn, "manual_investment_transactions", "unit_price")
 
     # 老 sync_jobs 表缺 account_id 欄位 → 補上

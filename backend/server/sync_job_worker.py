@@ -52,13 +52,13 @@ def run_scheduled_slot(now: datetime | None = None) -> dict[str, int]:
     for batch_id, user_id in swept.batches:
         sync_runner._maybe_send_batch_summary(batch_id=batch_id, user_id=user_id)
     local_now = now or datetime.now(ZoneInfo("Asia/Taipei"))
-    slot = (local_now.hour, 0)
+    slot = f"{local_now.hour:02d}:00"
     counts = {"users": 0, "jobs": 0, "done": 0, "failed": 0}
     repo = AccountsRepo()
     store = LocalFernetBackend()
 
     for pref in user_sync_pref_repo.list_all_enabled():
-        if not pref["enabled"] or (pref["hour"], pref["minute"]) != slot:
+        if slot not in pref["slots"]:
             continue
         counts["users"] += 1
         user_id = pref["user_id"]
