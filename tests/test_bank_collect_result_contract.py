@@ -345,7 +345,7 @@ def test_bankcrawler_run_rejects_bare_dict_collect_result(monkeypatch, tmp_path)
 
     result = _BadCrawler(name="bad").run("https://example.com", headless=True)
 
-    assert result["error"] == "collect_failed: TypeError"
+    assert result["error"] == "collect_failed: TypeError: code=collect_contract"
 
 
 def test_bankcrawler_run_rejects_missing_card_bill_contract(monkeypatch, tmp_path):
@@ -358,7 +358,7 @@ def test_bankcrawler_run_rejects_missing_card_bill_contract(monkeypatch, tmp_pat
         "https://example.com", headless=True,
     )
 
-    assert result["error"] == "collect_failed: ValueError"
+    assert result["error"] == "collect_failed: ValueError: code=collect_contract"
 
 
 def test_bankcrawler_run_surfaces_contract_validation_errors(monkeypatch, tmp_path):
@@ -369,4 +369,4 @@ def test_bankcrawler_run_surfaces_contract_validation_errors(monkeypatch, tmp_pa
 
     result = _BadDateCrawler(name="bad-date").run("https://example.com", headless=True)
 
-    assert result["error"] == "collect_failed: ValueError"
+    assert result["error"] == "collect_failed: ValueError: code=collect_contract"

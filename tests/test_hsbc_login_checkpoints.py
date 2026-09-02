@@ -650,7 +650,7 @@ def test_first_stage_dialog_blocks_final_submit_and_collect(monkeypatch, tmp_pat
 
         result = crawler.run("https://example.invalid", headless=True)
 
-        assert "HsbcLoginError" in result["error"]
+        assert result["error"] == "RuntimeError: login failed"
         assert "PRIVATE" not in result["error"]
         assert page.locator("body").get_attribute("data-challenge") == "1"
         assert page.locator("body").get_attribute("data-final") == "0"

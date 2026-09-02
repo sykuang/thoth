@@ -256,6 +256,21 @@ def test_unknown_state_never_requests_resubmit():
     assert "rule_name" not in str(raised.value)
 
 
+def test_login_budget_rejects_non_exact_int_values() -> None:
+    class PrivateValue:
+        def __hash__(self) -> int:
+            return hash(0)
+
+        def __eq__(self, other: object) -> bool:
+            return other == 0
+
+        def __format__(self, _spec: str) -> str:
+            return "PRIVATE_BUDGET_987654\nFORGED_LOG"
+
+    with pytest.raises(ValueError, match="invalid login budget"):
+        LoginBudget(credential_submissions=PrivateValue())  # type: ignore[arg-type]
+
+
 def test_otp_is_terminal_interaction_required_without_action():
     outcome = CheckpointOutcome(CheckpointKind.OTP_REQUIRED, interaction="otp")
 

@@ -378,14 +378,30 @@ class DbsCrawler(BankCrawler):
                 }
                 candidates.sort((a, b) => (b.score - a.score) || (a.area - b.area));
                 const dump = candidates.slice(0, 12).map(({el, ...rest}) => rest);
-                if (!candidates.length) return {clicked: false, reason: 'no_candidate', dump};
+                if (!candidates.length) return {
+                    clicked: false, reason: 'no_candidate',
+                    candidate_count: candidates.length, dump
+                };
                 const c = candidates[0];
                 try { c.el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
                 c.el.click();
-                return {clicked: true, target: dump[0], dump};
+                return {
+                    clicked: true, target: dump[0],
+                    candidate_count: candidates.length, dump
+                };
             }""", {"acctName": acct_name, "acctTail": acct_tail})
             out["twd_account_drilldown_click"] = click_result
-            _log(f"[dbs][twd] drilldown click={click_result.get('clicked')} target={click_result.get('target')}")
+            clicked = isinstance(click_result, dict) and click_result.get("clicked") is True
+            candidate_count = (
+                click_result.get("candidate_count", 0)
+                if isinstance(click_result, dict)
+                and type(click_result.get("candidate_count", 0)) is int
+                else 0
+            )
+            _log(
+                f"[dbs][twd] drilldown click={clicked} "
+                f"candidate_count={candidate_count}"
+            )
             page.wait_for_timeout(9000)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "01_twd_account_detail.png"), full_page=True)
@@ -436,8 +452,8 @@ class DbsCrawler(BankCrawler):
                     }""", label)
                     page.wait_for_timeout(2500)
                     month_clicks.append({"label": label, **(clicked or {})})
-                except Exception as me:
-                    month_clicks.append({"label": label, "clicked": False, "error": str(me)})
+                except Exception:
+                    month_clicks.append({"label": label, "clicked": False, "error": "probe_failed"})
             def _click_other_months_and_probe() -> dict:
                 try:
                     probe = page.evaluate(r"""() => {
@@ -457,8 +473,8 @@ class DbsCrawler(BankCrawler):
                     }""") or {"clicked": False}
                     page.wait_for_timeout(1000)
                     return probe
-                except Exception as exc:
-                    return {"clicked": False, "error": str(exc)}
+                except Exception:
+                    return {"clicked": False, "error": "probe_failed"}
 
             other_probe = _click_other_months_and_probe()
             page.wait_for_timeout(1500)
@@ -538,24 +554,34 @@ class DbsCrawler(BankCrawler):
                         "api_hits_before": before_hits,
                         "api_hits_after": after_hits,
                     })
-                except Exception as exc:
-                    other_month_clicks.append({"year": year, "month": month_label, "clicked": False, "error": str(exc)})
+                except Exception:
+                    other_month_clicks.append({
+                        "year": year, "month": month_label,
+                        "clicked": False, "error": "probe_failed",
+                    })
             out["twd_txn_month_clicks"] = month_clicks
             out["twd_txn_other_months_probe"] = other_probe
             out["twd_txn_other_month_clicks"] = other_month_clicks
             out["twd_txn_month_click_endpoints"] = sorted({
                 h.endpoint for h in collector.hits[before_month_click_hits:] if h.resp_json is not None
             })
-            _log(f"[dbs][twd] month_clicks={month_clicks} other_months={other_month_clicks} endpoints={out['twd_txn_month_click_endpoints']}")
-            _log(f"[dbs][twd] detail text_len={len(detail_text)} endpoints={out['twd_account_detail_api_endpoints']}")
+            _log(
+                f"[dbs][twd] month_click_count={len(month_clicks)} "
+                f"other_month_click_count={len(other_month_clicks)} "
+                f"endpoint_count={len(out['twd_txn_month_click_endpoints'])}"
+            )
+            _log(
+                f"[dbs][twd] detail text_len={len(detail_text)} "
+                f"endpoint_count={len(out['twd_account_detail_api_endpoints'])}"
+            )
 
             # Return to overview before probing top-nav card-fee shortcut.
             with contextlib.suppress(Exception):
                 page.goto("https://internet-banking.dbs.com.tw/digitw/overview", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(5000)
-        except Exception as e:
-            out["twd_account_drilldown_error"] = str(e)
-            _log(f"[dbs][twd] drilldown probe failed: {e}")
+        except Exception:
+            out["twd_account_drilldown_error"] = "probe_failed"
+            _log("[dbs][twd] drilldown probe failed; details withheld")
 
         # 2026-08-15 實頁驗證：overview 卡片 tile 不是 drilldown；點 CardWrapper 不改 URL、
         # 不發任何 API，頂部「繳卡費」也只有帳單摘要。DBS Internet Banking 未提供可證明
@@ -598,10 +624,18 @@ class DbsCrawler(BankCrawler):
             out["dbs_card_fee_endpoints"] = sorted({
                 h.endpoint for h in collector.hits[before_card_fee_hits:] if h.resp_json is not None
             })
-            _log(f"[dbs][card_fee] click={card_fee_click.get('clicked')} parsed={out['dbs_card_fee_page']} endpoints={out['dbs_card_fee_endpoints']}")
-        except Exception as e:
-            out["dbs_card_fee_error"] = str(e)
-            _log(f"[dbs][card_fee] probe failed: {e}")
+            card_fee_clicked = (
+                isinstance(card_fee_click, dict)
+                and card_fee_click.get("clicked") is True
+            )
+            _log(
+                f"[dbs][card_fee] click={card_fee_clicked} "
+                f"parsed={bool(out['dbs_card_fee_page'])} "
+                f"endpoint_count={len(out['dbs_card_fee_endpoints'])}"
+            )
+        except Exception:
+            out["dbs_card_fee_error"] = "probe_failed"
+            _log("[dbs][card_fee] probe failed; details withheld")
 
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
@@ -625,7 +659,7 @@ class DbsCrawler(BankCrawler):
 
         publish_card_bill_facts(out, [_dbs_card_bill_fact(out)])
 
-        _log(f"[dbs][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")
+        _log(f"[dbs][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
         return BankCollectResult(**out)
 
 
@@ -677,8 +711,8 @@ if __name__ == "__main__":
     crawler = DbsCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=False)
-    except DbsLoginError as e:
-        result = {"error": "login_failed_stop", "detail": str(e)}
+    except DbsLoginError:
+        result = {"error": "login_failed_stop"}
 
     out_file = Path(__file__).resolve().parents[1] / "data" / "dbs_collected.json"
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

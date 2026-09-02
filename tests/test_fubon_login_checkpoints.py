@@ -462,7 +462,7 @@ def test_ambiguous_login_frames_fail_run_before_submit_or_collect(monkeypatch, t
         result = crawler.run("https://ebank.taipeifubon.com.tw/B2C/common/Index.faces")
 
         assert crawler._find_login_frame(page) is None
-        assert "FubonLoginError" in result["error"]
+        assert result["error"] == "RuntimeError: login failed"
         submit.assert_not_called()
         collect.assert_not_called()
     finally:

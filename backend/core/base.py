@@ -40,6 +40,173 @@ from backend.core.login_checkpoints import (
 )
 
 
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+_SAFE_EXCEPTION_TYPES = (
+    (LoginCheckpointBlocked, "LoginCheckpointBlocked"),
+    (LoginInteractionRequired, "LoginInteractionRequired"),
+    (NotImplementedError, "NotImplementedError"),
+    (TimeoutError, "TimeoutError"),
+    (AssertionError, "AssertionError"),
+    (AttributeError, "AttributeError"),
+    (IndexError, "IndexError"),
+    (KeyError, "KeyError"),
+    (OSError, "OSError"),
+    (RuntimeError, "RuntimeError"),
+    (TypeError, "TypeError"),
+    (ValueError, "ValueError"),
+)
+
+
+_SAFE_CHECKPOINT_KIND_LABELS = (
+    (CheckpointKind.AUTHENTICATED, "authenticated"),
+    (CheckpointKind.READY_FOR_CREDENTIALS, "ready_for_credentials"),
+    (CheckpointKind.DISMISSIBLE_NOTICE, "dismissible_notice"),
+    (CheckpointKind.DUPLICATE_SESSION, "duplicate_session"),
+    (CheckpointKind.PROTOCOL_RESUBMIT, "protocol_resubmit"),
+    (CheckpointKind.CAPTCHA_RETRY, "captcha_retry"),
+    (CheckpointKind.STARTUP_RECOVERY, "startup_recovery"),
+    (CheckpointKind.OTP_REQUIRED, "otp_required"),
+    (CheckpointKind.PASSWORD_CHANGE_OPTIONAL, "password_change_optional"),
+    (CheckpointKind.PASSWORD_CHANGE_REQUIRED, "password_change_required"),
+    (CheckpointKind.EXPLICIT_LOGIN_ERROR, "explicit_login_error"),
+    (CheckpointKind.UNKNOWN_BLOCKER, "unknown_blocker"),
+)
+
+
+def _safe_exception_mro(exc: BaseException) -> tuple[type, ...]:
+    try:
+        mro = type.__getattribute__(type(exc), "__mro__")
+    except BaseException:
+        return ()
+    return mro if type(mro) is tuple else ()
+
+
+def _exception_inherits(exc: BaseException, *targets: type[BaseException]) -> bool:
+    return any(base is target for base in _safe_exception_mro(exc) for target in targets)
+
+
+def _safe_exception_type(exc: BaseException) -> str:
+    for base in _safe_exception_mro(exc):
+        for exception_type, label in _SAFE_EXCEPTION_TYPES:
+            if base is exception_type:
+                return label
+    return "Exception"
+
+
+def _safe_checkpoint_kind_label(kind: object) -> str:
+    return next(
+        (
+            label
+            for checkpoint_kind, label in _SAFE_CHECKPOINT_KIND_LABELS
+            if kind is checkpoint_kind
+        ),
+        "unknown_blocker",
+    )
+
+
+def _base_exception_state(exc: BaseException) -> dict:
+    try:
+        reduced = BaseException.__reduce__(exc)
+    except BaseException:
+        return {}
+    if type(reduced) is tuple and len(reduced) >= 3 and type(reduced[2]) is dict:
+        return reduced[2]
+    return {}
+
+
+def _safe_state_value(state: object, field: str) -> object | None:
+    if type(state) is not dict:
+        return None
+    try:
+        for key, value in dict.items(state):
+            if type(key) is str and key == field:
+                return value
+    except BaseException:
+        return None
+    return None
+
+
+def _safe_state_int(state: object, field: str) -> int:
+    value = _safe_state_value(state, field)
+    return value if type(value) is int else -1
+
+
+def _bank_collect_failure_code(function: str) -> str:
+    if "deadline" in function or "timeout" in function:
+        return "collect_timeout"
+    if "inventory" in function:
+        return "collect_inventory"
+    if "history_range" in function or "history_window" in function:
+        return "collect_range"
+    if "transport" in function or "fetch" in function or "response" in function:
+        return "collect_transport"
+    if any(
+        marker in function
+        for marker in ("frame", "open_", "query", "form", "dialog", "click")
+    ):
+        return "collect_navigation"
+    if any(
+        marker in function
+        for marker in (
+            "validate",
+            "normalize",
+            "amount",
+            "date",
+            "row",
+            "result",
+            "hit",
+            "canonical",
+            "strict",
+            "options",
+        )
+    ):
+        return "collect_validation"
+    if any(
+        marker in function
+        for marker in ("history", "transaction", "details", "loan")
+    ):
+        return "collect_history"
+    return "collect_adapter"
+
+
+def _safe_collect_failure_code(exc: BaseException) -> str:
+    """Map trusted application frames to one fixed, low-cardinality class."""
+    if _exception_inherits(exc, LoginCheckpointBlocked, LoginInteractionRequired):
+        return "collect_checkpoint"
+
+    code = "collect_external"
+    try:
+        tb = BaseException.__dict__["__traceback__"].__get__(exc, BaseException)
+    except BaseException:
+        return code
+    while tb is not None:
+        frame = tb.tb_frame
+        try:
+            relative = Path(frame.f_code.co_filename).resolve().relative_to(_BACKEND_ROOT)
+        except (OSError, RuntimeError, ValueError):
+            tb = tb.tb_next
+            continue
+        parts = relative.parts
+        function = frame.f_code.co_name
+        if not (
+            parts
+            and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", function)
+        ):
+            tb = tb.tb_next
+            continue
+        if parts[0] == "banks":
+            code = _bank_collect_failure_code(function)
+        elif parts[:2] == ("core", "login_checkpoints.py"):
+            code = "collect_checkpoint"
+        elif parts[:2] == ("core", "persist"):
+            code = "collect_persistence"
+        else:
+            code = "collect_contract"
+        tb = tb.tb_next
+    return code
+
+
 def write_private_json(path: Path, payload: dict) -> None:
     """Atomically replace a private JSON file without following links."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1101,7 +1268,8 @@ class BankCrawler(ABC):
         try:
             shutil.rmtree(self.session_dir)
         except OSError as e:
-            print(f"[{self.name}][session] rmtree 失敗（best-effort）: {e}",
+            print(f"[{self.name}][session] rmtree 失敗（best-effort）: "
+                  f"{_safe_exception_type(e)}; details withheld",
                   file=_sys.stderr)
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1421,17 +1589,62 @@ class BankCrawler(ABC):
                     else:
                         # login 子類可能 raise（例：ScsbLoginError、TaishinLoginError）
                         # — 不讓 StealthyFetcher 內部 swallow 變成 silent done。
-                        # 把 exception 訊息寫進 result，由 sync_runner 轉成 status=error。
+                        # 只寫固定診斷欄位，由 sync_runner 轉成 status=error。
                         import sys as _sys
-                        safe_code = getattr(e, "safe_code", None)
-                        if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
-                            msg = f"{type(e).__name__}: {e}"
-                        elif isinstance(safe_code, str) and safe_code in {"captcha_ocr_failed"}:
-                            msg = f"{type(e).__name__}: code={safe_code}"
+                        exception_type = _safe_exception_type(e)
+                        exception_state = _base_exception_state(e)
+                        safe_code = _safe_state_value(exception_state, "safe_code")
+                        if _exception_inherits(
+                            e, LoginCheckpointBlocked, LoginInteractionRequired
+                        ):
+                            outcome = _safe_state_value(exception_state, "outcome")
+                            try:
+                                outcome_state = (
+                                    object.__getattribute__(outcome, "__dict__")
+                                    if type(outcome) is CheckpointOutcome
+                                    else {}
+                                )
+                            except BaseException:
+                                outcome_state = {}
+                            kind = _safe_state_value(outcome_state, "kind")
+                            kind_label = _safe_checkpoint_kind_label(kind)
+                            raw_budget = _safe_state_value(exception_state, "budget")
+                            budget = LoginBudget()
+                            if type(raw_budget) is LoginBudget:
+                                try:
+                                    budget_state = object.__getattribute__(
+                                        raw_budget, "__dict__"
+                                    )
+                                    if type(budget_state) is dict:
+                                        budget = LoginBudget(
+                                            credential_submissions=_safe_state_int(
+                                                budget_state, "credential_submissions"
+                                            ),
+                                            protocol_resubmits=_safe_state_int(
+                                                budget_state, "protocol_resubmits"
+                                            ),
+                                            captcha_resubmits=_safe_state_int(
+                                                budget_state, "captcha_resubmits"
+                                            ),
+                                            reloads=_safe_state_int(
+                                                budget_state, "reloads"
+                                            ),
+                                        )
+                                except (AttributeError, TypeError, ValueError):
+                                    budget = LoginBudget()
+                            msg = (
+                                f"{exception_type}: kind={kind_label}, "
+                                f"credential_submissions={budget.credential_submissions}, "
+                                f"protocol_resubmits={budget.protocol_resubmits}, "
+                                f"captcha_resubmits={budget.captcha_resubmits}, "
+                                f"reloads={budget.reloads}"
+                            )
+                        elif type(safe_code) is str and safe_code == "captcha_ocr_failed":
+                            msg = f"{exception_type}: code=captcha_ocr_failed"
                         else:
-                            msg = f"{type(e).__name__}: login failed"
+                            msg = f"{exception_type}: login failed"
                         print(
-                            f"[{self.name}][login] raise → {type(e).__name__}: details withheld",
+                            f"[{self.name}][login] raise → {exception_type}: details withheld",
                             file=_sys.stderr,
                         )
                         result["error"] = msg
@@ -1470,15 +1683,14 @@ class BankCrawler(ABC):
                     # collect 階段 raise（包含 SCSB/Taishin 等明細查詢 raise）
                     # 一樣寫進 error，但 logged_in 仍 True → finally 會跑 logout。
                     import sys as _sys
-                    if isinstance(e, (LoginCheckpointBlocked, LoginInteractionRequired)):
-                        msg = f"collect_failed: {type(e).__name__}: {e}"
-                        print(f"[{self.name}][collect] raise → {msg}", file=_sys.stderr)
-                    else:
-                        msg = f"collect_failed: {type(e).__name__}"
-                        print(
-                            f"[{self.name}][collect] raise → {msg}: details withheld",
-                            file=_sys.stderr,
-                        )
+                    msg = (
+                        f"collect_failed: {_safe_exception_type(e)}: "
+                        f"code={_safe_collect_failure_code(e)}"
+                    )
+                    print(
+                        f"[{self.name}][collect] raise → {msg}; details withheld",
+                        file=_sys.stderr,
+                    )
                     result["error"] = msg
             finally:
                 # 已登入且仍在owned origin才best-effort logout；foreign origin零互動。
@@ -1488,7 +1700,7 @@ class BankCrawler(ABC):
                     except Exception as e:
                         import sys as _sys
                         print(
-                            f"[{self.name}][logout] exception {type(e).__name__} "
+                            f"[{self.name}][logout] exception {_safe_exception_type(e)} "
                             "(details withheld; best-effort, swallow)",
                             file=_sys.stderr,
                         )
@@ -1604,7 +1816,7 @@ class BankCrawler(ABC):
                     return True
             except Exception as e:
                 print(
-                    f"[{self.name}][logout] frame 掃描失敗: {type(e).__name__}",
+                    f"[{self.name}][logout] frame 掃描失敗: {_safe_exception_type(e)}",
                     file=_sys.stderr,
                 )
                 continue

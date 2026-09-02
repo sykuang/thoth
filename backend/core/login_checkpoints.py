@@ -170,7 +170,10 @@ class LoginBudget:
             self.protocol_resubmits,
             self.captcha_resubmits,
         )
-        if self.reloads not in (0, 1) or submission_state not in {
+        if any(
+            type(value) is not int
+            for value in (*submission_state, self.reloads)
+        ) or self.reloads not in (0, 1) or submission_state not in {
             (0, 0, 0),
             (1, 0, 0),
             (2, 1, 0),

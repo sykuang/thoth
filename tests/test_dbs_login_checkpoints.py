@@ -598,6 +598,20 @@ def test_login_prepare_and_authentication_are_direct_adapters(monkeypatch) -> No
     authenticated.assert_called_once_with(page)
 
 
+def test_collect_logs_only_dbs_drilldown_metadata() -> None:
+    source = Path(dbs_module.__file__).read_text()
+
+    assert "target={click_result.get('target')}" not in source
+    assert "candidate_count: candidates.length" in source
+    assert "candidate_count={candidate_count}" in source
+    assert "month_clicks={month_clicks}" not in source
+    assert "parsed={out['dbs_card_fee_page']}" not in source
+    assert "probe failed; details withheld" in source
+    assert "str(exc)" not in source
+    assert "str(me)" not in source
+    assert "str(e)" not in source
+
+
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     tree = ast.parse(Path(dbs_module.__file__).read_text())
     crawler = next(
@@ -611,4 +625,4 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     payload = "\n".join(
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     )
-    assert hashlib.sha256(payload.encode()).hexdigest() == "2d30dc5d76db3a54f88aabadcf27fadd888459e0ee085d0101eeb504b78e22a2"
+    assert hashlib.sha256(payload.encode()).hexdigest() == "310af690662679eb5c861d68a05853a81bc2f18089d37236a57c23e589c3b0cc"

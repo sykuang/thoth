@@ -6,16 +6,22 @@ import inspect
 from pathlib import Path
 import re
 from types import ModuleType, SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _safe_collect_failure_code,
+)
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
     CheckpointPhase,
     DEFAULT_ACTION_SELECTOR,
+    LoginBudget,
     LoginCheckpointBlocked,
     LoginCheckpointRule,
 )
@@ -322,10 +328,13 @@ def test_run_keeps_valid_machine_readable_login_error_code(
     crawler = _StagedCrawler(name="staged")
 
     class CodedLoginError(RuntimeError):
-        safe_code = "captcha_ocr_failed"
+        safe_code: str
+
+    error = CodedLoginError("PRIVATE-LOGIN-DOM-987654")
+    error.safe_code = "captcha_ocr_failed"
 
     def fail(_page):
-        raise CodedLoginError("PRIVATE-LOGIN-DOM-987654")
+        raise error
 
     monkeypatch.setattr(crawler, "prepare_login_page", fail)
     result, _ = _run(
@@ -337,7 +346,7 @@ def test_run_keeps_valid_machine_readable_login_error_code(
         ),
     )
 
-    assert result["error"] == "CodedLoginError: code=captcha_ocr_failed"
+    assert result["error"] == "RuntimeError: code=captcha_ocr_failed"
     assert "PRIVATE" not in result["error"]
     assert "PRIVATE" not in capsys.readouterr().err
 
@@ -367,7 +376,7 @@ def test_run_rejects_unregistered_or_non_string_login_error_codes(
         ),
     )
 
-    assert result["error"] == "CodedLoginError: login failed"
+    assert result["error"] == "RuntimeError: login failed"
     assert "PRIVATE" not in result["error"]
     assert "PRIVATE" not in capsys.readouterr().err
 
@@ -376,12 +385,13 @@ def test_run_redacts_collect_and_logout_exception_details(
     monkeypatch, tmp_path, capsys
 ) -> None:
     crawler = _StagedCrawler(name="staged")
+    unsafe_logout_error = type("PRIVATE_LOGOUT\nFORGED_LOG", (Exception,), {})
 
     def fail_collect(_page, _collector):
         raise RuntimeError("PRIVATE-COLLECT-DOM-987654")
 
     def fail_logout(_page):
-        raise RuntimeError("PRIVATE-LOGOUT-DOM-654321")
+        raise unsafe_logout_error("PRIVATE-LOGOUT-DOM-654321")
 
     monkeypatch.setattr(crawler, "collect", fail_collect)
     monkeypatch.setattr(crawler, "logout", fail_logout)
@@ -397,10 +407,383 @@ def test_run_redacts_collect_and_logout_exception_details(
     )
 
     stderr = capsys.readouterr().err
-    assert result["error"] == "collect_failed: RuntimeError"
+    assert result["error"] == "collect_failed: RuntimeError: code=collect_contract"
+    assert "code=collect_contract" in stderr
     assert "PRIVATE" not in repr(result)
     assert "PRIVATE" not in stderr
+    assert "FORGED_LOG" not in stderr
     assert "Traceback" not in stderr
+
+
+def test_run_redacts_login_checkpoint_rule_name(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail_login(_page):
+        raise LoginCheckpointBlocked(
+            LoginBudget(credential_submissions=1),
+            CheckpointOutcome(
+                CheckpointKind.UNKNOWN_BLOCKER,
+                rule_name="PRIVATE_ACCOUNT_987654",
+            ),
+        )
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == (
+        "LoginCheckpointBlocked: kind=unknown_blocker, credential_submissions=1, "
+        "protocol_resubmits=0, captcha_resubmits=0, reloads=0"
+    )
+    assert "PRIVATE_ACCOUNT_987654" not in repr(result)
+    assert "PRIVATE_ACCOUNT_987654" not in stderr
+
+
+def test_run_revalidates_mutated_login_budget(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+    budget = LoginBudget()
+
+    class HostileDict(dict):
+        def get(self, _key, _default=None):
+            raise RuntimeError("PRIVATE_BUDGET_987654\nFORGED_LOG")
+
+    object.__setattr__(
+        budget,
+        "__dict__",
+        HostileDict(
+            credential_submissions="PRIVATE_BUDGET_987654\nFORGED_LOG",
+            protocol_resubmits=0,
+            captcha_resubmits=0,
+            reloads=0,
+        ),
+    )
+
+    class HostileKindValue(str):
+        def __format__(self, _format_spec):
+            return "PRIVATE_KIND_987654\nFORGED_LOG"
+
+    monkeypatch.setattr(
+        CheckpointKind.UNKNOWN_BLOCKER,
+        "_value_",
+        HostileKindValue("unknown_blocker"),
+    )
+
+    def fail_login(_page):
+        raise LoginCheckpointBlocked(
+            budget,
+            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+        )
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == (
+        "LoginCheckpointBlocked: kind=unknown_blocker, credential_submissions=0, "
+        "protocol_resubmits=0, captcha_resubmits=0, reloads=0"
+    )
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+
+def test_run_redacts_hostile_login_exception_descriptors(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+    private_error = type("PRIVATE_TYPE_987654\nFORGED_LOG", (Exception,), {})
+
+    def hostile_traceback(_self):
+        raise private_error("PRIVATE_TRACEBACK_987654")
+
+    def hostile_dict(_self):
+        raise private_error("PRIVATE_DICT_987654")
+
+    def hostile_class(_self):
+        raise private_error("PRIVATE_CLASS_987654")
+
+    HostileLoginError = type(
+        "HostileLoginError",
+        (RuntimeError,),
+        {
+            "__traceback__": property(hostile_traceback),
+            "__dict__": property(hostile_dict),
+            "__class__": property(hostile_class),
+        },
+    )
+
+    def fail_login(_page):
+        raise HostileLoginError("PRIVATE_MESSAGE_987654")
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "RuntimeError: login failed"
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+
+def test_run_ignores_hostile_exception_state_keys(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+    private_error = type("PRIVATE_TYPE_987654\nFORGED_LOG", (Exception,), {})
+
+    class HostileKey:
+        def __hash__(self):
+            return hash("safe_code")
+
+        def __eq__(self, _other):
+            raise private_error("PRIVATE_KEY_987654")
+
+    error = RuntimeError("PRIVATE_MESSAGE_987654")
+    cast(dict[object, object], error.__dict__)[HostileKey()] = "captcha_ocr_failed"
+
+    def fail_login(_page):
+        raise error
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "RuntimeError: login failed"
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+
+def test_run_redacts_hostile_collect_exception_descriptors(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+    private_error = type("PRIVATE_TYPE_987654\nFORGED_LOG", (Exception,), {})
+
+    def hostile_traceback(_self):
+        raise private_error("PRIVATE_TRACEBACK_987654")
+
+    def hostile_dict(_self):
+        raise private_error("PRIVATE_DICT_987654")
+
+    def hostile_class(_self):
+        raise private_error("PRIVATE_CLASS_987654")
+
+    HostileCollectError = type(
+        "HostileCollectError",
+        (RuntimeError,),
+        {
+            "__traceback__": property(hostile_traceback),
+            "__dict__": property(hostile_dict),
+            "__class__": property(hostile_class),
+        },
+    )
+
+    def fail_collect(_page, _collector):
+        raise HostileCollectError("PRIVATE_MESSAGE_987654")
+
+    monkeypatch.setattr(crawler, "collect", fail_collect)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "collect_failed: RuntimeError: code=collect_contract"
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+
+def test_run_sanitizes_login_exception_type_name(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+    unsafe_error = type("PRIVATE_TOKEN_987654\nFORGED_LOG", (Exception,), {})
+
+    def fail_login(_page):
+        raise unsafe_error("PRIVATE-CUSTOMER-TEXT")
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "Exception: login failed"
+    assert "PRIVATE_TOKEN_987654" not in repr(result)
+    assert "PRIVATE_TOKEN_987654" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+    forged_crawler = _StagedCrawler(name="forged")
+    forged_crawler.session_dir.rmdir()
+    forged_runtime_error = type("RuntimeError", (Exception,), {})
+
+    def fail_with_forged_type(_page):
+        raise forged_runtime_error("PRIVATE-CUSTOMER-TEXT")
+
+    monkeypatch.setattr(forged_crawler, "_shared_login", fail_with_forged_type)
+    forged_result, _ = _run(
+        monkeypatch, tmp_path, forged_crawler, lambda *_args, **_kwargs: None
+    )
+    assert forged_result["error"] == "Exception: login failed"
+
+
+def test_run_rejects_str_subclass_login_error_code(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    class UnsafeCode(str):
+        def __format__(self, _spec: str) -> str:
+            return "PRIVATE_TOKEN_987654\nFORGED_LOG"
+
+    class CodedLoginError(RuntimeError):
+        safe_code = UnsafeCode("captcha_ocr_failed")
+
+    def fail_login(_page):
+        raise CodedLoginError("PRIVATE-CUSTOMER-TEXT")
+
+    monkeypatch.setattr(crawler, "_shared_login", fail_login)
+    result, _ = _run(monkeypatch, tmp_path, crawler, lambda *_args, **_kwargs: None)
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "RuntimeError: login failed"
+    assert "PRIVATE_TOKEN_987654" not in repr(result)
+    assert "PRIVATE_TOKEN_987654" not in stderr
+    assert "FORGED_LOG" not in stderr
+
+
+def test_safe_collect_failure_code_maps_trusted_frames_without_exposing_them(
+    monkeypatch,
+) -> None:
+    backend_root = Path(inspect.getfile(BankCrawler)).resolve().parents[1]
+    namespace: dict = {}
+    exec(
+        compile(
+            "def fail():\n    raise RuntimeError('PRIVATE-CUSTOMER-TEXT')\n",
+            str(backend_root / "banks/cathay.py"),
+            "exec",
+        ),
+        namespace,
+    )
+
+    try:
+        namespace["fail"]()
+    except RuntimeError as exc:
+        code = _safe_collect_failure_code(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert code == "collect_adapter"
+    assert "PRIVATE" not in code
+
+    namespace = {}
+    exec(
+        compile(
+            "def parse():\n    raise ValueError('PRIVATE-PERSISTENCE-TEXT')\n",
+            str(backend_root / "core/persist/esun.py"),
+            "exec",
+        ),
+        namespace,
+    )
+    try:
+        namespace["parse"]()
+    except ValueError as exc:
+        assert _safe_collect_failure_code(exc) == "collect_persistence"
+
+    namespace = {}
+    exec(
+        compile(
+            "def fail():\n    raise RuntimeError('PRIVATE-CUSTOMER-TEXT')\n",
+            "/tmp/backend/../PRIVATE.py",
+            "exec",
+        ),
+        namespace,
+    )
+    try:
+        namespace["fail"]()
+    except RuntimeError as exc:
+        assert _safe_collect_failure_code(exc) == "collect_external"
+
+    namespace = {}
+    exec(
+        compile(
+            "def fail():\n    raise RuntimeError('PRIVATE-CUSTOMER-TEXT')\n",
+            "/tmp/backend/../backend/banks/cathay.py",
+            "exec",
+        ),
+        namespace,
+    )
+    try:
+        namespace["fail"]()
+    except RuntimeError as exc:
+        assert _safe_collect_failure_code(exc) == "collect_external"
+
+    def fail_resolve(_path):
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    try:
+        namespace["fail"]()
+    except RuntimeError as exc:
+        assert _safe_collect_failure_code(exc) == "collect_external"
+
+
+def test_run_redacts_collect_checkpoint_metadata(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail_collect(_page, _collector):
+        raise LoginCheckpointBlocked(
+            LoginBudget(),
+            CheckpointOutcome(
+                CheckpointKind.UNKNOWN_BLOCKER,
+                rule_name="PRIVATE_ACCOUNT_987654",
+            ),
+        )
+
+    monkeypatch.setattr(crawler, "collect", fail_collect)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == (
+        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+    )
+    assert "PRIVATE_ACCOUNT_987654" not in repr(result)
+    assert "PRIVATE_ACCOUNT_987654" not in stderr
+
+
+def test_run_sanitizes_collect_exception_type_name(monkeypatch, tmp_path, capsys) -> None:
+    crawler = _StagedCrawler(name="staged")
+    unsafe_error = type("PRIVATE_ACCOUNT_987654\nFORGED_LOG", (Exception,), {})
+
+    def fail_collect(_page, _collector):
+        raise unsafe_error("PRIVATE-CUSTOMER-TEXT")
+
+    monkeypatch.setattr(crawler, "collect", fail_collect)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == "collect_failed: Exception: code=collect_contract"
+    assert "PRIVATE_ACCOUNT_987654" not in repr(result)
+    assert "PRIVATE_ACCOUNT_987654" not in stderr
+    assert "FORGED_LOG" not in stderr
 
 
 def test_default_logout_logs_only_fixed_status(capsys) -> None:
@@ -585,7 +968,9 @@ def test_collect_origin_drift_discards_data_and_skips_logout(
     assert crawler.submissions == 1
     assert "collect-origin-drift" not in crawler.events
     assert "data" not in result
-    assert "kind=unknown_blocker" in result["error"]
+    assert result["error"] == (
+        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+    )
     assert "PRIVATE-URL-MARKER" not in repr(result)
     assert "logout" not in crawler.events
 
@@ -960,7 +1345,8 @@ def test_unknown_outcome_may_name_active_different_kind_rule(monkeypatch, tmp_pa
     )
 
     assert crawler.submissions == 0
-    assert "kind=unknown_blocker, rule_name=otp-only" in result["error"]
+    assert "kind=unknown_blocker" in result["error"]
+    assert "rule_name" not in result["error"]
     assert "collect" not in crawler.events
     assert "logout" not in crawler.events
 
