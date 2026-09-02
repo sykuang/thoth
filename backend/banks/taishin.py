@@ -14,15 +14,26 @@
 from __future__ import annotations
 
 import base64
-import contextlib
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+import hashlib
+import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _OriginGuardProxy,
+    write_private_json,
+)
 from backend.core.card_bills import (
     card_bill_date,
     card_bill_money,
@@ -94,6 +105,9 @@ def _taishin_card_bill_fact(parsed: dict):
 
 class TaishinCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
+    FETCH_TIMEZONE_ID: ClassVar[str | None] = "Asia/Taipei"
     CREDENTIAL_HOSTS = frozenset({"my.taishinbank.com.tw"})
 
     def __init__(self):
@@ -101,7 +115,1049 @@ class TaishinCrawler(BankCrawler):
         self.creds = TaishinCreds.load()
 
     def _host_filter(self) -> str:
-        return "taishinbank.com"
+        return "taishinbank.com.tw"
+
+    @staticmethod
+    def _subtract_months(value: date, months: int) -> date:
+        month_index = value.year * 12 + value.month - 1 - months
+        year, month_zero = divmod(month_index, 12)
+        month = month_zero + 1
+        return date(year, month, min(value.day, monthrange(year, month)[1]))
+
+    def _history_window(self, identity: str, as_of: date) -> dict:
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        cursor = self.transaction_start_for(identity, domain="twd_transactions")
+        if mode == "full":
+            return {
+                "period": "12_months",
+                "start": self._subtract_months(as_of, 12),
+                "end": as_of,
+            }
+        if cursor is not None and cursor > as_of:
+            raise RuntimeError("taishin-twd-history-cursor")
+        if cursor is not None:
+            target = max(self._subtract_months(as_of, 12), cursor - timedelta(days=7))
+            periods = (
+                ("7_days", as_of - timedelta(days=7)),
+                ("14_days", as_of - timedelta(days=14)),
+                ("1_months", self._subtract_months(as_of, 1)),
+                ("2_months", self._subtract_months(as_of, 2)),
+                ("3_months", self._subtract_months(as_of, 3)),
+                ("6_months", self._subtract_months(as_of, 6)),
+                ("12_months", self._subtract_months(as_of, 12)),
+            )
+            period, start = next(item for item in periods if item[1] <= target)
+            return {"period": period, "start": start, "end": as_of}
+        return {
+            "period": "12_months",
+            "start": self._subtract_months(as_of, 12),
+            "end": as_of,
+        }
+
+    @staticmethod
+    def _validate_history_form(snapshot: dict) -> dict:
+        error = "taishin-twd-history-form"
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("query_buttons") != 1
+            or type(snapshot.get("query_button")) is not int
+            or snapshot["query_button"] < 0
+        ):
+            raise RuntimeError(error)
+        selects = snapshot.get("selects")
+        if not isinstance(selects, list):
+            raise RuntimeError(error)
+        expected_periods = [
+            ("-- 請選擇查詢期間 --", ""),
+            ("7天", "7_days"), ("14天", "14_days"),
+            ("1個月", "1_months"), ("2個月", "2_months"),
+            ("3個月", "3_months"), ("6個月", "6_months"),
+            ("12個月", "12_months"), ("自訂一年內期間", "inYear"),
+            ("申請查詢逾一年以上", "overYear"),
+        ]
+        expected_sort = [("由新到舊", "forward"), ("由舊到新", "reverse")]
+        period_selects, sort_selects, account_selects = [], [], []
+        last_index = -1
+        for select in selects:
+            if (
+                not isinstance(select, dict)
+                or type(select.get("index")) is not int
+                or select["index"] <= last_index
+            ):
+                raise RuntimeError(error)
+            last_index = select["index"]
+            options = select.get("options")
+            if not isinstance(options, list) or any(
+                not isinstance(option, dict) or option.get("index") != index
+                for index, option in enumerate(options)
+            ):
+                raise RuntimeError(error)
+            pairs = [(option.get("text"), option.get("value")) for option in options]
+            if pairs == expected_periods:
+                period_selects.append(select["index"])
+                continue
+            if pairs == expected_sort:
+                sort_selects.append(select["index"])
+                continue
+            if len(options) == 1:
+                first = options[0]
+                if (
+                    first.get("value") == ""
+                    and re.sub(r"\s+", " ", str(first.get("text") or "")).strip()
+                    == "-- 請選擇查詢帳號 --"
+                ):
+                    account_selects.append((select["index"], []))
+                continue
+            if len(options) < 2:
+                continue
+            first = options[0]
+            accounts, identities, values = [], set(), set()
+            for option in options[1:]:
+                text, value = option.get("text"), option.get("value")
+                digits = re.findall(r"(?<!\d)\d(?:[\d-]*\d)?(?!\d)", text or "")
+                matching = (
+                    [re.sub(r"\D", "", token) for token in digits
+                     if re.sub(r"\D", "", token) == value]
+                    if isinstance(value, str)
+                    else []
+                )
+                identity = matching[0] if len(matching) == 1 else ""
+                if (
+                    not isinstance(value, str)
+                    or not re.fullmatch(r"\d{12,14}", value)
+                    or identity != value
+                    or identity in identities
+                    or value in values
+                ):
+                    accounts = []
+                    break
+                identities.add(identity)
+                values.add(value)
+                accounts.append({"index": option["index"], "identity": identity, "value": value})
+            if (
+                accounts
+                and first.get("value") == ""
+                and "請選擇" in str(first.get("text") or "")
+            ):
+                account_selects.append((select["index"], accounts))
+        if len(period_selects) != 1 or len(sort_selects) != 1 or len(account_selects) != 1:
+            raise RuntimeError(error)
+        account_select, accounts = account_selects[0]
+        return {
+            "account_select": account_select,
+            "period_select": period_selects[0],
+            "sort_select": sort_selects[0],
+            "query_button": snapshot["query_button"],
+            "accounts": accounts,
+        }
+
+    @classmethod
+    def _require_history_inventory(
+        cls,
+        snapshot: dict,
+        expected: list[tuple[str, str]],
+    ) -> dict:
+        form = cls._validate_history_form(snapshot)
+        actual = [(item["identity"], item["value"]) for item in form["accounts"]]
+        if actual != expected:
+            raise RuntimeError("taishin-twd-history-inventory")
+        return form
+
+    def _require_history_network_quiescence(
+        self,
+        page,
+        collector: ResponseCollector,
+        *,
+        submitted_frame,
+        boundary: int,
+        request_sequence: int,
+        issued_count: int,
+    ):
+        matching = []
+        for _ in range(10):
+            page.wait_for_timeout(500)
+            if self._history_frame(page) is not submitted_frame:
+                raise RuntimeError("taishin-twd-history-frame")
+            matching = [
+                hit for hit in collector.hits
+                if hit.request_sequence > boundary
+                and urlparse(hit.raw_url or hit.url).path
+                == "/TIBNetBank/svc/web1/rb0102/query"
+            ]
+            if (
+                collector.request_sequence != request_sequence
+                or collector.issued_count("query") != issued_count
+                or len(matching) != 1
+            ):
+                raise RuntimeError("taishin-twd-history-response")
+        return matching[0]
+
+    @staticmethod
+    def _history_money(value: object, *, allow_dash: bool = False) -> int | None:
+        if allow_dash and value == "-":
+            return None
+        if not isinstance(value, str) or not re.fullmatch(
+            r"-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})",
+            value,
+        ):
+            raise RuntimeError("taishin-twd-history-dom")
+        parsed = int(value.replace(",", ""))
+        if abs(parsed) > 2_147_483_647:
+            raise RuntimeError("taishin-twd-history-dom")
+        return parsed
+
+    @staticmethod
+    def _add_history_response_bytes(total: int, body_size: int) -> int:
+        if (
+            type(total) is not int
+            or type(body_size) is not int
+            or total < 0
+            or body_size <= 0
+            or total + body_size > 5_000_000
+        ):
+            raise RuntimeError("taishin-twd-history-response-budget")
+        return total + body_size
+
+    @staticmethod
+    def _history_rows_digest(rows: list[dict]) -> str:
+        try:
+            serialized_rows = sorted(
+                json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for row in rows
+            )
+            encoded = ("[" + ",".join(serialized_rows) + "]").encode("utf-8")
+        except (TypeError, ValueError):
+            raise RuntimeError("taishin-twd-history-binding") from None
+        if len(encoded) > 5_000_000:
+            raise RuntimeError("taishin-twd-history-response-budget")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _non_sensitive_api_responses(hits: list) -> dict:
+        responses = {}
+        routes = {
+            "/TIBNetBank/svc/web1/rb0100/query": "query",
+            "/TIBNetBank/svc/web/common/qryTaishinPoint": "qryTaishinPoint",
+            "/TIBNetBank/svc/web4/rb0708rwd/qryRealTime": "qryRealTime",
+            "/TIBNetBank/svc/web4/rb0708rwd/doXTPA": "doXTPA",
+        }
+
+        def money(value: object) -> int:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise RuntimeError("taishin-api-projection")
+            raw = str(value).strip()
+            if re.fullmatch(r"-?(?:\d{1,12}|[1-9]\d{0,2}(?:,\d{3}){1,3})", raw) is None:
+                raise RuntimeError("taishin-api-projection")
+            parsed = int(raw.replace(",", ""))
+            if abs(parsed) > 2_147_483_647:
+                raise RuntimeError("taishin-api-projection")
+            return parsed
+
+        def text(value: object, limit: int, *, empty: bool = False) -> str:
+            if not isinstance(value, str) or len(value) > limit or (not empty and not value):
+                raise RuntimeError("taishin-api-projection")
+            if any(ord(char) < 32 and char not in "\t\n\r" for char in value):
+                raise RuntimeError("taishin-api-projection")
+            return value
+
+        for hit in hits:
+            parsed = urlparse(hit.raw_url or hit.url)
+            endpoint = routes.get(parsed.path)
+            mime = (hit.content_type or "").split(";", 1)[0].strip().lower()
+            if (
+                endpoint is None
+                or parsed.scheme != "https"
+                or parsed.hostname != "my.taishinbank.com.tw"
+                or parsed.port not in (None, 443)
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or hit.url != f"https://my.taishinbank.com.tw{parsed.path}"
+                or hit.method != "POST"
+                or hit.status != 200
+                or hit.redirected
+                or mime != "application/json"
+                or type(hit.body_size) is not int
+                or not 0 < hit.body_size <= 5_000_000
+                or not isinstance(hit.resp_json, dict)
+            ):
+                continue
+            try:
+                if endpoint == "query":
+                    output = hit.resp_json.get("OUTPUTDATA")
+                    savings = output.get("SavingAccount") if isinstance(output, dict) else None
+                    if hit.resp_json.get("RESULT") != "NORMAL" or not isinstance(savings, list) or len(savings) > 100:
+                        continue
+                    projected_accounts = []
+                    identities = set()
+                    for account in savings:
+                        if not isinstance(account, dict):
+                            raise RuntimeError("taishin-api-projection")
+                        account_no = text(account.get("accountNo"), 14)
+                        if not re.fullmatch(r"\d{12,14}", account_no) or account_no in identities:
+                            raise RuntimeError("taishin-api-projection")
+                        identities.add(account_no)
+                        projected_accounts.append({
+                            "accountNo": account_no,
+                            "balance": money(account.get("balance")),
+                            "accountTypeName": text(account.get("accountTypeName"), 100),
+                            "userdefineName": text(account.get("userdefineName") or "", 200, empty=True),
+                        })
+                    projected = {
+                        "RESULT": "NORMAL",
+                        "OUTPUTDATA": {"SavingAccount": projected_accounts},
+                    }
+                elif endpoint == "qryTaishinPoint":
+                    value = hit.resp_json.get("value")
+                    if not isinstance(value, dict):
+                        continue
+                    projected_value = {"balance": money(value.get("balance"))}
+                    if value.get("TSPOINT_balance") is not None:
+                        projected_value["TSPOINT_balance"] = money(value["TSPOINT_balance"])
+                    projected = {"value": projected_value}
+                elif endpoint == "qryRealTime":
+                    value = hit.resp_json.get("value")
+                    if not isinstance(value, dict):
+                        continue
+                    projected = {"value": {"crlimit": money(value.get("crlimit"))}}
+                else:
+                    value = hit.resp_json.get("value")
+                    card = value.get("001") if isinstance(value, dict) else None
+                    if not isinstance(card, dict):
+                        continue
+                    projected = {"value": {"001": {
+                        name: money(card.get(name))
+                        for name in ("OUT-CRLIMIT-PERM", "OUT-AVAIL-CREDIT")
+                    }}}
+            except RuntimeError:
+                continue
+            responses.setdefault(endpoint, projected)
+        return responses
+
+    @classmethod
+    def _normalize_history_cells(
+        cls,
+        row: list[str],
+        *,
+        identity: str,
+        start: date,
+        end: date,
+    ) -> dict:
+        error = "taishin-twd-history-dom"
+        limits = (100, 100, 500, 100, 100, 1000, 100)
+        if (
+            len(row) != 7
+            or not all(isinstance(value, str) for value in row)
+            or any(len(value) > limit for value, limit in zip(row, limits, strict=True))
+            or any(
+                ord(char) < 32 and char not in "\t\n\r"
+                for value in row for char in value
+            )
+        ):
+            raise RuntimeError(error)
+        row = [re.sub(r"\s+", " ", value).strip() for value in row]
+        try:
+            txn_at = datetime.strptime(row[0], "%Y/%m/%d %H:%M:%S")
+            account_day = datetime.strptime(row[1], "%Y/%m/%d").date()
+        except ValueError:
+            raise RuntimeError(error) from None
+        if (
+            not start <= txn_at.date() <= end
+            or not start <= account_day <= end
+            or abs((account_day - txn_at.date()).days) > 7
+        ):
+            raise RuntimeError(error)
+        description, memo = row[2], row[5]
+        if not description:
+            raise RuntimeError(error)
+        amount = cls._history_money(row[3], allow_dash=True)
+        balance = cls._history_money(row[4], allow_dash=True)
+        return {
+            "account_no": identity,
+            "datetime": txn_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "account_date": account_day.isoformat(),
+            "desc": description,
+            "expend": abs(amount) if amount is not None and amount < 0 else None,
+            "income": amount if amount is not None and amount >= 0 else None,
+            "balance": balance,
+            "counterparty_bank": None,
+            "counterparty_acct": memo[:30] if memo else None,
+            "memo": memo or None,
+        }
+
+    @staticmethod
+    def _validate_history_transport(
+        transport: dict,
+        *,
+        identity: str,
+        start: date,
+        end: date,
+    ) -> dict:
+        error = "taishin-twd-history-response"
+        keys = {
+            "url", "method", "status", "content_type", "redirected",
+            "main_frame_request", "request_frame_url", "request_body",
+            "response_result", "body_size", "request_sequence",
+        }
+        if (
+            not isinstance(transport, dict)
+            or set(transport) != keys
+            or not isinstance(transport.get("url"), str)
+            or not isinstance(transport.get("request_frame_url"), str)
+        ):
+            raise RuntimeError(error)
+        try:
+            parsed = urlparse(transport["url"])
+            frame_url = urlparse(transport["request_frame_url"])
+        except ValueError:
+            raise RuntimeError(error) from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "my.taishinbank.com.tw"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/TIBNetBank/svc/web1/rb0102/query"
+            or parsed.query
+            or parsed.fragment
+            or transport.get("method") != "POST"
+            or transport.get("status") != 200
+            or transport.get("content_type") != "application/json"
+            or transport.get("redirected") is not False
+            or transport.get("main_frame_request") is not False
+            or frame_url.scheme != "https"
+            or frame_url.hostname != "my.taishinbank.com.tw"
+            or frame_url.port not in (None, 443)
+            or frame_url.username is not None
+            or frame_url.password is not None
+            or frame_url.path not in {
+                "/TIBNetBank/svc/rwd/", "/TIBNetBank/svc/rwd/index.html",
+            }
+            or frame_url.query
+            or re.fullmatch(r"/RB0102/0100(?:\?ts=\d+)?", frame_url.fragment) is None
+            or transport.get("request_body") != {
+                "account": identity,
+                "start": start.strftime("%Y%m%d"),
+                "end": end.strftime("%Y%m%d"),
+            }
+            or transport.get("response_result") != "NORMAL"
+            or type(transport.get("body_size")) is not int
+            or not 0 < transport["body_size"] <= 5_000_000
+            or type(transport.get("request_sequence")) is not int
+            or transport["request_sequence"] <= 0
+        ):
+            raise RuntimeError(error)
+        return transport
+
+    @classmethod
+    def _validate_history_hit(
+        cls,
+        hit,
+        *,
+        identity: str,
+        start: date,
+        end: date,
+        boundary: int,
+        expected_frame=None,
+    ) -> dict:
+        error = "taishin-twd-history-response"
+        response = hit.resp_json
+        output = response.get("OUTPUTDATA") if isinstance(response, dict) else None
+        rows = output.get("userList") if isinstance(output, dict) else None
+        required = {
+            "sysdate", "dateNew", "memo", "txnamt",
+            "txnamtOut", "txnamtIn", "newbal", "message",
+        }
+        transport = {
+            "url": hit.raw_url or hit.url,
+            "method": hit.method,
+            "status": hit.status,
+            "content_type": (hit.content_type or "").split(";", 1)[0].strip().lower(),
+            "redirected": hit.redirected,
+            "main_frame_request": hit.main_frame_request,
+            "request_frame_url": hit.request_frame_url,
+            "request_body": hit.req_body,
+            "response_result": response.get("RESULT") if isinstance(response, dict) else None,
+            "body_size": hit.body_size,
+            "request_sequence": hit.request_sequence,
+        }
+        try:
+            cls._validate_history_transport(
+                transport, identity=identity, start=start, end=end,
+            )
+        except RuntimeError:
+            raise RuntimeError(error) from None
+        expected_frame = _OriginGuardProxy._unwrap(expected_frame)
+        if (
+            hit.url != transport["url"]
+            or hit.request_sequence <= boundary
+            or (expected_frame is not None and hit.request_frame is not expected_frame)
+            or not isinstance(response, dict)
+            or response.get("RESULT") != "NORMAL"
+            or not isinstance(output, dict)
+            or not isinstance(rows, list)
+            or len(rows) > 10_000
+            or any(not isinstance(row, dict) or not required <= set(row) for row in rows)
+        ):
+            raise RuntimeError(error)
+        normalized = []
+        for row in rows:
+            if (
+                any(
+                    not isinstance(row[key], str)
+                    for key in ("sysdate", "dateNew", "memo", "txnamtOut", "txnamtIn")
+                )
+                or not isinstance(row["message"], (str, type(None)))
+                or isinstance(row["txnamt"], bool)
+                or not isinstance(row["txnamt"], (str, int))
+                or isinstance(row["newbal"], bool)
+                or not isinstance(row["newbal"], (str, int, type(None)))
+            ):
+                raise RuntimeError(error)
+            stamp = re.fullmatch(r"(\d{8})\s?(\d{1,8})", row["sysdate"])
+            account_day = re.fullmatch(r"\d{8}", row["dateNew"])
+            description = row["memo"]
+            note = row["message"] or ""
+            incoming = row["txnamtIn"] != "-"
+            outgoing = row["txnamtOut"] != "-"
+            if (
+                stamp is None
+                or account_day is None
+                or (incoming and outgoing)
+            ):
+                raise RuntimeError(error)
+            time_digits = stamp[2].zfill(8)
+            try:
+                amount = None
+                if incoming or outgoing:
+                    amount = cls._history_money(str(row["txnamt"]))
+                    direction_amount = cls._history_money(
+                        row["txnamtIn"] if incoming else row["txnamtOut"],
+                    )
+                    if (
+                        direction_amount is None
+                        or direction_amount <= 0
+                        or amount is None
+                        or direction_amount != abs(amount)
+                    ):
+                        raise RuntimeError(error)
+                elif row["txnamt"] != "-" and cls._history_money(str(row["txnamt"])) != 0:
+                    raise RuntimeError(error)
+                balance = cls._history_money(
+                    "-" if row["newbal"] is None else str(row["newbal"]),
+                    allow_dash=True,
+                )
+                cells = [
+                    f"{stamp[1][:4]}/{stamp[1][4:6]}/{stamp[1][6:8]} "
+                    f"{time_digits[:2]}:{time_digits[2:4]}:{time_digits[4:6]}",
+                    f"{row['dateNew'][:4]}/{row['dateNew'][4:6]}/{row['dateNew'][6:8]}",
+                    description,
+                    "-" if amount is None else str(-abs(amount) if outgoing else abs(amount)),
+                    "-" if balance is None else str(balance),
+                    note,
+                    "",
+                ]
+                normalized.append(cls._normalize_history_cells(
+                    cells, identity=identity, start=start, end=end,
+                ))
+            except (RuntimeError, TypeError, ValueError):
+                raise RuntimeError(error) from None
+        return {"row_count": len(normalized), "rows": normalized, "transport": transport}
+
+    @classmethod
+    def _validate_history_snapshot(
+        cls,
+        snapshot: dict,
+        *,
+        identity: str,
+        period: str,
+        start: date,
+        end: date,
+        api_row_count: int,
+        api_rows: list[dict] | None = None,
+    ) -> dict:
+        error = "taishin-twd-history-dom"
+        keys = {
+            "evidence_fresh", "mutation_count", "quiet_ms", "route_bound",
+            "selected_identity", "selected_period",
+            "selected_sort", "busy_count", "dialog_count", "error_count", "table_count",
+            "headers", "rows", "total_count", "more_button_count", "no_more_count",
+            "pager_count", "no_result_count", "result_scope_bound",
+        }
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot) != keys
+            or snapshot.get("evidence_fresh") is not True
+            or snapshot.get("route_bound") is not True
+            or snapshot.get("result_scope_bound") is not True
+            or snapshot.get("selected_identity") != identity
+            or snapshot.get("selected_period") != period
+            or snapshot.get("selected_sort") != "forward"
+            or any(
+                type(snapshot.get(key)) is not int or snapshot[key] < 0
+                for key in (
+                    "mutation_count", "quiet_ms", "busy_count", "dialog_count",
+                    "error_count", "table_count",
+                    "total_count", "more_button_count", "no_more_count", "pager_count",
+                    "no_result_count",
+                )
+            )
+            or snapshot["busy_count"] != 0
+            or snapshot["dialog_count"] != 0
+            or snapshot["error_count"] != 0
+            or snapshot["pager_count"] != 0
+            or snapshot["mutation_count"] <= 0
+            or snapshot["quiet_ms"] < 1500
+            or type(api_row_count) is not int
+            or api_row_count < 0
+            or not isinstance(snapshot.get("headers"), list)
+            or not isinstance(snapshot.get("rows"), list)
+        ):
+            raise RuntimeError(error)
+        if api_row_count == 0:
+            if (
+                snapshot["table_count"] != 0
+                or snapshot["headers"]
+                or snapshot["rows"]
+                or snapshot["total_count"] != 0
+                or snapshot["more_button_count"] != 0
+                or snapshot["no_more_count"] != 0
+                or snapshot["no_result_count"] != 1
+            ):
+                raise RuntimeError(error)
+            return {"status": "explicit_empty", "rows": []}
+        if (
+            snapshot["table_count"] != 1
+            or snapshot["headers"] != ["交易日", "帳務日", "摘要", "金額", "餘額", "備註", ""]
+            or len(snapshot["rows"]) != api_row_count
+            or snapshot["total_count"] != api_row_count
+            or snapshot["more_button_count"] != 0
+            or snapshot["no_more_count"] != 1
+            or snapshot["no_result_count"] != 0
+        ):
+            raise RuntimeError(error)
+
+        normalized = []
+        for row in snapshot["rows"]:
+            if not isinstance(row, list) or len(row) != 7 or not all(isinstance(v, str) for v in row):
+                raise RuntimeError(error)
+            normalized.append(cls._normalize_history_cells(
+                row, identity=identity, start=start, end=end,
+            ))
+        if api_rows is not None:
+            try:
+                bound_dom = sorted(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    for row in normalized
+                )
+                bound_api = sorted(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    for row in api_rows
+                )
+            except (TypeError, ValueError):
+                raise RuntimeError(error) from None
+            if bound_dom != bound_api:
+                raise RuntimeError(error)
+        return {"status": "complete", "rows": normalized}
+
+    @staticmethod
+    def _history_frame(page):
+        matches = []
+        for frame in page.frames:
+            parsed = urlparse(frame.url or "")
+            if (
+                parsed.scheme == "https"
+                and parsed.hostname == "my.taishinbank.com.tw"
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in {
+                    "/TIBNetBank/svc/rwd/",
+                    "/TIBNetBank/svc/rwd/index.html",
+                }
+            ):
+                matches.append(frame)
+        if len(matches) != 1:
+            raise RuntimeError("taishin-twd-history-frame")
+        return matches[0]
+
+    @staticmethod
+    def _history_form_snapshot(frame) -> dict:
+        return frame.evaluate(r"""() => {
+            const visible = el => {
+                if (!el || el.hidden || (el.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
+                for (let p = el; p; p = p.parentElement) {
+                    const style = getComputedStyle(p);
+                    if (p.hidden || (p.getAttribute('aria-hidden') || '').toLowerCase() === 'true' ||
+                        style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
+                        Number(style.opacity) === 0) return false;
+                }
+                const box = el.getBoundingClientRect();
+                return box.width > 0 && box.height > 0;
+            };
+            const selects = [...document.querySelectorAll('select')]
+                .map((select, index) => ({select, index})).filter(item => visible(item.select));
+            const queryButtons = [...document.querySelectorAll("input[value='查詢']")]
+                .map((button, index) => ({button, index})).filter(item => visible(item.button));
+            return {
+                query_buttons: queryButtons.length,
+                query_button: queryButtons.length === 1 ? queryButtons[0].index : -1,
+                selects: selects.map(item => ({
+                    index: item.index,
+                    options: [...item.select.options].map((option, optionIndex) => ({
+                        index: optionIndex,
+                        text: (option.textContent || '').replace(/\s+/g, ' ').trim(),
+                        value: option.value || '',
+                    })),
+                })),
+            };
+        }""")
+
+    @staticmethod
+    def _history_result_snapshot(frame) -> dict:
+        return frame.evaluate(r"""() => {
+            const visible = el => {
+                if (!el || el.hidden || (el.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
+                for (let p = el; p; p = p.parentElement) {
+                    const style = getComputedStyle(p);
+                    if (p.hidden || (p.getAttribute('aria-hidden') || '').toLowerCase() === 'true' ||
+                        style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
+                        Number(style.opacity) === 0) return false;
+                }
+                const box = el.getBoundingClientRect();
+                return box.width > 0 && box.height > 0;
+            };
+            const norm = value => (value || '').replace(/\s+/g, ' ').trim();
+            const selects = [...document.querySelectorAll('select')].filter(visible);
+            const byOptions = labels => selects.find(select => {
+                const texts = [...select.options].map(option => norm(option.textContent));
+                return labels.every(label => texts.includes(label));
+            });
+            const accountSelect = selects.find(select =>
+                [...select.options].some(option => /^\d(?:[\d-]*\d)?(?:\s|$)/.test(norm(option.textContent)))
+            );
+            const periodSelect = byOptions(['7天', '12個月', '申請查詢逾一年以上']);
+            const sortSelect = byOptions(['由新到舊', '由舊到新']);
+            const tables = [...document.querySelectorAll('#savingAccountTransactionTable')].filter(visible);
+            const table = tables.length === 1 ? tables[0] : null;
+            let container = table && table.parentElement;
+            while (container && !container.querySelector('._table_more')) container = container.parentElement;
+            const total = norm(table && table.querySelector('tfoot')?.textContent).match(/共\s*(\d+)\s*筆(?:資料)?/);
+            const bodyText = norm(document.body?.innerText);
+            const noResults = [...document.querySelectorAll('._section_inquiry-result--noresult')]
+                .filter(visible).filter(node => norm(node.textContent).includes('查無資料'));
+            const resultAnchor = table || (noResults.length === 1 ? noResults[0] : null);
+            const resultRoot = resultAnchor && (
+                resultAnchor.closest('._section_inquiry-result, ._section_content, section') ||
+                (container && container !== document.body ? container : null) ||
+                (noResults.length === 1 && noResults[0].parentElement !== document.body
+                    ? noResults[0].parentElement : null)
+            );
+            const structuralErrors = [...document.querySelectorAll("[role='alert'], .alert, .error")]
+                .filter(visible);
+            const pagerControls = resultRoot ? [...resultRoot.querySelectorAll(
+                ".pagination, [class~='pagination'], [rel='next'], [aria-label='下一頁'], [title='下一頁']"
+            )] : [];
+            for (const node of resultRoot?.querySelectorAll("button, a, [role='button']") || []) {
+                const label = norm(node.textContent || node.getAttribute('aria-label') || node.title);
+                const handler = node.getAttribute('onclick') || '';
+                if (/^\d+$/.test(label) || /^(?:下一頁|next|›|»)>?$/i.test(label) || /(?:next|page)/i.test(handler)) {
+                    pagerControls.push(node);
+                }
+            }
+            const mutation = window.__thothTaishinHistoryMutation;
+            return {
+                evidence_fresh: false,
+                mutation_count: mutation?.count || 0,
+                quiet_ms: mutation?.count ? Math.max(0, Date.now() - mutation.last) : 0,
+                route_bound: /^#\/RB0102\/0100(?:\?ts=\d+)?$/.test(location.hash),
+                result_scope_bound: Boolean(resultRoot),
+                selected_identity: accountSelect ? accountSelect.value : '',
+                selected_period: periodSelect ? periodSelect.value : '',
+                selected_sort: sortSelect ? sortSelect.value : '',
+                busy_count: [...document.querySelectorAll(
+                    "[aria-busy='true'], [role='progressbar'], .loading, .loader, .spinner"
+                )].filter(visible).length,
+                dialog_count: [...document.querySelectorAll("[role='dialog'], .modal.show")]
+                    .filter(visible).length,
+                error_count: structuralErrors.length + (
+                    /(?:系統錯誤|系統忙碌|請稍後再試|登入逾時|請重新登入|session expired)/i
+                        .test(bodyText) ? 1 : 0
+                ),
+                table_count: tables.length,
+                headers: table ? [...table.querySelectorAll('thead th')].filter(visible).map(node => norm(node.textContent)) : [],
+                rows: table ? [...table.querySelectorAll('tbody tr')].filter(visible).map(row =>
+                    [...row.querySelectorAll(':scope > th, :scope > td')].filter(visible).map(cell => cell.textContent || '')
+                ) : [],
+                total_count: total ? Number(total[1]) : 0,
+                more_button_count: container ? container.querySelectorAll('._table_more__btn').length : 0,
+                no_more_count: container ? [...container.querySelectorAll('._table_more__nomore')]
+                    .filter(visible).filter(node => norm(node.textContent) === '沒有更多資料了').length : 0,
+                pager_count: new Set(pagerControls).size,
+                no_result_count: noResults.length,
+            };
+        }""")
+
+    def _collect_attested_twd_history(
+        self,
+        page,
+        collector: ResponseCollector,
+        *,
+        as_of: date | None = None,
+    ) -> dict:
+        as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        frame = self._history_frame(page)
+        frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
+        form = None
+        inventory_signature = None
+        inventory_stable_count = 0
+        for _ in range(60):
+            page.wait_for_timeout(500)
+            frame = self._history_frame(page)
+            try:
+                current_form = self._validate_history_form(self._history_form_snapshot(frame))
+            except RuntimeError:
+                inventory_signature = None
+                inventory_stable_count = 0
+                continue
+            current_signature = [
+                (item["identity"], item["value"]) for item in current_form["accounts"]
+            ]
+            if current_signature == inventory_signature:
+                inventory_stable_count += 1
+            else:
+                inventory_signature = current_signature
+                inventory_stable_count = 0
+            form = current_form
+            if inventory_stable_count >= 2 and current_signature:
+                break
+        if form is None or inventory_stable_count < 2:
+            raise RuntimeError("taishin-twd-history-form")
+        inventory = form["accounts"]
+        if not inventory:
+            state = self._history_result_snapshot(frame)
+            if (
+                state.get("route_bound") is not True
+                or any(
+                    type(state.get(key)) is not int or state[key] != 0
+                    for key in (
+                        "busy_count", "dialog_count", "error_count", "table_count",
+                        "no_result_count", "more_button_count", "no_more_count", "pager_count",
+                    )
+                )
+                or getattr(self, "_shared_dialog_blocked", False)
+            ):
+                raise RuntimeError("taishin-twd-history-empty-inventory")
+        results, expected, receipts = [], [], []
+        response_bytes = 0
+        inventory_signature = [(item["identity"], item["value"]) for item in inventory]
+
+        for position, account in enumerate(inventory):
+            if position:
+                frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
+                for _ in range(60):
+                    page.wait_for_timeout(500)
+                    frame = self._history_frame(page)
+                    try:
+                        form = self._validate_history_form(self._history_form_snapshot(frame))
+                    except RuntimeError:
+                        continue
+                    if [(item["identity"], item["value"]) for item in form["accounts"]] == inventory_signature:
+                        break
+                else:
+                    raise RuntimeError("taishin-twd-history-inventory")
+            window = self._history_window(account["identity"], as_of)
+            selects = frame.locator("select")
+            selects.nth(form["account_select"]).select_option(value=account["value"])
+            selects.nth(form["period_select"]).select_option(value=window["period"])
+            selects.nth(form["sort_select"]).select_option(value="forward")
+            selected = frame.evaluate("""indices => indices.map(index =>
+                [...document.querySelectorAll('select')][index].value
+            )""", [form["account_select"], form["period_select"], form["sort_select"]])
+            if selected != [account["value"], window["period"], "forward"]:
+                raise RuntimeError("taishin-twd-history-selection")
+
+            before_result = self._history_result_snapshot(frame)
+            if (
+                before_result["table_count"] != 0
+                or before_result["no_result_count"] != 0
+                or before_result["busy_count"] != 0
+                or before_result["dialog_count"] != 0
+                or before_result["error_count"] != 0
+            ):
+                raise RuntimeError("taishin-twd-history-stale-before-query")
+            frame.evaluate("""() => {
+                window.__thothTaishinHistoryObserver?.disconnect();
+                const state = {count: 0, last: 0};
+                window.__thothTaishinHistoryMutation = state;
+                window.__thothTaishinHistoryObserver = new MutationObserver(records => {
+                    state.count += records.length;
+                    state.last = Date.now();
+                });
+                window.__thothTaishinHistoryObserver.observe(document.body, {
+                    childList: true, subtree: true, characterData: true,
+                });
+            }""")
+            boundary = collector.request_sequence
+            issued_before = collector.issued_count("query")
+            query = frame.locator("input[value='查詢']")
+            if query.count() <= form["query_button"]:
+                raise RuntimeError("taishin-twd-history-query")
+            submitted_frame = frame
+            query.nth(form["query_button"]).click(timeout=8000)
+            matching = []
+            for _ in range(120):
+                page.wait_for_timeout(500)
+                matching = [
+                    hit for hit in collector.hits
+                    if hit.request_sequence > boundary
+                    and urlparse(hit.raw_url or hit.url).path == "/TIBNetBank/svc/web1/rb0102/query"
+                ]
+                if matching:
+                    break
+            if len(matching) != 1:
+                raise RuntimeError("taishin-twd-history-response")
+            response = self._validate_history_hit(
+                matching[0], identity=account["identity"], start=window["start"],
+                end=window["end"], boundary=boundary, expected_frame=submitted_frame,
+            )
+            body_size = matching[0].body_size
+            if type(body_size) is not int:
+                raise RuntimeError("taishin-twd-history-response-budget")
+            response_bytes = self._add_history_response_bytes(response_bytes, body_size)
+
+            frame = self._history_frame(page)
+            if frame is not submitted_frame:
+                raise RuntimeError("taishin-twd-history-frame")
+            for _ in range(min(response["row_count"] + 2, 10_002)):
+                if self._history_frame(page) is not submitted_frame:
+                    raise RuntimeError("taishin-twd-history-frame")
+                snapshot = self._history_result_snapshot(frame)
+                if snapshot["more_button_count"] == 0:
+                    break
+                before = len(snapshot["rows"])
+                buttons = frame.locator("._table_more__btn:visible")
+                if buttons.count() != 1:
+                    raise RuntimeError("taishin-twd-history-pagination")
+                buttons.nth(0).click(timeout=5000)
+                page.wait_for_timeout(300)
+                if len(self._history_result_snapshot(frame)["rows"]) <= before:
+                    raise RuntimeError("taishin-twd-history-pagination")
+            else:
+                raise RuntimeError("taishin-twd-history-pagination")
+
+            stable = None
+            stable_count = 0
+            for _ in range(60):
+                page.wait_for_timeout(500)
+                frame = self._history_frame(page)
+                if frame is not submitted_frame:
+                    raise RuntimeError("taishin-twd-history-frame")
+                snapshot = self._history_result_snapshot(frame)
+                signature = repr({**snapshot, "evidence_fresh": False, "quiet_ms": 0})
+                if signature == stable and snapshot["busy_count"] == 0:
+                    stable_count += 1
+                else:
+                    stable, stable_count = signature, 0
+                terminal = (
+                    snapshot["no_result_count"] == 1
+                    if response["row_count"] == 0
+                    else snapshot["table_count"] == 1 and snapshot["more_button_count"] == 0
+                )
+                if stable_count >= 4 and terminal and snapshot["quiet_ms"] >= 1500:
+                    snapshot["evidence_fresh"] = True
+                    break
+            else:
+                raise RuntimeError("taishin-twd-history-settle")
+            if self._shared_dialog_blocked:
+                raise RuntimeError("taishin-twd-history-dialog")
+            matching = [
+                hit for hit in collector.hits
+                if hit.request_sequence > boundary
+                and urlparse(hit.raw_url or hit.url).path == "/TIBNetBank/svc/web1/rb0102/query"
+            ]
+            if len(matching) != 1 or collector.issued_count("query") != issued_before + 1:
+                raise RuntimeError("taishin-twd-history-response")
+            quiescent_hit = self._require_history_network_quiescence(
+                page,
+                collector,
+                submitted_frame=submitted_frame,
+                boundary=boundary,
+                request_sequence=collector.request_sequence,
+                issued_count=issued_before + 1,
+            )
+            if quiescent_hit is not matching[0]:
+                raise RuntimeError("taishin-twd-history-response")
+            snapshot = self._history_result_snapshot(submitted_frame)
+            snapshot["evidence_fresh"] = True
+            submitted_frame.evaluate("window.__thothTaishinHistoryObserver?.disconnect()")
+            self._require_history_inventory(
+                self._history_form_snapshot(frame), inventory_signature,
+            )
+            validated = self._validate_history_snapshot(
+                snapshot, identity=account["identity"], period=window["period"],
+                start=window["start"], end=window["end"],
+                api_row_count=response["row_count"],
+                api_rows=response["rows"],
+            )
+            binding_digest = self._history_rows_digest(response["rows"])
+            receipt = {
+                "identity": account["identity"],
+                "start": window["start"].isoformat(),
+                "end": window["end"].isoformat(),
+                "status": validated["status"],
+                "pages": 1,
+            }
+            results.append({
+                **receipt,
+                "period": window["period"],
+                "rows": validated["rows"],
+                "snapshot": snapshot,
+                "api_row_count": response["row_count"],
+                "api_rows": response["rows"],
+                "transport": response["transport"],
+                "binding_digest": binding_digest,
+                "request_count": 1,
+                "response_count": 1,
+            })
+            expected.append({
+                "identity": account["identity"],
+                "start": window["start"].isoformat(),
+                "end": window["end"].isoformat(),
+            })
+            receipts.append(receipt)
+
+        domain = {
+            "domain": "twd_transactions",
+            "expected": expected,
+            "windows": receipts,
+        }
+        if not expected:
+            domain["empty_window"] = {
+                "start": self._subtract_months(as_of, 12).isoformat(),
+                "end": as_of.isoformat(),
+                "status": "explicit_empty",
+                "pages": 1,
+            }
+        coverage = {
+            "version": 1,
+            "mode": mode,
+            "domains": [domain],
+        }
+        from backend.core.base import validate_history_coverage
+
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=self.HISTORY_COVERAGE_DOMAINS,
+        )
+        return {"twd_txn_results": results, "history_coverage": coverage}
 
     def _find_login_frame(self, page):
         matches = [frame for frame in page.frames if self._is_login_frame_url(frame.url)]
@@ -289,7 +1345,7 @@ class TaishinCrawler(BankCrawler):
             ),
         )
 
-    def _try_ancestor_clicks(self, target_frame, page, debug_dir) -> bool:
+    def _try_ancestor_clicks(self, target_frame, page) -> bool:
         """台新信用卡 mega menu hover 策略 v2 (2026-06-11 真實 mouse)。
 
         實測揭示：信用卡 menu 是 `<li class="_nav_menu__item">` hover 觸發 mega menu。
@@ -317,8 +1373,8 @@ class TaishinCrawler(BankCrawler):
                 }
                 return null;
             }""")
-        except Exception as e:
-            _log(f"[taishin][collect] 取 LI bbox 例外: {e}")
+        except Exception:
+            _log("[taishin][collect] 取 LI bbox 例外")
             return False
 
         if not li_bbox:
@@ -340,8 +1396,8 @@ class TaishinCrawler(BankCrawler):
                         iframe_offset_y = fbox["y"]
                         _log(f"[taishin][collect] iframe offset: ({int(iframe_offset_x)},{int(iframe_offset_y)})")
                     break
-        except Exception as e:
-            _log(f"[taishin][collect] 取 iframe offset 失敗（用 0,0）: {e}")
+        except Exception:
+            _log("[taishin][collect] 取 iframe offset 失敗（用 0,0）")
 
         # Step 3: 真實 mouse.move 到 LI 中心
         li_center_x = iframe_offset_x + li_bbox["x"] + li_bbox["w"] / 2
@@ -354,9 +1410,8 @@ class TaishinCrawler(BankCrawler):
             page.wait_for_timeout(200)
             page.mouse.move(li_center_x, li_center_y, steps=10)
             page.wait_for_timeout(1500)  # 等 mega menu 展開動畫
-            page.screenshot(path=str(debug_dir / "mega_open.png"), full_page=False)
-        except Exception as e:
-            _log(f"[taishin][collect] mouse.move 例外: {e}")
+        except Exception:
+            _log("[taishin][collect] mouse.move 例外")
             return False
 
         # Step 4: dump mega menu 內可見 link（hover 還在，menu 還展開）
@@ -383,13 +1438,11 @@ class TaishinCrawler(BankCrawler):
                     return true;
                 });
             }""", li_bbox["y"])
-        except Exception as e:
-            _log(f"[taishin][collect] dump mega links 失敗: {e}")
+        except Exception:
+            _log("[taishin][collect] dump mega links 失敗")
             mega_links = []
 
-        _log(f"[taishin][collect] mega menu 內 {len(mega_links)} 個可見 link:")
-        for l in mega_links[:30]:
-            _log(f"  {l['tag']}@({int(l['x'])},{int(l['y'])}) {l['text']!r}")
+        _log(f"[taishin][collect] mega menu 可見 link 數={len(mega_links)}")
 
         # 判斷 mega menu 是否真的開了（找信用卡相關字樣）
         card_indicators = ["信用卡", "帳單", "消費明細", "紅利", "預借現金", "繳信"]
@@ -425,7 +1478,7 @@ class TaishinCrawler(BankCrawler):
             _log("[taishin][collect] ❌ mega menu 內找不到優先目標")
             return False
 
-        _log(f"[taishin][collect] 點 mega menu 子項: {target_link['text']!r} @({int(target_link['x'])},{int(target_link['y'])})")
+        _log("[taishin][collect] 點 allowlisted mega menu 子項")
         # 真實 mouse.move 到子項 → click（保 hover 同時 click）
         try:
             click_x = iframe_offset_x + target_link["x"] + target_link["w"] / 2
@@ -435,12 +1488,9 @@ class TaishinCrawler(BankCrawler):
             page.mouse.click(click_x, click_y)
             _log(f"[taishin][collect] page.mouse.click({click_x:.0f},{click_y:.0f})")
             page.wait_for_timeout(6000)
-            with contextlib.suppress(Exception):
-                page.screenshot(path=str(debug_dir / "card_detail.png"), full_page=False)
-            _log(f"[taishin][collect] click 後 url={page.url[:100]}")
             return True
-        except Exception as e:
-            _log(f"[taishin][collect] click 子項例外: {e}")
+        except Exception:
+            _log("[taishin][collect] click 子項例外")
             return False
 
     def _parse_credit_card_page(self, text: str) -> dict:
@@ -772,14 +1822,6 @@ class TaishinCrawler(BankCrawler):
         out: dict = {}
         page.wait_for_timeout(8000)
 
-        from backend.core.store import _data_root
-        debug_dir = _data_root() / "taishin_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-        out["initial_url"] = page.url
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "00_initial.png"), full_page=False)
-
         # ── Step 2: 從所有 frames（含主 page）找 top nav「信用卡」DOM 元素並點 ──
         # 台新 SPA 整個介面在 svc/rwd iframe 內，top nav 也在裡面（不在主 page）
         clicked_credit_card = False
@@ -787,7 +1829,7 @@ class TaishinCrawler(BankCrawler):
         target_info = None
         try:
             for f in [page] + [fr for fr in page.frames if fr != page.main_frame]:
-                kind = "page" if f == page else f'frame({(f.url or "")[:60]})'
+                kind = "page" if f == page else "frame"
                 try:
                     found = f.evaluate("""() => {
                         // 找 text='信用卡' 的元素，但更要找它的可點父鏈（a / button / [onclick] / [role=button]）
@@ -831,12 +1873,7 @@ class TaishinCrawler(BankCrawler):
                 except Exception:
                     found = []
                 if found:
-                    _log(f"[taishin][collect] {kind} 找到 {len(found)} 個「信用卡」候選:")
-                    for i, n in enumerate(found[:5]):
-                        _log(f"  [{i}] text={n['tag']}@({int(n['x'])},{int(n['y'])}) {int(n['w'])}x{int(n['h'])} "
-                             f"→ click_target={n['click_tag']}.{n['click_class'][:40]!r}"
-                             f" @({int(n['click_x'])},{int(n['click_y'])}) "
-                             f"{int(n['click_w'])}x{int(n['click_h'])} visible={n['click_visible']}")
+                    _log(f"[taishin][collect] {kind} 信用卡候選數={len(found)}")
                     if target_info is None:
                         # 優先 top nav (y < 250) + visible click_target
                         top_nav = [n for n in found if n["y"] < 250 and n["click_visible"]]
@@ -848,24 +1885,19 @@ class TaishinCrawler(BankCrawler):
             if target_info and target_frame:
                 # 2026-06-11 (C 路徑教訓): 直接 click SPAN 文字無效 (toggle 'on' class 但無 routing)
                 # 需逐層 click ancestors，找到真正能展開 dropdown / 跳頁的層級
-                clicked_credit_card = self._try_ancestor_clicks(target_frame, page, debug_dir)
+                clicked_credit_card = self._try_ancestor_clicks(target_frame, page)
             else:
                 _log("[taishin][collect] 全 frames 都找不到「信用卡」元素")
-        except Exception as e:
-            _log(f"[taishin][collect] 找信用卡 nav 例外: {e}")
-
-        out["clicked_credit_card"] = clicked_credit_card
+        except Exception:
+            _log("[taishin][collect] 找信用卡 nav 例外")
 
         # ── Step 3: 等信用卡頁載入 + 等 API call 跑完（10 秒） ──
         page.wait_for_timeout(10000)
-        with contextlib.suppress(Exception):
-            page.screenshot(path=str(debug_dir / "02_after_card_click.png"), full_page=True)
-        out["after_card_click_url"] = page.url
-        _log(f"[taishin][collect] click 後 final url={page.url[:100]}")
 
         # ── Step 4: dump 信用卡頁 frame text + 攔 API ──
         # 已經點過「查詢信用卡明細」（在 _try_ancestor_clicks 內），現在直接 dump
         credit_card_frame = None
+        page_text = ""
         if clicked_credit_card:
             for f in page.frames:
                 if f == page.main_frame:
@@ -874,19 +1906,13 @@ class TaishinCrawler(BankCrawler):
                     ct = f.evaluate("() => document.body.innerText.slice(0, 12000)")
                     if ct and ("信用卡" in ct or "帳單" in ct or "消費" in ct or "應繳" in ct):
                         credit_card_frame = f
-                        out["credit_card_page_text"] = ct
-                        out["credit_card_frame_url"] = f.url[:200]
-                        _log(f"[taishin][collect] 信用卡頁 frame text len={len(ct)} url={f.url[:100]}")
+                        page_text = ct
+                        _log(f"[taishin][collect] 信用卡頁 frame text len={len(ct)}")
                         break
                 except Exception:
                     pass
 
-        # 信用卡 menu hover 後也順便 dump 完整 mega menu 截圖（archive）
-        card_submenu = []
-        out["card_submenu"] = card_submenu  # 保留欄位但不再 click
-
         # ── Step 4b: parse 信用卡頁 frame text 抽結構化資料 ──
-        page_text = out.get("credit_card_page_text") or ""
         if page_text:
             try:
                 parsed = self._parse_credit_card_page(page_text)
@@ -914,11 +1940,11 @@ class TaishinCrawler(BankCrawler):
                                 .map((o, index) => ({index, text: (o.textContent || '').trim()}))
                                 .filter(o => /^\\d{4}\\/\\d{2}$/.test(o.text));
                         }""") or []
-                    except Exception as e:
-                        _log(f"[taishin][collect] 月份下拉 dump 失敗: {e}")
+                    except Exception:
+                        _log("[taishin][collect] 月份下拉 dump 失敗")
                     # 穩定按時間降序排 (2026/06, 2026/05, ...)，log 才不會神秘跳
                     month_options.sort(key=lambda o: o.get("text") or "", reverse=True)
-                    out["credit_card_month_options"] = month_options
+
                     seen_billed_keys = {
                         (r.get("txn_date"), r.get("post_date"), r.get("desc"), r.get("amount"))
                         for r in parsed.get("billed_txns", [])
@@ -950,8 +1976,8 @@ class TaishinCrawler(BankCrawler):
                                 if amt < 0 and ("扣繳" in desc or "轉帳" in desc):
                                     added += 1
                             _log(f"[taishin][collect] 月份 {opt.get('text')} 補 payment rows={added}")
-                        except Exception as e:
-                            _log(f"[taishin][collect] 月份 {opt.get('text')} 查詢失敗: {e}")
+                        except Exception:
+                            _log(f"[taishin][collect] 月份 {opt.get('text')} 查詢失敗")
 
                 out["credit_card_parsed"] = parsed
                 _log(f"[taishin][collect] parser 結果: "
@@ -959,122 +1985,16 @@ class TaishinCrawler(BankCrawler):
                      f"pending={len(parsed.get('pending_txns', []))} "
                      f"billed={len(parsed.get('billed_txns', []))} "
                      f"summary={'有' if parsed.get('summary') else '無'}")
-            except Exception as e:
-                _log(f"[taishin][collect] parser 例外: {e}")
-                out["credit_card_parsed"] = {"error": str(e)}
+            except Exception:
+                _log("[taishin][collect] parser 例外")
+                out["credit_card_parsed"] = {"error": "parse_failed"}
 
-        # ── Step 5: 台幣存款交易明細（RB0102/0100 查詢交易明細）──
-        # 2026-06-30: 使用者要求補齊 account drilldown 的存款交易。
-        # getNbMenuData 顯示臺幣服務 → 臺幣帳戶查詢 → 查詢交易明細 href=RB0102/0100。
-        # 先進 route dump form/results 與攔截 API；persist parser 下一步依真 raw shape 寫。
-        try:
-            txn_frame = None
-            for f in page.frames:
-                if "svc/rwd" in (f.url or ""):
-                    txn_frame = f
-                    break
-            if txn_frame:
-                nav = txn_frame.evaluate("""() => {
-                    location.hash = '#/RB0102/0100?ts=' + Date.now();
-                    return location.href;
-                }""")
-                _log(f"[taishin][twd] goto RB0102/0100 → {nav[:120]}")
-                page.wait_for_timeout(8000)
-                with contextlib.suppress(Exception):
-                    page.screenshot(path=str(debug_dir / "03_twd_txn_query.png"), full_page=True)
-                for f in page.frames:
-                    if "svc/rwd" in (f.url or ""):
-                        txn_frame = f
-                        break
-                twd_text = txn_frame.evaluate("() => document.body.innerText.slice(0, 30000)") or ""
-                out["twd_txn_page_text"] = twd_text
-                out["twd_txn_frame_url"] = txn_frame.url[:300]
-                out["twd_txn_form_controls"] = txn_frame.evaluate(r"""() => ({
-                    selects: [...document.querySelectorAll('select')].map((s, si) => ({
-                        index: si, id: s.id, name: s.name, value: s.value,
-                        visible: s.offsetParent !== null,
-                        options: [...s.options].map((o, oi) => ({index: oi, value: o.value || '', text: (o.textContent || '').trim()})).slice(0, 20),
-                    })),
-                    inputs: [...document.querySelectorAll('input')].map((i, ii) => ({
-                        index: ii, id: i.id, name: i.name, type: i.type, value: i.value,
-                        visible: i.offsetParent !== null,
-                        placeholder: i.placeholder || '',
-                        text: (i.closest('label,div,td,tr')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
-                    })).slice(0, 80),
-                    buttons: [...document.querySelectorAll('button,a,[role=button]')].map((b, bi) => ({
-                        index: bi, tag: b.tagName, id: b.id, cls: (b.className || '').toString().slice(0,80), href: b.getAttribute('href') || '',
-                        text: (b.textContent || '').replace(/\s+/g, ' ').trim(), visible: b.offsetParent !== null,
-                    })).filter(b => b.text || b.href).slice(0, 120),
-                })""")
-                _log(f"[taishin][twd] page text_len={len(twd_text)} url={txn_frame.url[:120]}")
+        # ── Step 5: attested TWD transaction history ──
+        out.update(self._collect_attested_twd_history(page, collector))
 
-                twd_results = []
-                account_options = (out.get("twd_txn_form_controls") or {}).get("selects", [{}])[0].get("options", [])[1:]
-                for acct_idx, opt in enumerate(account_options[:10], start=1):
-                    query_result = {"ok": False}
-                    try:
-                        # Taishin RB0102 uses visible native-looking selects backed by Vue.
-                        # Direct selectedIndex+dispatch reads back in DOM but does not update
-                        # Vue model; Playwright select_option(index=...) fires the trusted path.
-                        txn_frame.locator("select").nth(0).select_option(index=opt.get("index") or acct_idx)
-                        page.wait_for_timeout(800)
-                        txn_frame.locator("select").nth(1).select_option(index=3)  # 1個月
-                        page.wait_for_timeout(800)
-                        txn_frame.locator("select").nth(2).select_option(index=0)  # 由新到舊
-                        page.wait_for_timeout(500)
-                        selected = txn_frame.evaluate("""() => {
-                            const sels = [...document.querySelectorAll('select')];
-                            return {
-                                accountText: sels[0]?.options[sels[0].selectedIndex]?.textContent?.trim() || '',
-                                periodText: sels[1]?.options[sels[1].selectedIndex]?.textContent?.trim() || '',
-                                sortText: sels[2]?.options[sels[2].selectedIndex]?.textContent?.trim() || '',
-                            };
-                        }""")
-                        txn_frame.locator("input[value='查詢']").first.click(timeout=8000)
-                        query_result = {"ok": True, **(selected or {})}
-                    except Exception as e:
-                        query_result = {"ok": False, "error": str(e)}
-                    _log(f"[taishin][twd] 帳號#{acct_idx} 查詢: {query_result}")
-                    page.wait_for_timeout(8000)
-                    for f in page.frames:
-                        if "svc/rwd" in (f.url or ""):
-                            txn_frame = f
-                            break
-                    result_text = txn_frame.evaluate("() => document.body.innerText.slice(0, 50000)") or ""
-                    twd_results.append({
-                        "selected_text": opt.get("text"),
-                        "query_result": query_result,
-                        "url": txn_frame.url[:300],
-                        "text": result_text,
-                    })
-                    with contextlib.suppress(Exception):
-                        page.screenshot(path=str(debug_dir / f"04_twd_txn_result_{acct_idx}.png"), full_page=True)
-                    if acct_idx < len(account_options[:10]):
-                        with contextlib.suppress(Exception):
-                            txn_frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
-                            page.wait_for_timeout(5000)
-                            for f in page.frames:
-                                if "svc/rwd" in (f.url or ""):
-                                    txn_frame = f
-                                    break
-                out["twd_txn_results"] = twd_results
-            else:
-                out["twd_txn_error"] = "rwd_frame_not_found"
-                _log("[taishin][twd] 找不到 svc/rwd frame")
-        except Exception as e:
-            out["twd_txn_error"] = str(e)
-            _log(f"[taishin][twd] probe 失敗: {e}")
-
-        # ── Step 6: dump 所有攔到的 API responses ──
-        hits_by_endpoint = {}
-        for h in collector.hits:
-            if h.resp_json is None:
-                continue
-            if h.endpoint not in hits_by_endpoint:
-                hits_by_endpoint[h.endpoint] = h.resp_json
+        # ── Step 6: retain only non-sensitive API responses needed by persistence ──
+        hits_by_endpoint = self._non_sensitive_api_responses(collector.hits)
         out["api_responses"] = hits_by_endpoint
-        out["final_url"] = page.url
-        out["_all_endpoints"] = sorted(hits_by_endpoint.keys())
         parsed = out.get("credit_card_parsed") or {}
         publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])
         _log(f"[taishin][collect] 攔到 {len(hits_by_endpoint)} 個 endpoint")
@@ -1082,20 +2002,14 @@ class TaishinCrawler(BankCrawler):
 
 
 if __name__ == "__main__":
-    import json
     crawler = TaishinCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=True)
-    except TaishinLoginError as e:
-        result = {"error": "login_failed_stop", "detail": str(e)}
+    except TaishinLoginError:
+        result = {"error": "login_failed_stop"}
 
     out_file = Path(__file__).resolve().parents[1] / "data" / "taishin_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_private_json(out_file, result)
     _log(f"\n[taishin][done] 已存: {out_file}")
     if result.get("error"):
         _log(f"  ❌ error: {result['error']}")
-    else:
-        data = result.get("data", {})
-        _log(f"  url: {data.get('final_url')}")
-        _log(f"  frames: {len(data.get('frames', []))}")
-        _log(f"  endpoints: {data.get('_all_endpoints', [])}")

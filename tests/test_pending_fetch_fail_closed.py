@@ -17,6 +17,7 @@ from backend.core.persist.taishin import persist_taishin
 from backend.core.persist.ubot import persist_ubot
 from backend.core.persist import ubot as ubot_persist_module
 from backend.core.store import BankStore
+from tests.taishin_fixtures import with_taishin_history
 
 
 STALE_ERROR_MESSAGES = (
@@ -115,8 +116,8 @@ def _assert_kept(store):
     (persist_ubot, _ubot_with_history({"card_unbilled": {
         "error": "session expired", "CardList": [],
     }})),
-    (persist_taishin, {"credit_card_parsed": None}),
-    (persist_taishin, {"credit_card_parsed": {"pending_txns": []}}),
+    (persist_taishin, with_taishin_history({"credit_card_parsed": None})),
+    (persist_taishin, with_taishin_history({"credit_card_parsed": {"pending_txns": []}})),
     (persist_sinopac, {"card_unbilled": {"latest_tx": {
         "ResultCode": "99", "Error": {"message": "auth failed"},
         "Result": {"Items": []},
@@ -265,7 +266,7 @@ def test_taishin_generic_heading_with_error_is_not_success(store):
     parsed = crawler._parse_credit_card_page(
         "查詢信用卡明細\n即時消費紀錄\n系統錯誤，請稍後再試")
     assert parsed["fetch_ok"] is False
-    persist_taishin({"credit_card_parsed": parsed}, store, rules=[])
+    persist_taishin(with_taishin_history({"credit_card_parsed": parsed}), store, rules=[])
     _assert_kept(store)
 
 
@@ -287,7 +288,7 @@ def test_taishin_stale_headers_with_login_error_are_not_success(store, message):
     parsed = crawler._parse_credit_card_page(
         "即時消費紀錄\n消費日期\n消費時間\n消費明細\n授權結果\n" + message)
     assert parsed["fetch_ok"] is False
-    delta = persist_taishin({"credit_card_parsed": parsed}, store, rules=[])
+    delta = persist_taishin(with_taishin_history({"credit_card_parsed": parsed}), store, rules=[])
     assert delta["card_current"] == 1
     assert store.conn.execute(
         "SELECT COUNT(*) AS n FROM card_pending_txns WHERE scope='realtime'"
@@ -306,9 +307,9 @@ def test_taishin_explicit_target_page_success_sweeps_realtime(store):
         "card_no": "****1234", "date": "2026-07-01", "desc": "REALTIME",
         "amount": 300, "currency": "TWD",
     }], rules=[])
-    persist_taishin({"credit_card_parsed": {
+    persist_taishin(with_taishin_history({"credit_card_parsed": {
         "fetch_ok": True, "pending_txns": [],
-    }}, store, rules=[])
+    }}), store, rules=[])
     count = store.conn.execute(
         "SELECT COUNT(*) AS n FROM card_pending_txns WHERE scope='realtime'"
     ).fetchone()

@@ -474,6 +474,9 @@ class Connection:
     def commit(self) -> None:
         self._conn.commit()
 
+    def rollback(self) -> None:
+        self._conn.rollback()
+
     def close(self) -> None:
         if self._closed:
             return

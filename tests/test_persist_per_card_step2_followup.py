@@ -13,6 +13,7 @@ import pytest
 from backend.core.persist import persist_taishin
 from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.store import BankStore
+from tests.taishin_fixtures import with_taishin_history
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ def test_taishin_used_credit_computed_from_doxtpa(store_taishin):
             "top_summary": {"unpaid": 0},
         },
     }
-    persist_taishin(data, store_taishin)
+    persist_taishin(with_taishin_history(data), store_taishin)
     rows = list(store_taishin.conn.execute(
         "SELECT card_no, credit_limit, used_credit FROM cards"
     ))
@@ -80,55 +81,11 @@ def test_taishin_fallback_to_top_summary_when_doxtpa_missing(store_taishin):
             "top_summary": {"unpaid": 12345},
         },
     }
-    persist_taishin(data, store_taishin)
+    persist_taishin(with_taishin_history(data), store_taishin)
     rows = list(store_taishin.conn.execute(
         "SELECT used_credit FROM cards"
     ))
     assert rows[0][0] == 12345.0  # top_summary.unpaid fallback
-
-
-def test_taishin_persists_twd_transaction_detail_rows(store_taishin):
-    """RB0102 查詢交易明細結果必須寫入 twd_transactions."""
-    data = {
-        "api_responses": {
-            "query": {"OUTPUTDATA": {"SavingAccount": []}},
-        },
-        "twd_txn_results": [
-            {
-                "selected_text": "9000-00-0022703-1 測試帳戶",
-                "query_result": {
-                    "accountText": "9000-00-0022703-1 測試帳戶",
-                    "periodText": "1個月",
-                },
-                "text": (
-                    "查詢結果\n交易明細\n依排序\n"
-                    "交易日\n\t\n帳務日\n\t\n摘要\n\t\n金額\n\t\n餘額\n\t\n備註\n\t\n\n\n"
-                    "2026/06/29 16:16:16\n\t\n2026/06/29\n\t\n媒體轉帳\n\t\n-80\n\t\n0\n\t\n測試卡費\n\t\n消費屬性設定\n\n\n"
-                    "2026/06/26 16:53:41\n\t\n2026/06/26\n\t\nCD轉入\n\t\n80\n\t\n80\n\t\nATM 807-0090000000197014\n\t\n消費屬性設定\n\n\n"
-                    "共 2 筆資料資料日期：2026/06/30 22:17:28\n沒有更多資料了\n"
-                ),
-            }
-        ],
-    }
-
-    delta = persist_taishin(data, store_taishin)
-
-    assert delta["twd_txn_new"] == 2
-    rows = [
-        tuple(row)
-        for row in store_taishin.conn.execute(
-            "SELECT account_no, txn_datetime, account_date, description, raw_description, "
-            "expend, income, balance, memo "
-            "FROM twd_transactions ORDER BY txn_datetime"
-        )
-    ]
-    assert rows == [
-        ("90000000227031", "2026-06-26 16:53:41", "2026-06-26",
-         "CD轉入 - ATM 807-0090000000197014", "CD轉入", None, 80.0, 80.0,
-         "ATM 807-0090000000197014"),
-        ("90000000227031", "2026-06-29 16:16:16", "2026-06-29",
-         "媒體轉帳 - 測試卡費", "媒體轉帳", 80.0, None, 0.0, "測試卡費"),
-    ]
 
 
 def test_sinopac_applies_due_and_stmt_from_card_statements(store_sinopac):

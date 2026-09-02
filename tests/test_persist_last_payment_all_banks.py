@@ -33,6 +33,7 @@ from backend.core.persist import (
 )
 from backend.core.persist.sinopac import _persist_sinopac as persist_sinopac
 from backend.core.store import BankStore
+from tests.taishin_fixtures import with_taishin_history
 
 
 def _make_store(tmp_path, monkeypatch, bank):
@@ -848,7 +849,7 @@ def test_taishin_writes_bill_due_and_paid(tmp_path, monkeypatch):
                                               "OUT-AVAIL-CREDIT": "99900"}}},
             },
         }
-        persist_taishin(data, store, rules=None)
+        persist_taishin(with_taishin_history(data), store, rules=None)
         card = _read_card_fields(store, "****7050")
         assert card is not None
         assert card["bill_due_amount"] == 50.0
@@ -889,7 +890,7 @@ def test_taishin_writes_last_payment_from_credit_card_month_payment_row(tmp_path
                                               "OUT-AVAIL-CREDIT": "399920"}}},
             },
         }
-        persist_taishin(data, store, rules=None)
+        persist_taishin(with_taishin_history(data), store, rules=None)
         card = _read_card_fields(store, "****7018")
         assert card is not None
         assert card["bill_due_amount"] == 0.0

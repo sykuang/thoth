@@ -4,78 +4,173 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
+import json
 import re
+from zoneinfo import ZoneInfo
 
 from backend.core import account_classify, classify
+from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
 from backend.core.persist._common import _num, _num_real, _num_to_float, _slash_date_to_iso
 
 
-def _parse_taishin_twd_txn_results(results: list[dict]) -> list[dict]:
-    """台新 RB0102/0100「查詢交易明細」頁 text → twd_transactions rows."""
-    rows: list[dict] = []
-    for result in results or []:
-        if not isinstance(result, dict):
-            continue
-        text = result.get("text") or ""
-        if not text or "交易明細" not in text:
-            continue
-        selected = result.get("selected_text") or (result.get("query_result") or {}).get("accountText") or ""
-        acct_digits = re.sub(r"\D", "", selected)
-        account_no = acct_digits if len(acct_digits) >= 10 else None
-        if not account_no:
-            continue
+def _validated_attested_twd_rows(data: dict, store: BankStore) -> list[dict]:
+    coverage = data.get("history_coverage")
+    results = data.get("twd_txn_results")
+    if coverage is None and results is None:
+        raise ValueError("invalid Taishin history")
+    if not isinstance(coverage, dict) or not isinstance(results, list):
+        raise ValueError("invalid Taishin history")
+    try:
+        encoded_results = json.dumps(
+            results, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("invalid Taishin history") from None
+    if len(encoded_results) > 5_000_000:
+        raise ValueError("invalid Taishin history")
+    mode = coverage.get("mode")
+    validate_history_coverage(
+        coverage,
+        expected_mode=mode,
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    domains = coverage.get("domains")
+    if not isinstance(domains, list) or len(domains) != 1:
+        raise ValueError("invalid Taishin history")
+    expected = domains[0].get("expected")
+    windows = domains[0].get("windows")
+    if not isinstance(expected, list) or not isinstance(windows, list):
+        raise ValueError("invalid Taishin history")
+    from backend.banks.taishin import TaishinCrawler
 
-        # Real shape is multi-line 6-column blocks after header:
-        # 交易日 / 帳務日 / 摘要 / 金額 / 餘額 / 備註
-        pat = re.compile(
-            r"(\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}:\d{2})\s*\n\s*\t\s*\n\s*"
-            r"(\d{4}/\d{1,2}/\d{1,2})\s*\n\s*\t\s*\n\s*"
-            r"([^\n]+?)\s*\n\s*\t\s*\n\s*"
-            r"(-?[\d,]+(?:\.\d+)?)\s*\n\s*\t\s*\n\s*"
-            r"(-?[\d,]+(?:\.\d+)?)\s*\n\s*\t\s*\n\s*"
-            r"([^\n\t]*)(?:\s*\n\s*\t\s*\n\s*消費屬性設定)?",
-            re.MULTILINE,
-        )
-        for m in pat.finditer(text):
-            txn_dt = m.group(1).replace("/", "-")
-            account_date = _slash_date_to_iso(m.group(2))
-            desc = m.group(3).strip()
-            amount = _num_to_float(m.group(4))
-            balance = _num_to_float(m.group(5))
-            memo = (m.group(6) or "").strip() or None
-            expend = income = None
-            if amount is not None:
-                if amount < 0:
-                    expend = abs(amount)
-                else:
-                    income = amount
-            rows.append({
-                "account_no": account_no,
-                "datetime": txn_dt,
-                "account_date": account_date,
-                "desc": desc,
-                "expend": expend,
-                "income": income,
-                "balance": balance,
-                "counterparty_bank": None,
-                "counterparty_acct": memo[:30] if memo else None,
-                "memo": memo,
-            })
-    return rows
+    if not expected:
+        empty = domains[0].get("empty_window")
+        try:
+            start = date.fromisoformat(empty["start"])
+            end = date.fromisoformat(empty["end"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid Taishin history") from None
+        if (
+            results
+            or windows
+            or end != datetime.now(ZoneInfo("Asia/Taipei")).date()
+            or start != TaishinCrawler._subtract_months(end, 12)
+        ):
+            raise ValueError("invalid Taishin history")
+        return []
+    if len(results) != len(expected) or len(results) != len(windows):
+        raise ValueError("invalid Taishin history")
+
+    normalized = []
+    cursors = store.latest_twd_transaction_dates()
+    for result, expectation, receipt in zip(results, expected, windows, strict=True):
+        if not all(isinstance(item, dict) for item in (result, expectation, receipt)):
+            raise ValueError("invalid Taishin history")
+        identity = expectation.get("identity")
+        try:
+            start = date.fromisoformat(expectation["start"])
+            end = date.fromisoformat(expectation["end"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid Taishin history") from None
+        period = result.get("period")
+        period_starts = {
+            "7_days": end - timedelta(days=7),
+            "14_days": end - timedelta(days=14),
+            "1_months": TaishinCrawler._subtract_months(end, 1),
+            "2_months": TaishinCrawler._subtract_months(end, 2),
+            "3_months": TaishinCrawler._subtract_months(end, 3),
+            "6_months": TaishinCrawler._subtract_months(end, 6),
+            "12_months": TaishinCrawler._subtract_months(end, 12),
+        }
+        cursor = cursors.get(identity) if isinstance(identity, str) else None
+        if mode == "full":
+            expected_period = "12_months"
+        else:
+            if cursor is not None and cursor > end:
+                raise ValueError("invalid Taishin history")
+            target = max(
+                period_starts["12_months"],
+                (cursor - timedelta(days=7)) if cursor is not None else period_starts["12_months"],
+            )
+            expected_period = next(
+                name for name in (
+                    "7_days", "14_days", "1_months", "2_months",
+                    "3_months", "6_months", "12_months",
+                )
+                if period_starts[name] <= target
+            )
+        core = {
+            "identity": identity,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "status": result.get("status"),
+            "pages": result.get("pages"),
+        }
+        if (
+            not isinstance(identity, str)
+            or not re.fullmatch(r"\d{12,14}", identity)
+            or period not in period_starts
+            or period != expected_period
+            or start != period_starts[period]
+            or end != datetime.now(ZoneInfo("Asia/Taipei")).date()
+            or receipt != core
+            or any(result.get(key) != value for key, value in core.items())
+            or not isinstance(result.get("rows"), list)
+            or not isinstance(result.get("api_rows"), list)
+            or result.get("api_row_count") != len(result["api_rows"])
+            or not isinstance(result.get("transport"), dict)
+            or not isinstance(result.get("binding_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", result["binding_digest"]) is None
+            or type(result.get("request_count")) is not int
+            or result["request_count"] != 1
+            or type(result.get("response_count")) is not int
+            or result["response_count"] != 1
+        ):
+            raise ValueError("invalid Taishin history")
+        try:
+            TaishinCrawler._validate_history_transport(
+                result["transport"], identity=identity, start=start, end=end,
+            )
+            validated = TaishinCrawler._validate_history_snapshot(
+                result.get("snapshot"),
+                identity=identity,
+                period=period,
+                start=start,
+                end=end,
+                api_row_count=result.get("api_row_count"),
+                api_rows=result["api_rows"],
+            )
+        except RuntimeError:
+            raise ValueError("invalid Taishin history") from None
+        if (
+            validated["status"] != result.get("status")
+            or validated["rows"] != result["rows"]
+            or TaishinCrawler._history_rows_digest(result["api_rows"])
+            != result["binding_digest"]
+        ):
+            raise ValueError("invalid Taishin history")
+        normalized.extend(validated["rows"])
+    return normalized
 
 
-def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _persist_taishin(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
     """台新 collect → store 入庫。
 
     映射：
       api_responses.query.OUTPUTDATA.SavingAccount[] → accounts(UPSERT) + balance_history
       api_responses.qryTaishinPoint.value.balance     → daily_metrics
-      api_responses.login.CUSTNO                       → daily_metrics
-      api_responses 全保留                              → daily_metrics (dump)
+      api_responses endpoint names                     → daily_metrics
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    attested_twd_rows = _validated_attested_twd_rows(data, store)
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
     delta: dict = {"bank": "taishin"}
 
     apis = data.get("api_responses") or {}
@@ -107,39 +202,29 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
         })
         twd_total += bal
     if accts:
-        store.upsert_accounts(accts)
+        store.upsert_accounts(accts, commit=commit)
     if accts and twd_total >= 0:
         store.upsert_balance_history([{
             "snapshotDate": today,
             "twdBalance": twd_total if twd_total else None,
             "fxBalance": None,
-        }])
+        }], commit=commit)
         delta["balance_days"] = 1
-        store.put_daily_metric("balance_latest",
-                                {"twd": twd_total, "n_accounts": len(accts)}, today)
+        store.put_daily_metric(
+            "balance_latest", {"twd": twd_total, "n_accounts": len(accts)},
+            today, commit=commit,
+        )
 
     # --- qryTaishinPoint ---
     pts = apis.get("qryTaishinPoint") or {}
     val = pts.get("value") or {}
     if isinstance(val, dict) and val.get("balance") is not None:
-        store.put_daily_metric("taishin_points",
-                                {"balance": val.get("balance"),
-                                 "TSPOINT_balance": val.get("TSPOINT_balance")}, today)
+        store.put_daily_metric(
+            "taishin_points",
+            {"balance": val.get("balance"), "TSPOINT_balance": val.get("TSPOINT_balance")},
+            today, commit=commit,
+        )
 
-    # --- login meta ---
-    login_resp = apis.get("login") or {}
-    if isinstance(login_resp, dict):
-        store.put_daily_metric("taishin_login_meta", {
-            "custno": login_resp.get("CUSTNO"),
-            "cust_type": login_resp.get("custTypeCode"),
-            "pwd_expired": login_resp.get("PWDEXPIRED"),
-            "card_member": login_resp.get("CARDMBR"),
-        }, today)
-
-    # --- 全 endpoint dump（debug） ---
-    if apis:
-        store.put_daily_metric("taishin_endpoints",
-                                {"endpoints": sorted(apis.keys())}, today)
 
     # --- 信用卡（從 frame text parser 抽出）---
     # 2026-06-11 端到端：mouse.move hover mega menu → click「查詢信用卡明細」
@@ -247,7 +332,7 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
             card["last_payment_amount"] = taishin_last_pay_amt
             card["last_payment_date"] = taishin_last_pay_date
         if cards:
-            store.upsert_cards(cards)
+            store.upsert_cards(cards, commit=commit)
 
         # 帳單期間（給 bill_date 用）
         bill_date = _norm_date(period.get("statement_date")) or today
@@ -301,25 +386,52 @@ def persist_taishin(data: dict, store: BankStore, rules: list[dict] | None = Non
                     and parsed_raw.get("fetch_ok") is True
                     and not parsed_raw.get("error"))
         cc_pending_n = store.refresh_card_pending(
-            "realtime", pending_payload, rules=rules, fetch_ok=fetch_ok)
+            "realtime", pending_payload, rules=rules, fetch_ok=fetch_ok, commit=commit,
+        )
 
         # 各類 summary → daily_metrics（SCSB 模式）
         top = parsed.get("top_summary") or {}
         if top:
-            store.put_daily_metric("taishin_card_top_summary", top, today)
+            store.put_daily_metric("taishin_card_top_summary", top, today, commit=commit)
         summary = parsed.get("summary") or {}
         if summary:
-            store.put_daily_metric("taishin_card_current_period", summary, today)
+            store.put_daily_metric(
+                "taishin_card_current_period", summary, today, commit=commit,
+            )
         if period:
-            store.put_daily_metric("taishin_card_billing_period", period, today)
+            store.put_daily_metric(
+                "taishin_card_billing_period", period, today, commit=commit,
+            )
 
     delta.setdefault("balance_days", 0)
-    twd_rows = _parse_taishin_twd_txn_results(data.get("twd_txn_results") or [])
-    twd_new = store.upsert_twd_txns(twd_rows, rules=rules) if twd_rows else 0
+    twd_rows = attested_twd_rows
+    twd_new = (
+        store.upsert_twd_txns(twd_rows, rules=rules, commit=commit)
+        if twd_rows else 0
+    )
     delta["twd_txn_new"] = twd_new
     delta["card_billed_new"] = cc_new
     delta["card_unbilled"] = 0  # 台新「未出帳款」表頁無逐筆明細，僅頂部 TWD 80 摘要
     delta["card_current"] = cc_pending_n
 
-    store.log_sync(delta)
+    store.log_sync(delta, commit=commit)
     return delta
+
+
+def persist_taishin(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Validate and persist one Taishin payload atomically."""
+    try:
+        delta = _persist_taishin(data, store, rules, commit=False)
+        if commit:
+            store.commit()
+        return delta
+    except Exception:
+        if commit:
+            store.rollback()
+        raise

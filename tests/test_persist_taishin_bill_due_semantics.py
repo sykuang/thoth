@@ -15,6 +15,7 @@ from __future__ import annotations
 from backend.banks.taishin import _taishin_card_bill_fact
 from backend.core.persist.taishin import persist_taishin
 from backend.core.store import BankStore
+from tests.taishin_fixtures import with_taishin_history
 
 
 def _build_data(*, summary: dict, billed_txns: list[dict] | None = None) -> dict:
@@ -111,7 +112,7 @@ def test_taishin_bill_due_uses_summary_remaining_not_bill_amount(tmp_path, monke
             "paid": 80.0,
             "remaining": 0.0,
         })
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         card = _query_card(store)
         assert card["bill_due_amount"] == 0
         assert card["payment_due_date"] == "2026-06-29"
@@ -131,7 +132,7 @@ def test_taishin_bill_due_reflects_partial_payment(tmp_path, monkeypatch):
             "paid": 20.0,
             "remaining": 60.0,
         })
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         card = _query_card(store)
         assert card["bill_due_amount"] == 60
     finally:
@@ -147,7 +148,7 @@ def test_taishin_bill_due_falls_back_to_bill_minus_paid_when_remaining_missing(t
             "paid": 30.0,
             # 沒有 remaining
         })
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         card = _query_card(store)
         assert card["bill_due_amount"] == 70
     finally:
@@ -185,7 +186,7 @@ def test_taishin_last_payment_only_from_real_billed_payment_row(tmp_path, monkey
                 },
             ],
         )
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         card = _query_card(store)
         assert card["last_payment_amount"] == 80
         assert card["last_payment_date"] == "2026-06-29"
@@ -203,7 +204,7 @@ def test_taishin_no_real_payment_row_keeps_last_payment_null(tmp_path, monkeypat
             "paid": 80.0,
             "remaining": 0.0,
         })
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         card = _query_card(store)
         assert card["last_payment_amount"] is None
         assert card["last_payment_date"] is None
@@ -226,7 +227,7 @@ def test_taishin_billed_missing_post_date_stays_null(tmp_path, monkeypatch):
                 "card_no_suffix": "7018",
             }],
         )
-        persist_taishin(data, store)
+        persist_taishin(with_taishin_history(data), store)
         row = store.conn.execute(
             "SELECT consume_date, post_date FROM card_billed_txns"
         ).fetchone()

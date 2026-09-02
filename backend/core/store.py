@@ -828,7 +828,9 @@ class BankStore:
     def close(self):
         self.conn.close()
 
-    def _record_transaction_cursor(self, domain: str, identity, *raw_dates) -> None:
+    def _record_transaction_cursor(
+        self, domain: str, identity, *raw_dates, replace: bool = False,
+    ) -> None:
         if self.source_account_id is None:
             return
         identity = identity.strip() if isinstance(identity, str) else ""
@@ -838,7 +840,14 @@ class BankStore:
         )
         if not identity or latest is None:
             return
-        self.conn.execute(
+        sql = (
+            """INSERT INTO history_transaction_cursors
+               (user_id, source_account_id, domain, identity, latest_date)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, source_account_id, domain, identity) DO UPDATE SET
+                 latest_date = excluded.latest_date"""
+            if replace
+            else
             """INSERT INTO history_transaction_cursors
                (user_id, source_account_id, domain, identity, latest_date)
                VALUES (?, ?, ?, ?, ?)
@@ -847,14 +856,19 @@ class BankStore:
                    WHEN excluded.latest_date > history_transaction_cursors.latest_date
                    THEN excluded.latest_date
                    ELSE history_transaction_cursors.latest_date
-                 END""",
+                 END"""
+        )
+        self.conn.execute(
+            sql,
             (
                 self.user_id, self.source_account_id, domain, identity,
                 latest.isoformat(),
             ),
         )
 
-    def record_history_coverage_cursors(self, coverage, *, commit: bool = True) -> None:
+    def record_history_coverage_cursors(
+        self, coverage, *, commit: bool = True, replace: bool = False,
+    ) -> None:
         """Advance account-scoped cursors through validated complete/empty windows."""
         if coverage is None:
             return
@@ -880,9 +894,16 @@ class BankStore:
             expected_domains=domain_names,
         )
         for domain in domains:
+            if replace and self.source_account_id is not None:
+                self.conn.execute(
+                    """DELETE FROM history_transaction_cursors
+                       WHERE user_id = ? AND source_account_id = ? AND domain = ?""",
+                    (self.user_id, self.source_account_id, domain["domain"]),
+                )
             for expected in domain["expected"]:
                 self._record_transaction_cursor(
                     domain["domain"], expected["identity"], expected["end"],
+                    replace=replace,
                 )
         if commit:
             self.conn.commit()
@@ -1397,6 +1418,9 @@ class BankStore:
 
     def commit(self) -> None:
         self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
 
     def refresh_card_pending(self, scope: str, txns: list[dict],
                              rules: list[dict] | None = None,

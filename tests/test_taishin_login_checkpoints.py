@@ -868,6 +868,6 @@ def test_collect_keeps_credit_card_navigation_and_parser_without_popup_surgery()
 
     assert "_close_popups" not in source
     assert "01_after_close_popups.png" not in source
-    assert "self._try_ancestor_clicks(target_frame, page, debug_dir)" in source
+    assert "self._try_ancestor_clicks(target_frame, page)" in source
     assert "self._parse_credit_card_page(page_text)" in source
     assert "self._parse_credit_card_page(month_text)" in source

@@ -70,7 +70,7 @@ def persist_collected(bank, data, store, rules=None):
     except KeyError as exc:
         raise ValueError(f"unknown bank persist: {bank!r}") from exc
     coverage = data.get("history_coverage")
-    if bank in {"esun", "fubon", "hsbc", "sinopac", "ubot"} and coverage is None:
+    if bank in {"esun", "fubon", "hsbc", "sinopac", "taishin", "ubot"} and coverage is None:
         raise ValueError(f"{bank} persistence requires history coverage")
     _validate_history_coverage_before_persist(coverage)
     facts_ok = data.get("card_bill_facts_ok")
@@ -78,7 +78,7 @@ def persist_collected(bank, data, store, rules=None):
     validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
-    atomic = bank in {"hsbc", "sinopac", "ubot"}
+    atomic = bank in {"hsbc", "sinopac", "taishin", "ubot"}
     try:
         if atomic:
             delta = persist(data, barrier, rules=rules, commit=False)
@@ -93,7 +93,9 @@ def persist_collected(bank, data, store, rules=None):
         if data.get("card_bill_facts_ok") is not None:
             delta["card_bill_facts_applied"] = applied
         store.record_history_coverage_cursors(
-            data.get("history_coverage"), commit=not atomic,
+            data.get("history_coverage"),
+            commit=not atomic,
+            replace=bank == "taishin" and coverage.get("mode") == "full",
         )
         if atomic:
             store.commit()

@@ -138,6 +138,8 @@ class ApiHit:
     body_size: int | None = None
     request_sequence: int = 0
     main_frame_request: bool = False
+    request_frame_url: str = ""
+    request_frame: Any = None
 
     @property
     def endpoint(self) -> str:
@@ -160,10 +162,14 @@ class ResponseCollector:
         self.auth_token_url: str = ""
         self.auth_token_events: list[dict[str, Any]] = []
         self.hsbc_inventory_bytes = 0
+        self._taishin_json_bytes = 0
+        self._taishin_json_responses = 0
         self._auth_event_sequence = 0
         self._request_sequence = 0
         self._requests: dict[int, int] = {}
         self._request_main_frame: dict[int, bool] = {}
+        self._request_frame_urls: dict[int, str] = {}
+        self._request_frames: dict[int, Any] = {}
         self._issued_endpoint_counts: dict[str, int] = {}
         self._auth_requests: dict[int, dict[str, Any]] = {}
         self._latest_auth_request_sequence = 0
@@ -207,9 +213,13 @@ class ResponseCollector:
             main_frame_request = (
                 frame is not None and frame is getattr(page, "main_frame", None)
             )
+            frame_url = getattr(frame, "url", "")
+            frame_url = frame_url if isinstance(frame_url, str) else ""
             self._request_sequence += 1
             self._requests[id(req)] = self._request_sequence
             self._request_main_frame[id(req)] = main_frame_request
+            self._request_frame_urls[id(req)] = frame_url
+            self._request_frames[id(req)] = frame
             endpoint = parsed.path.rsplit("/", 1)[-1]
             self._issued_endpoint_counts[endpoint] = (
                 self._issued_endpoint_counts.get(endpoint, 0) + 1
@@ -230,6 +240,8 @@ class ResponseCollector:
     def _on_request_failed(self, req) -> None:
         self._requests.pop(id(req), None)
         self._request_main_frame.pop(id(req), None)
+        self._request_frame_urls.pop(id(req), None)
+        self._request_frames.pop(id(req), None)
         self._auth_requests.pop(id(req), None)
 
     def _on_response(self, resp):
@@ -249,6 +261,9 @@ class ResponseCollector:
             req = resp.request
             request_sequence = self._requests.pop(id(req), 0)
             main_frame_request = self._request_main_frame.pop(id(req), False)
+            request_frame_url = self._request_frame_urls.pop(id(req), "")
+            request_frame = self._request_frames.pop(id(req), None)
+            auth_event = self._auth_requests.pop(id(req), None)
             ct = resp.headers.get("content-type", "")
             content_length = resp.headers.get("content-length", "")
             content_encoding = resp.headers.get("content-encoding", "")
@@ -257,6 +272,36 @@ class ResponseCollector:
                 and parsed.hostname == "www.ubot.com.tw"
                 and parsed.path == "/MyBank/IBKB010102"
             )
+            is_taishin_history = (
+                self.host_filter == "taishinbank.com.tw"
+                and parsed.hostname == "my.taishinbank.com.tw"
+                and parsed.path == "/TIBNetBank/svc/web1/rb0102/query"
+            )
+            is_taishin_projected_api = (
+                self.host_filter == "taishinbank.com.tw"
+                and parsed.hostname == "my.taishinbank.com.tw"
+                and parsed.path in {
+                    "/TIBNetBank/svc/web1/rb0100/query",
+                    "/TIBNetBank/svc/web/common/qryTaishinPoint",
+                    "/TIBNetBank/svc/web4/rb0708rwd/qryRealTime",
+                    "/TIBNetBank/svc/web4/rb0708rwd/doXTPA",
+                }
+            )
+            if (
+                self.host_filter == "taishinbank.com.tw"
+                and not (is_taishin_history or is_taishin_projected_api)
+            ):
+                return
+            is_taishin_json = is_taishin_history or is_taishin_projected_api
+            if (
+                is_taishin_json
+                and "json" in ct
+                and (
+                    self._taishin_json_bytes >= 5_000_000
+                    or self._taishin_json_responses >= 64
+                )
+            ):
+                return
             is_bounded_json = (
                 (
                     self.host_filter == "card.hsbc.com.tw"
@@ -265,6 +310,8 @@ class ResponseCollector:
                     }
                 )
                 or is_ubot_history
+                or is_taishin_history
+                or is_taishin_projected_api
                 or (
                     self.host_filter == "sinopac.com"
                     and parsed.hostname == "mma.sinopac.com"
@@ -276,7 +323,6 @@ class ResponseCollector:
             )
             body_size = int(content_length) if content_length.isdigit() else None
             auth = req.headers.get("authorization", "")
-            auth_event = self._auth_requests.pop(id(req), None)
             # 只按 request 發出順序更新 token；response 亂序不得降回舊 token。
             if (
                 auth_event is not None
@@ -335,8 +381,22 @@ class ResponseCollector:
                             declared_size = body_size
                             raw_body = resp.body()
                             body_size = len(raw_body)
-                            if body_size <= 5_000_000 and (
-                                not is_ubot_history or body_size == declared_size
+                            within_taishin_budget = True
+                            if is_taishin_json:
+                                self._taishin_json_responses += 1
+                                total = self._taishin_json_bytes + body_size
+                                within_taishin_budget = (
+                                    self._taishin_json_responses <= 64
+                                    and total <= 5_000_000
+                                )
+                                self._taishin_json_bytes = min(total, 5_000_000)
+                            if body_size <= 5_000_000 and within_taishin_budget and (
+                                not (
+                                    is_ubot_history
+                                    or is_taishin_history
+                                    or is_taishin_projected_api
+                                )
+                                or body_size == declared_size
                             ):
                                 resp_json = json.loads(raw_body)
                 else:
@@ -350,6 +410,8 @@ class ResponseCollector:
                 body_size=body_size,
                 request_sequence=request_sequence,
                 main_frame_request=main_frame_request,
+                request_frame_url=request_frame_url,
+                request_frame=request_frame,
             ))
         except Exception:
             pass
@@ -823,7 +885,11 @@ class BankCollectResult:
             value = getattr(self, name)
             if value is None:
                 continue
-            if value == [] or value == {}:
+            if value == []:
+                if name == "twd_txn_results" and self.history_coverage is not None:
+                    out[name] = []
+                continue
+            if value == {}:
                 continue
             if isinstance(value, list):
                 out[name] = [dict(x) if isinstance(x, dict) else x for x in value]
@@ -1258,6 +1324,7 @@ class BankCrawler(ABC):
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
     }
     FETCH_LOCALE: ClassVar[str] = "zh-TW"
+    FETCH_TIMEZONE_ID: ClassVar[str | None] = None
     FETCH_INIT_SCRIPT: ClassVar[str] = MACOS_SPOOF_JS
     FETCH_REAL_CHROME: ClassVar[bool] = False
 
@@ -1276,6 +1343,8 @@ class BankCrawler(ABC):
             kw["extra_headers"] = dict(self.FETCH_EXTRA_HEADERS)
         if self.FETCH_LOCALE:
             kw["locale"] = self.FETCH_LOCALE
+        if self.FETCH_TIMEZONE_ID:
+            kw["timezone_id"] = self.FETCH_TIMEZONE_ID
         if self.FETCH_INIT_SCRIPT:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".js", delete=False, encoding="utf-8",
