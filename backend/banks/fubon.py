@@ -164,6 +164,16 @@ def _fubon_card_bill_fact(amount_text: str):
 
 class FubonCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "fubon-twd-history-controls",
+        "fubon-twd-history-frame",
+        "fubon-twd-history-inventory",
+        "fubon-twd-history-navigation",
+        "fubon-twd-history-result",
+        "fubon-twd-history-result-frame",
+        "fubon-twd-history-stale-result",
+        "fubon-twd-history-transport",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     CREDENTIAL_HOSTS = frozenset({"ebank.taipeifubon.com.tw"})

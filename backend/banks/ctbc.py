@@ -261,6 +261,20 @@ def _build_qu002_011_post_body(account_id: str, month_type: str, template_body: 
 
 class CtbcCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "count-mismatch",
+        "ctbc-twd-history-fetch",
+        "ctbc-twd-history-inventory",
+        "ctbc-twd-history-mode",
+        "ctbc-twd-history-range",
+        "ctbc-twd-history-row",
+        "ctbc-twd-history-template",
+        "invalid-request",
+        "invalid-response",
+        "missing-pagination-proof",
+        "ownership-mismatch",
+        "pagination-detected",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
         "twd_transactions",

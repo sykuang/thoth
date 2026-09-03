@@ -15,6 +15,7 @@ from backend.core.base import (
     BankCrawler,
     ResponseCollector,
     _safe_collect_failure_code,
+    _safe_collect_guard,
 )
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -56,6 +57,7 @@ def _opted_in_bank_modules() -> set[str]:
 class _StagedCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS = True
     CREDENTIAL_HOSTS = frozenset({"example.com"})
+    SAFE_COLLECT_GUARDS = frozenset({"staged-validation"})
     events: list[str] = field(default_factory=list)
     submissions: int = 0
     rules: tuple[LoginCheckpointRule, ...] | None = None
@@ -415,6 +417,39 @@ def test_run_redacts_collect_and_logout_exception_details(
     assert "Traceback" not in stderr
 
 
+def test_run_logs_only_allowlisted_collect_guard_from_suppressed_context(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    crawler = _StagedCrawler(name="staged")
+
+    def fail_collect(_page, _collector):
+        try:
+            raise RuntimeError("staged-validation")
+        except RuntimeError:
+            raise RuntimeError("PRIVATE-COLLECT-DOM-987654") from None
+
+    monkeypatch.setattr(crawler, "collect", fail_collect)
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert result["error"] == (
+        "collect_failed: RuntimeError: code=collect_contract: "
+        "guard=staged-validation"
+    )
+    assert "guard=staged-validation" in stderr
+    assert "PRIVATE" not in repr(result)
+    assert "PRIVATE" not in stderr
+
+
 def test_run_redacts_login_checkpoint_rule_name(monkeypatch, tmp_path, capsys) -> None:
     crawler = _StagedCrawler(name="staged")
 
@@ -437,6 +472,10 @@ def test_run_redacts_login_checkpoint_rule_name(monkeypatch, tmp_path, capsys) -
     )
     assert "PRIVATE_ACCOUNT_987654" not in repr(result)
     assert "PRIVATE_ACCOUNT_987654" not in stderr
+    assert (
+        "kind=unknown_blocker, credential_submissions=1, "
+        "protocol_resubmits=0, captcha_resubmits=0, reloads=0"
+    ) in stderr
 
 
 def test_run_revalidates_mutated_login_budget(monkeypatch, tmp_path, capsys) -> None:
@@ -726,6 +765,36 @@ def test_safe_collect_failure_code_maps_trusted_frames_without_exposing_them(
         namespace["fail"]()
     except RuntimeError as exc:
         assert _safe_collect_failure_code(exc) == "collect_external"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "guard"),
+    (
+        ("cathay", "CathayCrawler", "cathay-twd-history-account-mismatch"),
+        ("ctbc", "CtbcCrawler", "ctbc-twd-history-fetch"),
+        ("esun", "EsunCrawler", "esun-twd-history-submit"),
+        ("fubon", "FubonCrawler", "fubon-twd-history-navigation"),
+        ("hsbc", "HsbcCrawler", "hsbc-card-inventory-envelope"),
+        ("sinopac", "SinopacCrawler", "sinopac-twd-history-inventory-envelope"),
+        ("taishin", "TaishinCrawler", "taishin-twd-history-response"),
+        ("ubot", "UbotCrawler", "ubot-twd-history-response-cardinality"),
+        ("rakuten", "RakutenCrawler", "rakuten-twd-history-dom"),
+    ),
+)
+def test_history_adapters_allowlist_static_collect_guards(
+    module_name: str, class_name: str, guard: str,
+) -> None:
+    crawler_type = getattr(import_module(f"backend.banks.{module_name}"), class_name)
+
+    assert _safe_collect_guard(
+        RuntimeError(guard), crawler_type.SAFE_COLLECT_GUARDS
+    ) == guard
+
+
+def test_safe_collect_guard_rejects_non_runtime_exception() -> None:
+    assert _safe_collect_guard(
+        ValueError("staged-validation"), frozenset({"staged-validation"})
+    ) is None
 
 
 def test_run_redacts_collect_checkpoint_metadata(monkeypatch, tmp_path, capsys) -> None:

@@ -105,6 +105,24 @@ def _taishin_card_bill_fact(parsed: dict):
 
 class TaishinCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "taishin-api-projection",
+        "taishin-twd-history-binding",
+        "taishin-twd-history-cursor",
+        "taishin-twd-history-dialog",
+        "taishin-twd-history-dom",
+        "taishin-twd-history-empty-inventory",
+        "taishin-twd-history-form",
+        "taishin-twd-history-frame",
+        "taishin-twd-history-inventory",
+        "taishin-twd-history-pagination",
+        "taishin-twd-history-query",
+        "taishin-twd-history-response",
+        "taishin-twd-history-response-budget",
+        "taishin-twd-history-selection",
+        "taishin-twd-history-settle",
+        "taishin-twd-history-stale-before-query",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     FETCH_TIMEZONE_ID: ClassVar[str | None] = "Asia/Taipei"

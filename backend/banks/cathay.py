@@ -188,6 +188,25 @@ def _cathay_card_bill_fact(out: dict):
 
 class CathayCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "cathay-twd-history-account-control",
+        "cathay-twd-history-account-inventory",
+        "cathay-twd-history-account-mismatch",
+        "cathay-twd-history-count",
+        "cathay-twd-history-fetch",
+        "cathay-twd-history-invalid-range",
+        "cathay-twd-history-missing",
+        "cathay-twd-history-mode",
+        "cathay-twd-history-period-control",
+        "cathay-twd-history-query-control",
+        "cathay-twd-history-response",
+        "cathay-twd-history-seed-response",
+        "cathay-twd-history-template",
+        "cathay-twd-history-transaction-amount",
+        "cathay-twd-history-transaction-date",
+        "cathay-twd-history-transaction-range",
+        "cathay-twd-history-transaction-text",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
         "twd_transactions",

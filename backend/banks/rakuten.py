@@ -183,6 +183,16 @@ class RakutenLoginError(RuntimeError):
 
 class RakutenCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "rakuten-twd-history-cursor",
+        "rakuten-twd-history-dom",
+        "rakuten-twd-history-frame",
+        "rakuten-twd-history-inventory",
+        "rakuten-twd-history-months",
+        "rakuten-twd-history-range",
+        "rakuten-twd-history-response-cardinality",
+        "rakuten-twd-history-result",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     FETCH_TIMEZONE_ID: ClassVar[str | None] = "Asia/Taipei"

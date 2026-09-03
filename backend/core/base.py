@@ -114,6 +114,24 @@ def _base_exception_state(exc: BaseException) -> dict:
     return {}
 
 
+def _base_exception_args(exc: BaseException) -> tuple:
+    try:
+        reduced = BaseException.__reduce__(exc)
+    except BaseException:
+        return ()
+    if type(reduced) is tuple and len(reduced) >= 2 and type(reduced[1]) is tuple:
+        return reduced[1]
+    return ()
+
+
+def _base_exception_context(exc: BaseException) -> BaseException | None:
+    try:
+        context = BaseException.__dict__["__context__"].__get__(exc, BaseException)
+    except BaseException:
+        return None
+    return context if isinstance(context, BaseException) else None
+
+
 def _safe_state_value(state: object, field: str) -> object | None:
     if type(state) is not dict:
         return None
@@ -205,6 +223,29 @@ def _safe_collect_failure_code(exc: BaseException) -> str:
             code = "collect_contract"
         tb = tb.tb_next
     return code
+
+
+def _safe_collect_guard(exc: BaseException, allowlist: object) -> str | None:
+    """Return only a code-owned static guard, including suppressed contexts."""
+    if type(allowlist) is not frozenset or any(
+        type(value) is not str for value in allowlist
+    ):
+        return None
+    guard = None
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 16:
+        seen.add(id(current))
+        args = _base_exception_args(current)
+        if (
+            _exception_inherits(current, RuntimeError)
+            and len(args) == 1
+            and type(args[0]) is str
+            and args[0] in allowlist
+        ):
+            guard = args[0]
+        current = _base_exception_context(current)
+    return guard
 
 
 def write_private_json(path: Path, payload: dict) -> None:
@@ -1239,6 +1280,7 @@ class BankCrawler(ABC):
     SESSION_MAX_AGE_SECONDS: int = 180
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = False
     CREDENTIAL_HOSTS: ClassVar[frozenset[str]] = frozenset()
+    SAFE_COLLECT_GUARDS: ClassVar[frozenset[str]] = frozenset()
     _shared_dialog_blocked: bool = False
 
     def __post_init__(self):
@@ -1673,7 +1715,7 @@ class BankCrawler(ABC):
                         else:
                             msg = f"{exception_type}: login failed"
                         print(
-                            f"[{self.name}][login] raise → {exception_type}: details withheld",
+                            f"[{self.name}][login] raise → {msg}; details withheld",
                             file=_sys.stderr,
                         )
                         result["error"] = msg
@@ -1716,6 +1758,9 @@ class BankCrawler(ABC):
                         f"collect_failed: {_safe_exception_type(e)}: "
                         f"code={_safe_collect_failure_code(e)}"
                     )
+                    guard = _safe_collect_guard(e, self.SAFE_COLLECT_GUARDS)
+                    if guard is not None:
+                        msg += f": guard={guard}"
                     print(
                         f"[{self.name}][collect] raise → {msg}; details withheld",
                         file=_sys.stderr,

@@ -88,34 +88,42 @@ def test_hsbc_card_inventory_is_exact_and_authoritative() -> None:
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    ("mutation", "guard"),
     (
-        "wrong-url",
-        "wrong-method",
-        "wrong-status",
-        "wrong-content-type",
-        "jsonp-content-type",
-        "missing-content-type",
-        "api-failure",
-        "non-list",
-        "missing-id",
-        "unsafe-id",
-        "missing-mask",
-        "unmasked-pan",
-        "alternate-mask-format",
-        "oversized-name",
-        "oversized-body",
-        "unknown-status",
-        "duplicate-id",
-        "duplicate-mask",
-        "aggregate-body",
-        "conflicting-replay",
+        ("wrong-url", "hsbc-card-inventory-missing"),
+        ("wrong-method", "hsbc-card-inventory-envelope"),
+        ("wrong-status", "hsbc-card-inventory-envelope"),
+        ("wrong-content-type", "hsbc-card-inventory-envelope"),
+        ("jsonp-content-type", "hsbc-card-inventory-envelope"),
+        ("missing-content-type", "hsbc-card-inventory-envelope"),
+        ("api-failure", "hsbc-card-inventory-envelope"),
+        ("non-list", "hsbc-card-inventory-envelope"),
+        ("missing-id", "hsbc-card-inventory-identity"),
+        ("unsafe-id", "hsbc-card-inventory-identity"),
+        ("missing-mask", "hsbc-card-inventory-identity"),
+        ("unmasked-pan", "hsbc-card-inventory-identity"),
+        ("alternate-mask-format", "hsbc-card-inventory-identity"),
+        ("oversized-name", "hsbc-card-inventory-identity"),
+        ("oversized-body", "hsbc-card-inventory-byte-budget"),
+        ("unknown-status", "hsbc-card-inventory-identity"),
+        ("duplicate-id", "hsbc-card-inventory-identity"),
+        ("duplicate-mask", "hsbc-card-inventory-identity"),
+        ("aggregate-body", "hsbc-card-inventory-byte-budget"),
+        ("conflicting-replay", "hsbc-card-inventory-replay"),
+        ("non-dict-card", "hsbc-card-inventory-row"),
+        ("too-many-cards", "hsbc-card-inventory-count"),
+        ("missing-hit", "hsbc-card-inventory-missing"),
     ),
 )
-def test_hsbc_card_inventory_rejects_ambiguous_or_malformed_source(mutation: str) -> None:
+def test_hsbc_card_inventory_rejects_ambiguous_or_malformed_source(
+    mutation: str, guard: str,
+) -> None:
+    assert guard in HsbcCrawler.SAFE_COLLECT_GUARDS
     hit = _card_hit(_cards())
     hits = [hit]
-    if mutation == "wrong-url":
+    if mutation == "missing-hit":
+        hits = []
+    elif mutation == "wrong-url":
         hit.url += "/attacker"
     elif mutation == "wrong-method":
         hit.method = "POST"
@@ -157,6 +165,17 @@ def test_hsbc_card_inventory_rejects_ambiguous_or_malformed_source(mutation: str
             "id": "card-id-9999",
             "maskedCardNumber": "4029-****-****-7034",
         })
+    elif mutation == "non-dict-card":
+        hit.resp_json["payload"][0] = []
+    elif mutation == "too-many-cards":
+        hit.resp_json["payload"] = [
+            {
+                "id": f"card-{index}",
+                "maskedCardNumber": f"4029-****-****-{index:04d}",
+                "cardStatusDisplay": "ACTIVATED",
+            }
+            for index in range(101)
+        ]
     elif mutation == "aggregate-body":
         hit.body_size = 3_000_000
         other = _card_hit(deepcopy(_cards()))
@@ -168,7 +187,7 @@ def test_hsbc_card_inventory_rejects_ambiguous_or_malformed_source(mutation: str
         other.resp_json["payload"][0]["id"] = "card-id-replaced"
         hits.append(other)
 
-    with pytest.raises(RuntimeError, match="hsbc-card-inventory"):
+    with pytest.raises(RuntimeError, match=f"^{guard}$"):
         HsbcCrawler._card_inventory(SimpleNamespace(hits=hits))
 
 

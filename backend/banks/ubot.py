@@ -305,6 +305,19 @@ def _ubot_card_bill_fact(out: dict):
 
 class UbotCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "ubot-twd-history-byte-budget",
+        "ubot-twd-history-cursor",
+        "ubot-twd-history-dialog",
+        "ubot-twd-history-form",
+        "ubot-twd-history-inventory-changed",
+        "ubot-twd-history-mode",
+        "ubot-twd-history-operation-cardinality",
+        "ubot-twd-history-range",
+        "ubot-twd-history-response",
+        "ubot-twd-history-response-cardinality",
+        "ubot-twd-history-result",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
     CREDENTIAL_HOSTS = frozenset({"www.ubot.com.tw"})

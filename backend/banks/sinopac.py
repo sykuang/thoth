@@ -111,6 +111,28 @@ def _sinopac_card_bill_fact(out: dict):
 
 class SinopacCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "sinopac-twd-history-account-control",
+        "sinopac-twd-history-byte-budget",
+        "sinopac-twd-history-cursor",
+        "sinopac-twd-history-deadline",
+        "sinopac-twd-history-dialog",
+        "sinopac-twd-history-empty-inventory-blocked",
+        "sinopac-twd-history-inventory",
+        "sinopac-twd-history-inventory-cardinality",
+        "sinopac-twd-history-inventory-envelope",
+        "sinopac-twd-history-inventory-identity",
+        "sinopac-twd-history-inventory-row",
+        "sinopac-twd-history-mode",
+        "sinopac-twd-history-operation-cardinality",
+        "sinopac-twd-history-query-control",
+        "sinopac-twd-history-range",
+        "sinopac-twd-history-response",
+        "sinopac-twd-history-response-cardinality",
+        "sinopac-twd-history-result-table",
+        "sinopac-twd-history-row",
+        "sinopac-twd-history-row-budget",
+    })
     CREDENTIAL_HOSTS = frozenset({"mma.sinopac.com"})
     CAPTCHA_INVALID = "captcha_invalid"
     CREDENTIALS_INVALID = "credentials_invalid"
@@ -548,7 +570,7 @@ class SinopacCrawler(BankCrawler):
             and candidate.request_sequence > after_sequence
         ]
         if len(candidates) != 1:
-            raise RuntimeError("sinopac-twd-history-inventory")
+            raise RuntimeError("sinopac-twd-history-inventory-cardinality")
         hit = candidates[0]
         payload = hit.resp_json if hit else None
         body = payload[0] if isinstance(payload, list) and len(payload) == 1 else None
@@ -572,13 +594,13 @@ class SinopacCrawler(BankCrawler):
             or body.get("Message") not in (None, "")
             or not isinstance(rows, list)
         ):
-            raise RuntimeError("sinopac-twd-history-inventory")
+            raise RuntimeError("sinopac-twd-history-inventory-envelope")
         inventory = []
         seen_labels: set[str] = set()
         seen_identities: set[str] = set()
         for row in rows:
             if not isinstance(row, dict) or set(row) != {"DataText", "DataValue", "DisplayText"}:
-                raise RuntimeError("sinopac-twd-history-inventory")
+                raise RuntimeError("sinopac-twd-history-inventory-row")
             label = row.get("DataText")
             identity = row.get("DataValue")
             currency = row.get("DisplayText")
@@ -588,7 +610,7 @@ class SinopacCrawler(BankCrawler):
                 or currency != "TWD"
                 or label in seen_labels or identity in seen_identities
             ):
-                raise RuntimeError("sinopac-twd-history-inventory")
+                raise RuntimeError("sinopac-twd-history-inventory-identity")
             seen_labels.add(label)
             seen_identities.add(identity)
             inventory.append({"label": label, "identity": identity, "currency": currency})

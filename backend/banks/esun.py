@@ -104,6 +104,23 @@ def _esun_card_bill_fact(out: dict):
 
 class EsunCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "esun-twd-history",
+        "esun-twd-history-account",
+        "esun-twd-history-bank-date",
+        "esun-twd-history-form",
+        "esun-twd-history-inventory",
+        "esun-twd-history-mode",
+        "esun-twd-history-navigation",
+        "esun-twd-history-period",
+        "esun-twd-history-response-timeout",
+        "esun-twd-history-result",
+        "esun-twd-history-selected-account",
+        "esun-twd-history-sort",
+        "esun-twd-history-stale-result",
+        "esun-twd-history-submit",
+        "esun-twd-history-transport",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
         "twd_transactions",

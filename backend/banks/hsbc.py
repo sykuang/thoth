@@ -126,6 +126,20 @@ def _hsbc_card_bill_facts(out: dict):
 
 class HsbcCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_GUARDS = frozenset({
+        "hsbc-card-inventory-byte-budget",
+        "hsbc-card-inventory-count",
+        "hsbc-card-inventory-envelope",
+        "hsbc-card-inventory-identity",
+        "hsbc-card-inventory-missing",
+        "hsbc-card-inventory-replay",
+        "hsbc-card-inventory-row",
+        "hsbc-history-byte-budget",
+        "hsbc-history-cursor",
+        "hsbc-history-mode",
+        "hsbc-history-token",
+        "hsbc-posted-history",
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
         "card_billed_transactions",
@@ -507,14 +521,14 @@ class HsbcCrawler(BankCrawler):
         for hit in relevant:
             body_size = getattr(hit, "body_size", None)
             if type(body_size) is not int or not 0 <= body_size <= 5_000_000:
-                raise RuntimeError("hsbc-card-inventory")
+                raise RuntimeError("hsbc-card-inventory-byte-budget")
             inventory_bytes += body_size
             if inventory_bytes > 5_000_000:
-                raise RuntimeError("hsbc-card-inventory")
+                raise RuntimeError("hsbc-card-inventory-byte-budget")
         current = [hit for hit in collector.hits if hit.url == base + "cards"]
         hits = current or [hit for hit in collector.hits if hit.url == base + "cards/suspend"]
         if not hits:
-            raise RuntimeError("hsbc-card-inventory")
+            raise RuntimeError("hsbc-card-inventory-missing")
 
         payloads = []
         for hit in hits:
@@ -534,19 +548,19 @@ class HsbcCrawler(BankCrawler):
                 or body.get("error") not in (None, "", [])
                 or not isinstance(body.get("payload"), list)
             ):
-                raise RuntimeError("hsbc-card-inventory")
+                raise RuntimeError("hsbc-card-inventory-envelope")
             payloads.append(body["payload"])
         cards = payloads[0]
         if any(payload != cards for payload in payloads[1:]):
-            raise RuntimeError("hsbc-card-inventory")
+            raise RuntimeError("hsbc-card-inventory-replay")
         if len(cards) > 100:
-            raise RuntimeError("hsbc-card-inventory")
+            raise RuntimeError("hsbc-card-inventory-count")
 
         card_ids: set[str] = set()
         identities: set[str] = set()
         for card in cards:
             if not isinstance(card, dict):
-                raise RuntimeError("hsbc-card-inventory")
+                raise RuntimeError("hsbc-card-inventory-row")
             card_id = card.get("id")
             identity = card.get("maskedCardNumber")
             bounded_fields = (
@@ -571,7 +585,7 @@ class HsbcCrawler(BankCrawler):
                     for value in bounded_fields
                 )
             ):
-                raise RuntimeError("hsbc-card-inventory")
+                raise RuntimeError("hsbc-card-inventory-identity")
             card_ids.add(card_id)
             identities.add(identity)
         collector.hsbc_inventory_bytes = inventory_bytes

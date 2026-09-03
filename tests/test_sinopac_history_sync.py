@@ -202,13 +202,25 @@ def test_sinopac_incremental_range_uses_identity_cursor_and_rejects_future() -> 
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    ("mutation", "guard"),
     [
-        "method", "body", "host", "path", "status", "mime", "redirect", "duplicate",
-        "currency", "identity", "sequence", "frame",
+        ("method", "sinopac-twd-history-inventory-envelope"),
+        ("body", "sinopac-twd-history-inventory-envelope"),
+        ("host", "sinopac-twd-history-inventory-envelope"),
+        ("path", "sinopac-twd-history-inventory-envelope"),
+        ("status", "sinopac-twd-history-inventory-envelope"),
+        ("mime", "sinopac-twd-history-inventory-envelope"),
+        ("redirect", "sinopac-twd-history-inventory-envelope"),
+        ("duplicate", "sinopac-twd-history-inventory-identity"),
+        ("currency", "sinopac-twd-history-inventory-identity"),
+        ("identity", "sinopac-twd-history-inventory-identity"),
+        ("sequence", "sinopac-twd-history-inventory-cardinality"),
+        ("frame", "sinopac-twd-history-inventory-envelope"),
+        ("row", "sinopac-twd-history-inventory-row"),
     ],
 )
-def test_sinopac_inventory_is_exact_authoritative_set(mutation) -> None:
+def test_sinopac_inventory_is_exact_authoritative_set(mutation, guard) -> None:
+    assert guard in SinopacCrawler.SAFE_COLLECT_GUARDS
     hit = _inventory_hit()
     if mutation == "method":
         hit.method = "GET"
@@ -232,12 +244,14 @@ def test_sinopac_inventory_is_exact_authoritative_set(mutation) -> None:
         hit.resp_json[0]["SubInfo"][0]["DataValue"] = "1234"
     elif mutation == "sequence":
         hit.request_sequence = 0
+    elif mutation == "row":
+        hit.resp_json[0]["SubInfo"][0] = {}
     else:
         hit.main_frame_request = False
     collector = ResponseCollector("sinopac.com")
     collector.hits = [hit]
 
-    with pytest.raises(RuntimeError, match="sinopac-twd-history-inventory"):
+    with pytest.raises(RuntimeError, match=f"^{guard}$"):
         SinopacCrawler._twd_inventory(collector)
 
 
@@ -264,7 +278,9 @@ def test_sinopac_inventory_rejects_multiple_authoritative_responses() -> None:
     collector = ResponseCollector("sinopac.com")
     collector.hits = [first, second]
 
-    with pytest.raises(RuntimeError, match="sinopac-twd-history-inventory"):
+    with pytest.raises(
+        RuntimeError, match="^sinopac-twd-history-inventory-cardinality$"
+    ):
         SinopacCrawler._twd_inventory(collector)
 
 
