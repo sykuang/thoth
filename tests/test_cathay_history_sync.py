@@ -115,6 +115,59 @@ def test_cathay_twd_response_fails_closed_on_wrong_account_or_truncation():
             )
 
 
+def test_cathay_twd_response_accepts_exact_iso_datetime_range():
+    response = {
+        "success": "true",
+        "returnCode": "0000",
+        "content": {"datas": [{
+            "queryStatus": "Success",
+            "accountNumber": "00001234",
+            "count": 0,
+            "startDate": "2026-08-01T00:00:00",
+            "endDate": "2026-08-30T23:59:59+08:00",
+            "details": [],
+        }]},
+    }
+
+    account = CathayCrawler._validated_twd_account(
+        response, "00001234",
+        start=date(2026, 8, 1), end=date(2026, 8, 30),
+    )
+
+    assert account["count"] == 0
+
+
+def test_cathay_twd_response_normalizes_iso_datetime_account_date():
+    response = {
+        "success": "true",
+        "returnCode": "0000",
+        "content": {"datas": [{
+            "queryStatus": "Success",
+            "accountNumber": "00001234",
+            "count": 1,
+            "startDate": "2026-08-01T00:00:00",
+            "endDate": "2026-08-30T23:59:59+08:00",
+            "details": [{
+                "txnDateTime": "2026-08-20T10:00:00",
+                "accountDate": "2026-08-20T00:00:00",
+                "description": "測試交易",
+                "expendAmt": "1",
+                "incomeAmt": None,
+                "balance": "99",
+            }],
+        }]},
+    }
+
+    account = CathayCrawler._validated_twd_account(
+        response, "00001234",
+        start=date(2026, 8, 1), end=date(2026, 8, 30),
+    )
+    crawler = object.__new__(CathayCrawler)
+    transactions = crawler._normalize_twd_transactions(account["details"])
+
+    assert transactions[0]["account_date"] == "2026-08-20"
+
+
 @pytest.mark.parametrize(
     "mutation", ["method", "status", "host", "path", "userinfo", "customer_id"],
 )

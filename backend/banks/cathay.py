@@ -487,12 +487,12 @@ class CathayCrawler(BankCrawler):
             raise RuntimeError("cathay-twd-history-response")
         account = rows[0]
         if (
-            account.get("queryStatus") != "SUCCESS"
+            account.get("queryStatus") not in {"SUCCESS", "Success"}
             or account.get("accountNumber") != raw_account
             or start is not None
-            and account.get("startDate") != start.isoformat()
+            and not cls._twd_response_date_matches(account.get("startDate"), start)
             or end is not None
-            and account.get("endDate") != end.isoformat()
+            and not cls._twd_response_date_matches(account.get("endDate"), end)
         ):
             raise RuntimeError("cathay-twd-history-account-mismatch")
         details = account.get("details")
@@ -521,15 +521,9 @@ class CathayCrawler(BankCrawler):
                     raise RuntimeError("cathay-twd-history-transaction-range")
                 account_date = row.get("accountDate")
                 if account_date is not None:
-                    if (
-                        not isinstance(account_date, str)
-                        or cls._normalize_iso_date(account_date) != account_date
-                    ):
+                    parsed_account_date = cls._twd_response_date(account_date)
+                    if parsed_account_date is None:
                         raise RuntimeError("cathay-twd-history-transaction-date")
-                    try:
-                        parsed_account_date = date.fromisoformat(account_date)
-                    except ValueError:
-                        raise RuntimeError("cathay-twd-history-transaction-date") from None
                     if not start <= parsed_account_date <= end:
                         raise RuntimeError("cathay-twd-history-transaction-range")
                 if any(
@@ -573,6 +567,22 @@ class CathayCrawler(BankCrawler):
         ):
             raise ValueError("invalid amount")
         return int(amount)
+
+    @staticmethod
+    def _twd_response_date(value: object) -> date | None:
+        if not isinstance(value, str) or not (
+            re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+            or _TWD_DATETIME_RE.fullmatch(value)
+        ):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+
+    @classmethod
+    def _twd_response_date_matches(cls, value: object, expected: date) -> bool:
+        return cls._twd_response_date(value) == expected
 
     @staticmethod
     def _normalize_twd_datetime(value) -> str:
@@ -824,7 +834,11 @@ class CathayCrawler(BankCrawler):
         return [
             {
                 "datetime": self._normalize_twd_datetime(t.get("txnDateTime")),
-                "account_date": t.get("accountDate"),
+                "account_date": (
+                    parsed.isoformat()
+                    if (parsed := self._twd_response_date(t.get("accountDate"))) is not None
+                    else t.get("accountDate")
+                ),
                 "desc": t.get("description"),
                 "expend": (
                     self._normalize_twd_amount(t["expendAmt"], non_negative=True)
