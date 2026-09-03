@@ -375,6 +375,16 @@ class ResponseCollector:
                 or (hostname != expected and not hostname.endswith("." + expected))
             ):
                 return
+            rakuten_metadata_only = self.host_filter == "rakuten-bank.com.tw"
+            if rakuten_metadata_only and (
+                parsed.netloc != "www.rakuten-bank.com.tw"
+                or parsed.path != "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+                or req.method != "POST"
+            ):
+                return
             frame = getattr(req, "frame", None)
             page = getattr(frame, "page", None)
             main_frame_request = (
@@ -385,12 +395,14 @@ class ResponseCollector:
             self._request_sequence += 1
             self._requests[id(req)] = self._request_sequence
             self._request_main_frame[id(req)] = main_frame_request
-            self._request_frame_urls[id(req)] = frame_url
-            self._request_frames[id(req)] = frame
+            self._request_frame_urls[id(req)] = "" if rakuten_metadata_only else frame_url
+            self._request_frames[id(req)] = None if rakuten_metadata_only else frame
             endpoint = parsed.path.rsplit("/", 1)[-1]
             self._issued_endpoint_counts[endpoint] = (
                 self._issued_endpoint_counts.get(endpoint, 0) + 1
             )
+            if rakuten_metadata_only:
+                return
             auth = req.headers.get("authorization", "")
             if re.fullmatch(r"Bearer [^\s\r\n]+", auth) is None:
                 return
@@ -417,15 +429,26 @@ class ResponseCollector:
             if self.SKIP_RE.search(url):
                 return
             parsed = urlparse(url)
+            hostname = (parsed.hostname or "").lower()
             if self.host_filter:
                 expected = self.host_filter.lower().strip(".")
-                hostname = (parsed.hostname or "").lower()
                 if (
                     parsed.scheme.lower() != "https"
                     or (hostname != expected and not hostname.endswith("." + expected))
                 ):
                     return
             req = resp.request
+            metadata_only = self.host_filter == "rakuten-bank.com.tw"
+            if metadata_only and (
+                parsed.netloc != "www.rakuten-bank.com.tw"
+                or parsed.path != "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+                or req.method != "POST"
+            ):
+                self._on_request_failed(req)
+                return
             request_sequence = self._requests.pop(id(req), 0)
             main_frame_request = self._request_main_frame.pop(id(req), False)
             request_frame_url = self._request_frame_urls.pop(id(req), "")
@@ -489,7 +512,7 @@ class ResponseCollector:
                 )
             )
             body_size = int(content_length) if content_length.isdigit() else None
-            auth = req.headers.get("authorization", "")
+            auth = "" if metadata_only else req.headers.get("authorization", "")
             # 只按 request 發出順序更新 token；response 亂序不得降回舊 token。
             if (
                 auth_event is not None
@@ -513,7 +536,7 @@ class ResponseCollector:
                 return
             req_body = None
             try:
-                pd = req.post_data
+                pd = None if metadata_only else req.post_data
                 if pd:
                     if is_bounded_json:
                         if len(pd.encode("utf-8")) > 16_384:
@@ -536,7 +559,7 @@ class ResponseCollector:
             except Exception:
                 pass
             resp_json = None
-            if "json" in ct:
+            if "json" in ct and not metadata_only:
                 if is_bounded_json:
                     minimum_size = 64 if is_ubot_history else 0
                     if (
@@ -569,10 +592,16 @@ class ResponseCollector:
                 else:
                     with contextlib.suppress(Exception):
                         resp_json = resp.json()
+            stored_url = (
+                "https://www.rakuten-bank.com.tw/ixtein/adapters/ebank/txns/"
+                "channel-ctw/CTWQU0001/011"
+                if metadata_only
+                else url.split("?")[0]
+            )
             self.hits.append(ApiHit(
-                url=url.split("?")[0], method=req.method, status=resp.status,
+                url=stored_url, method=req.method, status=resp.status,
                 req_body=req_body, resp_json=resp_json, content_type=ct,
-                raw_url=url,
+                raw_url=stored_url if metadata_only else url,
                 redirected=getattr(req, "redirected_from", None) is not None,
                 body_size=body_size,
                 request_sequence=request_sequence,

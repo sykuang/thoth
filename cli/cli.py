@@ -31,6 +31,10 @@ def _write_private_json(path: Path, payload: dict) -> None:
     write_private_json(path, payload)
 
 
+def _remove_private_json(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
 def _get_crawler(bank: str):
     if bank == "cathay":
         from backend.banks.cathay import CathayCrawler, BASE
@@ -75,6 +79,10 @@ def _get_crawler(bank: str):
 
 
 def cmd_sync(args):
+    raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
+    # Rakuten history is DOM-normalized but still customer-bearing; canonical DB only.
+    if args.bank == "rakuten":
+        _remove_private_json(raw)
     crawler, login_url = _get_crawler(args.bank)
     print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
     store = BankStore(args.bank)
@@ -112,9 +120,8 @@ def cmd_sync(args):
         from backend.core.persist import persist_collected
 
         delta = persist_collected(args.bank, data, store, rules=rules)
-        # 只有通過銀行特定 persistence barrier 後，才保存 0600 原始備份。
-        raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
-        _write_private_json(raw, result)
+        if args.bank != "rakuten":
+            _write_private_json(raw, result)
         stats = store.stats()
     finally:
         store.close()

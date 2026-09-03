@@ -1,17 +1,21 @@
-"""樂天國際銀行網銀 DOM collect → normalized store。"""
+"""樂天國際銀行 attested DOM collect → normalized store。"""
 from __future__ import annotations
 
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 import json
 import re
-from datetime import datetime
+from zoneinfo import ZoneInfo
 
+from backend.banks.rakuten import RakutenCrawler
 from backend.core.account_classify import ProductType
+from backend.core.base import validate_history_coverage
 from backend.core.persist._common import _num_real, _slash_date_to_iso
 from backend.core.store import BankStore
 
 
 def _is_income(value: object) -> bool:
-    return value is True or str(value).strip().lower() in {"1", "true", "+", "income", "credit"}
+    return value is True
 
 
 def _money(value: object) -> float | None:
@@ -21,89 +25,178 @@ def _money(value: object) -> float | None:
 
 
 def _txn_datetime(row: dict) -> str | None:
-    date = _slash_date_to_iso(row.get("sysDate"))
-    if not date:
+    day = _slash_date_to_iso(row.get("sysDate"))
+    if not day:
         return None
     time = str(row.get("sysTime") or "").strip()
-    if not time:
-        return date
-    if len(time) == 5:
-        time += ":00"
-    return f"{date}T{time}"
+    return f"{day}T{time}" if time else day
 
 
-def persist_rakuten(
+def _today() -> date:
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+
+def _iso_date(value: object, error: str) -> date:
+    if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise ValueError(error)
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(error) from None
+
+
+def _six_month_floor(as_of: date) -> date:
+    month_index = as_of.year * 12 + as_of.month - 1 - 5
+    return date(month_index // 12, month_index % 12 + 1, 1)
+
+
+def _validate_rakuten_history(data: dict, store: BankStore) -> date:
+    error = "invalid Rakuten history coverage"
+    coverage = data.get("history_coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError(error)
+    mode = coverage.get("mode")
+    if mode not in {"full", "incremental"}:
+        raise ValueError(error)
+    as_of = _iso_date(coverage.get("as_of"), error)
+    today = _today()
+    if as_of > today or (today - as_of).days > 1:
+        raise ValueError(error)
+    validate_history_coverage(
+        coverage,
+        expected_mode=mode,
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    try:
+        encoded = json.dumps(
+            {
+                "history_coverage": coverage,
+                "account_options": data.get("account_options"),
+                "twd_txn_results": data.get("twd_txn_results"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+    if len(encoded) > 5_000_000:
+        raise ValueError(error)
+
+    domain = coverage["domains"][0]
+    expected = domain["expected"]
+    windows = domain["windows"]
+    expected_by_identity = {
+        item["identity"]: item for item in expected if isinstance(item, dict)
+    }
+    inventory = data.get("account_options")
+    inventory_ids = []
+    if isinstance(inventory, list):
+        for item in inventory:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"identity"}
+                or not isinstance(item.get("identity"), str)
+            ):
+                raise ValueError(error)
+            inventory_ids.append(item["identity"])
+    results = data.get("twd_txn_results")
+    if (
+        not expected
+        or len(expected_by_identity) != len(expected)
+        or len(inventory_ids) != len(set(inventory_ids))
+        or set(inventory_ids) != set(expected_by_identity)
+        or not isinstance(results, list)
+        or len(results) != len(windows)
+    ):
+        raise ValueError(error)
+
+    receipts = []
+    identities = set()
+    for result in results:
+        try:
+            receipt = RakutenCrawler._validated_history_result(result)
+        except RuntimeError:
+            raise ValueError(error) from None
+        identity = result["account_no"]
+        if identity not in expected_by_identity:
+            raise ValueError(error)
+        identities.add(identity)
+        receipts.append({
+            key: receipt[key]
+            for key in ("identity", "start", "end", "status", "pages")
+        })
+        start = _iso_date(receipt["start"], error)
+        end = _iso_date(receipt["end"], error)
+        native_end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+        if end != min(native_end, as_of):
+            raise ValueError(error)
+    if receipts != windows or identities != set(expected_by_identity):
+        raise ValueError(error)
+
+    floor = _six_month_floor(as_of)
+    existing = store.latest_twd_transaction_dates()
+    for identity, item in expected_by_identity.items():
+        cursor = existing.get(identity)
+        if mode == "incremental" and type(cursor) is date and cursor > as_of:
+            raise ValueError(error)
+        expected_start = floor
+        if mode == "incremental" and type(cursor) is date:
+            expected_start = max(floor, (cursor - timedelta(days=7)).replace(day=1))
+        if (
+            _iso_date(item.get("start"), error) != expected_start
+            or _iso_date(item.get("end"), error) != as_of
+        ):
+            raise ValueError(error)
+    return as_of
+
+
+def _persist_rakuten(
     data: dict,
     store: BankStore,
-    rules: list[dict] | None = None,
+    rules: list[dict] | None,
+    *,
+    as_of: date,
 ) -> dict:
-    """寫入樂天活存帳戶、每日餘額與六個月交易明細。"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    results = data.get("twd_txn_results") or []
+    today = as_of.isoformat()
+    results = data["twd_txn_results"]
     accounts_by_no: dict[str, dict] = {}
     txns: list[dict] = []
-    seen_snapshots: set[str] = set()
 
     for result in results:
-        if not isinstance(result, dict):
-            continue
-        fingerprint = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
-        if fingerprint in seen_snapshots:
-            continue
-        seen_snapshots.add(fingerprint)
-        raw_accounts = result.get("accounts") or []
-        fallback_no = result.get("account_no")
-        for raw in raw_accounts:
-            if not isinstance(raw, dict):
-                continue
-            account_no = raw.get("acctNo") or raw.get("account_no")
-            if not account_no:
-                continue
-            balance = _money(raw.get("balance"))
-            accounts_by_no[str(account_no)] = {
-                "account_no": str(account_no),
-                "currency": "TWD",
-                "branch": None,
-                "nickname": raw.get("nickname") or "樂天活存",
-                "type": "活期存款",
-                "product_type": ProductType.DEPOSIT,
-                "raw_balance": balance,
-                "raw_balance_date": today if balance is not None else None,
-            }
-            fallback_no = fallback_no or account_no
-
-        for row in result.get("txDetails") or []:
-            if not isinstance(row, dict):
-                continue
+        raw = result["accounts"][0]
+        account_no = result["account_no"]
+        balance = _money(raw["balance"])
+        accounts_by_no[account_no] = {
+            "account_no": account_no,
+            "currency": "TWD",
+            "branch": None,
+            "nickname": "樂天活存",
+            "type": "活期存款",
+            "product_type": ProductType.DEPOSIT,
+            "raw_balance": balance,
+            "raw_balance_date": today,
+        }
+        for row in result["txDetails"]:
             when = _txn_datetime(row)
-            amount = _money(row.get("amt"))
-            desc = str(row.get("txDesc") or "").strip()
-            if not when or amount is None or not desc:
-                continue
-            account_no = row.get("account_no") or fallback_no
-            if not account_no and len(accounts_by_no) == 1:
-                account_no = next(iter(accounts_by_no))
-            if not account_no:
-                continue
-            income = _is_income(row.get("amtSign"))
+            amount = _money(row["amt"])
+            if when is None or amount is None:
+                raise ValueError("invalid Rakuten history coverage")
             txns.append({
-                "account_no": str(account_no),
+                "account_no": account_no,
                 "datetime": when,
                 "account_date": when[:10],
-                "desc": desc,
-                "expend": None if income else abs(amount),
-                "income": abs(amount) if income else None,
-                "balance": _money(row.get("balance")),
-                "counterparty_bank": row.get("bankId"),
-                "counterparty_acct": row.get("nickNameOrAcct"),
-                "memo": str(row.get("memo") or "").strip() or None,
+                "desc": row["txDesc"].strip(),
+                "expend": None if _is_income(row["amtSign"]) else abs(amount),
+                "income": abs(amount) if _is_income(row["amtSign"]) else None,
+                "balance": _money(row["balance"]),
+                "counterparty_bank": None,
+                "counterparty_acct": row["nickNameOrAcct"],
+                "memo": row["memo"].strip() or None,
             })
 
     accounts = list(accounts_by_no.values())
-    if accounts:
-        store.upsert_accounts(accounts)
-
-    balances = [a["raw_balance"] for a in accounts if a["raw_balance"] is not None]
+    store.upsert_accounts(accounts, commit=False)
+    balances = [account["raw_balance"] for account in accounts]
     balance_days = 0
     if balances:
         store.upsert_balance_history([{
@@ -111,14 +204,9 @@ def persist_rakuten(
             "twdBalance": sum(balances),
             "fxBalance": None,
             "loanBalance": None,
-        }])
+        }], commit=False)
         balance_days = 1
-
-    twd_new = store.upsert_twd_txns(txns, rules=rules) if txns else 0
-    endpoints = data.get("_all_endpoints") or []
-    if endpoints:
-        store.put_daily_metric("rakuten_endpoints", {"endpoints": endpoints}, today)
-
+    twd_new = store.upsert_twd_txns(txns, rules=rules, commit=False) if txns else 0
     delta = {
         "bank": "rakuten",
         "scope": "structured",
@@ -129,5 +217,24 @@ def persist_rakuten(
         "card_unbilled": 0,
         "card_current": 0,
     }
-    store.log_sync(delta)
+    store.log_sync(delta, commit=False)
     return delta
+
+
+def persist_rakuten(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Validate and persist one Rakuten history payload atomically."""
+    try:
+        as_of = _validate_rakuten_history(data, store)
+        delta = _persist_rakuten(data, store, rules, as_of=as_of)
+        if commit:
+            store.commit()
+        return delta
+    except Exception:
+        store.conn.rollback()
+        raise

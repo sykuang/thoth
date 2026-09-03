@@ -7,14 +7,24 @@
 from __future__ import annotations
 
 import contextlib
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+import os
 import re
 import time
 from typing import ClassVar
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from scrapling.fetchers import StealthySession
 
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _OriginGuardProxy,
+    validate_history_coverage,
+)
 
 from backend.core.captcha import solve_captcha, wait_captcha_stable
 from backend.core.creds import RakutenCreds
@@ -78,13 +88,25 @@ def _six_month_labels(labels: list[str]) -> list[str]:
 
 
 def _row_from_dom(cells: list[str]) -> dict | None:
-    if len(cells) < 6:
+    if (
+        len(cells) != 6
+        or any(not isinstance(cell, str) for cell in cells)
+        or any(
+            len(cell.encode("utf-8")) > 4_000
+            or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", cell)
+            for cell in cells
+        )
+    ):
         return None
     date_time = cells[0].split()
     descriptions = [line.strip() for line in cells[1].splitlines() if line.strip()]
     income = cells[2].strip()
     expend = cells[3].strip()
-    if not date_time or not descriptions or not (income or expend):
+    if (
+        len(date_time) != 2
+        or not 1 <= len(descriptions) <= 2
+        or bool(income) == bool(expend)
+    ):
         return None
     return {
         "sysDate": date_time[0],
@@ -137,10 +159,11 @@ def _is_twd_query_request(request) -> bool:
     parsed = urlparse(request.url)
     return (
         parsed.scheme == "https"
-        and parsed.hostname == "www.rakuten-bank.com.tw"
+        and parsed.netloc == "www.rakuten-bank.com.tw"
         and parsed.path == QUERY_PATH
         and not parsed.params
         and not parsed.query
+        and not parsed.fragment
         and request.method == "POST"
     )
 
@@ -160,6 +183,9 @@ class RakutenLoginError(RuntimeError):
 
 class RakutenCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
+    HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
+    FETCH_TIMEZONE_ID: ClassVar[str | None] = "Asia/Taipei"
     CREDENTIAL_HOSTS = frozenset({"www.rakuten-bank.com.tw"})
     FETCH_REAL_CHROME = True  # Imperva/Incapsula 會擋 bundled Chromium。
     VISIBLE_CONFIRM_SELECTOR = (
@@ -179,6 +205,336 @@ class RakutenCrawler(BankCrawler):
 
     def _host_filter(self) -> str:
         return "rakuten-bank.com.tw"
+
+    @staticmethod
+    def _validated_account_options(
+        selected_label: str,
+        option_labels: list[str],
+    ) -> list[tuple[str, str]]:
+        error = "rakuten-twd-history-inventory"
+        selected = _account_number(selected_label)
+        if selected is None or not option_labels:
+            raise RuntimeError(error)
+        options: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for label in option_labels:
+            identity = _account_number(label)
+            if identity is None or identity in seen:
+                raise RuntimeError(error)
+            options.append((identity, label))
+            seen.add(identity)
+        if selected not in seen:
+            raise RuntimeError(error)
+        return options
+
+    def _history_plan(
+        self,
+        identity: str,
+        labels: list[str],
+        as_of: date,
+    ) -> list[dict]:
+        if any(
+            not isinstance(label, str)
+            or re.fullmatch(r"\s*\d{4}/(?:0[1-9]|1[0-2])\s+活存明細\s*", label) is None
+            for label in labels
+        ):
+            raise RuntimeError("rakuten-twd-history-months")
+        try:
+            months = _six_month_labels(labels)
+        except RuntimeError:
+            raise RuntimeError("rakuten-twd-history-months") from None
+        parsed = [date(int(label[:4]), int(label[5:7]), 1) for label in months]
+        expected = []
+        cursor = date(as_of.year, as_of.month, 1)
+        for _ in range(6):
+            expected.append(cursor)
+            cursor = (cursor - timedelta(days=1)).replace(day=1)
+        if parsed != expected:
+            raise RuntimeError("rakuten-twd-history-months")
+
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        oldest = parsed[-1]
+        start = oldest
+        persisted = self.transaction_start_for(identity, domain="twd_transactions")
+        if mode == "incremental" and persisted is not None and persisted > as_of:
+            raise RuntimeError("rakuten-twd-history-cursor")
+        if mode == "incremental" and persisted is not None:
+            start = max(oldest, (persisted - timedelta(days=7)).replace(day=1))
+
+        plan = []
+        for label, month_start in reversed(list(zip(months, parsed, strict=True))):
+            if month_start < start:
+                continue
+            month_end = date(
+                month_start.year,
+                month_start.month,
+                monthrange(month_start.year, month_start.month)[1],
+            )
+            plan.append({
+                "label": label,
+                "start": month_start,
+                "end": min(month_end, as_of),
+            })
+        return plan
+
+    @staticmethod
+    def _validate_history_dom(dom: dict, row_count: int) -> None:
+        error = "rakuten-twd-history-dom"
+        keys = {
+            "table_count", "visible_tables", "headers", "raw_rows", "no_data_count",
+            "invalid_cells", "pager", "busy", "dialogs", "alerts",
+        }
+        if (
+            not isinstance(dom, dict)
+            or set(dom) != keys
+            or type(row_count) is not int
+            or row_count < 0
+            or any(
+                type(dom.get(key)) is not int or dom[key] < 0
+                for key in keys - {"headers"}
+            )
+            or not isinstance(dom.get("headers"), list)
+            or any(type(header) is not str for header in dom["headers"])
+            or dom["raw_rows"] != row_count
+            or any(
+                dom[key] != 0
+                for key in ("invalid_cells", "pager", "busy", "dialogs", "alerts")
+            )
+        ):
+            raise RuntimeError(error)
+        if row_count:
+            if (
+                dom["table_count"] != 1
+                or dom["visible_tables"] != 1
+                or dom["no_data_count"] != 0
+                or dom["headers"] != [
+                    "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
+                    "帳戶餘額", "備註", "",
+                ]
+            ):
+                raise RuntimeError(error)
+        elif (
+            dom["table_count"] != 0
+            or dom["visible_tables"] != 0
+            or dom["no_data_count"] != 1
+            or dom["headers"]
+        ):
+            raise RuntimeError(error)
+
+    @staticmethod
+    def _validated_history_result(result: dict) -> dict:
+        error = "rakuten-twd-history-result"
+        if not isinstance(result, dict) or set(result) != {
+            "account_no", "accounts", "txDetails", "selected_month", "dom", "receipt",
+            "transport",
+        }:
+            raise RuntimeError(error)
+        identity = result.get("account_no")
+        rows = result.get("txDetails")
+        accounts = result.get("accounts")
+        dom = result.get("dom")
+        receipt = result.get("receipt")
+        transport = result.get("transport")
+        if (
+            not isinstance(identity, str)
+            or re.fullmatch(r"\d{10,16}", identity) is None
+            or not isinstance(rows, list)
+            or len(rows) > 50_000
+            or not isinstance(accounts, list)
+            or len(accounts) != 1
+            or not isinstance(accounts[0], dict)
+            or set(accounts[0]) != {"acctNo", "balance"}
+            or accounts[0].get("acctNo") != identity
+            or not isinstance(accounts[0].get("balance"), str)
+            or re.fullmatch(r"\s*(?:NT\$\s*)?-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})\s*", accounts[0]["balance"]) is None
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"identity", "start", "end", "status", "pages", "rows"}
+            or receipt.get("identity") != identity
+            or type(receipt.get("pages")) is not int
+            or receipt["pages"] != 1
+            or type(receipt.get("rows")) is not int
+            or receipt["rows"] != len(rows)
+            or receipt.get("status") not in {"complete", "explicit_empty"}
+            or (receipt["status"] == "complete") != bool(rows)
+            or not isinstance(result.get("selected_month"), str)
+            or not isinstance(dom, dict)
+            or not isinstance(transport, dict)
+            or set(transport) != {
+                "url", "method", "status", "content_type", "redirected", "main_frame",
+                "request_count", "response_count",
+            }
+        ):
+            raise RuntimeError(error)
+        try:
+            RakutenCrawler._validate_history_dom(dom, len(rows))
+        except RuntimeError:
+            raise RuntimeError(error) from None
+        try:
+            start = date.fromisoformat(receipt["start"])
+            end = date.fromisoformat(receipt["end"])
+            parsed_url = urlparse(transport["url"])
+        except (TypeError, ValueError):
+            raise RuntimeError(error) from None
+        if (
+            start > end
+            or (start.year, start.month) != (end.year, end.month)
+            or start.day != 1
+            or result["selected_month"] != f"{start:%Y/%m} 活存明細"
+            or parsed_url.scheme != "https"
+            or parsed_url.netloc != "www.rakuten-bank.com.tw"
+            or parsed_url.path != QUERY_PATH
+            or parsed_url.params
+            or parsed_url.query
+            or parsed_url.fragment
+            or transport.get("method") != "POST"
+            or transport.get("status") != 200
+            or transport.get("content_type") != "application/json"
+            or transport.get("redirected") is not False
+            or transport.get("main_frame") is not True
+            or type(transport.get("request_count")) is not int
+            or transport["request_count"] != 1
+            or type(transport.get("response_count")) is not int
+            or transport["response_count"] != 1
+        ):
+            raise RuntimeError(error)
+
+        row_keys = {
+            "sysDate", "sysTime", "txDesc", "nickNameOrAcct", "amt", "amtSign", "balance", "memo",
+        }
+        money = re.compile(r"(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})")
+        signed_money = re.compile(r"-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != row_keys:
+                raise RuntimeError(error)
+            try:
+                transacted = datetime.strptime(
+                    f"{row['sysDate']} {row['sysTime']}", "%Y/%m/%d %H:%M:%S",
+                ).date()
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError(error) from None
+            if (
+                not start <= transacted <= end
+                or not isinstance(row["txDesc"], str)
+                or not row["txDesc"].strip()
+                or len(row["txDesc"]) > 2_000
+                or row["nickNameOrAcct"] is not None
+                and (not isinstance(row["nickNameOrAcct"], str) or len(row["nickNameOrAcct"]) > 2_000)
+                or not isinstance(row["amt"], str)
+                or money.fullmatch(row["amt"]) is None
+                or type(row["amtSign"]) is not bool
+                or not isinstance(row["balance"], str)
+                or signed_money.fullmatch(row["balance"]) is None
+                or not isinstance(row["memo"], str)
+                or len(row["memo"]) > 2_000
+            ):
+                raise RuntimeError(error)
+        return receipt
+
+    def _collect_attested_twd_history(
+        self,
+        page,
+        collector: ResponseCollector,
+        *,
+        as_of: date | None = None,
+    ) -> dict:
+        as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
+        mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
+        if mode not in {"full", "incremental"}:
+            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+
+        account_root = "simple-dropdown2"
+        current_account = self._selected_label(page, account_root)
+        accounts = self._validated_account_options(
+            current_account,
+            self._visible_labels(page, account_root),
+        )
+
+        expected: list[dict] = []
+        windows: list[dict] = []
+        results: list[dict] = []
+        month_root = "simple-dropdown"
+        for identity, account_label in accounts:
+            if _account_number(self._selected_label(page, account_root)) != identity:
+                self._select_label(page, collector, account_root, account_label)
+            current_month = self._selected_label(page, month_root)
+            raw_month_labels = [
+                current_month,
+                *self._visible_labels(page, month_root),
+            ]
+            plan = self._history_plan(identity, raw_month_labels, as_of)
+            month_labels = _six_month_labels(raw_month_labels)
+            if not plan:
+                raise RuntimeError("rakuten-twd-history-range")
+            expected.append({
+                "identity": identity,
+                "start": plan[0]["start"].isoformat(),
+                "end": plan[-1]["end"].isoformat(),
+            })
+
+            if self._selected_label(page, month_root) == plan[0]["label"]:
+                bootstrap = next(
+                    (label for label in month_labels if label != plan[0]["label"]),
+                    None,
+                )
+                if bootstrap is None:
+                    raise RuntimeError("rakuten-twd-history-months")
+                self._select_label(page, collector, month_root, bootstrap)
+
+            for window in plan:
+                transport = self._select_label(
+                    page, collector, month_root, window["label"],
+                )
+                result = self._scrape_twd_page(page, identity)
+                status = "complete" if result["txDetails"] else "explicit_empty"
+                receipt = {
+                    "identity": identity,
+                    "start": window["start"].isoformat(),
+                    "end": window["end"].isoformat(),
+                    "status": status,
+                    "pages": 1,
+                    "rows": len(result["txDetails"]),
+                }
+                result.update({
+                    "selected_month": window["label"],
+                    "receipt": receipt,
+                    "transport": transport,
+                })
+                self._validated_history_result(result)
+                results.append(result)
+                windows.append({
+                    key: receipt[key]
+                    for key in ("identity", "start", "end", "status", "pages")
+                })
+
+        final_accounts = self._validated_account_options(
+            self._selected_label(page, account_root),
+            self._visible_labels(page, account_root),
+        )
+        if final_accounts != accounts:
+            raise RuntimeError("rakuten-twd-history-inventory")
+
+        coverage = {
+            "version": 1,
+            "mode": mode,
+            "as_of": as_of.isoformat(),
+            "domains": [{
+                "domain": "twd_transactions",
+                "expected": expected,
+                "windows": windows,
+            }],
+        }
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=self.HISTORY_COVERAGE_DOMAINS,
+        )
+        return {
+            "account_options": [{"identity": identity} for identity, _label in accounts],
+            "twd_txn_results": results,
+            "history_coverage": coverage,
+        }
 
     def _execute_browser_flow(
         self,
@@ -481,23 +837,115 @@ class RakutenCrawler(BankCrawler):
     @staticmethod
     def _scrape_twd_page(page, account_no: str | None = None) -> dict:
         snapshot = page.evaluate(r"""() => {
-            const visible = e => !!e && !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+            const visible = e => {
+                if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) return false;
+                for (let n = e; n; n = n.parentElement) {
+                    const s = getComputedStyle(n);
+                    if (n.hidden || s.display === 'none' || s.visibility === 'hidden'
+                        || s.visibility === 'collapse' || Number(s.opacity) === 0
+                        || (n.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
+                }
+                return true;
+            };
+            const text = e => (e?.innerText || '').replace(/\s+/g, ' ').trim();
             const selected = document.querySelector('simple-dropdown2 a.txt_dropdown');
             const accountLabel = selected?.innerText || document.querySelector('simple-dropdown2')?.innerText || '';
             const balance = document.querySelector('.card-title-money')?.innerText || '';
-            const rows = [...document.querySelectorAll('table.tb_mul tbody tr')]
-                .filter(visible)
-                .map(row => [...row.querySelectorAll(':scope > td')].map(cell => cell.innerText || ''));
-            return {accountLabel, balance, rows};
+            const tables = [...document.querySelectorAll('table.tb_mul')];
+            const visibleTables = tables.filter(visible);
+            const table = visibleTables.length === 1 ? visibleTables[0] : null;
+            const headerElements = table
+                ? [...table.querySelectorAll(':scope > thead > tr > th')]
+                : [];
+            const headers = headerElements.every(visible) ? headerElements.map(text) : [];
+            const allRowElements = table
+                ? [...table.querySelectorAll(':scope > tbody > tr')]
+                : [];
+            const rowElements = allRowElements.filter(visible);
+            const encoder = new TextEncoder();
+            let rawBytes = 0;
+            let invalidCells = 0;
+            const rows = [];
+            for (const row of rowElements) {
+                const cells = [...row.querySelectorAll(':scope > td')];
+                const values = cells.map(cell => cell.innerText || '');
+                const sizes = values.map(value => encoder.encode(value).length);
+                rawBytes += sizes.reduce((sum, size) => sum + size, 0);
+                if (cells.length !== 6 || !cells.every(visible)
+                    || sizes.some(size => size > 4000) || rawBytes > 5000000) {
+                    invalidCells += 1;
+                    continue;
+                }
+                rows.push(values);
+            }
+            const noDataNodes = [...document.querySelectorAll('.page-result.pic-card .pic-card-title')]
+                .filter(e => visible(e) && text(e) === '此月份沒有任何交易明細。');
+            const anchor = table || noDataNodes[0];
+            let root = null;
+            for (let node = anchor?.parentElement; node && node !== document.body; node = node.parentElement) {
+                if (node.querySelector('simple-dropdown') && node.querySelector('simple-dropdown2')) {
+                    root = node;
+                    break;
+                }
+            }
+            root ||= anchor?.closest('main') || document;
+            const pager = [...root.querySelectorAll(
+                '.pagination, .pager, [class*="pagination"], [class*="pager"], '
+                + '[data-page], [aria-current="page"], a, button'
+            )].filter(e => {
+                const label = text(e);
+                const target = ["href", "onclick", "rel", "title", "aria-label"]
+                    .map(name => e.getAttribute(name) || "").join(" ");
+                return /pagination|pager/i.test(e.className || '')
+                    || /^(下一頁|上一頁|第一頁|最後一頁|首頁|末頁|next|prev|previous|first|last)$/i.test(label)
+                    || /^\d{1,4}$/.test(label)
+                    || /^[‹›«»←→]$/.test(label)
+                    || /^(next|previous|first|last|page)/i.test(e.getAttribute('aria-label') || '')
+                    || /(?:page|next|prev)/i.test(target);
+            }).length;
+            const busy = [...document.querySelectorAll(
+                '[aria-busy="true"], [role="progressbar"], .modal_loading, .loading, .spinner'
+            )].filter(visible).length;
+            const dialogs = [...document.querySelectorAll(
+                '.modal.show:not(.modal_loading), [role="dialog"]'
+            )].filter(visible).length;
+            const alerts = [...root.querySelectorAll(
+                '[role="alert"], .alert, .error, .alert-danger, .alert-error, .error-message'
+            )].filter(visible).length;
+            return {
+                accountLabel,
+                balance,
+                rows,
+                dom: {
+                    table_count: tables.length,
+                    visible_tables: visibleTables.length,
+                    headers,
+                    raw_rows: allRowElements.length,
+                    no_data_count: noDataNodes.length,
+                    invalid_cells: invalidCells,
+                    pager,
+                    busy,
+                    dialogs,
+                    alerts,
+                },
+            };
         }""")
         account_label = str(snapshot.pop("accountLabel", "") or "")
         raw_balance = snapshot.pop("balance", "")
-        number = account_no or _account_number(account_label)
-        snapshot["txDetails"] = [
-            parsed
-            for cells in snapshot.pop("rows", [])
-            if (parsed := _row_from_dom(cells)) is not None
-        ]
+        raw_rows = snapshot.pop("rows", [])
+        dom = snapshot.pop("dom", None)
+        extracted_number = _account_number(account_label)
+        if account_no is not None and extracted_number != account_no:
+            raise RuntimeError("rakuten-twd-history-dom")
+        number = account_no or extracted_number
+        if not isinstance(raw_rows, list):
+            raise RuntimeError("rakuten-twd-history-dom")
+        parsed_rows = [_row_from_dom(cells) for cells in raw_rows]
+        if any(parsed is None for parsed in parsed_rows) or snapshot:
+            raise RuntimeError("rakuten-twd-history-dom")
+        RakutenCrawler._validate_history_dom(dom, len(parsed_rows))
+        snapshot["txDetails"] = [parsed for parsed in parsed_rows if parsed is not None]
+        snapshot["dom"] = dom
         snapshot["account_no"] = number
         snapshot["accounts"] = [{
             "acctNo": number,
@@ -523,11 +971,43 @@ class RakutenCrawler(BankCrawler):
     @staticmethod
     def _visible_labels(page, root: str) -> list[str]:
         RakutenCrawler._open_dropdown(page, root)
-        page.wait_for_timeout(200)
-        options = page.locator(f"{root} .dropdown-menu a.dropdown-item:visible")
-        labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
-        page.keyboard.press("Escape")
-        return [label for label in labels if label]
+        previous: list[str] | None = None
+        stable_since: float | None = None
+        deadline = time.monotonic() + 3.0
+        try:
+            options = page.locator(f"{root} .dropdown-menu a.dropdown-item")
+            while time.monotonic() < deadline:
+                sample = options.evaluate_all(r"""elements => elements.map(element => {
+                    let visible = !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                    for (let node = element; visible && node; node = node.parentElement) {
+                        const style = getComputedStyle(node);
+                        if (node.hidden || style.display === 'none' || style.visibility === 'hidden'
+                            || style.visibility === 'collapse' || Number(style.opacity) <= 0.01) {
+                            visible = false;
+                        }
+                    }
+                    return {label: (element.innerText || '').trim(), visible};
+                })""")
+                labels = [item.get("label") for item in sample]
+                valid = (
+                    bool(labels)
+                    and all(item.get("visible") is True for item in sample)
+                    and all(isinstance(label, str) and label for label in labels)
+                )
+                now = time.monotonic()
+                if valid and labels == previous and stable_since is not None:
+                    if now - stable_since >= 1.0:
+                        return labels
+                else:
+                    stable_since = now if valid else None
+                previous = labels if valid else None
+                remaining_ms = int((deadline - now) * 1000)
+                if remaining_ms <= 0:
+                    break
+                page.wait_for_timeout(min(100, remaining_ms))
+            raise RuntimeError("rakuten-twd-history-inventory")
+        finally:
+            page.keyboard.press("Escape")
 
     @staticmethod
     def _twd_view_state(page) -> dict:
@@ -586,7 +1066,13 @@ class RakutenCrawler(BankCrawler):
         )
         raise RuntimeError(f"樂天臺幣頁資料未完成（kind={kind}）")
 
-    def _select_label(self, page, root: str, label: str) -> None:
+    def _select_label(
+        self,
+        page,
+        collector: ResponseCollector,
+        root: str,
+        label: str,
+    ) -> dict:
         self._open_dropdown(page, root)
         page.wait_for_timeout(100)
         options = page.locator(f"{root} .dropdown-menu a.dropdown-item:visible")
@@ -597,6 +1083,8 @@ class RakutenCrawler(BankCrawler):
             raise RuntimeError(f"找不到唯一可見的樂天下拉選項（kind={kind}）")
         target = options.nth(target_index)
         before_rows = str(self._twd_view_state(page).get("rows") or "")
+        request_boundary = collector.request_sequence
+        issued_before = collector.issued_count("011")
         page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=20000)
         with page.expect_request(_is_twd_query_request, timeout=20000) as request_info:
             target.click()
@@ -615,6 +1103,40 @@ class RakutenCrawler(BankCrawler):
             selected_label=label,
             before_rows=before_rows,
         )
+        hits = []
+        for _ in range(4):
+            page.wait_for_timeout(500)
+            hits = [
+                hit for hit in collector.hits
+                if hit.request_sequence > request_boundary
+                and urlparse(hit.raw_url or hit.url).path == QUERY_PATH
+            ]
+            if (
+                collector.issued_count("011") - issued_before > 1
+                or len(hits) > 1
+            ):
+                raise RuntimeError("rakuten-twd-history-response-cardinality")
+        if (
+            collector.issued_count("011") - issued_before != 1
+            or len(hits) != 1
+        ):
+            raise RuntimeError("rakuten-twd-history-response-cardinality")
+        hit = hits[0]
+        request = request_info.value
+        request_frame = _OriginGuardProxy._unwrap(getattr(request, "frame", None))
+        main_frame = _OriginGuardProxy._unwrap(getattr(page, "main_frame", None))
+        if request_frame is not main_frame:
+            raise RuntimeError("rakuten-twd-history-frame")
+        return {
+            "url": hit.raw_url or hit.url,
+            "method": hit.method,
+            "status": hit.status,
+            "content_type": (hit.content_type or "").split(";", 1)[0].strip().lower(),
+            "redirected": hit.redirected,
+            "main_frame": hit.main_frame_request,
+            "request_count": 1,
+            "response_count": 1,
+        }
 
     def _goto_twd(self, page) -> None:
         """走真實 UI 導覽進臺幣存款頁。
@@ -677,36 +1199,7 @@ class RakutenCrawler(BankCrawler):
             raise RakutenLoginError("進入臺幣存款頁後 session 無效")
         self._wait_for_twd_view(page, timeout_seconds=30)
 
-        account_root = "simple-dropdown2"
-        current_account = self._selected_label(page, account_root)
-        account_labels = [current_account, *self._visible_labels(page, account_root)]
-        accounts: list[tuple[str, str]] = []
-        seen_accounts: set[str] = set()
-        for label in account_labels:
-            number = _account_number(label)
-            if number and number not in seen_accounts:
-                accounts.append((number, label))
-                seen_accounts.add(number)
-        if not accounts:
-            raise RuntimeError("樂天帳戶選單沒有可辨識的帳號")
-
-        results: list[dict] = []
-        for account_no, account_label in accounts:
-            selected_account = self._selected_label(page, account_root)
-            if _account_number(selected_account) != account_no:
-                self._select_label(page, account_root, account_label)
-
-            month_root = "simple-dropdown"
-            current_month = self._selected_label(page, month_root)
-            month_labels = _six_month_labels([
-                current_month,
-                *self._visible_labels(page, month_root),
-            ])
-            for month_label in month_labels:
-                selected_month = self._selected_label(page, month_root)
-                if selected_month != month_label:
-                    self._select_label(page, month_root, month_label)
-                results.append(self._scrape_twd_page(page, account_no))
+        history = self._collect_attested_twd_history(page, collector)
 
         endpoints = sorted({
             _endpoint_key(hit.url)
@@ -716,7 +1209,9 @@ class RakutenCrawler(BankCrawler):
         return BankCollectResult(
             bank="rakuten",
             final_url=page.url,
-            twd_txn_results=results,
+            account_options=history["account_options"],
+            twd_txn_results=history["twd_txn_results"],
+            history_coverage=history["history_coverage"],
             _all_endpoints=endpoints,
             card_bill_facts_ok=False,
             card_bill_facts=[],

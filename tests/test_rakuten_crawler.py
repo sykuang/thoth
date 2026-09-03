@@ -26,7 +26,7 @@ from backend.banks.rakuten import (
     _unique_option_index,
     _view_ready,
 )
-from backend.core.base import BankCollectResult
+from backend.core.base import ApiHit, BankCollectResult, ResponseCollector
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
@@ -927,6 +927,12 @@ def test_query_request_and_dom_readiness_fail_closed() -> None:
 def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> None:
     events: list[str] = []
     label = "2026/06 活存明細"
+    endpoint = (
+        "https://www.rakuten-bank.com.tw/ixtein/adapters/ebank/txns/"
+        "channel-ctw/CTWQU0001/011"
+    )
+    frame_obj = object()
+    collector = ResponseCollector("rakuten-bank.com.tw")
 
     class Target:
         def count(self) -> int:
@@ -940,6 +946,18 @@ def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> No
 
         def click(self) -> None:
             events.append("click")
+            collector._request_sequence = 1
+            collector._issued_endpoint_counts["011"] = 1
+            collector.hits.append(ApiHit(
+                url=endpoint,
+                raw_url=endpoint,
+                method="POST",
+                status=200,
+                content_type="application/json; charset=utf-8",
+                request_sequence=1,
+                main_frame_request=True,
+                request_frame=frame_obj,
+            ))
 
     class Response:
         status = 200
@@ -949,10 +967,8 @@ def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> No
 
     class Request:
         method = "POST"
-        url = (
-            "https://www.rakuten-bank.com.tw/ixtein/adapters/ebank/txns/"
-            "channel-ctw/CTWQU0001/011"
-        )
+        url = endpoint
+        frame = frame_obj
 
         def response(self) -> Response:
             events.append("bound-response")
@@ -970,12 +986,14 @@ def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> No
 
     class Page:
         keyboard = object()
+        main_frame = frame_obj
 
         def locator(self, _selector: str) -> Target:
             return Target()
 
-        def wait_for_timeout(self, _milliseconds: int) -> None:
-            pass
+        def wait_for_timeout(self, milliseconds: int) -> None:
+            if milliseconds == 500:
+                events.append("network-quiet")
 
         def wait_for_selector(self, _selector: str, *, state: str, timeout: int) -> None:
             events.append(f"loader-{state}")
@@ -989,7 +1007,16 @@ def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> No
     monkeypatch.setattr(crawler, "_twd_view_state", lambda *_args: {"rows": ""})
     monkeypatch.setattr(crawler, "_wait_for_twd_view", lambda *_args, **_kwargs: events.append("dom-ready"))
 
-    crawler._select_label(Page(), "simple-dropdown", label)
+    assert crawler._select_label(Page(), collector, "simple-dropdown", label) == {
+        "url": endpoint,
+        "method": "POST",
+        "status": 200,
+        "content_type": "application/json",
+        "redirected": False,
+        "main_frame": True,
+        "request_count": 1,
+        "response_count": 1,
+    }
     assert events == [
         "loader-hidden",
         "expect-request",
@@ -1000,6 +1027,10 @@ def test_select_waits_for_bound_request_and_loader_transition(monkeypatch) -> No
         "response-finished",
         "loader-hidden",
         "dom-ready",
+        "network-quiet",
+        "network-quiet",
+        "network-quiet",
+        "network-quiet",
     ]
 
 
@@ -1055,6 +1086,18 @@ def test_row_from_dom_maps_the_six_bank_columns() -> None:
     assert _row_from_dom([
         "2026/07/25 18:05:00", "轉帳支出", "", "200", "10,845", "",
     ])["amtSign"] is False
+    assert _row_from_dom([
+        "2026/07/25 18:05:00", "矛盾", "100", "200", "10,845", "",
+    ]) is None
+    assert _row_from_dom([
+        "2026/07/25 18:05:00", "摘要\n對方\n額外未解析資料", "100", "", "10,845", "",
+    ]) is None
+    assert _row_from_dom([
+        "2026/07/25 18:05:00", "A" * 4001, "100", "", "10,845", "",
+    ]) is None
+    assert _row_from_dom([
+        "2026/07/25 18:05:00", "摘要", "100", "", "10,845", "bad\x00memo",
+    ]) is None
 
 
 def test_scrape_twd_page_returns_only_normalized_fields() -> None:
@@ -1072,13 +1115,30 @@ def test_scrape_twd_page_returns_only_normalized_fields() -> None:
                     "12,345",
                     "薪資",
                 ]],
+                "dom": {
+                    "table_count": 1,
+                    "visible_tables": 1,
+                    "headers": [
+                        "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
+                        "帳戶餘額", "備註", "",
+                    ],
+                    "raw_rows": 1,
+                    "no_data_count": 0,
+                    "invalid_cells": 0,
+                    "pager": 0,
+                    "busy": 0,
+                    "dialogs": 0,
+                    "alerts": 0,
+                },
             }
 
     result = RakutenCrawler._scrape_twd_page(FakePage())
-    assert set(result) == {"account_no", "accounts", "txDetails"}
+    assert set(result) == {"account_no", "accounts", "txDetails", "dom"}
     assert result["account_no"] == "81234567890123"
     assert result["accounts"] == [{
         "acctNo": "81234567890123",
         "balance": "NT$ 0",
     }]
     assert result["txDetails"][0]["txDesc"] == "跨行轉入"
+    with pytest.raises(RuntimeError, match="rakuten-twd-history-dom"):
+        RakutenCrawler._scrape_twd_page(FakePage(), "81234567890124")
