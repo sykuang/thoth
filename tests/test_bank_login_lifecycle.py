@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 import re
 from types import ModuleType, SimpleNamespace
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -448,6 +448,191 @@ def test_run_logs_only_allowlisted_collect_guard_from_suppressed_context(
     assert "guard=staged-validation" in stderr
     assert "PRIVATE" not in repr(result)
     assert "PRIVATE" not in stderr
+
+
+def test_run_ignores_instance_collect_guard_allowlist_shadow(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    marker = "PRIVATE-CUSTOMER-ACCOUNT-987654"
+    crawler = _StagedCrawler(name="staged")
+    object.__getattribute__(crawler, "__dict__")["SAFE_COLLECT_GUARDS"] = frozenset({marker})
+    monkeypatch.setattr(
+        crawler,
+        "collect",
+        lambda _page, _collector: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "guard=" not in result["error"]
+    assert marker not in repr(result)
+    assert marker not in stderr
+
+
+def test_run_ignores_descriptor_collect_guard_allowlist(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    marker = "PRIVATE-CUSTOMER-ACCOUNT-987654"
+
+    class HostileAllowlist:
+        def __get__(self, _instance, _owner):
+            return frozenset({marker})
+
+    crawler = _StagedCrawler(name="staged")
+    monkeypatch.setattr(_StagedCrawler, "SAFE_COLLECT_GUARDS", HostileAllowlist())
+    monkeypatch.setattr(
+        crawler,
+        "collect",
+        lambda _page, _collector: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "guard=" not in result["error"]
+    assert marker not in repr(result)
+    assert marker not in stderr
+
+
+def test_run_ignores_metaclass_collect_guard_allowlist_descriptor(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    marker = "PRIVATE-CUSTOMER-ACCOUNT-987654"
+
+    HostileMeta = cast(Any, type)(
+        "HostileMeta",
+        (type(_StagedCrawler),),
+        {"__dict__": property(
+            lambda _cls: {"SAFE_COLLECT_GUARDS": frozenset({marker})}
+        )},
+    )
+    HostileCrawler = HostileMeta(
+        "HostileCrawler",
+        (_StagedCrawler,),
+        {"SAFE_COLLECT_GUARDS": frozenset({"staged-validation"})},
+    )
+
+    crawler = HostileCrawler(name="staged")
+    monkeypatch.setattr(
+        crawler,
+        "collect",
+        lambda _page, _collector: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "guard=" not in result["error"]
+    assert marker not in repr(result)
+    assert marker not in stderr
+
+
+def test_run_ignores_hostile_collect_guard_namespace_key(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    marker = "PRIVATE-CUSTOMER-ACCOUNT-987654"
+
+    class HostileKey(str):
+        def __hash__(self):
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            return str(other) == "SAFE_COLLECT_GUARDS"
+
+    HostileCrawler = cast(Any, type)(
+        "HostileCrawler",
+        (_StagedCrawler,),
+        {HostileKey("SAFE_COLLECT_GUARDS"): frozenset({marker})},
+    )
+    crawler = HostileCrawler(name="staged")
+    monkeypatch.setattr(
+        crawler,
+        "collect",
+        lambda _page, _collector: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "guard=" not in result["error"]
+    assert marker not in repr(result)
+    assert marker not in stderr
+
+
+@pytest.mark.parametrize(
+    ("allowlist", "marker"),
+    [
+        (frozenset(f"guard-{index}" for index in range(129)), "guard-0"),
+        (frozenset({"x" * 129}), "x" * 129),
+    ],
+)
+def test_run_rejects_oversized_collect_guard_allowlists(
+    monkeypatch, tmp_path, capsys, allowlist, marker
+) -> None:
+    BoundedCrawler = cast(Any, type)(
+        "BoundedCrawler",
+        (_StagedCrawler,),
+        {"SAFE_COLLECT_GUARDS": allowlist},
+    )
+    crawler = BoundedCrawler(name="staged")
+    monkeypatch.setattr(
+        crawler,
+        "collect",
+        lambda _page, _collector: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    result, _ = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(
+            CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+            CheckpointOutcome(CheckpointKind.AUTHENTICATED),
+        ),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "guard=" not in result["error"]
+    assert marker not in repr(result)
+    assert marker not in stderr
 
 
 def test_run_redacts_login_checkpoint_rule_name(monkeypatch, tmp_path, capsys) -> None:

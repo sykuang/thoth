@@ -227,8 +227,8 @@ def _safe_collect_failure_code(exc: BaseException) -> str:
 
 def _safe_collect_guard(exc: BaseException, allowlist: object) -> str | None:
     """Return only a code-owned static guard, including suppressed contexts."""
-    if type(allowlist) is not frozenset or any(
-        type(value) is not str for value in allowlist
+    if type(allowlist) is not frozenset or len(allowlist) > 128 or any(
+        type(value) is not str or len(value) > 128 for value in allowlist
     ):
         return None
     guard = None
@@ -241,11 +241,37 @@ def _safe_collect_guard(exc: BaseException, allowlist: object) -> str | None:
             _exception_inherits(current, RuntimeError)
             and len(args) == 1
             and type(args[0]) is str
+            and len(args[0]) <= 128
             and args[0] in allowlist
         ):
             guard = args[0]
         current = _base_exception_context(current)
     return guard
+
+
+def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
+    """Read the exact crawler class namespace without invoking descriptors."""
+    try:
+        namespace = type.__dict__["__dict__"].__get__(
+            type(crawler), type(type(crawler))
+        )
+        if type(namespace) is not type(type.__dict__) or len(namespace) > 128:
+            return frozenset()
+        allowlist = next(
+            (
+                value
+                for key, value in namespace.items()
+                if type(key) is str and key == "SAFE_COLLECT_GUARDS"
+            ),
+            None,
+        )
+    except BaseException:
+        return frozenset()
+    if type(allowlist) is not frozenset or len(allowlist) > 128 or any(
+        type(value) is not str or len(value) > 128 for value in allowlist
+    ):
+        return frozenset()
+    return allowlist
 
 
 def write_private_json(path: Path, payload: dict) -> None:
@@ -1758,7 +1784,9 @@ class BankCrawler(ABC):
                         f"collect_failed: {_safe_exception_type(e)}: "
                         f"code={_safe_collect_failure_code(e)}"
                     )
-                    guard = _safe_collect_guard(e, self.SAFE_COLLECT_GUARDS)
+                    guard = _safe_collect_guard(
+                        e, _class_collect_guard_allowlist(self)
+                    )
                     if guard is not None:
                         msg += f": guard={guard}"
                     print(
