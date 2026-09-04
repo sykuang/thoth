@@ -8,7 +8,7 @@ from typing import Any
 
 from backend.core.base import validate_card_bill_facts, validate_history_coverage
 from backend.core.persist.cathay import persist_cathay
-from backend.core.persist.ctbc import persist_ctbc
+from backend.core.persist.ctbc import _validate_ctbc_history_binding, persist_ctbc
 from backend.core.persist.dbs import persist_dbs
 from backend.core.persist.esun import persist_esun
 from backend.core.persist.fubon import persist_fubon
@@ -70,15 +70,17 @@ def persist_collected(bank, data, store, rules=None):
     except KeyError as exc:
         raise ValueError(f"unknown bank persist: {bank!r}") from exc
     coverage = data.get("history_coverage")
-    if bank in {"esun", "fubon", "hsbc", "rakuten", "sinopac", "taishin", "ubot"} and coverage is None:
+    if bank in {"ctbc", "esun", "fubon", "hsbc", "rakuten", "sinopac", "taishin", "ubot"} and coverage is None:
         raise ValueError(f"{bank} persistence requires history coverage")
     _validate_history_coverage_before_persist(coverage)
+    if bank == "ctbc":
+        _validate_ctbc_history_binding(data)
     facts_ok = data.get("card_bill_facts_ok")
     facts = data.get("card_bill_facts") or []
     validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
-    atomic = bank in {"hsbc", "rakuten", "sinopac", "taishin", "ubot"}
+    atomic = bank in {"ctbc", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
     try:
         if atomic:
             delta = persist(data, barrier, rules=rules, commit=False)
@@ -95,7 +97,7 @@ def persist_collected(bank, data, store, rules=None):
         store.record_history_coverage_cursors(
             data.get("history_coverage"),
             commit=not atomic,
-            replace=bank in {"rakuten", "taishin"} and coverage.get("mode") == "full",
+            replace=bank in {"ctbc", "rakuten", "taishin"} and coverage.get("mode") == "full",
         )
         if atomic:
             store.commit()

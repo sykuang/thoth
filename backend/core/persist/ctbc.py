@@ -142,7 +142,108 @@ def _parse_ctbc_twd_history(twd_history: list) -> list[dict]:
     return rows
 
 
-def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _validate_ctbc_history_binding(data: dict) -> None:
+    """Bind collected CTBC account/month rows to attested coverage before writes."""
+    coverage = data.get("history_coverage")
+    history = data.get("twd_history")
+    try:
+        if not isinstance(coverage, dict) or not isinstance(history, list):
+            raise ValueError
+        domains = coverage["domains"]
+        if len(domains) != 1 or domains[0]["domain"] != "twd_transactions":
+            raise ValueError
+        domain = domains[0]
+        expected = domain["expected"]
+        windows = domain["windows"]
+        if not isinstance(expected, list) or not isinstance(windows, list):
+            raise ValueError
+        expected_ids = [item["identity"] for item in expected]
+        history_ids = [item["account_no"] for item in history]
+        deposit = data["twd_deposit"]
+        inventory = deposit["demDepBalSummaryResponse"]["infoList"]
+        if not isinstance(inventory, list):
+            raise ValueError
+        inventory_ids = [item["accountId"] for item in inventory]
+        if (
+            any(
+                not isinstance(identity, str)
+                or not identity
+                or identity != identity.strip()
+                for identity in inventory_ids
+            )
+            or len(expected_ids) != len(set(expected_ids))
+            or len(history_ids) != len(set(history_ids))
+            or len(inventory_ids) != len(set(inventory_ids))
+            or set(history_ids) != set(expected_ids)
+            or set(inventory_ids) != set(expected_ids)
+        ):
+            raise ValueError
+        if not expected_ids:
+            if history or windows:
+                raise ValueError
+            return
+        by_identity = {item["identity"]: item for item in expected}
+        windows_by_identity = {
+            identity: sorted(
+                (window for window in windows if window["identity"] == identity),
+                key=lambda window: window["start"],
+            )
+            for identity in expected_ids
+        }
+        if sum(map(len, windows_by_identity.values())) != len(windows):
+            raise ValueError
+        for account in history:
+            identity = account["account_no"]
+            months = account["months"]
+            if account.get("errors") != {} or not isinstance(months, dict):
+                raise ValueError
+            valid_months = {f"m{i}" for i in range(6)}
+            if not set(months) <= valid_months:
+                raise ValueError
+            month_names = sorted(months, key=lambda name: -int(name[1:]))
+            account_windows = windows_by_identity[identity]
+            if len(month_names) != len(account_windows) or not month_names:
+                raise ValueError
+            for month, window in zip(month_names, account_windows, strict=True):
+                rows = months[month]
+                if not isinstance(rows, list):
+                    raise ValueError
+                if window["status"] != ("complete" if rows else "explicit_empty"):
+                    raise ValueError
+                start = datetime.strptime(window["start"], "%Y-%m-%d").date()
+                end = datetime.strptime(window["end"], "%Y-%m-%d").date()
+                for row in rows:
+                    if not isinstance(row, dict):
+                        raise ValueError
+                    account_day = datetime.strptime(row["trnDtRaw"], "%Y%m%d").date()
+                    normalized_txn = _normalize_ctbc_datetime(row["actDtTm"])
+                    if normalized_txn is None:
+                        raise ValueError
+                    transaction_day = datetime.strptime(
+                        normalized_txn, "%Y-%m-%d %H:%M:%S"
+                    ).date()
+                    if (
+                        not start <= account_day <= end
+                        or not start <= transaction_day <= end
+                    ):
+                        raise ValueError
+            expected_range = by_identity[identity]
+            if (
+                expected_range["start"] != account_windows[0]["start"]
+                or expected_range["end"] != account_windows[-1]["end"]
+            ):
+                raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("invalid CTBC history coverage binding") from None
+
+
+def persist_ctbc(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
     """CTBC collect() 結構 → store。
 
     CTBC 抓取覆蓋層：
@@ -181,14 +282,17 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # 實未動用），不該為了「結構完整」造視覺垃圾 row 給使用者看。
     # 若使用者未來真的動用信貸 → 重新規劃 collector 進信貸頁抓 used，再回來加 row。
     if acct_rows:
-        store.upsert_accounts(acct_rows)
+        store.upsert_accounts(acct_rows, commit=commit)
     delta["accounts"] = len([a for a in acct_rows if a.get("account_no")])
 
     # 台幣已過帳交易（append-only, 回真正新增筆數）
     # 2026-06-20: 補上 known TODO. collect() 抓近 6 個月 detailList 進 twd_history.
     # _parse_ctbc_twd_history 拍平成 store schema dict, upsert_twd_txns 用 dedup_key 去重.
     twd_history_rows = _parse_ctbc_twd_history(data.get("twd_history") or [])
-    twd_new = store.upsert_twd_txns(twd_history_rows, rules=rules) if twd_history_rows else 0
+    twd_new = (
+        store.upsert_twd_txns(twd_history_rows, rules=rules, commit=commit)
+        if twd_history_rows else 0
+    )
     delta["twd_txn_new"] = twd_new
 
     # 餘額快照（每日 metric）——含各帳號餘額（accounts 表不存餘額）
@@ -198,13 +302,13 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
             "twd": _to_num(twd.get("totalCurrentBal")) if twd else None,
             "accounts": [{"account_no": a.get("accountId"), "balance": _to_num(a.get("balance")),
                           "available": _to_num(a.get("availableBalance"))} for a in info_list],
-        }, today)
+        }, today, commit=commit)
     cc = summary.get("creditCardSummary") or {}
     if cc:
         store.put_daily_metric("card_limit", {
             "quota": _to_num(cc.get("quota")), "available": _to_num(cc.get("availBal")),
             "unpaid": _to_num(cc.get("unpaidStmt")), "due_date": cc.get("pmtExpDt"),
-        }, today)
+        }, today, commit=commit)
     # daily_metric loan_credit 也拔除：quota 沒實質意義（不影響淨資產也不影響支出），
     # 每天記只會把 daily_metrics 表越塞越大。若未來真要追蹤可動用額度變化再加回。
     delta["balance_days"] = 1
@@ -468,7 +572,7 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # --- 寫入 store ---
     cards_n = 0
     if seen_cards:
-        store.upsert_cards(list(seen_cards.values()))
+        store.upsert_cards(list(seen_cards.values()), commit=commit)
         cards_n = len(seen_cards)
 
     billed_n = 0
@@ -484,21 +588,25 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 and isinstance(qu006_raw.get("allItems"), list))
     pending_n = store.refresh_card_pending(
         "unbilled", pending_rows, rules=rules,
-        fetch_ok=qu006_ok)
+        fetch_ok=qu006_ok, commit=commit)
 
     if months_summary:
-        store.put_daily_metric("ctbc_bill_months_summary", months_summary, today)
+        store.put_daily_metric(
+            "ctbc_bill_months_summary", months_summary, today, commit=commit,
+        )
 
     # 2026-06-22 (mega menu probe raw 留底, 明早 sync 後從 PG 撈出來看 menu 全 list,
     # 找「繳款紀錄」類 menu, ship 0.3.32 hard-code 進 card_targets).
     mega_menu = data.get("card_mega_menu_dump")
     if mega_menu:
-        store.put_daily_metric("ctbc_card_mega_menu_dump", mega_menu, today)
+        store.put_daily_metric(
+            "ctbc_card_mega_menu_dump", mega_menu, today, commit=commit,
+        )
 
     delta["cards"] = cards_n
     delta["card_billed_new"] = billed_n
     delta["card_unbilled"] = pending_n
     delta["bill_months"] = len(months_summary)
 
-    store.log_sync(delta)
+    store.log_sync(delta, commit=commit)
     return delta

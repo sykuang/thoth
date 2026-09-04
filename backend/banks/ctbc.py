@@ -22,11 +22,16 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _OriginGuardProxy,
+)
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.core.creds import CtbcCreds
 from backend.core.login_checkpoints import (
@@ -156,11 +161,44 @@ def _filter_valid_ctbc_details(
 _CTBC_MONTHS = ("m0", "m1", "m2", "m3", "m4", "m5")
 _CTBC_EBMW_PATH = "/IB/api/adapters/IB_Adapter/resource/ebmwResource"
 _CTBC_AMOUNT_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.0+)?$")
+_CTBC_LEGACY_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?$"
+)
+_CTBC_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+$"
+)
 _PG_INTEGER_MAX = 2_147_483_647
 
 
 def _valid_bearer(value) -> bool:
     return isinstance(value, str) and re.fullmatch(r"Bearer [^\s]+", value) is not None
+
+
+def _ctbc_raw_url_matches(stored, raw) -> bool:
+    if (
+        raw.scheme != stored.scheme
+        or raw.hostname != stored.hostname
+        or raw.port != stored.port
+        or raw.username is not None
+        or raw.password is not None
+        or raw.path != stored.path
+        or stored.params
+        or raw.params
+        or raw.fragment
+    ):
+        return False
+    if not raw.query:
+        return False
+    try:
+        pairs = parse_qsl(raw.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    return (
+        len(pairs) == 1
+        and pairs[0][0] == "IIhfvu"
+        and 1 <= len(pairs[0][1]) <= 4096
+        and all(0x21 <= ord(char) <= 0x7E for char in pairs[0][1])
+    )
 
 
 def _ctbc_month_windows(as_of: date) -> list[tuple[str, date, date]]:
@@ -200,12 +238,16 @@ def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
     raw_datetime = row.get("actDtTm")
     if not isinstance(raw_datetime, str) or raw_datetime != raw_datetime.strip():
         raise ValueError("invalid row")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?", raw_datetime):
-        raise ValueError("invalid row")
     try:
-        txn_date = datetime.strptime(raw_datetime[:19], "%Y-%m-%d-%H.%M.%S").date()
+        if _CTBC_LEGACY_DATETIME_RE.fullmatch(raw_datetime):
+            parsed_datetime = datetime.strptime(raw_datetime[:19], "%Y-%m-%d-%H.%M.%S")
+        elif _CTBC_ISO_DATETIME_RE.fullmatch(raw_datetime):
+            parsed_datetime = datetime.fromisoformat(raw_datetime.replace("Z", "+00:00"))
+        else:
+            raise ValueError
     except ValueError:
         raise ValueError("invalid row") from None
+    txn_date = parsed_datetime.date()
     if not start <= txn_date <= end:
         raise ValueError("invalid row")
     raw_account_date = row.get("trnDtRaw")
@@ -221,6 +263,7 @@ def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
     if row.get("dbAmt") is None and row.get("crAmt") is None:
         raise ValueError("invalid row")
     normalized = dict(row)
+    normalized["actDtTm"] = parsed_datetime.strftime("%Y-%m-%d-%H.%M.%S")
     for field in ("dbAmt", "crAmt", "balanceAmt"):
         value = row.get(field)
         if value is not None:
@@ -264,6 +307,8 @@ class CtbcCrawler(BankCrawler):
     SAFE_COLLECT_GUARDS = frozenset({
         "count-mismatch",
         "ctbc-twd-history-fetch",
+        "ctbc-twd-history-form",
+        "ctbc-twd-history-account-selection",
         "ctbc-twd-history-inventory",
         "ctbc-twd-history-mode",
         "ctbc-twd-history-range",
@@ -488,7 +533,7 @@ class CtbcCrawler(BankCrawler):
                 """,
             )
             if logged_out:
-                print(f"[ctbc][logout] ✅ 登出完成 -> {page.url}", file=_sys.stderr)
+                print("[ctbc][logout] ✅ 登出完成", file=_sys.stderr)
                 return True
 
         print("[ctbc][logout] ⚠️ 已點確認但頁面仍像登入狀態（best-effort）", file=_sys.stderr)
@@ -496,7 +541,7 @@ class CtbcCrawler(BankCrawler):
 
     @classmethod
     def _validated_twd_inventory(
-        cls, collector: ResponseCollector,
+        cls, collector: ResponseCollector, page,
     ) -> tuple[dict, set[str]]:
         hit = next((
             item for item in reversed(collector.hits)
@@ -504,19 +549,57 @@ class CtbcCrawler(BankCrawler):
             and item.req_body.get("resource") == "/twrbc-deposit/qu001/010"
         ), None)
         parsed = urlparse(hit.url) if hit else None
+        parsed_raw = urlparse(hit.raw_url) if hit else None
+        parsed_frame = urlparse(hit.request_frame_url) if hit else None
+        try:
+            current = urlparse(page.url)
+            main_frame = _OriginGuardProxy._unwrap(page.main_frame)
+        except Exception:
+            current = None
+            main_frame = None
         response = hit.resp_json if hit else None
+        request_data = hit.req_body.get("rqData") if hit else None
+        media_type = (
+            hit.content_type.split(";", 1)[0].strip().lower()
+            if hit and isinstance(hit.content_type, str)
+            else ""
+        )
         if (
             hit is None
             or hit.method != "POST"
             or type(hit.status) is not int
-            or not 200 <= hit.status < 300
+            or hit.status != 200
+            or hit.redirected is not False
+            or hit.main_frame_request is not True
+            or hit.request_frame is not main_frame
+            or current is None
+            or hit.request_frame_url != page.url
             or parsed is None
+            or parsed_raw is None
+            or parsed_frame is None
+            or parsed_frame != current
             or parsed.scheme != "https"
             or parsed.hostname != "www.ctbcbank.com"
             or parsed.port not in (None, 443)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path != _CTBC_EBMW_PATH
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or not _ctbc_raw_url_matches(parsed, parsed_raw)
+            or parsed_frame.scheme != "https"
+            or parsed_frame.hostname != "www.ctbcbank.com"
+            or parsed_frame.port not in (None, 443)
+            or parsed_frame.username is not None
+            or parsed_frame.password is not None
+            or parsed_frame.path != "/twrbc/twrbc-deposit/qu001/010"
+            or parsed_frame.params
+            or parsed_frame.query
+            or parsed_frame.fragment
+            or media_type != "application/json"
+            or set(hit.req_body) != {"resource", "rqData"}
+            or request_data != {}
             or not isinstance(response, dict)
             or response.get("code") != "0000"
             or not isinstance(response.get("rsData"), dict)
@@ -567,7 +650,9 @@ class CtbcCrawler(BankCrawler):
         # 2) 台幣存款帳戶（點臺幣存款 link 觸發，或直接複用攔到的）
         self._goto_twd_deposit(page)
         page.wait_for_timeout(3000)
-        out["twd_deposit"], twd_identities = self._validated_twd_inventory(collector)
+        out["twd_deposit"], twd_identities = self._validated_twd_inventory(
+            collector, page,
+        )
 
         # 2.5) 台幣逐筆交易明細 (2026-06-20: known TODO 補上)
         # SPA route: /twrbc/twrbc-deposit/qu002/010 (date range picker) → fires qu002/011
@@ -756,17 +841,29 @@ class CtbcCrawler(BankCrawler):
             or current.port not in (None, 443)
             or current.username is not None
             or current.password is not None
+            or current.path != "/twrbc/twrbc-deposit/qu002/010"
+            or current.params
+            or current.query
+            or current.fragment
         ):
             raise RuntimeError("ctbc-twd-history-template")
         page.wait_for_timeout(5000)
-        template_hit = self._latest_qu002_011_hit(collector)
-        if template_hit is None:
-            raise RuntimeError("ctbc-twd-history-template")
-        template_body = template_hit.req_body
-        template_url = template_hit.url
         bearer = collector.auth_token
-        if not _valid_bearer(bearer):
-            raise RuntimeError("ctbc-twd-history-template")
+        use_native_form = not _valid_bearer(bearer)
+        if use_native_form:
+            # ponytail: live cookie-auth UI currently exposes one selected account;
+            # add account-dropdown selection when a real multi-account session exists.
+            if len(identities) != 1:
+                raise RuntimeError("ctbc-twd-history-account-selection")
+            template_hit = None
+            template_body = None
+            template_url = None
+        else:
+            template_hit = self._latest_qu002_011_hit(collector)
+            if template_hit is None:
+                raise RuntimeError("ctbc-twd-history-template")
+            template_body = template_hit.req_body
+            template_url = template_hit.url
 
         accounts = []
         expected = []
@@ -778,12 +875,19 @@ class CtbcCrawler(BankCrawler):
                 raise RuntimeError("ctbc-twd-history-range")
             months_data: dict[str, list[dict]] = {}
             for month, window_start, window_end in selected:
-                try:
-                    raw_rows = self._fetch_qu002_011(
-                        page, template_url, template_body, account_id, month, bearer,
+                if use_native_form:
+                    raw_rows = self._fetch_native_history_window(
+                        page, collector, account_id, window_start, window_end,
                     )
-                except Exception:
-                    raise RuntimeError("ctbc-twd-history-fetch") from None
+                else:
+                    try:
+                        if template_url is None or template_body is None:
+                            raise RuntimeError("missing template")
+                        raw_rows = self._fetch_qu002_011(
+                            page, template_url, template_body, account_id, month, bearer,
+                        )
+                    except Exception:
+                        raise RuntimeError("ctbc-twd-history-fetch") from None
                 detail_list, skipped = _filter_valid_ctbc_details(
                     raw_rows, start=window_start, end=window_end,
                 )
@@ -826,6 +930,165 @@ class CtbcCrawler(BankCrawler):
         }
 
     @staticmethod
+    def _fetch_native_history_window(
+        page,
+        collector: ResponseCollector,
+        account_id: str,
+        start: date,
+        end: date,
+    ) -> list:
+        try:
+            submitting_url = page.url
+            current = urlparse(submitting_url)
+        except Exception:
+            raise RuntimeError("ctbc-twd-history-form") from None
+        if (
+            current.scheme != "https"
+            or current.hostname != "www.ctbcbank.com"
+            or current.port not in (None, 443)
+            or current.username is not None
+            or current.password is not None
+            or current.path != "/twrbc/twrbc-deposit/qu002/010"
+            or current.params
+            or current.query
+            or current.fragment
+        ):
+            raise RuntimeError("ctbc-twd-history-form")
+
+        start_fields = page.locator("input[formcontrolname='startDt']")
+        end_fields = page.locator("input[formcontrolname='endDt']")
+        if start_fields.count() != 1 or end_fields.count() != 1:
+            raise RuntimeError("ctbc-twd-history-form")
+        start_field, end_field = start_fields.nth(0), end_fields.nth(0)
+        if not (start_field.is_visible() and end_field.is_visible()):
+            navs = page.locator("twrbc-deposit-qu002-010 nav-tabs")
+            if navs.count() != 1:
+                raise RuntimeError("ctbc-twd-history-form")
+            actions = navs.nth(0).locator("a,button,[role='tab']")
+            search = []
+            for index in range(actions.count()):
+                action = actions.nth(index)
+                if (
+                    action.is_visible()
+                    and action.is_enabled()
+                    and " ".join(action.inner_text().split()) == "搜尋"
+                ):
+                    search.append(action)
+            if len(search) != 1:
+                raise RuntimeError("ctbc-twd-history-form")
+            search[0].click(timeout=8000)
+            page.wait_for_timeout(3000)
+        if not all(
+            field.is_visible() and field.is_enabled()
+            for field in (start_field, end_field)
+        ):
+            raise RuntimeError("ctbc-twd-history-form")
+
+        for field, value in (
+            (start_field, start.strftime("%Y/%m/%d")),
+            (end_field, end.strftime("%Y/%m/%d")),
+        ):
+            field.click()
+            field.click(click_count=3)
+            page.keyboard.press("Backspace")
+            page.keyboard.type(value, delay=80)
+            if field.input_value() != value:
+                raise RuntimeError("ctbc-twd-history-form")
+
+        panels = page.locator(".tab-pane:has(input[formcontrolname='startDt'])")
+        if panels.count() != 1 or not panels.nth(0).is_visible():
+            raise RuntimeError("ctbc-twd-history-form")
+        actions = panels.nth(0).locator(
+            "button, a, input[type='submit'], input[type='button']"
+        )
+        query = []
+        for index in range(actions.count()):
+            action = actions.nth(index)
+            label = (
+                action.get_attribute("value")
+                if action.evaluate("el => el.tagName === 'INPUT'")
+                else action.inner_text()
+            )
+            if (
+                action.is_visible()
+                and action.is_enabled()
+                and " ".join((label or "").split()) == "搜尋"
+            ):
+                query.append(action)
+        if len(query) != 1:
+            raise RuntimeError("ctbc-twd-history-form")
+
+        before = len(collector.hits)
+        baseline_sequence = collector.request_sequence
+        query[0].click(timeout=8000)
+        hits = []
+        for _ in range(20):
+            page.wait_for_timeout(1000)
+            hits = [
+                hit for hit in collector.hits[before:]
+                if isinstance(hit.req_body, dict)
+                and hit.req_body.get("resource") == "/twrbc-deposit/qu002/011"
+                and hit.request_sequence > baseline_sequence
+            ]
+            if hits:
+                break
+        if hits:
+            page.wait_for_timeout(1000)
+            hits = [
+                hit for hit in collector.hits[before:]
+                if isinstance(hit.req_body, dict)
+                and hit.req_body.get("resource") == "/twrbc-deposit/qu002/011"
+                and hit.request_sequence > baseline_sequence
+            ]
+        if len(hits) != 1:
+            raise RuntimeError("ctbc-twd-history-fetch")
+        hit = hits[0]
+        parsed = urlparse(hit.url)
+        parsed_raw = urlparse(hit.raw_url)
+        parsed_frame = urlparse(hit.request_frame_url)
+        request_data = hit.req_body.get("rqData")
+        response = hit.resp_json
+        response_data = response.get("rsData") if isinstance(response, dict) else None
+        media_type = hit.content_type.split(";", 1)[0].strip().lower()
+        main_frame = _OriginGuardProxy._unwrap(page.main_frame)
+        if (
+            hit.method != "POST"
+            or hit.status != 200
+            or hit.redirected is not False
+            or hit.main_frame_request is not True
+            or hit.request_frame is not main_frame
+            or hit.request_frame_url != submitting_url
+            or parsed.scheme != "https"
+            or parsed.hostname != "www.ctbcbank.com"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != _CTBC_EBMW_PATH
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or not _ctbc_raw_url_matches(parsed, parsed_raw)
+            or parsed_frame.params
+            or parsed_frame != current
+            or media_type != "application/json"
+            or set(hit.req_body) != {"resource", "rqData"}
+            or not isinstance(request_data, dict)
+            or set(request_data) != {"accountId", "startDate", "endDate", "type"}
+            or request_data.get("accountId") != account_id
+            or request_data.get("startDate") != start.strftime("%Y%m%d")
+            or request_data.get("endDate") != end.strftime("%Y%m%d")
+            or request_data.get("type") != "search"
+            or not isinstance(response, dict)
+            or response.get("code") != "0000"
+            or not isinstance(response_data, dict)
+            or set(response_data) != {"dataTime", "detailList", "dtSort", "nextKey"}
+            or not isinstance(response_data.get("detailList"), list)
+            or response_data.get("nextKey") != ""
+        ):
+            raise RuntimeError("ctbc-twd-history-fetch")
+        return response_data["detailList"]
+
+    @staticmethod
     def _latest_qu002_011_hit(collector: ResponseCollector):
         """Return the newest exact, successful owned history seed request."""
         for hit in reversed(collector.hits):
@@ -837,14 +1100,19 @@ class CtbcCrawler(BankCrawler):
             if (
                 hit.method == "POST"
                 and type(hit.status) is int
-                and 200 <= hit.status < 300
+                and hit.status == 200
+                and hit.redirected is False
                 and parsed.scheme == "https"
                 and parsed.hostname == "www.ctbcbank.com"
                 and parsed.port in (None, 443)
                 and parsed.username is None
                 and parsed.password is None
                 and parsed.path == _CTBC_EBMW_PATH
+                and not parsed.params
+                and not parsed.query
+                and not parsed.fragment
                 and isinstance(body, dict)
+                and set(body) == {"resource", "rqData"}
                 and body.get("resource") == "/twrbc-deposit/qu002/011"
                 and isinstance(request_data, dict)
                 and isinstance(request_data.get("accountId"), str)
@@ -877,7 +1145,11 @@ class CtbcCrawler(BankCrawler):
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path != _CTBC_EBMW_PATH
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
             or not isinstance(template_body, dict)
+            or set(template_body) != {"resource", "rqData"}
             or template_body.get("resource") != "/twrbc-deposit/qu002/011"
             or not isinstance(template_body.get("rqData"), dict)
             or not isinstance(account_id, str)

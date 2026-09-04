@@ -21,11 +21,12 @@ case 3: 空 detail / 缺帳號 / 缺 actDtTm gracefully handle
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from backend.core.persist import persist_ctbc
+from backend.core.persist import persist_collected, persist_ctbc
 from backend.core.persist.ctbc import (
     _ctbc_yyyymmdd_to_iso,
     _normalize_ctbc_datetime,
@@ -259,3 +260,120 @@ def test_persist_no_twd_history_returns_zero(store: BankStore):
     """data 沒 twd_history → twd_txn_new=0, 不 raise."""
     delta = persist_ctbc({"twd_history": []}, store)
     assert delta["twd_txn_new"] == 0
+
+
+def _coverage(identity: str, *, mode: str = "full") -> dict:
+    return {
+        "mode": mode,
+        "domains": [{
+            "domain": "twd_transactions",
+            "expected": [{
+                "identity": identity, "start": "2026-08-01", "end": "2026-08-31",
+            }],
+            "windows": [{
+                "identity": identity, "start": "2026-08-01", "end": "2026-08-31",
+                "status": "explicit_empty", "pages": 1,
+            }],
+        }],
+    }
+
+
+def _covered_data(identity: str, *, mode: str = "full") -> dict:
+    return {
+        "twd_deposit": {
+            "demDepBalSummaryResponse": {
+                "infoList": [{"accountId": identity, "balance": "0"}],
+            },
+        },
+        "twd_history": [{"account_no": identity, "months": {"m0": []}, "errors": {}}],
+        "history_coverage": _coverage(identity, mode=mode),
+    }
+
+
+def test_ctbc_persist_rejects_history_identity_outside_coverage_before_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("ctbc", user_id=7, source_account_id=91)
+    try:
+        data = _covered_data("covered-account")
+        data["twd_history"][0]["account_no"] = "different-account"
+        with pytest.raises(ValueError, match="CTBC history coverage binding"):
+            persist_collected("ctbc", data, store)
+        assert all(count == 0 for count in store.stats().values())
+        assert store.latest_twd_transaction_dates() == {}
+    finally:
+        store.close()
+
+
+def test_ctbc_persist_rejects_inventory_identity_outside_coverage_before_write(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("ctbc", user_id=7, source_account_id=91)
+    try:
+        data = _covered_data("covered-account")
+        data["twd_deposit"]["demDepBalSummaryResponse"]["infoList"][0][
+            "accountId"
+        ] = "different-account"
+        with pytest.raises(ValueError, match="CTBC history coverage binding"):
+            persist_collected("ctbc", data, store)
+        assert all(count == 0 for count in store.stats().values())
+        assert store.latest_twd_transaction_dates() == {}
+    finally:
+        store.close()
+
+
+def test_ctbc_persist_rejects_transaction_datetime_outside_coverage_before_write(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("ctbc", user_id=7, source_account_id=91)
+    try:
+        data = _covered_data("covered-account")
+        data["twd_history"][0]["months"]["m0"] = [{
+            "actDtTm": "2026-09-01-10.00.00",
+            "trnDtRaw": "20260831",
+            "memo1": "synthetic",
+            "dbAmt": 1,
+            "crAmt": 0,
+            "balanceAmt": 99,
+        }]
+        data["history_coverage"]["domains"][0]["windows"][0]["status"] = "complete"
+        with pytest.raises(ValueError, match="CTBC history coverage binding"):
+            persist_collected("ctbc", data, store)
+        assert all(count == 0 for count in store.stats().values())
+        assert store.latest_twd_transaction_dates() == {}
+    finally:
+        store.close()
+
+
+def test_ctbc_persistence_rolls_back_every_write_when_cursor_update_fails(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("ctbc", user_id=7, source_account_id=93)
+    try:
+        data = _covered_data("covered-account")
+
+        def fail_cursor(*_args, **_kwargs):
+            raise RuntimeError("synthetic cursor failure")
+
+        monkeypatch.setattr(store, "record_history_coverage_cursors", fail_cursor)
+        with pytest.raises(RuntimeError, match="synthetic cursor failure"):
+            persist_collected("ctbc", data, store)
+        assert all(count == 0 for count in store.stats().values())
+        assert store.latest_twd_transaction_dates() == {}
+    finally:
+        store.close()
+
+
+def test_ctbc_full_coverage_replaces_stale_account_cursors(tmp_path, monkeypatch):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("ctbc", user_id=7, source_account_id=92)
+    try:
+        store.record_history_coverage_cursors(_coverage("stale-account", mode="incremental"))
+        persist_collected("ctbc", _covered_data("covered-account"), store)
+        assert store.latest_twd_transaction_dates() == {
+            "covered-account": date(2026, 8, 31),
+        }
+    finally:
+        store.close()
