@@ -182,6 +182,38 @@ def test_exact_container_body_marker_and_unique_action_clicks_once():
     assert action.clicks == 1
 
 
+def test_action_guard_runs_immediately_before_click():
+    action = Node(text="Continue")
+    container = Node(
+        text="Important security notice",
+        queries={"button, a, [role=button]": [action]},
+    )
+    rule = LoginCheckpointRule(
+        name="test-bank-security-notice",
+        bank="test-bank",
+        phases=(CheckpointPhase.POST_SUBMIT,),
+        kind=CheckpointKind.DISMISSIBLE_NOTICE,
+        container_selector="#notice",
+        action_texts=("Continue",),
+        required_body_pattern=re.compile(r"security notice"),
+    )
+
+    outcome = evaluate_login_checkpoint(
+        Page({"#notice": [container]}),
+        bank="test-bank",
+        phase=CheckpointPhase.POST_SUBMIT,
+        rules=(rule,),
+        is_authenticated=lambda page: False,
+        can_act=lambda: False,
+    )
+
+    assert outcome == CheckpointOutcome(
+        CheckpointKind.UNKNOWN_BLOCKER,
+        rule_name="test-bank-security-notice",
+    )
+    assert action.clicks == 0
+
+
 def test_required_body_pattern_mismatch_does_not_click_or_match_rule():
     action = Node(text="Continue")
     container = Node(

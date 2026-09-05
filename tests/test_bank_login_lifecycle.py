@@ -167,6 +167,71 @@ def test_shared_dialog_handler_is_opaque_dismiss_only_and_terminal() -> None:
     assert crawler.submissions == 0
 
 
+def test_dialog_latched_after_login_blocks_collect(monkeypatch, tmp_path) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._shared_dialog_blocked = False
+
+    def login(_page):
+        crawler._shared_dialog_blocked = True
+        return True
+
+    crawler._shared_login = login
+    result, _page = _run(
+        monkeypatch,
+        tmp_path,
+        crawler,
+        _outcomes(CheckpointOutcome(CheckpointKind.AUTHENTICATED)),
+    )
+
+    assert "collect_failed" in result["error"]
+    assert "collect" not in crawler.events
+    assert "data" not in result
+
+
+def test_shared_login_passes_dialog_barrier_to_evaluator(monkeypatch, tmp_path) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._shared_dialog_blocked = False
+    barrier_seen: list[bool] = []
+
+    def evaluate(_page, *, phase, **kwargs):
+        if phase is CheckpointPhase.PRE_SUBMIT:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+        crawler._shared_dialog_blocked = True
+        can_act = kwargs.get("can_act")
+        barrier_seen.append(can_act is not None and not can_act())
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+
+    result, _page = _run(monkeypatch, tmp_path, crawler, evaluate)
+
+    assert "LoginCheckpointBlocked" in result["error"]
+    assert barrier_seen == [True]
+    assert "collect" not in crawler.events
+
+
+def test_shared_action_barrier_rechecks_dialog_after_origin_probe(monkeypatch, tmp_path) -> None:
+    crawler = _StagedCrawler(name="staged")
+    crawler._shared_dialog_blocked = False
+    barrier_seen: list[bool] = []
+
+    def evaluate(_page, *, phase, **kwargs):
+        if phase is CheckpointPhase.PRE_SUBMIT:
+            return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+
+        def origin(_candidate):
+            crawler._shared_dialog_blocked = True
+            return True
+
+        crawler._credential_origin_allowed = origin
+        barrier_seen.append(not kwargs["can_act"]())
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+
+    result, _page = _run(monkeypatch, tmp_path, crawler, evaluate)
+
+    assert "LoginCheckpointBlocked" in result["error"]
+    assert barrier_seen == [True]
+    assert "collect" not in crawler.events
+
+
 def test_dialog_during_protocol_evaluation_blocks_before_resubmit(monkeypatch) -> None:
     protocol = _rule(
         "protocol",
@@ -231,7 +296,7 @@ def test_staged_login_happy_path_settles_before_collect(monkeypatch, tmp_path):
     )
     labels = iter(("pre-submit", "post-submit", "authenticated", "settle"))
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         assert bank == "staged"
         assert phase in CheckpointPhase
         crawler.events.append(f"checkpoint:{next(labels)}")
@@ -1358,7 +1423,7 @@ def test_exhausted_clickable_rule_becomes_classifier_only_shadow(monkeypatch, tm
     crawler = _StagedCrawler(name="staged", rules=(rule,))
     rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         rules_seen.append(rules)
         if len(rules_seen) == 1:
             return CheckpointOutcome(
@@ -1420,7 +1485,7 @@ def test_protocol_resubmit_allows_exactly_one_second_submission(monkeypatch, tmp
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         rules_seen.append(rules)
         return next(pending)
 
@@ -1457,7 +1522,7 @@ def test_exhausted_captcha_classifier_becomes_unknown_shadow(monkeypatch, tmp_pa
     crawler = _StagedCrawler(name="staged", rules=(rule,))
     rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         rules_seen.append(rules)
         if phase is CheckpointPhase.PRE_SUBMIT:
             return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
@@ -1653,7 +1718,7 @@ def test_phase_ineligible_captcha_rule_cannot_authorize_resubmit(monkeypatch, tm
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         rules_seen.append(tuple(item.name for item in rules))
         return next(pending)
 
@@ -1708,7 +1773,7 @@ def test_settle_notice_is_dismissed_before_collect(monkeypatch, tmp_path):
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         phases.append(phase)
         return next(pending)
 
@@ -1925,7 +1990,7 @@ def test_rules_keep_order_and_twelve_action_budget_is_enforced(monkeypatch, tmp_
     )
     rules_seen: list[tuple[tuple[str, CheckpointKind], ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         assert bank == "staged"
         assert all(rule.bank == bank for rule in rules)
         rules_seen.append(tuple((rule.name, rule.kind) for rule in rules))
@@ -1968,7 +2033,7 @@ def test_twelve_actions_still_leave_room_for_successful_login(monkeypatch, tmp_p
     )
     calls: list[tuple[CheckpointPhase, tuple[str, ...]]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
         assert bank == "staged"
         assert all(rule.bank == bank for rule in rules)
         names = tuple(rule.name for rule in rules)

@@ -1511,6 +1511,11 @@ class BankCrawler(ABC):
                 rules=active_rules,
                 is_authenticated=self.is_authenticated,
                 is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                can_act=lambda: (
+                    not getattr(self, "_shared_dialog_blocked", False)
+                    and self._credential_origin_allowed(page)
+                    and not getattr(self, "_shared_dialog_blocked", False)
+                ),
             )
             if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(
@@ -1781,7 +1786,10 @@ class BankCrawler(ABC):
                 logged_in = True
                 try:
                     def ensure_collect_origin() -> None:
-                        if not self._credential_origin_allowed(page):
+                        if (
+                            getattr(self, "_shared_dialog_blocked", False)
+                            or not self._credential_origin_allowed(page)
+                        ):
                             reduce_login_checkpoint(
                                 CheckpointPhase.POST_SUBMIT_SETTLE,
                                 LoginBudget(credential_submissions=1),

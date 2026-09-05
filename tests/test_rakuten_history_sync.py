@@ -174,6 +174,34 @@ def test_rakuten_history_result_rejects_noncanonical_transport_url(url: str) -> 
         RakutenCrawler._validated_history_result(result)
 
 
+def test_rakuten_history_result_accepts_live_text_json_transport() -> None:
+    result = _history_result(empty=True)
+    result["transport"]["content_type"] = "text/json"
+
+    assert RakutenCrawler._validated_history_result(result)["status"] == "explicit_empty"
+
+
+def test_rakuten_history_result_accepts_live_dollar_balance() -> None:
+    result = _history_result(empty=True)
+    result["accounts"][0]["balance"] = "$105"
+
+    assert RakutenCrawler._validated_history_result(result)["status"] == "explicit_empty"
+
+
+def test_rakuten_explicit_empty_accepts_live_responsive_tables() -> None:
+    result = _history_result(empty=True)
+    result["dom"].update({
+        "table_count": 3,
+        "visible_tables": 1,
+        "headers": [
+            "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
+            "帳戶餘額", "備註", "",
+        ],
+    })
+
+    assert RakutenCrawler._validated_history_result(result)["status"] == "explicit_empty"
+
+
 def test_rakuten_history_result_rejects_visible_pager() -> None:
     result = _history_result()
     result["dom"]["pager"] = 1
@@ -366,6 +394,29 @@ def test_rakuten_account_options_wait_for_stable_nonblank_inventory() -> None:
             )
             with pytest.raises(RuntimeError, match="rakuten-twd-history-inventory"):
                 RakutenCrawler._visible_labels(page, "simple-dropdown2")
+        finally:
+            browser.close()
+
+
+def test_rakuten_single_account_hidden_menu_is_inventory() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(f"""
+                <simple-dropdown2 class="show">
+                  <a aria-expanded="true" class="txt_dropdown">帳號 {ACCOUNT}</a>
+                  <div class="dropdown-menu show" hidden style="display: none">
+                    <a class="dropdown-item">{ACCOUNT}</a>
+                  </div>
+                </simple-dropdown2>
+            """)
+
+            assert RakutenCrawler._visible_labels(page, "simple-dropdown2") == [ACCOUNT]
         finally:
             browser.close()
 

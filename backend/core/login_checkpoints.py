@@ -237,7 +237,11 @@ def _matching_body_fingerprint(
     return sha256(body.encode()).digest()
 
 
-def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOutcome | None:
+def _evaluate_rule(
+    scopes: list[Any],
+    rule: LoginCheckpointRule,
+    can_act: Callable[[], bool] | None = None,
+) -> CheckpointOutcome | None:
     matched = []
     for scope in scopes:
         containers = scope.locator(rule.container_selector)
@@ -300,6 +304,11 @@ def _evaluate_rule(scopes: list[Any], rule: LoginCheckpointRule) -> CheckpointOu
     was_enabled = action.is_enabled()
     was_selected = _action_selected(action)
     try:
+        if can_act is not None and not can_act():
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+    except Exception:
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+    try:
         action.click()
     except Exception:
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
@@ -337,6 +346,7 @@ def _evaluate_login_checkpoint(
     rules: tuple[LoginCheckpointRule, ...],
     is_authenticated: Callable[[Any], bool],
     is_scope_owned: Callable[[Any], bool] | None = None,
+    can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome:
     try:
         if any(rule.bank != bank for rule in rules):
@@ -360,7 +370,7 @@ def _evaluate_login_checkpoint(
         if phase not in rule.phases:
             continue
         try:
-            outcome = _evaluate_rule(scopes, rule)
+            outcome = _evaluate_rule(scopes, rule, can_act)
         except Exception:
             return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
         if outcome:
@@ -388,6 +398,7 @@ def evaluate_login_checkpoint(
     rules: tuple[LoginCheckpointRule, ...],
     is_authenticated: Callable[[Any], bool],
     is_scope_owned: Callable[[Any], bool] | None = None,
+    can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome:
     if any(rule.bank != bank for rule in rules):
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
@@ -400,6 +411,7 @@ def evaluate_login_checkpoint(
                 rules=rules,
                 is_authenticated=is_authenticated,
                 is_scope_owned=is_scope_owned,
+                can_act=can_act,
             )
     except Exception:
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)

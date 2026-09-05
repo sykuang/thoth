@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 import os
 import re
 import time
-from typing import ClassVar
+from typing import Callable, ClassVar
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -30,9 +30,11 @@ from backend.core.captcha import solve_captcha, wait_captcha_stable
 from backend.core.creds import RakutenCreds
 from backend.core.login_checkpoints import (
     CheckpointKind,
+    CheckpointOutcome,
     CheckpointPhase,
     LoginBudget,
     LoginCheckpointBlocked,
+    LoginInteractionRequired,
     LoginCheckpointTerminal,
     LoginCheckpointRule,
     evaluate_login_checkpoint,
@@ -46,6 +48,7 @@ TWD_PATH_HINT = "/ctw/ctwqu0001/"
 LOGIN_PATH_HINT = "/cgn/cgnot0001/010"
 CAPTCHA_IMG = "captcha-image img"
 LOADER_SELECTOR = "modal-loader .modal_loading"
+SEMANTIC_MODAL_SELECTOR = ".modal.show:not(.modal_loading)"
 QUERY_PATH = "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
 
 
@@ -141,7 +144,7 @@ def _any_visible(page, selector: str) -> bool:
     return any(locators.nth(index).is_visible() for index in range(locators.count()))
 
 
-def _click_visible_login(page) -> bool:
+def _click_visible_login(page, *, can_click: Callable[[], bool] | None = None) -> bool:
     candidates = page.locator("a.btn.btn-primary:visible").filter(
         has_text=re.compile(r"^\s*登入\s*$"),
     )
@@ -150,6 +153,8 @@ def _click_visible_login(page) -> bool:
     button = candidates.first
     classes = button.get_attribute("class") or ""
     if not button.is_visible() or not button.is_enabled() or "disabled" in classes.split():
+        return False
+    if can_click is not None and not can_click():
         return False
     button.click()
     return True
@@ -207,6 +212,7 @@ class RakutenCrawler(BankCrawler):
     )
     REFERRAL_PROMO_PREFIX = "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~"
     INSURANCE_PROMO_PREFIX = "輸入專案代碼【RICB】投保即可抽大獎"
+    TIME_DEPOSIT_PROMO_PREFIX = "夏末優存限定，高利 2.0% 限額開搶!"
     LOGOUT_BODY = "登出網路銀行 確認登出本系統？"
 
     def __init__(self) -> None:
@@ -314,22 +320,32 @@ class RakutenCrawler(BankCrawler):
             )
         ):
             raise RuntimeError(error)
+        expected_headers = [
+            "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
+            "帳戶餘額", "備註", "",
+        ]
         if row_count:
             if (
-                dom["table_count"] != 1
+                dom["table_count"] not in {1, 3}
                 or dom["visible_tables"] != 1
                 or dom["no_data_count"] != 0
-                or dom["headers"] != [
-                    "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
-                    "帳戶餘額", "備註", "",
-                ]
+                or dom["headers"] != expected_headers
             ):
                 raise RuntimeError(error)
         elif (
-            dom["table_count"] != 0
-            or dom["visible_tables"] != 0
-            or dom["no_data_count"] != 1
-            or dom["headers"]
+            dom["no_data_count"] != 1
+            or not (
+                (
+                    dom["table_count"] == 0
+                    and dom["visible_tables"] == 0
+                    and dom["headers"] == []
+                )
+                or (
+                    dom["table_count"] == 3
+                    and dom["visible_tables"] == 1
+                    and dom["headers"] == expected_headers
+                )
+            )
         ):
             raise RuntimeError(error)
 
@@ -358,7 +374,7 @@ class RakutenCrawler(BankCrawler):
             or set(accounts[0]) != {"acctNo", "balance"}
             or accounts[0].get("acctNo") != identity
             or not isinstance(accounts[0].get("balance"), str)
-            or re.fullmatch(r"\s*(?:NT\$\s*)?-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})\s*", accounts[0]["balance"]) is None
+            or re.fullmatch(r"\s*(?:(?:NT)?\$\s*)?-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})(?:\.\d{2})?\s*", accounts[0]["balance"]) is None
             or not isinstance(receipt, dict)
             or set(receipt) != {"identity", "start", "end", "status", "pages", "rows"}
             or receipt.get("identity") != identity
@@ -400,7 +416,7 @@ class RakutenCrawler(BankCrawler):
             or parsed_url.fragment
             or transport.get("method") != "POST"
             or transport.get("status") != 200
-            or transport.get("content_type") != "application/json"
+            or transport.get("content_type") not in {"application/json", "text/json"}
             or transport.get("redirected") is not False
             or transport.get("main_frame") is not True
             or type(transport.get("request_count")) is not int
@@ -620,57 +636,102 @@ class RakutenCrawler(BankCrawler):
             not isinstance(error, LoginCheckpointBlocked)
             or error.budget != LoginBudget(credential_submissions=1)
             or error.outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER
-            or error.outcome.rule_name is not None
+            or error.outcome.rule_name not in {None, "rakuten-unknown-modal"}
             or getattr(self, "_shared_dialog_blocked", False)
         ):
             return False
-        page.wait_for_timeout(5000)
-        if (
-            getattr(self, "_shared_dialog_blocked", False)
-            or not self._credential_origin_allowed(page)
-            or _any_visible(page, "input[name='otpCode']")
-            or _any_visible(page, "#ib_init_connect_error_popup")
-        ):
-            return False
-        if not _any_visible(page, ".modal.show"):
-            return self._logged_in(page)
-
         rules = self.login_checkpoint_rules()
         active_rules = tuple(
             rule for rule in rules if CheckpointPhase.POST_SUBMIT_SETTLE in rule.phases
         )
-        outcome = validate_login_checkpoint_outcome(
-            evaluate_login_checkpoint(
-                page,
-                bank=self.name,
-                phase=CheckpointPhase.POST_SUBMIT_SETTLE,
-                rules=rules,
-                is_authenticated=self.is_authenticated,
-                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
-            ),
-            active_rules,
-        )
-        if outcome.kind not in {
-            CheckpointKind.DUPLICATE_SESSION,
-            CheckpointKind.DISMISSIBLE_NOTICE,
-        }:
-            return False
-        try:
-            reduce_login_checkpoint(
-                CheckpointPhase.POST_SUBMIT_SETTLE,
-                error.budget,
-                outcome,
+        active_rules_by_name = {rule.name: rule for rule in active_rules}
+        action_counts: dict[str, int] = {}
+        authenticated_quiet_polls = 0
+        deadline = time.monotonic() + 20.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            page.wait_for_timeout(min(1000, max(1, int(remaining * 1000))))
+            if time.monotonic() >= deadline:
+                return False
+            if (
+                getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)
+                or _any_visible(page, "input[name='otpCode']")
+                or _any_visible(page, "#ib_init_connect_error_popup")
+            ):
+                return False
+            if _any_visible(page, LOADER_SELECTOR):
+                authenticated_quiet_polls = 0
+                continue
+            if not _any_visible(page, SEMANTIC_MODAL_SELECTOR):
+                if self._logged_in(page):
+                    authenticated_quiet_polls += 1
+                    if authenticated_quiet_polls >= 3:
+                        if time.monotonic() >= deadline:
+                            return False
+                        if (
+                            getattr(self, "_shared_dialog_blocked", False)
+                            or not self._credential_origin_allowed(page)
+                            or _any_visible(page, "input[name='otpCode']")
+                            or _any_visible(page, "#ib_init_connect_error_popup")
+                        ):
+                            return False
+                        if (
+                            _any_visible(page, LOADER_SELECTOR)
+                            or _any_visible(page, SEMANTIC_MODAL_SELECTOR)
+                        ):
+                            authenticated_quiet_polls = 0
+                            continue
+                        return True
+                else:
+                    authenticated_quiet_polls = 0
+                continue
+            authenticated_quiet_polls = 0
+            if action_counts:
+                return False
+            outcome = validate_login_checkpoint_outcome(
+                evaluate_login_checkpoint(
+                    page,
+                    bank=self.name,
+                    phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                    rules=rules,
+                    is_authenticated=self.is_authenticated,
+                    is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                    can_act=lambda: (
+                        time.monotonic() < deadline
+                        and not getattr(self, "_shared_dialog_blocked", False)
+                        and self._credential_origin_allowed(page)
+                        and not _any_visible(page, "input[name='otpCode']")
+                        and not _any_visible(page, "#ib_init_connect_error_popup")
+                        and self._credential_origin_allowed(page)
+                        and not getattr(self, "_shared_dialog_blocked", False)
+                        and time.monotonic() < deadline
+                    ),
+                ),
+                active_rules,
             )
-        except LoginCheckpointTerminal:
-            return False
-        return (
-            not getattr(self, "_shared_dialog_blocked", False)
-            and self._credential_origin_allowed(page)
-            and not _any_visible(page, "input[name='otpCode']")
-            and not _any_visible(page, ".modal.show")
-            and not _any_visible(page, "#ib_init_connect_error_popup")
-            and self._logged_in(page)
-        )
+            if time.monotonic() >= deadline:
+                return False
+            if outcome.kind not in {
+                CheckpointKind.DUPLICATE_SESSION,
+                CheckpointKind.DISMISSIBLE_NOTICE,
+            }:
+                return False
+            rule = active_rules_by_name.get(outcome.rule_name or "")
+            if rule is None or action_counts.get(rule.name, 0) >= rule.max_actions:
+                return False
+            try:
+                reduce_login_checkpoint(
+                    CheckpointPhase.POST_SUBMIT_SETTLE,
+                    error.budget,
+                    outcome,
+                )
+            except LoginCheckpointTerminal:
+                return False
+            action_counts[rule.name] = action_counts.get(rule.name, 0) + 1
+        return False
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -721,8 +782,17 @@ class RakutenCrawler(BankCrawler):
                 phases=all_phases,
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
                 container_selector=".modal.show",
-                action_texts=("略過",),
+                action_texts=("略過了",),
                 required_body_pattern=prefix(self.INSURANCE_PROMO_PREFIX),
+            ),
+            LoginCheckpointRule(
+                name="rakuten-time-deposit-promo",
+                bank="rakuten",
+                phases=all_phases,
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector=".modal.show",
+                action_texts=("稍後再說",),
+                required_body_pattern=prefix(self.TIME_DEPOSIT_PROMO_PREFIX),
             ),
             LoginCheckpointRule(
                 name="rakuten-unknown-modal",
@@ -798,7 +868,19 @@ class RakutenCrawler(BankCrawler):
         if any(lengths.get(key) != value for key, value in expected.items()):
             raise RakutenLoginError("登入欄位輸入長度不符；未送出登入")
 
-        if not _click_visible_login(page):
+        if (
+            getattr(self, "_shared_dialog_blocked", False)
+            or not self._credential_origin_allowed(page)
+        ):
+            raise RakutenLoginError("登入安全狀態已變更；未送出登入")
+        if not _click_visible_login(
+            page,
+            can_click=lambda: (
+                not getattr(self, "_shared_dialog_blocked", False)
+                and self._credential_origin_allowed(page)
+                and not getattr(self, "_shared_dialog_blocked", False)
+            ),
+        ):
             raise RakutenLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
 
         for _ in range(20):
@@ -808,7 +890,7 @@ class RakutenCrawler(BankCrawler):
                     _any_visible(page, selector)
                     for selector in (
                         "input[name='otpCode']",
-                        ".modal.show:not(.modal_loading)",
+                        SEMANTIC_MODAL_SELECTOR,
                         "#ib_init_connect_error_popup",
                     )
                 ):
@@ -981,6 +1063,11 @@ class RakutenCrawler(BankCrawler):
     @staticmethod
     def _visible_labels(page, root: str) -> list[str]:
         RakutenCrawler._open_dropdown(page, root)
+        selected_account = (
+            _account_number(RakutenCrawler._selected_label(page, root))
+            if root == "simple-dropdown2"
+            else None
+        )
         previous: list[str] | None = None
         stable_since: float | None = None
         deadline = time.monotonic() + 3.0
@@ -999,9 +1086,38 @@ class RakutenCrawler(BankCrawler):
                     return {label: (element.innerText || '').trim(), visible};
                 })""")
                 labels = [item.get("label") for item in sample]
+                hidden_single_account = False
+                if root == "simple-dropdown2" and len(labels) == 1:
+                    menu_state = page.evaluate(r"""root => {
+                        const scope = document.querySelector(root);
+                        const trigger = scope?.querySelector('a.txt_dropdown');
+                        const menus = scope ? [...scope.querySelectorAll('.dropdown-menu')] : [];
+                        const menu = menus.length === 1 ? menus[0] : null;
+                        return {
+                            menu_count: menus.length,
+                            expanded: trigger?.getAttribute('aria-expanded') === 'true',
+                            shown: !!menu?.classList.contains('show'),
+                            hidden: !!menu?.hidden,
+                            display_none: menu ? getComputedStyle(menu).display === 'none' : false,
+                        };
+                    }""", root)
+                    hidden_single_account = (
+                        selected_account is not None
+                        and _account_number(labels[0]) == selected_account
+                        and menu_state == {
+                            "menu_count": 1,
+                            "expanded": True,
+                            "shown": True,
+                            "hidden": True,
+                            "display_none": True,
+                        }
+                    )
                 valid = (
                     bool(labels)
-                    and all(item.get("visible") is True for item in sample)
+                    and (
+                        all(item.get("visible") is True for item in sample)
+                        or hidden_single_account
+                    )
                     and all(isinstance(label, str) and label for label in labels)
                 )
                 now = time.monotonic()
@@ -1155,11 +1271,38 @@ class RakutenCrawler(BankCrawler):
         不會被 SPA 還原，結果被踢回登入頁（2026-07-28 real-account probe 實證，
         final_url 落在 /cgn/cgnot0001/010）。只能點側邊導覽。
         """
+        budget = LoginBudget(credential_submissions=1)
+
+        def ensure_navigation_safe() -> None:
+            if (
+                getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)
+                or _any_visible(page, "#ib_init_connect_error_popup")
+            ):
+                raise LoginCheckpointBlocked(
+                    budget,
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                ) from None
+            if _any_visible(page, "input[name='otpCode']"):
+                raise LoginInteractionRequired(
+                    budget,
+                    CheckpointOutcome(
+                        CheckpointKind.OTP_REQUIRED,
+                        rule_name="rakuten-otp-required",
+                        interaction="otp",
+                    ),
+                    phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                ) from None
+
+        ensure_navigation_safe()
         page.wait_for_selector(LOADER_SELECTOR, state="hidden", timeout=60000)
+        ensure_navigation_safe()
         deposit = page.get_by_role("link", name="存款", exact=True).first
         try:
             deposit.click(timeout=5000)
         except Exception:
+            ensure_navigation_safe()
             rules = self.login_checkpoint_rules()
             outcome = evaluate_login_checkpoint(
                 page,
@@ -1167,6 +1310,14 @@ class RakutenCrawler(BankCrawler):
                 phase=CheckpointPhase.POST_SUBMIT_SETTLE,
                 rules=rules,
                 is_authenticated=self.is_authenticated,
+                can_act=lambda: (
+                    not getattr(self, "_shared_dialog_blocked", False)
+                    and self._credential_origin_allowed(page)
+                    and not _any_visible(page, "input[name='otpCode']")
+                    and not _any_visible(page, "#ib_init_connect_error_popup")
+                    and self._credential_origin_allowed(page)
+                    and not getattr(self, "_shared_dialog_blocked", False)
+                ),
             )
             active_rules = tuple(
                 rule
@@ -1177,7 +1328,7 @@ class RakutenCrawler(BankCrawler):
             try:
                 reduce_login_checkpoint(
                     CheckpointPhase.POST_SUBMIT_SETTLE,
-                    LoginBudget(credential_submissions=1),
+                    budget,
                     outcome,
                 )
             except LoginCheckpointTerminal as terminal:
@@ -1187,10 +1338,15 @@ class RakutenCrawler(BankCrawler):
                 CheckpointKind.DISMISSIBLE_NOTICE,
             }:
                 raise
+            ensure_navigation_safe()
             deposit.click(timeout=5000)
+        ensure_navigation_safe()
         page.wait_for_selector("a.sub-nav-link:has-text('臺幣存款')", state="visible", timeout=15000)
+        ensure_navigation_safe()
         page.locator("a.sub-nav-link", has_text="臺幣存款").first.click()
+        ensure_navigation_safe()
         page.wait_for_url(lambda url: TWD_PATH_HINT in url, timeout=30000)
+        ensure_navigation_safe()
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         self._goto_twd(page)
