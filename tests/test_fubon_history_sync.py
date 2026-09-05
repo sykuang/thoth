@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -16,7 +17,7 @@ from backend.banks.fubon import (
     _fubon_history_windows,
     _validated_fubon_twd_options,
 )
-from backend.core.base import BankCollectResult, ResponseCollector
+from backend.core.base import BankCollectResult, ResponseCollector, _OriginGuardProxy
 from backend.core.persist import persist_collected
 from backend.core.store import BankStore
 
@@ -32,8 +33,8 @@ def _coverage(*, status="complete"):
             "domain": "twd_transactions",
             "expected": [{"identity": ACCOUNT, "start": "2025-08-30", "end": "2026-08-30"}],
             "windows": [
-                {"identity": ACCOUNT, "start": "2025-08-30", "end": "2026-03-02", "status": status, "pages": 1},
-                {"identity": ACCOUNT, "start": "2026-03-03", "end": "2026-08-30", "status": status, "pages": 1},
+                {"identity": ACCOUNT, "start": "2025-08-30", "end": "2026-02-27", "status": status, "pages": 1},
+                {"identity": ACCOUNT, "start": "2026-02-28", "end": "2026-08-30", "status": status, "pages": 1},
             ],
         }],
     }
@@ -53,26 +54,26 @@ def _result(start, end, txn_date, *, empty=False):
             "status": 200,
             "contentType": "text/plain",
             "responseCount": 1,
-            "frameBound": True,
-            "presetBound": True,
-            "fieldsBound": True,
-            "viewStateBound": True,
-            "actionBound": True,
+            "frameExact": True,
+            "fieldsExact": True,
+            "requestCaptured": True,
+            "responseMatched": True,
+            "controlValuesMatched": True,
+            "viewStateFingerprintMatched": True,
             "formBound": True,
         },
         "snapshot": {
             "evidenceFresh": True,
+            "documentFresh": True,
+            "documentReady": True,
             "busy": False,
             "failed": False,
             "selectedValue": "012-000-90000000267053-X-TW",
             "selectedIdentity": ACCOUNT,
-            "selectedPreset": "rdoDay180_365" if start == "2025-08-30" else "rdoDay180",
-            "windowBound": True,
-            "displayedStart": start,
-            "displayedEnd": end,
             "hasGrid": not empty,
             "gridCandidateCount": 0 if empty else 1,
             "hiddenGridCount": 0,
+            "hiddenGridDataRowCount": 0,
             "pagerNodeCount": 0,
             "structuralErrorCount": 0,
             "resultContainerBound": True,
@@ -97,8 +98,8 @@ def _payload():
         "history_coverage": _coverage(),
         "accounts": [{"account_no": ACCOUNT, "currency": "TWD", "type": "deposit", "name": "台幣存款"}],
         "deposit_txn_results": [
-            _result("2025-08-30", "2026-03-02", "2025-09-02"),
-            _result("2026-03-03", "2026-08-30", "2026-08-29"),
+            _result("2025-08-30", "2026-02-27", "2025-09-02"),
+            _result("2026-02-28", "2026-08-30", "2026-08-29"),
         ],
         "deposit_page_text": (
             f"{ACCOUNT}\n\t活儲存款\t測試分行\t臺幣\t84\t84\t快速功能"
@@ -151,8 +152,8 @@ def test_fubon_full_history_uses_two_native_six_month_windows(monkeypatch):
     crawler.transaction_cursors = {"twd_transactions": {ACCOUNT: date(2026, 8, 20)}}
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
     assert crawler._history_windows(ACCOUNT, date(2026, 8, 30)) == [
-        {"preset": "rdoDay180_365", "start": "2025-08-30", "end": "2026-03-02"},
-        {"preset": "rdoDay180", "start": "2026-03-03", "end": "2026-08-30"},
+        {"preset": "rdoDay180_365", "start": "2025-08-30", "end": "2026-02-27"},
+        {"preset": "rdoDay180", "start": "2026-02-28", "end": "2026-08-30"},
     ]
 
 
@@ -161,7 +162,7 @@ def test_fubon_incremental_uses_live_verified_native_window(monkeypatch):
     crawler.transaction_cursors = {"twd_transactions": {ACCOUNT: date(2026, 8, 20)}}
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "incremental")
     assert crawler._history_windows(ACCOUNT, date(2026, 8, 30)) == [
-        {"preset": "rdoDay180", "start": "2026-03-03", "end": "2026-08-30"},
+        {"preset": "rdoDay180", "start": "2026-02-28", "end": "2026-08-30"},
     ]
 
 
@@ -206,55 +207,75 @@ def test_fubon_inventory_requires_exact_unique_twd_options():
     assert _validated_fubon_twd_options(options) == [
         {"index": 1, "value": "012-000-90000000267053-X-TW", "text": f"{ACCOUNT} (測試分行)", "identity": ACCOUNT},
     ]
+    opaque = [options[0], {**options[1], "value": f"012-A{ACCOUNT}-TWD"}]
+    assert _validated_fubon_twd_options(opaque)[0]["identity"] == ACCOUNT
+    digit_adjacent = [options[0], {**options[1], "value": f"012-99{ACCOUNT}88-X"}]
+    assert _validated_fubon_twd_options(digit_adjacent)[0]["identity"] == ACCOUNT
     for bad in (
         [*options, deepcopy(options[1])],
         [options[0], {**options[1], "index": 2, "value": "arbitrary-TW"}],
         [options[0], {**options[1], "index": 2}],
         [
             options[0],
-            {"index": 1, "value": "012-000-99123456789012-X-TW", "text": "1234567890 (測試分行)"},
+            {"index": 1, "value": "012-000-99876543210987-X-TW", "text": "1234567890 (測試分行)"},
         ],
         [options[0]],
         [*options, {"index": 2, "value": "012-0000000000000002-US", "text": "90000000267054 (測試分行)"}],
         [*options, {"index": 2, "value": "loading", "text": "資料載入中"}],
+        [options[0], {**options[1], "value": f"012-{ACCOUNT}<script>"}],
     ):
         with pytest.raises(ValueError, match="inventory"):
             _validated_fubon_twd_options(bad)
 
 
 def test_fubon_result_requires_transport_account_range_and_complete_dom():
-    valid = _result("2025-08-30", "2026-03-02", "2025-09-02")
+    valid = _result("2025-08-30", "2026-02-27", "2025-09-02")
+    without_total_marker = deepcopy(valid)
+    without_total_marker["snapshot"]["nativeTotalFound"] = False
+    without_total_marker["snapshot"]["nativeTotalMarkerCount"] = 0
+    assert FubonCrawler._validated_twd_history_result(without_total_marker)["status"] == "complete"
+    unbound_total_marker = deepcopy(without_total_marker)
+    unbound_total_marker["snapshot"]["nativeTotalMarkerCount"] = 1
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(unbound_total_marker)
+    hidden_template = deepcopy(valid)
+    hidden_template["snapshot"]["hiddenGridCount"] = 1
+    assert FubonCrawler._validated_twd_history_result(hidden_template)["status"] == "complete"
+    opaque = deepcopy(valid)
+    opaque["account_value"] = f"012-A{ACCOUNT}-PRIVATE_OPAQUE_TOKEN"
+    opaque["snapshot"]["selectedValue"] = opaque["account_value"]
+    assert FubonCrawler._validated_twd_history_result(opaque)["identity"] == ACCOUNT
+    sanitized = deepcopy(opaque)
+    sanitized.pop("account_value")
+    sanitized["snapshot"].pop("selectedValue")
+    sanitized["snapshot"]["selectedValueBound"] = True
+    assert FubonCrawler._validated_twd_history_result(sanitized)["identity"] == ACCOUNT
+    assert "PRIVATE_OPAQUE_TOKEN" not in json.dumps(sanitized)
     mutations = (
         lambda item: item.update(url="https://ebank.taipeifubon.com.tw/B2C/wrong.faces"),
         lambda item: item.update(url="https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces;attacker"),
         lambda item: item["transport"].update(status=204),
         lambda item: item["transport"].update(responseCount=2),
-        lambda item: item["transport"].update(frameBound=False),
-        lambda item: item["transport"].update(presetBound=False),
-        lambda item: item["transport"].update(fieldsBound=False),
-        lambda item: item["transport"].update(viewStateBound=False),
-        lambda item: item["transport"].update(actionBound=False),
+        lambda item: item["transport"].update(frameExact=False),
+        lambda item: item["transport"].update(fieldsExact=False),
+        lambda item: item["transport"].update(requestCaptured=False),
+        lambda item: item["transport"].update(responseMatched=False),
+        lambda item: item["transport"].update(controlValuesMatched=False),
+        lambda item: item["transport"].update(viewStateFingerprintMatched=False),
         lambda item: item["transport"].update(formBound=False),
         lambda item: item.update(
             url="https://ebank.taipeifubon.com.tw/b2c/cdsqu/cdsqu001/cdsqu001_home.faces",
         ),
         lambda item: item["snapshot"].update(selectedIdentity="90000000267054"),
         lambda item: item["snapshot"].update(selectedValue="012-000-90000000267054-X-TW"),
-        lambda item: item["snapshot"].update(selectedPreset="rdoDay30"),
-        lambda item: item["snapshot"].update(windowBound=False),
-        lambda item: item["snapshot"].update(displayedStart="2025-08-31"),
-        lambda item: item["snapshot"].update(displayedEnd="2026-03-01"),
-        lambda item: item["snapshot"].update(
-            displayedStart="2026-03-02", displayedEnd="2025-08-30", windowBound=True,
-        ),
+        lambda item: item["snapshot"].update(documentFresh=False),
+        lambda item: item["snapshot"].update(documentReady=False),
         lambda item: item["snapshot"].update(failed=True),
-        lambda item: item["snapshot"].update(nativeTotalFound=False),
         lambda item: item["snapshot"].update(nativeTotalMarkerCount=2),
         lambda item: item["snapshot"].update(rawDataRowCount=2),
-        lambda item: item["snapshot"].update(hiddenGridCount=1),
+        lambda item: item["snapshot"].update(hiddenGridDataRowCount=1),
         lambda item: item["snapshot"].update(pagerNodeCount=1),
         lambda item: item["snapshot"].update(structuralErrorCount=1),
-        lambda item: item["snapshot"].update(resultContainerBound=False),
         lambda item: item["snapshot"].update(malformedRowCount=1),
         lambda item: item["snapshot"].update(hiddenRowCount=1),
         lambda item: item["snapshot"].update(hiddenCellCount=1),
@@ -266,59 +287,191 @@ def test_fubon_result_requires_transport_account_range_and_complete_dom():
             FubonCrawler._validated_twd_history_result(item)
 
 
+def test_fubon_navigation_waits_for_delayed_history_anchor(monkeypatch):
+    crawler = object.__new__(FubonCrawler)
+    frame = SimpleNamespace(locator=lambda _selector: evaluator)
+    evaluator = SimpleNamespace(
+        evaluate=Mock(side_effect=[
+            {"ok": False, "count": 0},
+            {"ok": True},
+        ])
+    )
+    page = Mock()
+    monkeypatch.setattr(
+        crawler,
+        "_fubon_content_frame",
+        Mock(return_value=frame),
+    )
+
+    assert crawler._open_twd_query(page) is frame
+    assert evaluator.evaluate.call_count == 2
+    assert page.wait_for_timeout.call_args_list == [call(5000), call(500), call(8000)]
+
+
+def test_fubon_window_rereads_native_controls_after_ajax_settle():
+    source = inspect.getsource(FubonCrawler._collect_twd_window)
+    assert '("requestfinished", control_finished)' in source
+    assert '("requestfailed", control_failed_request)' in source
+    assert "remove_control_listeners()" in source
+    assert source.count("add_control_listeners()") >= 2
+    assert 'click_control("#form1\\\\:rdoTxDetail")' in source
+    assert 'click_control("#form1\\\\:rdoFast")' in source
+    assert "click_control(f\"#form1\\\\:{window['preset']}\")" in source
+    assert "control_pending or control_failed or stable_ticks < 10" in source
+    assert 'settled["presetValue"]' in source
+    assert 'settled["viewState"]' in source
+    assert "dates.length===0&&headers.every" in source
+    assert "rawDataRowCount++;" in source
+    assert source.index("dates.length===0&&headers.every") < source.index("rawDataRowCount++;")
+    assert source.index("stable_ticks < 10") < source.index('settled["presetValue"]')
+
+
+def test_fubon_result_accepts_only_live_queryless_post_submit_url():
+    valid = _result("2025-08-30", "2026-02-27", "2025-09-02")
+    assert FubonCrawler._validated_twd_history_result(valid)["status"] == "complete"
+    for query in (
+        "menuId=CDS0401",
+        "account=PRIVATE",
+        "menuId=private",
+        "menuId=CDS0401&&",
+        "menuId=CDS0401&menuId=CDS0401",
+        "menuId=",
+        "menuId=CDS0401&extra=1",
+    ):
+        invalid = deepcopy(valid)
+        invalid["url"] += "?" + query
+        with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+            FubonCrawler._validated_twd_history_result(invalid)
+
+
 def test_fubon_frame_and_post_binding_are_exact(monkeypatch):
     crawler = object.__new__(FubonCrawler)
     crawler._is_owned_frame = lambda page, frame: page is not None and frame is not None
     correct = SimpleNamespace(
-        url="https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces",
+        url=(
+            "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/"
+            "CDSQU001_Home.faces?menuId=CDS0401"
+        ),
         name="",
     )
     misleading = SimpleNamespace(
         url="https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces;attacker",
         name="txnFrame",
     )
+    wrong_query = SimpleNamespace(
+        url=(
+            "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/"
+            "CDSQU001_Home.faces?account=PRIVATE"
+        ),
+        name="txnFrame",
+    )
+    duplicate_query = SimpleNamespace(
+        url=(
+            "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/"
+            "CDSQU001_Home.faces?menuId=CDS0401&menuId=CDS0401"
+        ),
+        name="txnFrame",
+    )
     lowercase = SimpleNamespace(
         url="https://ebank.taipeifubon.com.tw/b2c/cdsqu/cdsqu001/cdsqu001_home.faces",
         name="",
     )
-    page = SimpleNamespace(frames=[misleading, lowercase, correct])
+    page = SimpleNamespace(
+        frames=[misleading, wrong_query, duplicate_query, lowercase, correct]
+    )
     assert crawler._fubon_content_frame(page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces") is correct
     monkeypatch.setattr(
-        FubonCrawler, "_fubon_content_frame", lambda self, page, *routes: lowercase,
+        crawler, "_is_owned_frame", lambda page, frame: frame is correct,
     )
-    with pytest.raises(RuntimeError):
-        crawler._bound_twd_result_frame(page, correct)
+    correct.url = correct.url.split("?", 1)[0]
+    assert crawler._bound_twd_result_frame(page, correct) is correct
 
+    owned_page = object()
+    raw_frame = SimpleNamespace(page=owned_page)
+    guarded_frame = _OriginGuardProxy(raw_frame, lambda: None)
+    settled_state = "ABCDEFGH" + "A" * 121
+    request_state = "ABCDEFGH" + "B" * 121
     request = SimpleNamespace(
+        url=correct.url.split("?", 1)[0],
         method="POST",
-        frame=correct,
-        post_data="ajaxAction=query-action&checkedConvenientPeriod=rdoDay180&javax.faces.ViewState=state-1",
+        frame=raw_frame,
+        post_data=f"ajaxAction=query-action&checkedConvenientPeriod=native-180&javax.faces.ViewState={request_state}",
     )
     response = SimpleNamespace(
-        url=correct.url,
+        url=correct.url.split("?", 1)[0],
         request=request,
         status=200,
         headers={"content-type": "text/plain; charset=UTF-8"},
     )
-    hits = []
-    FubonCrawler._capture_twd_response(
-        response, hits, correct, "rdoDay180", "state-1", "query-action", True,
+    requests = []
+    request.post_data = "ajaxAction=combo-change"
+    FubonCrawler._capture_twd_request(
+        request, requests, guarded_frame, True, {("query-action", "native-180")}, settled_state,
     )
+    assert requests == []
+    request.post_data = f"ajaxAction=query-action&checkedConvenientPeriod=native-180&javax.faces.ViewState={request_state}"
+    FubonCrawler._capture_twd_request(
+        request, requests, guarded_frame, True, {("query-action", "native-180")}, settled_state,
+    )
+    assert requests == [request]
+    for post_data in (
+        f"ajaxAction=wrong&checkedConvenientPeriod=native-180&javax.faces.ViewState={request_state}",
+        f"ajaxAction=query-action&checkedConvenientPeriod=wrong&javax.faces.ViewState={request_state}",
+        f"ajaxAction=query-action&checkedConvenientPeriod=native-180&javax.faces.ViewState={'ZZZZZZZZ' + 'B' * 121}",
+    ):
+        request.post_data = post_data
+        rejected = []
+        FubonCrawler._capture_twd_request(
+            request, rejected, guarded_frame, True, {("query-action", "native-180")}, settled_state,
+        )
+        assert rejected == []
+    request.post_data = f"ajaxAction=query-action&checkedConvenientPeriod=other-preset&javax.faces.ViewState={request_state}"
+    cross_product = []
+    FubonCrawler._capture_twd_request(
+        request, cross_product, guarded_frame, True,
+        {("query-action", "native-180"), ("other-action", "other-preset")}, settled_state,
+    )
+    assert cross_product == []
+    request.post_data = f"ajaxAction=query-action&checkedConvenientPeriod=native-180&javax.faces.ViewState={request_state}"
+    hits = []
+    FubonCrawler._capture_twd_response(response, hits, requests)
     assert hits == [{
         "status": 200,
         "contentType": "text/plain",
-        "frameBound": True,
-        "presetBound": True,
-        "fieldsBound": True,
-        "viewStateBound": True,
-        "actionBound": True,
+        "frameExact": True,
+        "fieldsExact": True,
+        "requestCaptured": True,
+        "responseMatched": True,
+        "controlValuesMatched": True,
+        "viewStateFingerprintMatched": True,
         "formBound": True,
     }]
+    response.request = SimpleNamespace()
+    mismatched_request_hits = []
+    FubonCrawler._capture_twd_response(response, mismatched_request_hits, requests)
+    assert mismatched_request_hits == []
+    response.request = request
+    response.url = correct.url + "?menuId=CDS0401"
+    query_bearing_hits = []
+    FubonCrawler._capture_twd_response(response, query_bearing_hits, requests)
+    assert query_bearing_hits == []
+    response.url = correct.url.split("?", 1)[0]
+    request.frame = SimpleNamespace(page=owned_page)
+    sibling_frame_requests = []
+    FubonCrawler._capture_twd_request(
+        request, sibling_frame_requests, guarded_frame, True,
+        {("query-action", "native-180")}, settled_state,
+    )
+    assert sibling_frame_requests == []
 
 
 def test_fubon_result_rejects_pager_busy_and_ambiguous_empty():
-    valid = _result("2026-03-03", "2026-08-30", "2026-08-29")
+    valid = _result("2026-02-28", "2026-08-30", "2026-08-29")
     assert FubonCrawler._validated_twd_history_result(valid)["status"] == "complete"
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(
+            _result("2026-02-28", "2026-08-30", "2026-08-29", empty=True),
+        )
     for mutation in ("pager", "busy", "empty", "count", "stale"):
         bad = deepcopy(valid)
         if mutation == "pager": bad["snapshot"]["pager"] = {"present": True, "actionableNext": 1}
@@ -330,11 +483,68 @@ def test_fubon_result_rejects_pager_busy_and_ambiguous_empty():
             FubonCrawler._validated_twd_history_result(bad)
 
 
+def test_fubon_cli_keeps_dom_history_in_canonical_db_only(monkeypatch):
+    from cli import cli
+    from backend.core import persist as persist_module
+    from backend.server import rules_repo
+
+    class Crawler:
+        HISTORY_COVERAGE_REQUIRED = True
+        HISTORY_COVERAGE_DOMAINS = frozenset({"twd_transactions"})
+
+        @staticmethod
+        def configure_transaction_cursor(_domain, _cursor):
+            pass
+
+        @staticmethod
+        def run(*, login_url, headless):
+            return {"data": _payload()}
+
+    class Store:
+        db_path = "private"
+
+        @staticmethod
+        def latest_twd_transaction_dates():
+            return {}
+
+        @staticmethod
+        def latest_card_transaction_dates():
+            return {}
+
+        @staticmethod
+        def stats():
+            return {}
+
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr(cli, "_get_crawler", lambda _bank: (Crawler(), "https://example.com"))
+    monkeypatch.setattr(cli, "BankStore", lambda _bank: Store())
+    monkeypatch.setattr(rules_repo, "list_rules", lambda **_kwargs: [{}])
+    monkeypatch.setattr(persist_module, "persist_collected", lambda *_args, **_kwargs: {})
+    removed = []
+    monkeypatch.setattr(
+        cli,
+        "_write_private_json",
+        lambda *_args, **_kwargs: pytest.fail("Fubon collected backup must stay disabled"),
+    )
+    monkeypatch.setattr(cli, "_remove_private_json", lambda path: removed.append(path.name))
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+
+    assert cli.cmd_sync(SimpleNamespace(bank="fubon", headless=True)) == 0
+    assert removed == ["fubon_collected.json"]
+
+
 def test_fubon_valid_attested_payload_persists_and_advances_cursor(tmp_path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     store = BankStore("fubon", user_id=7, source_account_id=97)
     try:
         data = _payload()
+        for result in data["deposit_txn_results"]:
+            result.pop("account_value")
+            result["snapshot"].pop("selectedValue")
+            result["snapshot"]["selectedValueBound"] = True
         data["deposit_page_text"] = ""
         delta = persist_collected("fubon", data, store)
         assert delta["accounts_new"] == 1
@@ -451,9 +661,9 @@ def test_fubon_incremental_native_window_persists(tmp_path, monkeypatch):
         "mode": "incremental",
         "domains": [{
             "domain": "twd_transactions",
-            "expected": [{"identity": ACCOUNT, "start": "2026-03-03", "end": "2026-08-30"}],
+            "expected": [{"identity": ACCOUNT, "start": "2026-02-28", "end": "2026-08-30"}],
             "windows": [{
-                "identity": ACCOUNT, "start": "2026-03-03", "end": "2026-08-30",
+                "identity": ACCOUNT, "start": "2026-02-28", "end": "2026-08-30",
                 "status": "complete", "pages": 1,
             }],
         }],

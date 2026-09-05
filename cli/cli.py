@@ -80,8 +80,8 @@ def _get_crawler(bank: str):
 
 def cmd_sync(args):
     raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
-    # Rakuten history is DOM-normalized but still customer-bearing; canonical DB only.
-    if args.bank == "rakuten":
+    # DOM-normalized history remains customer-bearing; canonical DB only.
+    if args.bank in {"rakuten", "fubon"}:
         _remove_private_json(raw)
     crawler, login_url = _get_crawler(args.bank)
     print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
@@ -120,7 +120,7 @@ def cmd_sync(args):
         from backend.core.persist import persist_collected
 
         delta = persist_collected(args.bank, data, store, rules=rules)
-        if args.bank != "rakuten":
+        if args.bank not in {"rakuten", "fubon"}:
             _write_private_json(raw, result)
         stats = store.stats()
     finally:
