@@ -24,7 +24,7 @@ _HSBC_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$"
 )
 _HSBC_MONEY_RE = re.compile(
-    r"^([+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})$"
+    r"^([+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})$"
 )
 _HSBC_SCALAR_RE = re.compile(
     r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$"
@@ -72,7 +72,7 @@ def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> 
     description = row.get("description")
     transaction = _hsbc_history_date(row.get("transactionDate"))
     posted_raw = row.get("postedDate")
-    if start is None and posted_raw != "0002-11-30T00:00":
+    if start is None and posted_raw in (None, ""):
         raise ValueError("invalid HSBC history transaction")
     posted = None
     if posted_raw not in (None, "", "0002-11-30T00:00"):
@@ -90,15 +90,21 @@ def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> 
         or transaction > end
         or (posted is not None and (transaction > posted or posted > end))
         or (start is not None and (posted is None or not start <= posted <= end))
-        or (not is_foreign and row.get("foreignAmount") not in (None, "", "-"))
     ):
         raise ValueError("invalid HSBC history transaction")
-    if is_foreign:
-        foreign_amount, foreign_currency = _hsbc_amt(row.get("foreignAmount"))
+    # Unposted domestic authorization may supply a bare auxiliary scalar;
+    # it is not an original-currency amount and never becomes consume_amount.
+    if (not is_foreign and start is None and isinstance(row.get("foreignAmount"), str)
+            and _bounded_card_scalar(row["foreignAmount"], allow_negative=True)):
+        return
+    if is_foreign or row.get("foreignAmount") not in (None, "", "-"):
+        foreign_amount, foreign_currency = _hsbc_amt(row.get("foreignAmount"), signed=True)
         if (
             isinstance(foreign_amount, bool)
             or not isinstance(foreign_amount, (int, float))
-            or foreign_currency in (None, "TWD")
+            or foreign_currency is None
+            or (foreign_currency != "TWD") != is_foreign
+            or (is_foreign and foreign_amount < 0 and row["isPositive"])
         ):
             raise ValueError("invalid HSBC history transaction")
 
@@ -280,7 +286,7 @@ def _validate_hsbc_history(data: dict, store: BankStore) -> None:
                     raise ValueError("invalid HSBC card detail")
 
 
-def _hsbc_amt(s):
+def _hsbc_amt(s, *, signed: bool = False):
     """Parse one bounded HSBC money scalar without binary-float validation."""
     if s is None:
         return None, None
@@ -293,7 +299,8 @@ def _hsbc_amt(s):
         amount = Decimal(match.group(1).replace(",", "")) if match else None
     except InvalidOperation:
         amount = None
-    if amount is None or not amount.is_finite() or not 0 <= amount <= _HSBC_MAX_MONEY:
+    if (amount is None or not amount.is_finite() or abs(amount) > _HSBC_MAX_MONEY
+            or (not signed and amount < 0)):
         return None, currency
     if amount == amount.to_integral_value():
         return int(amount), currency
@@ -339,7 +346,7 @@ def _hsbc_card_txn(t: dict) -> dict:
     鐵律：消費日(transactionDate) vs 入帳日(postedDate) 分存；外幣保留小數。
     """
     ntd_val, _ = _hsbc_amt(t.get("ntdAmount") or t.get("amount"))
-    fx_val, fx_cur = _hsbc_amt(t.get("foreignAmount"))
+    fx_val, fx_cur = _hsbc_amt(t.get("foreignAmount"), signed=True)
     is_foreign = bool(t.get("isForeign"))
     is_positive = t.get("isPositive", True)
     desc = (t.get("description") or "").strip()

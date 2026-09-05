@@ -683,5 +683,5 @@ def test_legacy_login_sources_are_absent_and_collect_ast_is_unchanged() -> None:
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     )
     assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "a6e43f79a469c35268b7c5296a9c6016ac092d5fe58e5bd92809aa08e22438e0"
+        "5bbe60dacb580da7a60ecc265761dcebdfbbb2cbb2af3d43f220cb716d6a51fb"
     )

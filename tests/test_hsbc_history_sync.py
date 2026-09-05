@@ -246,6 +246,118 @@ class _Page:
         self.waits.append(milliseconds)
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_hsbc_collect_streams_inventory_when_passive_length_is_missing(monkeypatch, changed) -> None:
+    crawler = _crawler()
+    cards = _cards()
+    hit = _card_hit(cards)
+    hit.body_size = None
+    hit.resp_json = None  # Live gzip response has no Content-Length.
+    collector = ResponseCollector("card.hsbc.com.tw")
+    collector.hits = [hit]
+    collector.auth_token_events = [{
+        "token": "Bearer synthetic-token",
+        "url": hit.url, "redirected": False, "sequence": 1,
+    }]
+    response = {
+        "url": hit.url, "status": 200, "redirected": False,
+        "contentType": "application/json", "bytes": 100,
+        "body": {"success": True, "error": None, "payload": cards},
+    }
+    replay = deepcopy(response)
+    if changed:
+        replay["body"]["payload"] = []
+    page = _Page([response, replay])
+    budgets = []
+
+    def details(_page, _collector, inventory, *, byte_budget):
+        assert inventory == cards
+        budgets.append(byte_budget[0])
+        return {}, _persist_payload()["history_coverage"]
+
+    monkeypatch.setattr(crawler, "_collect_card_details", details)
+    if changed:
+        with pytest.raises(RuntimeError, match="hsbc-card-inventory-replay"):
+            crawler.collect(page, collector)
+        return
+    result = crawler.collect(page, collector)
+
+    assert result.cards == cards
+    assert "_final_url" not in result.to_dict()
+    assert [arg["url"] for arg in page.args] == [hit.url, hit.url]
+    assert budgets == [4_999_900]
+    assert page.args[1]["maxBytes"] == 4_999_900
+
+
+@pytest.mark.parametrize("login_error", [False, True])
+def test_hsbc_cli_never_retains_raw_backup(monkeypatch, login_error) -> None:
+    from cli import cli
+    from backend.core import persist as persist_module
+    from backend.server import rules_repo
+
+    removed = []
+    crawler = SimpleNamespace(
+        HISTORY_COVERAGE_REQUIRED=True,
+        HISTORY_COVERAGE_DOMAINS=HsbcCrawler.HISTORY_COVERAGE_DOMAINS,
+        configure_transaction_cursor=lambda *_args: None,
+        run=lambda **_kwargs: {"error": "stopped"} if login_error else {"data": _persist_payload()},
+    )
+    monkeypatch.setattr(cli, "_get_crawler", lambda _bank: (crawler, "https://example.com"))
+    monkeypatch.setattr(cli, "BankStore", lambda _bank: SimpleNamespace(
+        db_path="isolated", close=lambda: None, stats=lambda: {},
+        latest_twd_transaction_dates=lambda: {}, latest_card_transaction_dates=lambda: {},
+    ))
+    monkeypatch.setattr(rules_repo, "list_rules", lambda **_kwargs: [{}])
+    monkeypatch.setattr(persist_module, "persist_collected", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(cli, "_remove_private_json", lambda p: removed.append(p.name))
+    monkeypatch.setattr(cli, "_write_private_json", lambda *_args: pytest.fail("raw backup"))
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+
+    assert cli.cmd_sync(SimpleNamespace(bank="hsbc", headless=True)) == int(login_error)
+    assert removed == ["hsbc_collected.json"]
+
+
+def test_hsbc_inventory_stream_bounds_decoded_bytes_without_length() -> None:
+    class Page:
+        @staticmethod
+        def evaluate(script, args):
+            runner = """
+const fn=eval('('+process.argv[1]+')');
+const body=new TextEncoder().encode(JSON.stringify(JSON.parse(process.argv[3])));
+global.fetch=async url=>({url,status:200,redirected:false,
+  headers:{get:name=>({'content-type':'application/json','content-encoding':'gzip'}[name]??null)},
+  body:new ReadableStream({start(c){c.enqueue(body);c.close();}})});
+fn(JSON.parse(process.argv[2])).then(v=>process.stdout.write(JSON.stringify(v)));
+"""
+            result = subprocess.run([
+                "node", "-e", runner, script, json.dumps(args),
+                json.dumps({"success": True, "payload": _cards()}),
+            ], check=True, capture_output=True, text=True)
+            return json.loads(result.stdout)
+
+    budget = [5_000_000]
+    assert HsbcCrawler._fetch_card_inventory(Page(), "Bearer synthetic-token", budget) == _cards()
+    assert 0 < budget[0] < 5_000_000
+    with pytest.raises(RuntimeError, match="hsbc-card-inventory-byte-budget"):
+        HsbcCrawler._fetch_card_inventory(Page(), "Bearer synthetic-token", [1])
+
+
+@pytest.mark.parametrize("mutation", ["url", "redirect", "bytes", "status", "body"])
+def test_hsbc_streamed_inventory_rejects_unbound_response(mutation) -> None:
+    hit = _card_hit(_cards())
+    response = {
+        "url": hit.url, "status": 200, "redirected": False,
+        "contentType": "application/json", "bytes": 100, "body": hit.resp_json,
+    }
+    if mutation == "url": response["url"] += "?activeOnly=true"
+    elif mutation == "redirect": response["redirected"] = True
+    elif mutation == "bytes": response["bytes"] = 5_000_001
+    elif mutation == "status": response["status"] = 500
+    else: response["body"]["success"] = False
+    with pytest.raises(RuntimeError, match="hsbc-card-inventory"):
+        HsbcCrawler._fetch_card_inventory(_Page([response]), "Bearer synthetic-token", [5_000_000])
+
+
 def test_hsbc_inventory_rejects_query_filtered_or_redirected_source() -> None:
     def collect(url: str, *, redirected: bool = False) -> ResponseCollector:
         collector = ResponseCollector("card.hsbc.com.tw")
@@ -523,8 +635,20 @@ def test_hsbc_posted_fetch_refuses_redirects_before_sending_authorization() -> N
     assert "redirect:'follow'" not in source
 
 
+def test_hsbc_long_history_keeps_per_page_timeout(monkeypatch) -> None:
+    clock = iter((0.0, 600.0, 601.0, 900.0, 901.0))
+    monkeypatch.setattr(hsbc_module.time, "monotonic", lambda: next(clock))
+    page = _Page([_page_response("card-id-7034", 0, 1, [])])
+    result = HsbcCrawler._fetch_posted_history(
+        page, card_id="card-id-7034", identity="4029-****-****-7034",
+        token="Bearer synthetic-token", start=date(2025, 9, 1), end=date(2026, 8, 31),
+    )
+    assert result["receipt"]["status"] == "explicit_empty"
+    assert [args["timeoutMs"] for args in page.args] == [30_000, 30_000]
+
+
 def test_hsbc_posted_history_has_total_operation_deadline(monkeypatch) -> None:
-    clock = iter((0.0, 121.0))
+    clock = iter((0.0, 1801.0))
     monkeypatch.setattr(hsbc_module.time, "monotonic", lambda: next(clock))
     page = _Page([])
 
@@ -542,7 +666,7 @@ def test_hsbc_posted_history_has_total_operation_deadline(monkeypatch) -> None:
 
 
 def test_hsbc_posted_history_rechecks_deadline_after_fetch(monkeypatch) -> None:
-    clock = iter((0.0, 119.0, 121.0))
+    clock = iter((0.0, 1799.0, 1801.0))
     monkeypatch.setattr(hsbc_module.time, "monotonic", lambda: next(clock))
     page = _Page([_page_response("card-id-7034", 0, 1, [])])
 
@@ -1055,6 +1179,60 @@ def _persist_payload() -> dict:
     }
 
 
+@pytest.mark.parametrize("zero", ["0 TWD", "0.00 TWD", "100 TWD", "150 TWD", "-150 TWD"])
+@pytest.mark.parametrize("posted_date", ["0002-11-30T00:00", "2026-08-31T00:00"])
+def test_hsbc_domestic_twd_placeholder_survives_persistence(store, zero, posted_date) -> None:
+    payload = _persist_payload()
+    entry = next(iter(payload["card_detail"].values()))
+    row = entry["posted"][0]
+    row["foreignAmount"] = zero
+    assert HsbcCrawler._validate_posted_row(row, end=date(2026, 8, 31)) == date(2026, 8, 31)
+    pending = deepcopy(row)
+    pending["description"] = "different pending purchase"
+    pending["postedDate"] = posted_date
+    entry["unposted"] = [pending]
+    persist_collected("hsbc", payload, store)
+    for table in ("card_billed_txns", "card_pending_txns"):
+        stored = store.conn.execute(f"SELECT consume_currency,consume_amount FROM {table}").fetchone()
+        assert stored["consume_currency"] == "TWD"
+        assert stored["consume_amount"] is None
+
+
+def test_hsbc_unposted_domestic_bare_auxiliary_amount_is_not_fx(store) -> None:
+    payload = _persist_payload()
+    entry = next(iter(payload["card_detail"].values()))
+    row = _posted_row(date(2026, 8, 31))
+    row.update(description="pending authorization", foreignAmount="5")
+    entry["unposted"] = [row]
+    persist_collected("hsbc", payload, store)
+    saved = store.conn.execute("SELECT amount,consume_amount,consume_currency,post_date FROM card_pending_txns").fetchone()
+    assert tuple(saved) == (100, None, "TWD", "2026-08-31")
+    with pytest.raises(RuntimeError, match="hsbc-posted-history"):
+        HsbcCrawler._validate_posted_row(row, end=date(2026, 8, 31))
+
+
+def test_hsbc_foreign_refund_preserves_signed_original_amount(store) -> None:
+    payload = _persist_payload()
+    row = next(iter(payload["card_detail"].values()))["posted"][0]
+    row.update(isForeign=True, isPositive=False, foreignAmount="-3.25 USD")
+    assert HsbcCrawler._validate_posted_row(row, end=date(2026, 8, 31)) == date(2026, 8, 31)
+    persist_collected("hsbc", payload, store)
+    saved = store.conn.execute("SELECT amount,consume_amount,consume_currency FROM card_billed_txns").fetchone()
+    assert tuple(saved) == (-100, -3.25, "USD")
+
+
+@pytest.mark.parametrize("foreign", ["-3.25 USD", "-100000001 USD", "-1e3 USD"])
+def test_hsbc_purchase_rejects_negative_or_malformed_foreign_amount(store, foreign) -> None:
+    payload = _persist_payload()
+    row = next(iter(payload["card_detail"].values()))["posted"][0]
+    row.update(isForeign=True, isPositive=True, foreignAmount=foreign)
+    with pytest.raises(RuntimeError, match="hsbc-posted-history"):
+        HsbcCrawler._validate_posted_row(row, end=date(2026, 8, 31))
+    with pytest.raises(ValueError, match="invalid HSBC history transaction"):
+        persist_collected("hsbc", payload, store)
+    assert store.latest_card_transaction_dates() == {}
+
+
 def test_hsbc_persistence_revalidates_history_before_writing(store) -> None:
     payload = _persist_payload()
 
@@ -1296,7 +1474,7 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "invalid-detail-date",
         "invalid-card-date",
         "duplicate-detail-key",
-        "posted-unposted-row",
+        "future-unposted-row",
         "garbage-unposted-placeholder",
         "alternate-unposted-placeholder",
         "missing-card-status",
@@ -1425,8 +1603,8 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
                 {"key": "Credit Limit", "value": "200 TWD"},
             ],
         }
-    elif mutation == "posted-unposted-row":
-        detail["unposted"] = [_posted_row(date(2026, 8, 30))]
+    elif mutation == "future-unposted-row":
+        detail["unposted"] = [_posted_row(date(2026, 9, 1))]
     elif mutation == "garbage-unposted-placeholder":
         row = _posted_row(date(2026, 8, 30))
         row["postedDate"] = "0002-garbage"
