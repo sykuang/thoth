@@ -437,12 +437,25 @@ class ResponseCollector:
             parsed = urlparse(req.url)
             expected = self.host_filter.lower().strip(".")
             hostname = (parsed.hostname or "").lower()
+            canonical_path = "/".join(
+                segment.split(";", 1)[0] for segment in parsed.path.split("/")
+            )
             if self.host_filter and (
                 parsed.scheme.lower() != "https"
                 or (hostname != expected and not hostname.endswith("." + expected))
             ):
                 return
             rakuten_metadata_only = self.host_filter == "rakuten-bank.com.tw"
+            esun_history_metadata_only = (
+                self.host_filter == "esunbank.com.tw"
+                and hostname == "ebank.esunbank.com.tw"
+                and canonical_path in {
+                    "/fco/fao01002/FAO01002.faces",
+                    "/fao/fao01002/FAO01002_Home.faces",
+                }
+                and req.method == "POST"
+            )
+            metadata_only = rakuten_metadata_only or esun_history_metadata_only
             if rakuten_metadata_only and (
                 parsed.netloc != "www.rakuten-bank.com.tw"
                 or parsed.path != "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
@@ -462,13 +475,13 @@ class ResponseCollector:
             self._request_sequence += 1
             self._requests[id(req)] = self._request_sequence
             self._request_main_frame[id(req)] = main_frame_request
-            self._request_frame_urls[id(req)] = "" if rakuten_metadata_only else frame_url
-            self._request_frames[id(req)] = None if rakuten_metadata_only else frame
+            self._request_frame_urls[id(req)] = "" if metadata_only else frame_url
+            self._request_frames[id(req)] = None if metadata_only else frame
             endpoint = parsed.path.rsplit("/", 1)[-1]
             self._issued_endpoint_counts[endpoint] = (
                 self._issued_endpoint_counts.get(endpoint, 0) + 1
             )
-            if rakuten_metadata_only:
+            if metadata_only:
                 return
             auth = req.headers.get("authorization", "")
             if re.fullmatch(r"Bearer [^\s\r\n]+", auth) is None:
@@ -497,6 +510,9 @@ class ResponseCollector:
                 return
             parsed = urlparse(url)
             hostname = (parsed.hostname or "").lower()
+            canonical_path = "/".join(
+                segment.split(";", 1)[0] for segment in parsed.path.split("/")
+            )
             if self.host_filter:
                 expected = self.host_filter.lower().strip(".")
                 if (
@@ -505,8 +521,18 @@ class ResponseCollector:
                 ):
                     return
             req = resp.request
-            metadata_only = self.host_filter == "rakuten-bank.com.tw"
-            if metadata_only and (
+            rakuten_metadata_only = self.host_filter == "rakuten-bank.com.tw"
+            esun_history_metadata_only = (
+                self.host_filter == "esunbank.com.tw"
+                and parsed.hostname == "ebank.esunbank.com.tw"
+                and canonical_path in {
+                    "/fco/fao01002/FAO01002.faces",
+                    "/fao/fao01002/FAO01002_Home.faces",
+                }
+                and req.method == "POST"
+            )
+            metadata_only = rakuten_metadata_only or esun_history_metadata_only
+            if rakuten_metadata_only and (
                 parsed.netloc != "www.rakuten-bank.com.tw"
                 or parsed.path != "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
                 or parsed.params
@@ -662,7 +688,9 @@ class ResponseCollector:
             stored_url = (
                 "https://www.rakuten-bank.com.tw/ixtein/adapters/ebank/txns/"
                 "channel-ctw/CTWQU0001/011"
-                if metadata_only
+                if rakuten_metadata_only
+                else f"https://ebank.esunbank.com.tw{canonical_path}"
+                if esun_history_metadata_only
                 else url.split("?")[0]
             )
             self.hits.append(ApiHit(

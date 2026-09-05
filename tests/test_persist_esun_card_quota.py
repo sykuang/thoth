@@ -72,13 +72,12 @@ def test_parse_card_quota_zero_used_just_after_payment():
     assert out["credit_limit_twd"] == 400000
 
 
-def test_parse_card_quota_empty_text_keeps_sample_only():
-    """頁面沒抓到任何 keyword → 不命中, 但 raw_text_sample 還在好讓使用者 audit。"""
+def test_parse_card_quota_empty_text_keeps_no_raw_preview():
     text = "Language\nENGLISH\n登出\n"
     out = EsunCrawler._parse_card_quota(text)
     assert "credit_limit_twd" not in out
     assert "used_credit_twd" not in out
-    assert "raw_text_sample" in out
+    assert "raw_text_sample" not in out
 
 
 def test_parse_card_quota_inline_tabs_no_newlines():
@@ -213,3 +212,4 @@ def test_persist_writes_card_quota_daily_metric(store):
     import json
     payload = json.loads(row["payload_json"])
     assert payload["used_credit_twd"] == 87654
+    assert "raw_text_sample" not in payload

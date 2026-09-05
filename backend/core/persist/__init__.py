@@ -80,7 +80,7 @@ def persist_collected(bank, data, store, rules=None):
     validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
-    atomic = bank in {"ctbc", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
+    atomic = bank in {"ctbc", "esun", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
     try:
         if atomic:
             delta = persist(data, barrier, rules=rules, commit=False)
@@ -97,7 +97,7 @@ def persist_collected(bank, data, store, rules=None):
         store.record_history_coverage_cursors(
             data.get("history_coverage"),
             commit=not atomic,
-            replace=bank in {"ctbc", "rakuten", "taishin"} and coverage.get("mode") == "full",
+            replace=bank in {"ctbc", "esun", "rakuten", "taishin"} and coverage.get("mode") == "full",
         )
         if atomic:
             store.commit()

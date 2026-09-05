@@ -21,12 +21,19 @@ import os
 import re
 import sys
 from datetime import date, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qsl, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import ApiHit, BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import (
+    ApiHit,
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _OriginGuardProxy,
+)
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.core.creds import EsunCreds
 from backend.core.login_checkpoints import (
@@ -44,6 +51,10 @@ FIELD_USER_CODE   = "loginform:name"     # password type, maxlen=15
 FIELD_PASSWORD    = "loginform:pxsswd"   # password type, maxlen=15 (注意是 pxsswd 不是 password)
 LOGIN_BTN_ID      = "loginform:linkCommand"  # <a class="login_btn">
 _ESUN_TWD_HISTORY_PATH = "/fco/fao01002/FAO01002.faces"
+_ESUN_TWD_AJAX_PATH = "/fao/fao01002/FAO01002_Home.faces"
+_ESUN_HOME_FRAME_PATH = "/fco/fco08001/FCO08001_Home.faces"
+_ESUN_TWD_FRAME_PATHS = frozenset({_ESUN_TWD_HISTORY_PATH, _ESUN_HOME_FRAME_PATH})
+_ESUN_TWD_MAX_RESPONSE_BYTES = 1_000_000
 _ESUN_TWD_FAILURE_RE = re.compile(
     r"(?:錯誤|失敗|異常|逾時|逾期|失效|中斷|請稍後再試|重新登入|"
     r"載入中|讀取中|處理中|查詢中|等待|等候|忙碌|請稍候|timeout|timed?\s*out|"
@@ -72,6 +83,244 @@ def _log(*a):
 def _sel(field_id: str) -> str:
     """JSF id 含 colon，用 attr selector 才不用 escape。"""
     return f"[id='{field_id}']"
+
+
+def _is_esun_twd_transport_url(value: str) -> bool:
+    current = urlparse(value)
+    if (
+        current.scheme != "https"
+        or current.hostname != "ebank.esunbank.com.tw"
+        or current.port not in (None, 443)
+        or current.username is not None
+        or current.password is not None
+        or current.params
+        or current.fragment
+    ):
+        return False
+    if current.path == _ESUN_TWD_HISTORY_PATH:
+        return not current.query
+    return (
+        current.path == _ESUN_TWD_AJAX_PATH
+        and current.query == "ajax=true"
+    )
+
+
+class _EsunTwdGridParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.candidates = 0
+        self.table_depth = 0
+        self.rows: list[list[str]] = []
+        self.row: list[str] | None = None
+        self.cell: list[str] | None = None
+        self.text: list[str] = []
+        self.ignored_depth = 0
+        self.pager_nodes = 0
+        self.hidden_candidates = 0
+        self.busy_nodes = 0
+        self.structural_errors = 0
+        self.cell_tag: str | None = None
+        self.visibility_stack: list[tuple[str, bool]] = []
+        self.hidden_rows = 0
+        self.hidden_grid_nodes = 0
+        self.target_tags: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        prior_table_depth = self.table_depth
+        attributes = {key: value or "" for key, value in attrs}
+        style = re.sub(r"\s+", "", attributes.get("style", "")).lower()
+        classes = set(attributes.get("class", "").lower().split())
+        opacity = re.search(r"(?:^|;)opacity:([^;]+)", style)
+        opacity_hidden = False
+        if opacity:
+            value = opacity.group(1).removesuffix("!important").removesuffix("%")
+            try:
+                opacity_hidden = float(value) <= 0
+            except ValueError:
+                opacity_hidden = True
+        own_hidden = (
+            "hidden" in attributes
+            or attributes.get("aria-hidden", "").lower() == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+            or "visibility:collapse" in style
+            or opacity_hidden
+            or bool(classes & {"hidden", "d-none"})
+        )
+        inherited_hidden = self.visibility_stack[-1][1] if self.visibility_stack else False
+        current_hidden = own_hidden or inherited_hidden
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self.visibility_stack.append((tag, current_hidden))
+        if tag in {"script", "style"}:
+            self.ignored_depth += 1
+        pager_meta = " ".join(
+            f"{key}={attributes.get(key, '')}"
+            for key in (
+                "id", "class", "aria-label", "rel", "href", "onclick", "data-page", "title", "value",
+            )
+        )
+        if re.search(
+            r"(?:pager|paginator|pagination|下一頁|下頁|next\s*page|page[-_: ]?next|pagenext|go.?page\D*[2-9]\d*|data-page=[2-9]\d*|rel[=: ]?next|[?&]page=[2-9]\d*)",
+            pager_meta,
+            re.I,
+        ):
+            self.pager_nodes += 1
+        if tag == "table":
+            candidate = attributes.get("id") == "fao01002:grid_DataGridBody"
+            if candidate:
+                self.candidates += 1
+                if current_hidden:
+                    self.hidden_candidates += 1
+            if self.table_depth:
+                self.table_depth += 1
+            elif candidate:
+                self.table_depth = 1
+        elif self.table_depth == 1 and tag == "tr":
+            if current_hidden:
+                self.hidden_rows += 1
+            if self.row is not None or self.cell is not None:
+                self.structural_errors += 1
+            self.row = []
+        elif self.row is not None and tag in {"td", "th"}:
+            if self.cell is not None:
+                self.structural_errors += 1
+            self.cell = []
+            self.cell_tag = tag
+        if self.table_depth and current_hidden:
+            self.hidden_grid_nodes += 1
+        if (
+            (prior_table_depth or tag == "table" and attributes.get("id") == "fao01002:grid_DataGridBody")
+            and tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+        ):
+            self.target_tags.append(tag)
+        marker = " ".join((attributes.get("id", ""), attributes.get("class", "")))
+        if (
+            attributes.get("aria-busy", "").lower() == "true"
+            or attributes.get("role", "").lower() == "progressbar"
+            or tag == "progress"
+            or re.search(r"(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)", marker, re.I)
+        ):
+            self.busy_nodes += 1
+
+    def handle_data(self, data):
+        if not self.ignored_depth:
+            self.text.append(data)
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if self.table_depth and tag not in {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }:
+            if not self.target_tags or self.target_tags[-1] != tag:
+                self.structural_errors += 1
+            else:
+                self.target_tags.pop()
+        if tag in {"td", "th"}:
+            if not self.table_depth:
+                return
+            if self.cell is None or self.cell_tag != tag:
+                self.structural_errors += 1
+                return
+            if self.row is not None:
+                self.row.append(" ".join(" ".join(self.cell).split()))
+            self.cell = None
+            self.cell_tag = None
+        elif tag == "tr":
+            if not self.table_depth:
+                return
+            if self.row is None or self.cell is not None:
+                self.structural_errors += 1
+                return
+            self.rows.append(self.row)
+            self.row = None
+        elif self.table_depth and tag == "table":
+            if self.row is not None or self.cell is not None:
+                self.structural_errors += 1
+            self.table_depth -= 1
+        if tag in {"script", "style"} and self.ignored_depth:
+            self.ignored_depth -= 1
+        for index in range(len(self.visibility_stack) - 1, -1, -1):
+            if self.visibility_stack[index][0] == tag:
+                del self.visibility_stack[index:]
+                break
+
+
+def _parse_esun_twd_html_response(body: str) -> dict:
+    if not isinstance(body, str) or not body:
+        raise ValueError("invalid E.SUN TWD HTML")
+    parser = _EsunTwdGridParser()
+    parser.feed(body)
+    parser.close()
+    if (
+        parser.candidates != 1
+        or parser.hidden_candidates
+        or parser.hidden_rows
+        or parser.hidden_grid_nodes
+        or parser.busy_nodes
+        or parser.structural_errors
+        or parser.table_depth
+        or parser.row is not None
+        or parser.cell is not None
+        or parser.target_tags
+    ):
+        raise ValueError("invalid E.SUN TWD grid cardinality")
+    body_text = "\n".join(" ".join(parser.text).split())
+    if _ESUN_TWD_FAILURE_RE.search(body_text):
+        raise ValueError("invalid E.SUN TWD state")
+    date_cell = re.compile(r"\*?20\d{2}/\d{2}/\d{2}(?:\s+\d{2}:\d{2}:\d{2})?")
+    total_cell = re.compile(r"(?:共|總計|總筆數|資料筆數)\s*[\d,]+\s*筆")
+    empty_labels = {"查無交易資料", "查無資料", "無交易明細"}
+    grid_rows = []
+    empty_markers = []
+    header_rows = 0
+    allowed_headers = {
+        ("交易日期/時間", "摘要", "支出", "存入", "帳戶餘額"),
+        ("交易日期", "交易時間", "摘要", "支出金額", "存入金額", "帳戶餘額", "附註"),
+    }
+    for row in parser.rows:
+        if not row or not any(row):
+            continue
+        if date_cell.fullmatch(row[0]):
+            grid_rows.append(row)
+        elif any(cell in empty_labels for cell in row):
+            empty_markers.extend(cell for cell in row if cell in empty_labels)
+        elif tuple(re.sub(r"\s+", "", cell) for cell in row) in allowed_headers:
+            header_rows += 1
+        elif any(total_cell.fullmatch(cell) for cell in row):
+            continue
+        else:
+            raise ValueError("invalid E.SUN TWD row")
+    if header_rows != 1:
+        raise ValueError("invalid E.SUN TWD header cardinality")
+    if len(empty_markers) > 1:
+        raise ValueError("invalid E.SUN TWD empty cardinality")
+    if grid_rows and empty_markers:
+        raise ValueError("ambiguous E.SUN TWD grid")
+    grid_text = "\n".join("\n".join(row) for row in grid_rows)
+    totals = [
+        int(match.group(1).replace(",", ""))
+        for match in re.finditer(r"(?:共|總計|總筆數|資料筆數)\s*([\d,]+)\s*筆", body_text)
+    ]
+    if len(totals) > 1:
+        raise ValueError("invalid E.SUN TWD total cardinality")
+    pager_present = bool(
+        parser.pager_nodes
+        or re.search(r"(?:下一頁|下頁|next\s*page)", body_text, re.I)
+    )
+    total_count = totals[0] if totals else (0 if empty_markers else None)
+    return {
+        "hasGrid": bool(grid_rows),
+        "gridCandidateCount": 1 if grid_rows else 0,
+        "gridText": grid_text,
+        "gridRowCount": len(grid_rows),
+        "gridRows": grid_rows,
+        "totalCount": total_count,
+        "pager": {"present": pager_present, "actionableNext": int(pager_present)},
+        "busy": False,
+        "emptyMarker": empty_markers[0] if len(empty_markers) == 1 else None,
+    }
 
 
 class EsunLoginError(RuntimeError):
@@ -132,7 +381,7 @@ class EsunCrawler(BankCrawler):
         self.creds = EsunCreds.load()
 
     def _host_filter(self) -> str:
-        return "esunbank.com"
+        return "esunbank.com.tw"
 
     def _find_login_frame(self, page):
         matches = [
@@ -367,26 +616,95 @@ class EsunCrawler(BankCrawler):
             return
 
     @staticmethod
-    def _unique_twd_query_frame(frames):
+    def _twd_form_contract(frame) -> dict:
+        contract = frame.evaluate(r"""() => {
+            const all = (selector) => [...document.querySelectorAll(selector)];
+            const controls = {
+                account: all('select[id="fao01002:dract"]'),
+                start: all('input[id="fao01002:startDate"]'),
+                end: all('input[id="fao01002:endDate"]'),
+                action: all('input[name="fao01002:linkCommand"]'),
+                viewState: all('input[name="javax.faces.ViewState"]'),
+                period: all('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]'),
+                sort: all('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]'),
+            };
+            const forms = [...document.querySelectorAll('form')].filter((form) =>
+                Object.values(controls).some((nodes) => nodes.some((node) => form.contains(node)))
+            );
+            const form = forms.length === 1 ? forms[0] : null;
+            const query = form ? [...form.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')].filter((el) =>
+                (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim() === '查詢'
+            ) : [];
+            let action = '';
+            try { action = form ? new URL(form.getAttribute('action') || form.action, location.href).href : ''; } catch (_e) {}
+            return {
+                formCount: forms.length,
+                method: form?.method?.toUpperCase() || '',
+                action,
+                accountCount: controls.account.length,
+                startCount: controls.start.length,
+                endCount: controls.end.length,
+                actionCount: controls.action.length,
+                viewStateCount: controls.viewState.length,
+                periodCount: controls.period.length,
+                sortCount: controls.sort.length,
+                queryCount: query.length,
+                sameForm: !!form && Object.values(controls).every((nodes) =>
+                    nodes.length === 1 && form.contains(nodes[0])
+                ),
+                actionValue: controls.action.length === 1 ? controls.action[0].value || '' : '',
+                viewState: controls.viewState.length === 1 ? controls.viewState[0].value || '' : '',
+            };
+        }""")
+        if (
+            not isinstance(contract, dict)
+            or contract.get("formCount") != 1
+            or contract.get("method") != "POST"
+            or not _is_esun_twd_transport_url(contract.get("action") or "")
+            or any(contract.get(key) != 1 for key in (
+                "accountCount", "startCount", "endCount", "actionCount",
+                "viewStateCount", "periodCount", "sortCount", "queryCount",
+            ))
+            or contract.get("sameForm") is not True
+            or not isinstance(contract.get("actionValue"), str)
+            or not contract["actionValue"]
+            or len(contract["actionValue"]) > 256
+            or not isinstance(contract.get("viewState"), str)
+            or not 1 <= len(contract["viewState"]) <= 8_192
+        ):
+            raise ValueError("esun-twd-history-form")
+        return contract
+
+    @classmethod
+    def _unique_twd_query_frame(cls, frames):
         matches = []
         for frame in frames:
             try:
-                if frame.evaluate("""() => Boolean(
-                    document.querySelector('select[id="fao01002:dract"]') &&
-                    document.querySelector('input[name="fao01002:linkCommand"]')
-                )""") is True:
-                    matches.append(frame)
+                cls._twd_form_contract(frame)
+                matches.append(frame)
+            except ValueError:
+                continue
             except Exception:
                 raise RuntimeError("esun-twd-history-form") from None
         if len(matches) != 1:
             raise RuntimeError("esun-twd-history-form")
         return matches[0]
 
+    @classmethod
+    def _wait_for_twd_query_frame(cls, page):
+        for _ in range(100):
+            try:
+                return cls._unique_twd_query_frame(page.frames)
+            except RuntimeError:
+                page.wait_for_timeout(100)
+        raise RuntimeError("esun-twd-history-form")
+
     @staticmethod
     def _validated_twd_options(options) -> list[dict]:
         if not isinstance(options, list):
             raise RuntimeError("esun-twd-history-inventory")
         out = []
+        values = []
         for option in options:
             if not isinstance(option, dict):
                 raise RuntimeError("esun-twd-history-inventory")
@@ -398,60 +716,110 @@ class EsunCrawler(BankCrawler):
                 or index < 0
                 or not isinstance(text, str)
                 or text != text.strip()
-            ):
-                raise RuntimeError("esun-twd-history-inventory")
-            if option == {"index": 0, "text": "===請選擇===", "value": ""}:
-                continue
-            if not any(marker in text for marker in ("臺幣", "台幣")):
-                raise RuntimeError("esun-twd-history-inventory")
-            matches = re.findall(r"(?<!\d)\d{13}(?!\d)", text or "")
-            if (
-                len(matches) != 1
                 or not isinstance(value, str)
-                or not value
                 or value != value.strip()
             ):
                 raise RuntimeError("esun-twd-history-inventory")
+            values.append(value)
+            if index == 0 and text == "===請選擇===":
+                continue
+            if not value:
+                raise RuntimeError("esun-twd-history-inventory")
+            matches = re.findall(r"(?<!\d)\d{13}(?!\d)", text or "")
+            if not any(marker in text for marker in ("臺幣", "台幣")):
+                if "外幣" in text and len(matches) == 1:
+                    continue
+                raise RuntimeError("esun-twd-history-inventory")
+            if len(matches) != 1:
+                raise RuntimeError("esun-twd-history-inventory")
             out.append({**option, "identity": matches[0]})
         identities = [row["identity"] for row in out]
-        if len(identities) != len(set(identities)):
+        if len(identities) != len(set(identities)) or len(values) != len(set(values)):
             raise RuntimeError("esun-twd-history-inventory")
         if not identities:
             raise RuntimeError("esun-twd-history-inventory")
         return out
 
     @staticmethod
-    def _capture_twd_response(response, hits: list[ApiHit]) -> None:
+    def _capture_twd_request(
+        request,
+        requests: list[dict],
+        expected_frame,
+        expected_url: str,
+        account_value: str,
+        start: date,
+        end: date,
+        action_value: str,
+        view_state: str,
+    ) -> None:
+        try:
+            expected_frame = _OriginGuardProxy._unwrap(expected_frame)
+            post_data = request.post_data or ""
+            fields = parse_qsl(post_data, keep_blank_values=True)
+            values = lambda name: [value for key, value in fields if key == name]
+            if (
+                request.method == "POST"
+                and request.frame is expected_frame
+                and getattr(request, "redirected_from", None) is None
+                and request.url == expected_url
+                and _is_esun_twd_transport_url(expected_url)
+                and len(post_data) <= 32_768
+                and values("fao01002:dract") == [account_value]
+                and values("fao01002:startDate") == [start.strftime("%Y/%m/%d")]
+                and values("fao01002:endDate") == [end.strftime("%Y/%m/%d")]
+                and values("fao01002:linkCommand") == [action_value]
+                and values("javax.faces.ViewState") == [view_state]
+            ):
+                requests.append({
+                    "requestId": id(request),
+                    "url": expected_url,
+                    "fieldsExact": True,
+                    "actionExact": True,
+                    "viewStateExact": True,
+                    "frameExact": True,
+                })
+        except Exception:
+            return
+
+    @staticmethod
+    def _capture_twd_response(response, hits: list[ApiHit], requests: list) -> None:
         try:
             request = response.request
-            current = urlparse(response.url or "")
+            headers = response.headers
+            content_type = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            declared_size = headers.get("content-length")
+            matched_requests = [
+                candidate for candidate in requests
+                if candidate.get("requestId") == id(request)
+                and candidate.get("url") == response.url
+            ]
             if (
-                request.method != "POST"
-                or current.scheme != "https"
-                or current.hostname != "ebank.esunbank.com.tw"
-                or current.port not in (None, 443)
-                or current.username is not None
-                or current.password is not None
-                or current.path != _ESUN_TWD_HISTORY_PATH
-                or current.query
-                or current.fragment
+                len(matched_requests) != 1
+                or request.url != response.url
+                or request.method != "POST"
+                or not _is_esun_twd_transport_url(response.url or "")
+                or type(response.status) is not int
+                or response.status != 200
+                or content_type not in {"text/html", "application/xhtml+xml", "text/xml", "application/xml"}
+                or not isinstance(declared_size, str)
+                or not declared_size.isdigit()
+                or int(declared_size) > _ESUN_TWD_MAX_RESPONSE_BYTES
             ):
                 return
-            fields = parse_qs(request.post_data or "", keep_blank_values=True)
-            safe_fields = {
-                key: fields.get(key)
-                for key in (
-                    "fao01002:dract",
-                    "fao01002:startDate",
-                    "fao01002:endDate",
-                )
-            }
+            body = response.text()
+            if not isinstance(body, str) or len(body.encode("utf-8")) > _ESUN_TWD_MAX_RESPONSE_BYTES:
+                return
+            snapshot = {**_parse_esun_twd_html_response(body), "evidenceFresh": True}
             hits.append(ApiHit(
                 url=response.url,
                 method=request.method,
                 status=response.status,
-                req_body=safe_fields,
-                content_type=response.headers.get("content-type", ""),
+                req_body={
+                    key: matched_requests[0][key]
+                    for key in ("fieldsExact", "actionExact", "viewStateExact", "frameExact")
+                },
+                resp_json=snapshot,
+                content_type=content_type,
             ))
         except Exception:
             return
@@ -461,10 +829,7 @@ class EsunCrawler(BankCrawler):
         hits,
         *,
         result_url: str,
-        account_value: str,
-        start: date,
-        end: date,
-    ) -> None:
+    ) -> ApiHit:
         parsed_result = urlparse(result_url)
         if (
             parsed_result.scheme != "https"
@@ -472,16 +837,12 @@ class EsunCrawler(BankCrawler):
             or parsed_result.port not in (None, 443)
             or parsed_result.username is not None
             or parsed_result.password is not None
-            or parsed_result.path != _ESUN_TWD_HISTORY_PATH
+            or parsed_result.params
+            or parsed_result.path not in _ESUN_TWD_FRAME_PATHS
             or parsed_result.query
             or parsed_result.fragment
         ):
             raise RuntimeError("esun-twd-history-transport")
-        expected_fields = {
-            "fao01002:dract": account_value,
-            "fao01002:startDate": start.strftime("%Y/%m/%d"),
-            "fao01002:endDate": end.strftime("%Y/%m/%d"),
-        }
         matches = []
         for hit in hits:
             content_type = (
@@ -490,18 +851,23 @@ class EsunCrawler(BankCrawler):
                 else ""
             )
             if (
-                hit.url == result_url
-                and hit.method == "POST"
+                hit.method == "POST"
                 and type(hit.status) is int
-                and 200 <= hit.status < 300
+                and hit.status == 200
+                and _is_esun_twd_transport_url(hit.url)
                 and content_type in {"text/html", "application/xhtml+xml", "text/xml", "application/xml"}
                 and isinstance(hit.req_body, dict)
             ):
-                fields = hit.req_body
-                if all(fields.get(key) == [value] for key, value in expected_fields.items()):
+                if hit.req_body == {
+                    "fieldsExact": True,
+                    "actionExact": True,
+                    "viewStateExact": True,
+                    "frameExact": True,
+                }:
                     matches.append(hit)
         if len(matches) != 1:
             raise RuntimeError("esun-twd-history-transport")
+        return matches[0]
 
     @staticmethod
     def _fresh_twd_result(candidates) -> dict:
@@ -511,6 +877,20 @@ class EsunCrawler(BankCrawler):
         if not isinstance(result, dict) or result.get("evidenceFresh") is not True:
             raise RuntimeError("esun-twd-history-stale-result")
         return result
+
+    @staticmethod
+    def _wait_for_twd_operation(page, requests, hits) -> None:
+        stable_ticks = 0
+        previous = (-1, -1)
+        for tick in range(120):
+            page.wait_for_timeout(100)
+            current = (len(requests), len(hits))
+            stable_ticks = stable_ticks + 1 if hits and current == previous else 0
+            previous = current
+            if tick >= 89 and stable_ticks >= 5:
+                break
+        if len(requests) != 1 or len(hits) != 1 or stable_ticks < 5:
+            raise RuntimeError("esun-twd-history-response-timeout")
 
     @staticmethod
     def _validated_twd_history_result(
@@ -541,16 +921,12 @@ class EsunCrawler(BankCrawler):
             or current.port not in (None, 443)
             or current.username is not None
             or current.password is not None
-            or current.path != _ESUN_TWD_HISTORY_PATH
+            or current.params
+            or current.path not in _ESUN_TWD_FRAME_PATHS
+            or current.query
+            or current.fragment
             or not isinstance(text, str)
             or _ESUN_TWD_FAILURE_RE.search(text) is not None
-            or re.search(rf"(?<!\d){re.escape(identity)}(?!\d)", text) is None
-            or re.search(
-                rf"(?<!\d){re.escape(start.strftime('%Y/%m/%d'))}(?!\d)", text,
-            ) is None
-            or re.search(
-                rf"(?<!\d){re.escape(end.strftime('%Y/%m/%d'))}(?!\d)", text,
-            ) is None
             or not isinstance(snapshot, dict)
             or snapshot.get("busy") is not False
         ):
@@ -566,7 +942,7 @@ class EsunCrawler(BankCrawler):
         ):
             raise RuntimeError("esun-twd-history-result")
         total_count = snapshot.get("totalCount")
-        if type(total_count) is not int or total_count < 0:
+        if total_count is not None and (type(total_count) is not int or total_count < 0):
             raise RuntimeError("esun-twd-history-result")
         has_grid = snapshot.get("hasGrid")
         grid_candidate_count = snapshot.get("gridCandidateCount")
@@ -587,7 +963,10 @@ class EsunCrawler(BankCrawler):
                     date.fromisoformat(match.group(1).replace("/", "-"))
                     for cells in grid_rows
                     for cell in cells
-                    if (match := re.fullmatch(r"\*?(20\d{2}/\d{2}/\d{2})", cell))
+                    if (match := re.fullmatch(
+                        r"\*?(20\d{2}/\d{2}/\d{2})(?:\s+\d{2}:\d{2}:\d{2})?",
+                        cell,
+                    ))
                 ]
             except (TypeError, ValueError):
                 raise RuntimeError("esun-twd-history-result") from None
@@ -595,7 +974,7 @@ class EsunCrawler(BankCrawler):
             if (
                 type(row_count) is not int
                 or row_count <= 0
-                or total_count != row_count
+                or total_count is not None and total_count != row_count
                 or not grid_text.strip()
                 or len(dates) != row_count
                 or snapshot.get("emptyMarker") is not None
@@ -711,7 +1090,7 @@ class EsunCrawler(BankCrawler):
                 coverage_expected = []
                 expected_twd_identities: set[str] = set()
                 submitted_accounts: set[str] = set()
-                query_frame = self._unique_twd_query_frame(page.frames)
+                query_frame = self._wait_for_twd_query_frame(page)
                 form_url = urlparse(query_frame.url or "")
                 if (
                     form_url.scheme != "https"
@@ -719,7 +1098,10 @@ class EsunCrawler(BankCrawler):
                     or form_url.port not in (None, 443)
                     or form_url.username is not None
                     or form_url.password is not None
-                    or form_url.path != _ESUN_TWD_HISTORY_PATH
+                    or form_url.params
+                    or form_url.path not in _ESUN_TWD_FRAME_PATHS
+                    or form_url.query
+                    or form_url.fragment
                 ):
                     raise RuntimeError("esun-twd-history-form")
                 bank_today_raw = query_frame.evaluate(r"""() =>
@@ -733,7 +1115,11 @@ class EsunCrawler(BankCrawler):
                 if query_frame is not None:
                     try:
                         acct_options = query_frame.evaluate(r"""() => {
-                            const s = document.querySelector('select[id="fao01002:dract"]');
+                            const forms = [...document.querySelectorAll('form')].filter((form) =>
+                                form.querySelector('select[id="fao01002:dract"]')
+                            );
+                            const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+                            const s = forms.length === 1 && xs.length === 1 && forms[0].contains(xs[0]) ? xs[0] : null;
                             if (!s) return [];
                             return [...s.options].map((o, index) => ({
                                 index,
@@ -755,7 +1141,9 @@ class EsunCrawler(BankCrawler):
                             query_frame.locator("select[id='fao01002:dract']").select_option(index=int(opt["index"]), timeout=8000)
                             page.wait_for_timeout(800)
                             selected = query_frame.evaluate(r"""() => {
-                                const s = document.querySelector('select[id="fao01002:dract"]');
+                                const forms = [...document.querySelectorAll('form')];
+                                const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+                                const s = forms.length === 1 && xs.length === 1 && forms[0].contains(xs[0]) ? xs[0] : null;
                                 const o = s?.options[s.selectedIndex];
                                 return s && o ? {
                                     index: s.selectedIndex,
@@ -779,8 +1167,14 @@ class EsunCrawler(BankCrawler):
                                 "end": history_end.strftime("%Y/%m/%d"),
                             }
                             clicked_period = query_frame.evaluate(r"""(period) => {
-                                const r = document.querySelector('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]');
-                                if (!r) return {ok: false, error: 'no intervalrdo4'};
+                                const forms = [...document.querySelectorAll('form')];
+                                const radios = [...document.querySelectorAll('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]')];
+                                const starts = [...document.querySelectorAll('input[id="fao01002:startDate"]')];
+                                const ends = [...document.querySelectorAll('input[id="fao01002:endDate"]')];
+                                const form = forms.length === 1 ? forms[0] : null;
+                                const r = form && radios.length === 1 && starts.length === 1 && ends.length === 1
+                                    && [radios[0], starts[0], ends[0]].every((node) => form.contains(node)) ? radios[0] : null;
+                                if (!r) return {ok: false, error: 'invalid controls'};
                                 const label = r.closest('label');
                                 if (label) {
                                     try { label.click(); } catch (e) {}
@@ -794,8 +1188,8 @@ class EsunCrawler(BankCrawler):
                                 for (const lbl of document.querySelectorAll('.radiobutton-group label')) {
                                     lbl.classList.toggle('checked', lbl.contains(r));
                                 }
-                                const s = document.querySelector('input[id="fao01002:startDate"]');
-                                const e = document.querySelector('input[id="fao01002:endDate"]');
+                                const s = starts[0];
+                                const e = ends[0];
                                 if (s) {
                                     s.value = period.start;
                                     s.dispatchEvent(new Event('change', {bubbles: true}));
@@ -810,7 +1204,9 @@ class EsunCrawler(BankCrawler):
                                 raise RuntimeError("esun-twd-history-period")
                             page.wait_for_timeout(500)
                             sort_selected = query_frame.evaluate(r"""() => {
-                                const r = document.querySelector('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]');
+                                const forms = [...document.querySelectorAll('form')];
+                                const radios = [...document.querySelectorAll('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]')];
+                                const r = forms.length === 1 && radios.length === 1 && forms[0].contains(radios[0]) ? radios[0] : null;
                                 if (!r) return false;
                                 r.checked = true;
                                 r.dispatchEvent(new Event('change', {bubbles: true}));
@@ -818,30 +1214,18 @@ class EsunCrawler(BankCrawler):
                             }""")
                             if sort_selected is not True:
                                 raise RuntimeError("esun-twd-history-sort")
-                            stale_evidence = query_frame.evaluate(r"""() => {
-                                const selector = '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]';
-                                const evidence = [...document.querySelectorAll(selector)];
-                                const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
-                                for (const el of document.querySelectorAll('*')) {
-                                    if (emptyLabels.has((el.textContent || '').trim()) && ![...el.children].some(
-                                        (child) => emptyLabels.has((child.textContent || '').trim())
-                                    )) evidence.push(el);
-                                }
-                                for (const el of new Set(evidence)) {
-                                    el.setAttribute('data-hermes-stale-evidence', '1');
-                                }
-                                return {ok: true, marked: new Set(evidence).size};
-                            }""")
-                            if (
-                                not isinstance(stale_evidence, dict)
-                                or stale_evidence.get("ok") is not True
-                                or type(stale_evidence.get("marked")) is not int
-                            ):
-                                raise RuntimeError("esun-twd-history-stale-result")
+                            operation_contract = self._twd_form_contract(query_frame)
+                            operation_requests = []
                             operation_hits: list[ApiHit] = []
-                            response_listener = lambda response: self._capture_twd_response(
-                                response, operation_hits,
+                            request_listener = lambda request: self._capture_twd_request(
+                                request, operation_requests, query_frame, operation_contract["action"],
+                                opt["value"], history_start, history_end,
+                                operation_contract["actionValue"], operation_contract["viewState"],
                             )
+                            response_listener = lambda response: self._capture_twd_response(
+                                response, operation_hits, operation_requests,
+                            )
+                            page.on("request", request_listener)
                             page.on("response", response_listener)
                             try:
                                 submit_info = query_frame.evaluate(r"""() => {
@@ -850,14 +1234,16 @@ class EsunCrawler(BankCrawler):
                                         const st = window.getComputedStyle(el);
                                         return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
                                     };
-                                    for (const el of document.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')) {
+                                    const forms = [...document.querySelectorAll('form')];
+                                    const form = forms.length === 1 ? forms[0] : null;
+                                    const matches = form ? [...form.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')].filter((el) => {
                                         const t = (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim();
-                                        if (t === '查詢' && visible(el)) {
-                                            el.click();
-                                            return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: t};
-                                        }
-                                    }
-                                    return {clicked: null};
+                                        return t === '查詢' && visible(el);
+                                    }) : [];
+                                    if (matches.length !== 1) return {clicked: null};
+                                    const el = matches[0];
+                                    el.click();
+                                    return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: '查詢'};
                                 }""")
                                 if submit_info != {
                                     "clicked": "visible-query",
@@ -867,133 +1253,28 @@ class EsunCrawler(BankCrawler):
                                     "text": "查詢",
                                 }:
                                     raise RuntimeError("esun-twd-history-submit")
-                                for _ in range(90):
-                                    if operation_hits:
-                                        break
-                                    page.wait_for_timeout(100)
-                                if not operation_hits:
-                                    raise RuntimeError("esun-twd-history-response-timeout")
+                                self._wait_for_twd_operation(
+                                    page, operation_requests, operation_hits,
+                                )
                             finally:
+                                page.remove_listener("request", request_listener)
                                 page.remove_listener("response", response_listener)
-                            # The response event exposes headers before JSF finishes replacing the result DOM.
-                            page.wait_for_timeout(9000)
-                            result_candidates = []
-                            for rf in (query_frame,):
-                                try:
-                                    snap = rf.evaluate(r"""(expected) => {
-                                        const exactToken = (text, token) => new RegExp(
-                                            `(^|\\D)${token}(?!\\d)`
-                                        ).test(text);
-                                        const visible = (el) => {
-                                            const r = el.getBoundingClientRect();
-                                            if (r.width <= 0 || r.height <= 0) return false;
-                                            for (let node = el; node; node = node.parentElement) {
-                                                const st = window.getComputedStyle(node);
-                                                if (st.display === 'none'
-                                                    || st.visibility === 'hidden'
-                                                    || st.visibility === 'collapse'
-                                                    || Number(st.opacity) === 0
-                                                    || node.hidden
-                                                    || (node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
-                                            }
-                                            return true;
-                                        };
-                                        const scopes = [...document.querySelectorAll(
-                                            '.qryresult, [id^="fao01002:"][id*="qry" i]'
-                                        )].filter((el) => {
-                                            if (!visible(el)) return false;
-                                            const text = el.textContent || '';
-                                            return exactToken(text, expected.identity)
-                                                && exactToken(text, expected.start)
-                                                && exactToken(text, expected.end);
-                                        });
-                                        if (scopes.length !== 1) return {bound: false, scopeCount: scopes.length};
-                                        const resultScope = scopes[0];
-                                        const bodyText = resultScope.textContent || '';
-                                        const grids = [...resultScope.querySelectorAll(
-                                            '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]'
-                                        )].filter(visible);
-                                        const grid = grids.length === 1 ? grids[0] : null;
-                                        const gridText = grid ? (grid.textContent || '') : '';
-                                        const gridRows = grid ? [...grid.querySelectorAll('tr')].map((row) => {
-                                            const cells = [...row.querySelectorAll(':scope > th, :scope > td')];
-                                            if (!visible(row) || cells.some((cell) => !visible(cell))) return [];
-                                            return cells.map((cell) => (cell.textContent || '').trim());
-                                        }).filter((cells) => cells.some(
-                                            (cell) => /(^|\D)20\d{2}\/\d{1,2}\/\d{1,2}(?!\d)/.test(cell)
-                                        )) : [];
-                                        const pagerRoots = [...resultScope.querySelectorAll(
-                                            '[id*="pager" i], [class*="pager" i], [id*="paginator" i], [class*="paginator" i]'
-                                        )];
-                                        const nextControls = [...resultScope.querySelectorAll('a,button,input')].filter((el) => {
-                                            const marker = [
-                                                el.textContent, el.value, el.title,
-                                                el.getAttribute('aria-label'), el.getAttribute('rel'),
-                                                el.id, el.className,
-                                            ].filter(Boolean).join(' ').replace(/\s+/g, '');
-                                            return /(?:下一頁|下頁|next|page-next|pagenext|>)/i.test(marker);
-                                        });
-                                        const hasNextText = /(?:下一頁|下頁)/.test(bodyText);
-                                        const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
-                                        const emptyMarkers = [resultScope, ...resultScope.querySelectorAll('*')].filter((el) => {
-                                            if (!visible(el)) return false;
-                                            const label = (el.textContent || '').trim();
-                                            return emptyLabels.has(label) && ![...el.children].some(
-                                                (child) => emptyLabels.has((child.textContent || '').trim())
-                                            );
-                                        });
-                                        const totals = [...bodyText.matchAll(
-                                            /(?:共|總計|總筆數|資料筆數)\s*(\d+)\s*筆/g
-                                        )].map((match) => Number(match[1]));
-                                        const uniqueTotals = [...new Set(totals)];
-                                        return {
-                                            bound: true,
-                                            href: location.href,
-                                            bodyText,
-                                            busy: [document.documentElement, ...document.querySelectorAll('*')].some((el) =>
-                                                visible(el) && (
-                                                    (el.getAttribute('aria-busy') || '').toLowerCase() === 'true'
-                                                    || (el.getAttribute('role') || '').toLowerCase() === 'progressbar'
-                                                    || el.tagName.toLowerCase() === 'progress'
-                                                    || /(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([
-                                                        el.id, el.getAttribute('class'),
-                                                    ].filter(Boolean).join(' '))
-                                                )
-                                            ),
-                                            evidenceFresh: grid
-                                                ? !grid.hasAttribute('data-hermes-stale-evidence')
-                                                : emptyMarkers.length === 1
-                                                    && !emptyMarkers[0].hasAttribute('data-hermes-stale-evidence'),
-                                            gridText,
-                                            gridRows,
-                                            hasGrid: !!grid,
-                                            gridCandidateCount: grids.length,
-                                            gridRowCount: gridRows.length,
-                                            totalCount: uniqueTotals.length === 1 ? uniqueTotals[0] : null,
-                                            pager: {
-                                                present: pagerRoots.length > 0 || hasNextText,
-                                                actionableNext: nextControls.length,
-                                            },
-                                            emptyMarker: emptyMarkers.length === 1
-                                                ? (emptyMarkers[0].textContent || '').trim()
-                                                : null,
-                                            gridHtml: grid ? grid.outerHTML.slice(0, 20000) : '',
-                                            qryResult: [...document.querySelectorAll('.qryresult, [class*=qryresult], [id*=qry]')].map((el) => ({
-                                                id: el.id || '', cls: (el.className || '').toString(), visible: el.offsetParent !== null,
-                                                text: (el.textContent || '').slice(0, 20000),
-                                                html: el.outerHTML.slice(0, 20000),
-                                            })).slice(0, 10),
-                                            tables: [...document.querySelectorAll('table')].map((t, idx) => ({
-                                                idx, id: t.id || '', cls: (t.className || '').toString(), visible: t.offsetParent !== null,
-                                                text: (t.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 4000),
-                                                html: t.outerHTML.slice(0, 12000),
-                                            })).filter(t => /交易|日期|金額|餘額|摘要|明細|TWD|查詢/.test(t.text) || t.id.includes('fao01002')).slice(0, 30),
-                                        };
-                                    }""", {"identity": account_no, **expected_period})
-                                    if snap.get("bound") is True:
-                                        result_candidates.append(snap)
-                                except Exception:
-                                    pass
+                            # Parse the exact request/response pair; the widget DOM may stay stale.
+                            bound_hit = self._validated_twd_transport(
+                                operation_hits,
+                                result_url=query_frame.url,
+                            )
+                            response_snapshot = bound_hit.resp_json
+                            if not isinstance(response_snapshot, dict):
+                                raise RuntimeError("esun-twd-history-result")
+                            result_candidates = [{
+                                **response_snapshot,
+                                "bound": True,
+                                "href": query_frame.url,
+                                "bodyText": response_snapshot.get("gridText")
+                                or response_snapshot.get("emptyMarker")
+                                or "",
+                            }]
                             bound_result = self._fresh_twd_result(result_candidates)
                             result_text = bound_result["bodyText"]
                             result_url = bound_result["href"]
@@ -1005,13 +1286,7 @@ class EsunCrawler(BankCrawler):
                                     "emptyMarker", "gridRows",
                                 )
                             }
-                            self._validated_twd_transport(
-                                operation_hits,
-                                result_url=result_url,
-                                account_value=opt["value"],
-                                start=history_start,
-                                end=history_end,
-                            )
+
                             result = {
                                 "account_no": account_no,
                                 "selected_identity": account_no,
@@ -1073,43 +1348,6 @@ class EsunCrawler(BankCrawler):
             # 玉山 widget 載入慢且可能掛新 iframe — 等 10 秒讓 Playwright 註冊新 frame
             page.wait_for_timeout(10000)
 
-            # debug: 對比 page.frames vs DOM iframe 真實數
-            try:
-                dom_iframe_count = page.evaluate("() => document.querySelectorAll('iframe').length")
-                _log(f"[esun][collect] DOM iframe count={dom_iframe_count} vs page.frames={len(page.frames)}")
-                # 各 frame iframe count
-                for f in page.frames:
-                    try:
-                        sub = f.evaluate("() => document.querySelectorAll('iframe').length")
-                        sub_srcs = f.evaluate("() => [...document.querySelectorAll('iframe')].map(e => (e.src || e.id || '').slice(0, 150))")
-                        _log(f"[esun][collect][nest] {f.url[:60]} sub_iframes={sub} srcs={sub_srcs[:3]}")
-                    except Exception:
-                        pass
-            except Exception as e:
-                _log(f"[esun][collect] iframe count debug failed: {e}")
-
-            # debug: dump 所有 frame URL + body innerText 長度
-            all_frames_meta = []
-            for f in page.frames:
-                try:
-                    url = f.url[:200]
-                    # 用 textContent（不受 CSS hidden / visibility 影響）+ innerText 兩種對比
-                    txt_inner = f.evaluate("() => document.body.innerText.slice(0, 15000)")
-                    txt_content = f.evaluate("() => document.body.textContent.slice(0, 20000)")
-                    all_frames_meta.append({
-                        "url": url,
-                        "inner_len": len(txt_inner),
-                        "content_len": len(txt_content),
-                        "has_card_kw_inner": any(k in txt_inner for k in ("歸戶信用額度", "預借現金額度")),
-                        "has_card_kw_content": any(k in txt_content for k in ("歸戶信用額度", "預借現金額度")),
-                        "first_200": txt_inner[:200],
-                    })
-                except Exception as e:
-                    all_frames_meta.append({"url": getattr(f, "url", "?")[:80], "error": str(e)})
-            out["card_all_frames_meta"] = all_frames_meta
-            for m in all_frames_meta:
-                _log(f"[esun][collect][meta] {m.get('url', '')[:60]} inner_len={m.get('inner_len')} content_len={m.get('content_len')} card_kw inner={m.get('has_card_kw_inner')} content={m.get('has_card_kw_content')}")
-
             card_frames = []
             for f in page.frames:
                 if f == page.main_frame:
@@ -1134,7 +1372,6 @@ class EsunCrawler(BankCrawler):
                 full_text = card_frames[0].get("text_preview", "")
                 out["card_summary"] = self._parse_card_summary(full_text)
                 out["card_bills"] = self._parse_card_bills(full_text)
-                _log(f"[esun][collect] card_summary={out['card_summary']}")
                 _log(f"[esun][collect] card_bills count={len(out['card_bills'])}")
 
                 # 帳單列表只含月份／總額；逐月點橘色「明細」才有真實入帳日。
@@ -1205,7 +1442,7 @@ class EsunCrawler(BankCrawler):
                 _log(f"[esun][collect] card_bill_details={len(bill_details)}")
             _log(f"[esun][collect] card_frames={len(card_frames)} (widget mode)")
         except Exception as e:
-            _log(f"[esun][collect] 信用卡 navigate 失敗: {e}")
+            _log("[esun][collect] 信用卡 navigate 失敗")
             out["card_frames"] = []
             out["card_nav_probe"] = {"error": str(e)}
 
@@ -1304,7 +1541,7 @@ class EsunCrawler(BankCrawler):
                 out["card_txn_frames"] = card_txn_frames
                 _log(f"[esun][collect] card_txn_frames={len(card_txn_frames)} (widget mode, 累計)")
         except Exception as e:
-            _log(f"[esun][collect] 信用卡消費明細 navigate 失敗: {e}")
+            _log("[esun][collect] 信用卡消費明細 navigate 失敗")
             out["card_txn_frames"] = []
             out["card_txn_nav_probe"] = {"error": str(e)}
 
@@ -1361,13 +1598,13 @@ class EsunCrawler(BankCrawler):
                     best = max(quota_frames, key=lambda x: x.get("txt_len", 0))
                     full_text = best.get("text_preview", "")
                     out["card_quota"] = self._parse_card_quota(full_text)
-                    _log(f"[esun][collect] card_quota={out['card_quota']}")
+                    _log("[esun][collect] card_quota parsed")
                 else:
                     out["card_quota"] = {}
                     _log("[esun][collect] 信用卡額度查詢 frame 沒抓到 (已用額度+可用餘額+number)")
                 _log(f"[esun][collect] card_quota_frames={len(quota_frames)} (widget mode)")
         except Exception as e:
-            _log(f"[esun][collect] 信用卡額度查詢 navigate 失敗: {e}")
+            _log("[esun][collect] 信用卡額度查詢 navigate 失敗")
             out["card_quota_frames"] = []
             out["card_quota"] = {}
             out["card_quota_nav_probe"] = {"error": str(e)}
@@ -1424,13 +1661,12 @@ class EsunCrawler(BankCrawler):
                 _log(f"[esun][collect] card_pay_frames={len(pay_frames)} "
                      f"records={len(out['card_pay_history'].get('records', []))}")
         except Exception as e:
-            _log(f"[esun][collect] 信用卡繳款明細查詢 navigate 失敗: {e}")
+            _log("[esun][collect] 信用卡繳款明細查詢 navigate 失敗")
             out["card_pay_frames"] = []
             out["card_pay_history"] = {}
             out["card_pay_nav_probe"] = {"error": str(e)}
 
-        out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
-        out["_endpoint_count"] = len(out["_all_endpoints"])
+        endpoint_count = len({h.endpoint for h in collector.hits if h.resp_json})
         out["card_statement_transactions"] = self._parse_card_bill_details(
             out.get("card_bill_details") or [],
         )
@@ -1439,7 +1675,20 @@ class EsunCrawler(BankCrawler):
             out["card_statement_transactions"],
         )
         publish_card_bill_facts(out, [_esun_card_bill_fact(out)])
-        _log(f"[esun][collect] 攔到 {out['_endpoint_count']} 個 API endpoint")
+        _log(f"[esun][collect] 攔到 {endpoint_count} 個 API endpoint")
+        for result in out.get("twd_txn_results") or []:
+            snapshot = result.get("snapshot") if isinstance(result, dict) else None
+            if isinstance(snapshot, dict):
+                snapshot.pop("gridText", None)
+        for key in (
+            "final_url", "main_text", "frames", "all_pages", "card_all_frames_meta",
+            "twd_txn_nav_probe", "card_nav_probe", "card_frames",
+            "card_bill_details", "card_statement_transactions", "card_txn_form_submitted",
+            "card_txn_nav_probe", "card_txn_frames",
+            "card_quota_nav_probe", "card_quota_frames",
+            "card_pay_nav_probe", "card_pay_frames",
+        ):
+            out.pop(key, None)
         return BankCollectResult(**out)
 
     @staticmethod
@@ -1525,7 +1774,7 @@ class EsunCrawler(BankCrawler):
             "used_credit_twd": -807,             # 可能為負 (溢繳)
             "available_credit_twd": 400807,
             "credit_limit_twd": 400000,          # = used + available (玉山這頁不顯示)
-            "raw_text_sample": "...",
+
           }
         """
         import re as _re
@@ -1550,8 +1799,6 @@ class EsunCrawler(BankCrawler):
             except ValueError:
                 pass
 
-        # debug：永遠留 sample，命中失敗時使用者才能 audit
-        out["raw_text_sample"] = text[:500]
         return out
 
     # ---------- 解析帳戶 ----------
@@ -1602,7 +1849,6 @@ class EsunCrawler(BankCrawler):
                     "category": category,
                     "currency": currency,
                     "balance": balance,
-                    "source_frame": fd.get("url", "")[:80],
                 })
         return accounts
 
@@ -1883,11 +2129,11 @@ class EsunCrawler(BankCrawler):
                     label,
                 )
                 probe_info["frames"].append({"url": f.url[:120], "result": result})
-                _log(f"[esun][collect][nav][{label}] {f.url[:50]} clicked={result and result.get('clicked')!r}")
+                _log(f"[esun][collect][nav][{label}] clicked={result and result.get('clicked')!r}")
                 if result and result.get("clicked"):
                     return probe_info
             except Exception as e:
-                _log(f"[esun][collect][nav][{label}] frame {f.url[:60]} 失敗: {e}")
+                _log(f"[esun][collect][nav][{label}] frame failed")
                 probe_info["frames"].append({"url": f.url[:120], "error": str(e)})
                 continue
         return probe_info
@@ -1971,31 +2217,10 @@ class EsunCrawler(BankCrawler):
                 """, period_label)
                 if result and result.get("periodSelected") and result.get("queryClicked"):
                     info["strategy"] = result
-                    _log(f"[esun][collect][txn-form] {f.url[:60]} {result.get('log')}")
+                    _log("[esun][collect][txn-form] submitted")
                     return info
             except Exception as e:
                 info["errors"].append({"url": f.url[:80], "error": str(e)})
                 continue
         _log("[esun][collect][txn-form] 無 frame 能點到表單（probe 已存）")
         return info
-
-
-if __name__ == "__main__":
-    import json
-    crawler = EsunCrawler()
-    try:
-        result = crawler.run(login_url=BASE, headless=True)
-    except EsunLoginError as e:
-        result = {"error": "login_failed_stop", "detail": str(e)}
-
-    out_file = Path(__file__).resolve().parents[1] / "data" / "esun_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    _log(f"\n[esun][done] 已存: {out_file}")
-
-    if result.get("error"):
-        _log(f"  ❌ error: {result['error']}")
-    else:
-        data = result.get("data", {})
-        _log(f"  url: {data.get('final_url')}")
-        _log(f"  frames: {len(data.get('frames', []))}")
-        _log(f"  endpoints: {data.get('_all_endpoints', [])}")

@@ -2,8 +2,8 @@ from datetime import date
 
 import pytest
 
-from backend.banks.esun import EsunCrawler, _esun_history_window
-from backend.core.base import ApiHit, ResponseCollector
+from backend.banks.esun import EsunCrawler, _esun_history_window, _parse_esun_twd_html_response
+from backend.core.base import ApiHit, ResponseCollector, _OriginGuardProxy
 from backend.core.persist import persist_collected
 from backend.core.persist.esun import (
     _esun_twd_integer,
@@ -11,6 +11,25 @@ from backend.core.persist.esun import (
     _validated_esun_twd_row,
 )
 from backend.core.store import BankStore
+
+
+def _form_contract() -> dict:
+    return {
+        "formCount": 1,
+        "method": "POST",
+        "action": "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true",
+        "accountCount": 1,
+        "startCount": 1,
+        "endCount": 1,
+        "actionCount": 1,
+        "viewStateCount": 1,
+        "periodCount": 1,
+        "sortCount": 1,
+        "queryCount": 1,
+        "sameForm": True,
+        "actionValue": "query",
+        "viewState": "state",
+    }
 
 
 def test_esun_opts_in_only_twd_transactions():
@@ -51,13 +70,57 @@ def test_esun_requires_one_authoritative_query_frame():
         def evaluate(self, _script):
             if self.has_form == "error":
                 raise RuntimeError("detached")
-            return self.has_form
+            return _form_contract() if self.has_form else {}
 
     owned = Frame(True)
     assert EsunCrawler._unique_twd_query_frame([Frame(False), owned]) is owned
     for frames in ([], [Frame(True), Frame(True)], [owned, Frame("error")]):
         with pytest.raises(RuntimeError, match="esun-twd-history-form"):
             EsunCrawler._unique_twd_query_frame(frames)
+
+
+def test_esun_query_form_requires_unique_same_form_canonical_controls():
+    class Frame:
+        def __init__(self, contract):
+            self.contract = contract
+
+        def evaluate(self, _script):
+            return self.contract
+
+    assert EsunCrawler._twd_form_contract(Frame(_form_contract())) == _form_contract()
+    for key, value in (
+        ("formCount", 2), ("method", "GET"), ("accountCount", 2),
+        ("startCount", 0), ("queryCount", 2), ("viewStateCount", 2),
+        ("sameForm", False), ("actionValue", ""), ("viewState", ""),
+        ("action", "https://attacker.example/query"),
+        ("action", _form_contract()["action"] + "&"),
+        ("action", _form_contract()["action"].replace("true", "%74rue")),
+    ):
+        with pytest.raises(ValueError, match="esun-twd-history-form"):
+            EsunCrawler._twd_form_contract(Frame({**_form_contract(), key: value}))
+
+
+def test_esun_waits_for_home_widget_form_after_navigation():
+    class Frame:
+        def evaluate(self, _script):
+            return _form_contract()
+
+    class Page:
+        def __init__(self):
+            self.polls = 0
+            self.waits = []
+
+        @property
+        def frames(self):
+            self.polls += 1
+            return [] if self.polls < 3 else [Frame()]
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    page = Page()
+    assert isinstance(EsunCrawler._wait_for_twd_query_frame(page), Frame)
+    assert page.waits == [100, 100]
 
 
 def test_esun_query_inventory_is_authoritative_and_unique():
@@ -72,6 +135,18 @@ def test_esun_query_inventory_is_authoritative_and_unique():
         {"index": 0, "text": "===請選擇===", "value": ""},
         *options,
     ])) == 2
+    live_options = [
+        {"index": 0, "text": "===請選擇===", "value": "dynamic-placeholder"},
+        {"index": 1, "text": "外幣活存 0900000087021", "value": "opaque-fx"},
+        {"index": 2, "text": "臺幣綜存 0900000087022", "value": "opaque-twd"},
+    ]
+    assert EsunCrawler._validated_twd_options(live_options) == [{
+        **live_options[2], "identity": "0900000087022",
+    }]
+    with pytest.raises(RuntimeError, match="esun-twd-history-inventory"):
+        EsunCrawler._validated_twd_options([
+            {**live_options[0], "value": "opaque-twd"}, live_options[2],
+        ])
 
     with pytest.raises(RuntimeError, match="esun-twd-history-inventory"):
         EsunCrawler._validated_twd_options([])
@@ -94,6 +169,10 @@ def test_esun_query_inventory_is_authoritative_and_unique():
         EsunCrawler._validated_twd_options([*options, dict(options[0])])
     with pytest.raises(RuntimeError, match="esun-twd-history-inventory"):
         EsunCrawler._validated_twd_options([
+            options[0], {**options[1], "value": options[0]["value"]},
+        ])
+    with pytest.raises(RuntimeError, match="esun-twd-history-inventory"):
+        EsunCrawler._validated_twd_options([
             {"index": 1, "text": "臺幣綜存 acct", "value": "opaque-a"},
         ])
     for unknown in (
@@ -106,27 +185,25 @@ def test_esun_query_inventory_is_authoritative_and_unique():
 
 
 def test_esun_transport_binds_exact_post_response_account_and_range():
-    url = "https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces"
+    url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
+    frame_url = "https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces"
     hit = ApiHit(
         url=url,
         method="POST",
         status=200,
         content_type="text/html;charset=UTF-8",
-        req_body={
-            "fao01002:dract": ["opaque-a"],
-            "fao01002:startDate": ["2025/08/31"],
-            "fao01002:endDate": ["2026/08/30"],
-        },
+        req_body={"fieldsExact": True, "actionExact": True, "viewStateExact": True, "frameExact": True},
     )
-    EsunCrawler._validated_twd_transport(
-        [hit], result_url=url, account_value="opaque-a",
-        start=date(2025, 8, 31), end=date(2026, 8, 30),
-    )
+    assert EsunCrawler._validated_twd_transport(
+        [hit], result_url=frame_url,
+    ) is hit
 
     for bad in (
         ApiHit(**{**hit.__dict__, "method": "GET"}),
         ApiHit(**{**hit.__dict__, "status": 500}),
         ApiHit(**{**hit.__dict__, "url": "https://attacker.example/FAO01002.faces"}),
+        ApiHit(**{**hit.__dict__, "url": url.replace("ajax=true", "ajax=false")}),
+        ApiHit(**{**hit.__dict__, "url": url.replace("FAO01002_Home.faces", "FAO01002_Home.faces;jsessionid=opaque")}),
         ApiHit(**{
             **hit.__dict__,
             "req_body": {**hit.req_body, "fao01002:dract": ["opaque-b"]},
@@ -146,40 +223,292 @@ def test_esun_transport_binds_exact_post_response_account_and_range():
     ):
         with pytest.raises(RuntimeError, match="esun-twd-history-transport"):
             EsunCrawler._validated_twd_transport(
-                [bad], result_url=url, account_value="opaque-a",
-                start=date(2025, 8, 31), end=date(2026, 8, 30),
+                [bad], result_url=url,
             )
     with pytest.raises(RuntimeError, match="esun-twd-history-transport"):
         EsunCrawler._validated_twd_transport(
-            [hit], result_url=f"{url}?unexpected=1", account_value="opaque-a",
-            start=date(2025, 8, 31), end=date(2026, 8, 30),
+            [hit], result_url=f"{frame_url}?unexpected=1",
         )
 
 
-def test_esun_operation_listener_keeps_only_required_fields_from_long_form():
+def _live_ajax_html() -> str:
+    return """
+    <html><body><table id="fao01002:grid_DataGridBody" class="table_ver">
+      <tr><th>交易日期/時間</th><th>摘要</th><th>支出</th><th>存入</th><th>帳戶餘額</th></tr>
+      <tr><td><span>2026/08/20</span><span>12:00:00</span></td><td>利息</td><td></td><td>2</td><td>84</td></tr>
+    </table></body></html>
+    """
+
+
+def test_esun_live_ajax_html_projects_operation_bound_grid_without_total_label():
+    snapshot = _parse_esun_twd_html_response(_live_ajax_html())
+    assert snapshot["gridRows"] == [["2026/08/20 12:00:00", "利息", "", "2", "84"]]
+    assert snapshot["gridRowCount"] == 1
+    assert snapshot["totalCount"] is None
+    assert snapshot["pager"] == {"present": False, "actionableNext": 0}
+
+
+def test_esun_ajax_html_rejects_failed_malformed_duplicate_or_paginated_results():
+    header = (
+        '<tr><th>交易日期/時間</th><th>摘要</th><th>支出</th>'
+        '<th>存入</th><th>帳戶餘額</th></tr>'
+    )
+    valid_row = (
+        '<tr><td>2026/08/20 12:00:00</td><td>利息</td>'
+        '<td></td><td>2</td><td>84</td></tr>'
+    )
+    for body in (
+        f'<div class="error">系統錯誤</div><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row}<tr><td>broken</td></tr></table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row}<table id="fao01002:grid_DataGridBody"></table></table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}<tr><th>交易日期/錯誤欄</th></tr>{valid_row}</table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row}<tr><td>2026/08/21',
+        f'<table id="fao01002:grid_DataGridBody">{header}<tr><tr>{valid_row}</tr></tr></table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}<tr><td>2026/08/21</th></tr></table>',
+        f'<table hidden id="fao01002:grid_DataGridBody">{header}{valid_row}</table>',
+        f'<div hidden><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<article hidden><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></article>',
+        f'<div style="display:\t none"><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<div style="opacity: 0"><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<div style="opacity:0!important"><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<div style="opacity:0%"><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<div style="opacity:.0"><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table></div>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row.replace("<tr>", "<tr hidden>")}</table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row.replace("<td>2</td>", "<td hidden>2</td>")}</table>',
+        f'<table id="fao01002:grid_DataGridBody">{header}{valid_row.replace("<td>2</td>", "<td><span hidden>2</span></td>")}</table>',
+        f'<div aria-busy="true"></div><table id="fao01002:grid_DataGridBody">{header}{valid_row}</table>',
+    ):
+        with pytest.raises(ValueError, match="invalid E.SUN TWD"):
+            _parse_esun_twd_html_response(body)
+
+    for pager in (
+        '<a rel="next">Next</a>', '<a title="Next page"></a>',
+        '<input value="下一頁">', '<a onclick="goPage(2)">2</a>',
+        '<div class="pagination"><a>2</a></div>', '<a>下一頁</a>',
+    ):
+        snapshot = _parse_esun_twd_html_response(
+            f'<table id="fao01002:grid_DataGridBody">{header}{valid_row}</table>{pager}'
+        )
+        assert snapshot["pager"]["present"] is True
+
+
+def test_esun_ajax_html_binds_footer_total_and_explicit_empty():
+    with pytest.raises(ValueError, match="invalid E.SUN TWD total"):
+        _parse_esun_twd_html_response(
+            _live_ajax_html() + '<div>共 1 筆</div><div>總計 2 筆</div>'
+        )
+    with pytest.raises(ValueError, match="invalid E.SUN TWD total"):
+        _parse_esun_twd_html_response(
+            _live_ajax_html() + '<div>共 1 筆</div><div>共 1 筆</div>'
+        )
+    snapshot = _parse_esun_twd_html_response(_live_ajax_html() + '<div>共 2 筆</div>')
+    assert snapshot["totalCount"] == 2
+
+    empty = _parse_esun_twd_html_response(
+        '<table id="fao01002:grid_DataGridBody">'
+        '<tr><th>交易日期/時間</th><th>摘要</th><th>支出</th><th>存入</th><th>帳戶餘額</th></tr>'
+        '<tr><td>查無交易資料</td></tr></table>'
+    )
+    assert empty["totalCount"] == 0
+    assert empty["emptyMarker"] == "查無交易資料"
+
+
+def test_esun_response_capture_requires_owned_request_and_bounded_body():
     class Request:
         method = "POST"
+        redirected_from: object | None = None
+        post_data = (
+            "fao01002%3Adract=opaque-a"
+            "&fao01002%3AstartDate=2025%2F08%2F31"
+            "&fao01002%3AendDate=2026%2F08%2F30"
+            "&fao01002%3AlinkCommand=query"
+            "&javax.faces.ViewState=state"
+        )
+
+        def __init__(self, frame):
+            self.frame = frame
+            self.url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
+
+    frame = object()
+    owned = Request(frame)
+    requests = []
+    proxy = _OriginGuardProxy(frame, lambda: None)
+    EsunCrawler._capture_twd_request(
+        owned, requests, proxy, owned.url, "opaque-a",
+        date(2025, 8, 31), date(2026, 8, 30),
+        "query", "state",
+    )
+    assert len(requests) == 1
+    EsunCrawler._capture_twd_request(
+        Request(object()), requests, proxy, owned.url, "opaque-a",
+        date(2025, 8, 31), date(2026, 8, 30),
+        "query", "state",
+    )
+    assert len(requests) == 1
+
+    class Response:
+        url = owned.url
+        request = owned
+        status = 200
+        headers = {"content-type": "text/html", "content-length": str(len(_live_ajax_html()))}
+
+        @staticmethod
+        def text():
+            return _live_ajax_html()
+
+    hits = []
+    EsunCrawler._capture_twd_response(Response(), hits, requests)
+    assert len(hits) == 1
+    EsunCrawler._capture_twd_response(
+        type("Oversize", (), {
+            **Response.__dict__,
+            "headers": {"content-type": "text/html", "content-length": "1000001"},
+        })(),
+        hits,
+        requests,
+    )
+    assert len(hits) == 1
+
+    missing_length_calls = []
+
+    class MissingLength(Response):
+        headers = {"content-type": "text/html"}
+
+        @staticmethod
+        def text():
+            missing_length_calls.append(True)
+            return _live_ajax_html()
+
+    EsunCrawler._capture_twd_response(MissingLength(), hits, requests)
+    assert len(hits) == 1
+    assert missing_length_calls == []
+
+    for status, redirected_from in ((206, None), (200, object())):
+        redirected = Request(frame)
+        redirected.redirected_from = redirected_from
+        owned_requests = []
+        EsunCrawler._capture_twd_request(
+            redirected, owned_requests, proxy, owned.url, "opaque-a",
+            date(2025, 8, 31), date(2026, 8, 30),
+            "query", "state",
+        )
+        response = Response()
+        response.status = status
+        response.request = redirected
+        EsunCrawler._capture_twd_response(response, hits, owned_requests)
+    assert len(hits) == 1
+
+
+def test_esun_operation_wait_rejects_delayed_second_pair():
+    requests = [object()]
+    hits = [object()]
+
+    class Page:
+        ticks = 0
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 100
+            self.ticks += 1
+            if self.ticks == 7:
+                requests.append(object())
+                hits.append(object())
+
+    with pytest.raises(RuntimeError, match="esun-twd-history-response-timeout"):
+        EsunCrawler._wait_for_twd_operation(Page(), requests, hits)
+
+
+def test_esun_operation_wait_requires_quiet_ticks_after_final_poll_hit():
+    requests = []
+    hits = []
+
+    class Page:
+        ticks = 0
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 100
+            self.ticks += 1
+            if self.ticks == 90:
+                requests.append(object())
+                hits.append(object())
+
+    page = Page()
+    EsunCrawler._wait_for_twd_operation(page, requests, hits)
+    assert page.ticks == 95
+
+
+def test_esun_operation_listener_keeps_only_required_fields_from_long_form():
+    frame = object()
+
+    class Request:
+        method = "POST"
+        frame: object | None = None
+        url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
         post_data = (
             "javax.faces.ViewState=" + "x" * 2000
             + "&fao01002%3Adract=opaque-a"
             + "&fao01002%3AstartDate=2025%2F08%2F31"
             + "&fao01002%3AendDate=2026%2F08%2F30"
+            + "&fao01002%3AlinkCommand=query"
         )
 
+    Request.frame = frame
+
     class Response:
-        url = "https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces"
+        url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
         request = Request()
         status = 200
-        headers = {"content-type": "text/html"}
+        headers = {"content-type": "text/html", "content-length": str(len(_live_ajax_html()))}
+
+        @staticmethod
+        def text():
+            return _live_ajax_html()
 
     hits = []
-    EsunCrawler._capture_twd_response(Response(), hits)
+    requests = []
+    EsunCrawler._capture_twd_request(
+        Response.request, requests, frame, Response.url, "opaque-a",
+        date(2025, 8, 31), date(2026, 8, 30),
+        "query", "x" * 2000,
+    )
+    EsunCrawler._capture_twd_response(Response(), hits, requests)
     assert len(hits) == 1
     assert hits[0].req_body == {
-        "fao01002:dract": ["opaque-a"],
-        "fao01002:startDate": ["2025/08/31"],
-        "fao01002:endDate": ["2026/08/30"],
+        "fieldsExact": True,
+        "actionExact": True,
+        "viewStateExact": True,
+        "frameExact": True,
     }
+
+
+def test_esun_generic_collector_keeps_history_posts_metadata_only():
+    class Frame:
+        url = "https://ebank.esunbank.com.tw/frame?account=PRIVATE"
+        page = None
+
+    class Request:
+        url = "https://ebank.esunbank.com.tw/fao;jsessionid=PRIVATE/fao01002/FAO01002_Home.faces?ajax=true"
+        method = "POST"
+        headers = {}
+        post_data = "javax.faces.ViewState=PRIVATE&fao01002%3Adract=PRIVATE"
+        frame = Frame()
+        redirected_from = None
+
+    class Response:
+        url = Request.url
+        request = Request()
+        status = 200
+        headers = {"content-type": "text/html", "content-length": "10"}
+
+    collector = ResponseCollector("esunbank.com.tw")
+    collector._on_request(Response.request)
+    collector._on_response(Response())
+    assert len(collector.hits) == 1
+    hit = collector.hits[0]
+    assert hit.req_body is None
+    assert hit.url == "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces"
+    assert hit.raw_url == hit.url
+    assert hit.request_frame is None
+    assert "PRIVATE" not in hit.url + hit.raw_url + hit.request_frame_url
 
 
 def test_esun_result_uses_structured_date_cells_not_concatenated_grid_text():
@@ -187,6 +516,29 @@ def test_esun_result_uses_structured_date_cells_not_concatenated_grid_text():
     compact["snapshot"]["gridText"] = "2026/08/2012:00:00利息284活存利息"
     assert EsunCrawler._validated_twd_history_result(
         compact,
+        identity="0900000087022",
+        start=date(2025, 8, 31),
+        end=date(2026, 8, 30),
+    )["status"] == "complete"
+
+
+def test_esun_result_accepts_live_owned_home_widget_frame():
+    result = _bound_result()
+    result["url"] = "https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces"
+    assert EsunCrawler._validated_twd_history_result(
+        result,
+        identity="0900000087022",
+        start=date(2025, 8, 31),
+        end=date(2026, 8, 30),
+    )["status"] == "complete"
+
+
+def test_esun_result_does_not_require_redundant_dom_echo_after_transport_binding():
+    result = _bound_result()
+    result["text"] = "交易明細\n2026/08/20\n12:00:00 利息 2 84 活存利息"
+    result["snapshot"]["totalCount"] = None
+    assert EsunCrawler._validated_twd_history_result(
+        result,
         identity="0900000087022",
         start=date(2025, 8, 31),
         end=date(2026, 8, 30),
@@ -299,15 +651,11 @@ def test_esun_result_requires_exact_account_range_and_pagination_binding():
                 start=date(2025, 8, 31), end=date(2026, 8, 30),
             )
 
-    contained_identity = _bound_result()
-    contained_identity["text"] = contained_identity["text"].replace(
-        "0900000087022", "10900000087022",
-    )
     next_page = _bound_result()
     next_page["text"] += " 下一頁"
     contained_date = _bound_result()
     contained_date["snapshot"]["gridRows"][0][0] = "*12026/08/20"
-    for bad in (contained_identity, next_page, contained_date):
+    for bad in (next_page, contained_date):
         with pytest.raises(RuntimeError, match="esun-twd-history-result"):
             EsunCrawler._validated_twd_history_result(
                 bad, identity="0900000087022",
@@ -452,7 +800,6 @@ def test_esun_money_rejects_bad_grouping_and_ambiguous_columns():
 
 @pytest.mark.parametrize("snapshot", [
     {},
-    {"hasGrid": False, "gridRows": []},
     {"hasGrid": False, "gridText": None, "gridRows": []},
     {"hasGrid": True, "gridText": "row"},
     {"hasGrid": True, "gridText": "row", "gridRows": []},
@@ -464,6 +811,13 @@ def test_esun_parser_rejects_inconsistent_structured_grid(snapshot):
             "account_no": "0900000087022",
             "snapshot": snapshot,
         }])
+
+
+def test_esun_parser_accepts_scrubbed_empty_grid():
+    assert _parse_esun_twd_txn_results([{
+        "account_no": "0900000087022",
+        "snapshot": {"hasGrid": False, "gridRows": []},
+    }]) == []
 
 
 @pytest.mark.parametrize(
@@ -500,6 +854,7 @@ def test_esun_persistence_row_rejects_malformed_values(field, value):
 def test_esun_attested_result_persists_and_advances_account_cursor(tmp_path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     result = _bound_result()
+    result["snapshot"]["totalCount"] = None
     coverage = _bound_coverage()
     store = BankStore("esun", user_id=7, source_account_id=91)
     try:
@@ -521,6 +876,36 @@ def test_esun_attested_result_persists_and_advances_account_cursor(tmp_path, mon
         assert store.latest_twd_transaction_dates() == {
             "0900000087022": date(2026, 8, 30),
         }
+    finally:
+        store.close()
+
+
+def test_esun_history_rows_and_cursor_rollback_together(tmp_path, monkeypatch):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    result = _bound_result()
+    result["snapshot"]["totalCount"] = None
+    payload = {
+        "accounts": [{
+            "account_no": "0900000087022",
+            "category": "臺幣綜存",
+            "currency": "TWD",
+            "balance": 84,
+        }],
+        "twd_txn_results": [result],
+        "history_coverage": _bound_coverage(),
+    }
+    store = BankStore("esun", user_id=7, source_account_id=91)
+    monkeypatch.setattr(
+        store,
+        "record_history_coverage_cursors",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cursor failed")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="cursor failed"):
+            persist_collected("esun", payload, store)
+        assert store.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == 0
+        assert store.conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+        assert store.latest_twd_transaction_dates() == {}
     finally:
         store.close()
 
@@ -702,23 +1087,37 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
     collector = ResponseCollector()
     account = "0900000087022"
-    url = "https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces"
+    frame_url = "https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces"
+    request_listeners = []
     response_listeners = []
     state = {"dom_ready": False}
 
     class Request:
         method = "POST"
+        frame: object | None = None
+        url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
         post_data = (
             "fao01002%3Adract=opaque-a&"
             "fao01002%3AstartDate=2025%2F08%2F31&"
-            "fao01002%3AendDate=2026%2F08%2F30"
+            "fao01002%3AendDate=2026%2F08%2F30&"
+            "fao01002%3AlinkCommand=query&"
+            "javax.faces.ViewState=state"
         )
 
     class Response:
-        url = "https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces"
-        request = Request()
+        url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
         status = 200
-        headers = {"content-type": "text/html;charset=UTF-8"}
+        headers = {
+            "content-type": "text/html;charset=UTF-8",
+            "content-length": str(len(_live_ajax_html())),
+        }
+
+        def __init__(self, request):
+            self.request = request
+
+        @staticmethod
+        def text():
+            return _live_ajax_html()
 
     class Locator:
         def select_option(self, **kwargs):
@@ -726,15 +1125,15 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
 
     class Frame:
         name = "history"
-        url = "https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces"
+        url = frame_url
 
         def locator(self, selector):
             assert selector == "select[id='fao01002:dract']"
             return Locator()
 
         def evaluate(self, script, arg=None):
-            if "Boolean(" in script:
-                return True
+            if "formCount" in script and "sameForm" in script:
+                return _form_contract()
             if "[...s.options]" in script:
                 return [{"index": 1, "text": f"臺幣綜存 {account}", "value": "opaque-a"}]
             if "s.selectedIndex" in script:
@@ -749,20 +1148,20 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
             if "return {ok: true, marked" in script:
                 return {"ok": True, "marked": 0}
             if "visible-query" in script:
+                request = Request()
+                request.frame = self
+                for listener in request_listeners:
+                    listener(request)
                 for listener in response_listeners:
-                    listener(Response())
+                    listener(Response(request))
                 return {"clicked": "visible-query", "tag": "BUTTON", "id": "q", "name": "", "text": "查詢"}
             if "const bodyText" in script:
                 if not state["dom_ready"]:
                     return {"bound": False, "scopeCount": 0}
-                text = (
-                    f"存款交易明細查詢 帳號 {account} 查詢期間 "
-                    "2025/08/31 至 2026/08/30 查詢時間 交易 共 1 筆\n"
-                    "2026/08/20\n12:00:00 利息 2 84 活存利息"
-                )
+                text = "交易 共 1 筆\n2026/08/20\n12:00:00 利息 2 84 活存利息"
                 return {
                     "bound": True,
-                    "href": url,
+                    "href": frame_url,
                     "bodyText": text,
                     "busy": False,
                     "evidenceFresh": True,
@@ -806,8 +1205,8 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
             self.inner = Frame()
 
         def evaluate(self, script, arg=None):
-            if "Boolean(" in script:
-                return False
+            if "formCount" in script and "sameForm" in script:
+                return {}
             return self.inner.evaluate(script, arg)
 
     class Context:
@@ -829,12 +1228,10 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
                 state["dom_ready"] = True
 
         def on(self, event, listener):
-            assert event == "response"
-            response_listeners.append(listener)
+            {"request": request_listeners, "response": response_listeners}[event].append(listener)
 
         def remove_listener(self, event, listener):
-            assert event == "response"
-            response_listeners.remove(listener)
+            {"request": request_listeners, "response": response_listeners}[event].remove(listener)
 
         def evaluate(self, script, arg=None):
             return self.main_frame.evaluate(script, arg)
@@ -849,7 +1246,7 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
     monkeypatch.setattr(crawler, "_navigate_credit_card_bill", lambda *_args: {"frames": []})
     page = Page()
     result = crawler.collect(page, collector).to_dict()
-    assert 9000 in page.waits
+    assert 9000 not in page.waits
     assert result["history_coverage"]["domains"][0]["windows"] == [{
         "identity": account,
         "start": "2025-08-31",
@@ -857,3 +1254,12 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
         "status": "complete",
         "pages": 1,
     }]
+    assert "gridText" not in result["twd_txn_results"][0]["snapshot"]
+    assert not ({
+        "final_url", "main_text", "frames", "card_all_frames_meta",
+        "twd_txn_nav_probe", "card_nav_probe", "card_frames",
+        "card_bill_details", "card_statement_transactions", "card_txn_form_submitted",
+        "card_txn_nav_probe", "card_txn_frames",
+        "card_quota_nav_probe", "card_quota_frames",
+        "card_pay_nav_probe", "card_pay_frames",
+    } & result.keys())
