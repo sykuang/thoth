@@ -437,20 +437,137 @@ def test_ubot_dom_snapshot_rejects_unchanged_pre_submit_tables() -> None:
             browser.close()
 
 
-def test_ubot_dom_settle_observes_delayed_pager() -> None:
+@pytest.mark.parametrize("status,rows", [("complete", 2), ("explicit_empty", 0)])
+def test_ubot_dom_settle_ignores_ticking_portal_chrome(status: str, rows: int) -> None:
     from patchright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
         browser = _launch_browser(playwright)
         page = browser.new_page()
-        page.set_content('<main><table><tbody><tr><td>row</td></tr></tbody></table></main>')
+        page.set_content('<header><span id="clock">0</span></header><main></main>')
         try:
             UbotCrawler._mark_twd_dom_boundary(page)
-            page.evaluate("""() => setTimeout(() => {
-              document.querySelector('main').insertAdjacentHTML(
-                'beforeend', '<nav class="pagination"><span>1</span><span>2</span></nav>');
-            }, 500)""")
-            assert UbotCrawler._wait_for_twd_dom_settle(page)["pagers"] > 0
+            if rows:
+                page.locator("main").evaluate("""node => { node.innerHTML =
+                  '<table><tbody><tr><td>total</td></tr></tbody></table>' +
+                  '<table><tbody><tr><td>first</td></tr><tr><td>second</td></tr></tbody></table>';
+                }""")
+            page.evaluate("""() => {
+              window.ticks = 0;
+              window.timer = setInterval(() => {
+                const clock = document.querySelector('#clock');
+                clock.firstChild.data = String(++window.ticks);
+                clock.dataset.tick = String(window.ticks);
+                clock.appendChild(document.createElement('i')).remove();
+                document.body.dataset.tick = String(window.ticks);
+              }, 100);
+            }""")
+            started = page.evaluate("performance.now()")
+            state = UbotCrawler._wait_for_twd_dom_settle(page)
+            assert page.evaluate("performance.now()") - started >= 5_000
+            assert page.evaluate("window.ticks") >= 20
+            assert state["quiet_ms"] >= 2_000, state
+            UbotCrawler._validate_twd_dom(state, status=status, rows=rows)
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("blocker_html,key", [
+    ('<nav class="pagination"><span>1</span><span>2</span></nav>', "pagers"),
+    ('<input type="hidden" name="page" value="2">', "pagers"),
+    ('<div class="loading">loading</div>', "busy"),
+    ('<div role="dialog">modal</div>', "dialogs"),
+    ('<div class="error">error</div>', "dialogs"),
+])
+def test_ubot_dom_settle_observes_delayed_blocker(blocker_html: str, key: str) -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        page.set_content('<main></main><aside></aside>')
+        try:
+            UbotCrawler._mark_twd_dom_boundary(page)
+            page.locator("main").evaluate("""node => { node.innerHTML =
+              '<table><tbody><tr><td>total</td></tr></tbody></table>' +
+              '<table><tbody><tr><td>row</td></tr></tbody></table>';
+            }""")
+            page.evaluate("""html => setTimeout(() => {
+              document.querySelector('aside').innerHTML = html;
+              window.blockerInserted = performance.now();
+            }, 4_000)""", blocker_html)
+            state = UbotCrawler._wait_for_twd_dom_settle(page)
+            assert state[key] > 0
+            assert state["stale_tables"] == 0
+            assert state["visible_rows"] == 2
+            assert page.evaluate("performance.now() - window.blockerInserted") >= 2_000
+            with pytest.raises(RuntimeError, match="ubot-twd-history-result"):
+                UbotCrawler._validate_twd_dom(state, status="complete", rows=1)
+        finally:
+            browser.close()
+
+
+def test_ubot_dom_settle_rejects_continuously_mutating_rows() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        page.set_content('<main></main>')
+        try:
+            UbotCrawler._mark_twd_dom_boundary(page)
+            page.evaluate("""() => {
+              document.querySelector('main').innerHTML =
+                '<table><tbody><tr><td>total</td></tr></tbody></table>' +
+                '<table><tbody><tr><td id="row">0</td></tr></tbody></table>';
+              let tick = 0;
+              setInterval(() => { document.querySelector('#row').firstChild.data = String(++tick); }, 100);
+            }""")
+            state = UbotCrawler._wait_for_twd_dom_settle(page)
+            assert state["visible_tables"] == state["visible_rows"] == 2
+            assert state["stale_tables"] == 0
+            assert state["quiet_ms"] < 2_000
+            with pytest.raises(RuntimeError, match="ubot-twd-history-result"):
+                UbotCrawler._validate_twd_dom(state, status="complete", rows=1)
+        finally:
+            browser.close()
+
+
+def test_ubot_dom_boundary_tracks_result_roots_and_visibility_changes() -> None:
+    from patchright.sync_api import sync_playwright
+
+    mutations = [
+        "document.querySelector('main').remove()",
+        "document.querySelector('main').insertAdjacentHTML('afterend', '<section><table></table></section>')",
+        "document.querySelector('td').firstChild.data = 'changed'",
+        "document.querySelector('td').textContent = 'changed'",
+        "document.querySelector('main').hidden = true",
+        "document.querySelector('main').style.display = 'none'",
+        "document.querySelector('main').setAttribute('aria-hidden', 'true')",
+        "document.querySelector('main').className = 'hidden-result'",
+        "document.querySelector('input').value = '2'",
+        "document.querySelector('button').textContent = '下一頁'",
+        "document.querySelector('aside').className = 'loading'",
+        "document.querySelector('aside').className = 'error'",
+        "document.querySelector('aside').setAttribute('role', 'dialog')",
+        "document.querySelector('.error').className = ''",
+        "document.querySelector('.error').remove()",
+        "document.querySelector('[role=dialog]').removeAttribute('role')",
+    ]
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        try:
+            for mutation in mutations:
+                page.set_content('''<main><table><tbody><tr><td>old</td></tr></tbody></table></main>
+                  <aside></aside><input type="hidden" name="page" value="1"><button>1</button>
+                  <div class="error">error</div><div role="dialog">modal</div>''')
+                UbotCrawler._mark_twd_dom_boundary(page)
+                before = page.evaluate("window.__thothUbotHistoryLastMutation")
+                page.wait_for_timeout(20)
+                page.evaluate(f"() => {{ {mutation}; }}")
+                assert page.evaluate("window.__thothUbotHistoryLastMutation") > before, mutation
+                assert UbotCrawler._twd_dom_snapshot(page)["quiet_ms"] < 2_000
         finally:
             browser.close()
 
@@ -486,7 +603,7 @@ def test_response_collector_rejects_lying_ubot_content_length_before_body_read()
     assert collector.hits[0].resp_json is None
 
 
-def test_response_collector_preserves_exact_bounded_ubot_json_bytes() -> None:
+def _collected_history_hit(post_data: str) -> ApiHit:
     collector = ResponseCollector("ubot.com.tw")
     page = SimpleNamespace()
     frame = SimpleNamespace(page=page)
@@ -494,13 +611,12 @@ def test_response_collector_preserves_exact_bounded_ubot_json_bytes() -> None:
     request = SimpleNamespace(
         url="https://www.ubot.com.tw/MyBank/IBKB010102",
         headers={}, method="POST",
-        post_data=(
-            f"acctNo={ACCOUNT}&beginDate=20260701&endDate=20260731&"
-            "sessionId=opaque-session&sid=opaque-sid"
-        ),
+        post_data=post_data,
         redirected_from=None, frame=frame,
     )
     raw = json.dumps(_history_hit().resp_json).encode()
+    # This helper tests request parsing; real CDP admission is covered separately.
+    collector._history_observer = SimpleNamespace(read=lambda *_args: raw)
 
     collector._on_request(request)
     collector._on_response(SimpleNamespace(
@@ -510,16 +626,132 @@ def test_response_collector_preserves_exact_bounded_ubot_json_bytes() -> None:
             "content-length": str(len(raw)),
             "content-encoding": "identity",
         },
-        body=lambda: raw,
+        body=lambda: pytest.fail("history must use observer bytes"),
         json=lambda: pytest.fail("UBOT bounded response must use raw body"),
     ))
 
+    assert len(collector.hits) == 1
     assert collector.hits[0].body_size == len(raw)
     assert collector.hits[0].resp_json == _history_hit().resp_json
+    return collector.hits[0]
 
 
+def _json_request() -> dict:
+    return {
+        "sid": "opaque-sid", "sessionId": "opaque-session", "acctNo": ACCOUNT,
+        "beginDate": "20260701", "endDate": "20260731",
+    }
+
+
+@pytest.mark.parametrize("encoding", ["json", "form"])
+def test_response_collector_preserves_exact_bounded_ubot_json_bytes(encoding) -> None:
+    post_data = (
+        " \n" + json.dumps(_json_request()) if encoding == "json" else _history_hit().req_body
+    )
+    hit = _collected_history_hit(post_data)
+    assert hit.req_body == post_data
+    assert UbotCrawler._validate_history_hit(
+        hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+        after_sequence=0,
+    ) == {"records": [_row()], "status": "complete", "rows": 1}
+
+
+@pytest.mark.parametrize("encoding", ["json", "form"])
+@pytest.mark.parametrize("key", ["sid", "sessionId", "acctNo", "beginDate", "endDate"])
+def test_ubot_collected_request_rejects_duplicate_fields(encoding, key) -> None:
+    fields = _json_request()
+    if encoding == "json":
+        post_data = json.dumps(fields)[:-1] + "," + json.dumps({key: fields[key]})[1:]
+    else:
+        post_data = _history_hit().req_body + f"&{key}={fields[key]}"
+    hit = _collected_history_hit(post_data)
+    assert hit.req_body == post_data
+    with pytest.raises(RuntimeError, match="^ubot-twd-history-response$"):
+        UbotCrawler._validate_history_hit(
+            hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+            after_sequence=0,
+        )
+
+
+@pytest.mark.parametrize("mutation", [
+    "array", "pairs_array", "nested", "bool", "number", "null", "unknown", "missing",
+    "account", "start", "end", "empty_session", "empty_sid", "malformed", "trailing",
+    "escaped_duplicate", "deep_nesting", "dict",
+])
+def test_ubot_collected_json_request_fails_closed(mutation) -> None:
+    fields = _json_request()
+    if mutation in {"nested", "bool", "number", "null"}:
+        fields["sessionId"] = {
+            "nested": {"value": "opaque-session"}, "bool": True, "number": 1, "null": None,
+        }[mutation]
+    elif mutation == "unknown":
+        fields["extra"] = "unknown"
+    elif mutation == "missing":
+        fields.pop("sid")
+    elif mutation in {"account", "start", "end", "empty_session", "empty_sid"}:
+        key, value = {
+            "account": ("acctNo", "999999999999"), "start": ("beginDate", "20260601"),
+            "end": ("endDate", "20260831"), "empty_session": ("sessionId", ""),
+            "empty_sid": ("sid", ""),
+        }[mutation]
+        fields[key] = value
+    post_data = json.dumps(fields)
+    if mutation == "array":
+        post_data = json.dumps([fields])
+    elif mutation == "pairs_array":
+        post_data = json.dumps(list(fields.items()))
+    elif mutation == "malformed":
+        post_data = post_data[:-1]
+    elif mutation == "trailing":
+        post_data += "{}"
+    elif mutation == "escaped_duplicate":
+        post_data = post_data[:-1] + r',"\u0073id":"opaque-sid"}'
+    elif mutation == "deep_nesting":
+        post_data = '{"sid":' + '[' * 2_000 + '0' + ']' * 2_000 + '}'
+    hit = _collected_history_hit(post_data)
+    assert hit.req_body == post_data
+    if mutation == "dict":
+        hit.req_body = fields  # Already-decoded mappings cannot prove field uniqueness.
+    with pytest.raises(RuntimeError, match="^ubot-twd-history-response$"):
+        UbotCrawler._validate_history_hit(
+            hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+            after_sequence=0,
+        )
+
+
+@pytest.mark.parametrize("encoding", ["json", "form"])
+@pytest.mark.parametrize("size", [16_384, 16_385])
+def test_ubot_request_body_byte_limit_at_collector_and_validator(encoding, size) -> None:
+    fields = _json_request()
+    fields["sid"] = "測試"
+    post_data = (
+        json.dumps(fields, ensure_ascii=False) if encoding == "json"
+        else _history_hit().req_body.replace("opaque-sid", fields["sid"])
+    )
+    post_data = post_data.replace("測試", "測試" + "x" * (size - len(post_data.encode("utf-8"))))
+    assert len(post_data.encode("utf-8")) == size
+    hit = _collected_history_hit(post_data)
+    if size <= 16_384:
+        assert hit.req_body == post_data
+        assert UbotCrawler._validate_history_hit(
+            hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+            after_sequence=0,
+        )["rows"] == 1
+    else:
+        assert hit.req_body == {"__oversize__": True}
+        for body in (hit.req_body, post_data):
+            hit.req_body = body
+            with pytest.raises(RuntimeError, match="^ubot-twd-history-response$"):
+                UbotCrawler._validate_history_hit(
+                    hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+                    after_sequence=0,
+                )
+
+
+@pytest.mark.parametrize("encoding", ["json", "form"])
+@pytest.mark.parametrize("duplicate", [None, "on_response", "after_settle"])
 def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_coverage(
-    monkeypatch,
+    monkeypatch, duplicate, encoding,
 ) -> None:
     collector = ResponseCollector("ubot.com.tw")
     crawler = _crawler()
@@ -527,6 +759,7 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
     routes: list[str] = []
     selected = {"account": None, "period": None}
     last_status = "explicit_empty"
+    pending_response = None
 
     class Select:
         def __init__(self, kind: str):
@@ -546,7 +779,7 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
             return "搜尋"
 
         def click(self, **_kwargs):
-            nonlocal last_status
+            nonlocal last_status, pending_response
             month = {"7月份": 7, "8月份": 8, "9月份": 9}[selected["period"]]
             start = date(2026, month, 1)
             end = date(2026, month, 31 if month in {7, 8} else 1)
@@ -556,12 +789,32 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
                 f"acctNo={ACCOUNT}&beginDate={start:%Y%m%d}&endDate={end:%Y%m%d}&"
                 "sessionId=opaque-session&sid=opaque-sid"
             )
-            hit.request_sequence = collector.request_sequence + 1
-            collector._request_sequence += 1
-            collector._issued_endpoint_counts["IBKB010102"] = (
-                collector.issued_count("IBKB010102") + 1
+            if encoding == "json":
+                hit.req_body = json.dumps({
+                    **_json_request(), "beginDate": f"{start:%Y%m%d}", "endDate": f"{end:%Y%m%d}",
+                })
+            frame = SimpleNamespace()
+            frame.page = SimpleNamespace(main_frame=frame)
+            request = SimpleNamespace(
+                url=hit.url, headers={}, method="POST", post_data=hit.req_body,
+                redirected_from=None, frame=frame,
             )
-            collector.hits.append(hit)
+            raw = json.dumps(hit.resp_json).encode()
+            response = SimpleNamespace(
+                url=hit.url, request=request, status=200,
+                headers={"content-type": hit.content_type, "content-length": str(len(raw))},
+                body=lambda: pytest.fail("history must use observer bytes"),
+                json=lambda: pytest.fail("bounded collector must use raw bytes"),
+            )
+            collector._history_observer = SimpleNamespace(read=lambda *_args: raw)
+            collector._on_request(request)
+            collector._on_response(response)
+            if duplicate:
+                response.headers["content-encoding"] = "gzip"
+                if duplicate == "on_response":
+                    collector._on_response(response)
+                else:
+                    pending_response = response
             last_status = "complete" if rows else "explicit_empty"
 
     class Locator:
@@ -573,6 +826,10 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
 
     class Page:
         def wait_for_timeout(self, _milliseconds):
+            nonlocal pending_response
+            if pending_response is not None:
+                collector._on_response(pending_response)
+                pending_response = None
             return None
 
         def query_selector_all(self, selector):
@@ -601,6 +858,15 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
                 return None
             raise AssertionError("unexpected evaluate")
 
+    if duplicate:
+        guard = (
+            "ubot-twd-history-response-cardinality" if duplicate == "on_response"
+            else "ubot-twd-history-operation-cardinality"
+        )
+        with pytest.raises(RuntimeError, match=f"^{guard}$"):
+            crawler._collect_twd_history(Page(), collector, as_of=date(2026, 9, 1))
+        return
+
     result = crawler._collect_twd_history(Page(), collector, as_of=date(2026, 9, 1))
 
     assert routes == ["/B0101001"] * 4
@@ -614,6 +880,99 @@ def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_cove
         result["coverage"], expected_mode="full",
         expected_domains=frozenset({"twd_transactions"}),
     )["windows"] == 3
+
+
+@pytest.mark.parametrize("failure,body_reads", [
+    ("encoding", 0), ("missing_length", 0), ("invalid_length", 0),
+    ("short_length", 0), ("oversize_length", 0), ("mime", 0),
+    ("length_mismatch", 1), ("invalid_json", 1), ("body_error", 1),
+])
+@pytest.mark.parametrize("requests,responses", [(1, 1), (0, 0), (1, 0), (2, 1), (1, 2)])
+def test_ubot_history_distinguishes_unreadable_response_from_cardinality(
+    monkeypatch, failure: str, body_reads: int, requests: int, responses: int,
+) -> None:
+    from backend.core.base import _class_collect_guard_allowlist, _safe_collect_guard
+
+    collector = ResponseCollector("ubot.com.tw")
+    crawler = _crawler()
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+    page = SimpleNamespace(
+        wait_for_timeout=lambda _ms: None,
+        query_selector_all=lambda _selector: [
+            SimpleNamespace(select_option=lambda **_kwargs: None) for _ in range(2)
+        ],
+    )
+    page.main_frame = SimpleNamespace(page=page)
+    monkeypatch.setattr(crawler, "_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(crawler, "_twd_form_snapshot", lambda _page: _form_snapshot())
+    monkeypatch.setattr(crawler, "_mark_twd_dom_boundary", lambda _page: None)
+    monkeypatch.setattr(
+        crawler, "_wait_for_twd_dom_settle",
+        lambda _page: pytest.fail("rejected response must not publish coverage"),
+    )
+    raw = json.dumps(_history_hit().resp_json).encode()
+    headers = {
+        "content-type": "application/json;charset=utf-8",
+        "content-length": str(len(raw)), "content-encoding": "identity",
+    }
+    if failure == "encoding":
+        headers["content-encoding"] = "gzip"
+    elif failure == "missing_length":
+        headers.pop("content-length")
+    elif failure in {"invalid_length", "short_length", "oversize_length"}:
+        headers["content-length"] = {
+            "invalid_length": "unknown", "short_length": "1", "oversize_length": "5000001",
+        }[failure]
+    elif failure == "mime":
+        headers["content-type"] = "text/html"
+    elif failure == "length_mismatch":
+        headers["content-length"] = str(len(raw) + 1)
+    elif failure == "invalid_json":
+        raw = b"x" * len(raw)
+    reads = 0
+
+    def observed_body(*_args):
+        nonlocal reads
+        reads += 1
+        if failure == "body_error":
+            raise RuntimeError("synthetic-private-body-error")
+        return raw
+
+    if body_reads:
+        collector._history_observer = SimpleNamespace(read=observed_body)
+
+    def click(**_kwargs):
+        request = None
+        for _ in range(requests):
+            request = SimpleNamespace(
+                url=_history_hit().url, headers={}, method="POST",
+                post_data=_history_hit().req_body, redirected_from=None, frame=page.main_frame,
+            )
+            collector._on_request(request)
+        for _ in range(responses):
+            assert request is not None
+            collector._on_response(SimpleNamespace(
+                url=request.url, request=request, status=200, headers=headers,
+                body=lambda: pytest.fail("history must not use native body reader"),
+                json=lambda: pytest.fail("bounded collector must not call response.json"),
+            ))
+
+    monkeypatch.setattr(
+        "backend.banks.ubot._unique_visible_enabled_exact",
+        lambda *_args: SimpleNamespace(click=click),
+    )
+    guard = (
+        "ubot-twd-history-response-unreadable" if requests == responses == 1
+        else "ubot-twd-history-response-cardinality"
+    )
+    with pytest.raises(RuntimeError) as caught:
+        crawler._collect_twd_history(page, collector, as_of=date(2026, 9, 1))
+    assert str(caught.value) == guard
+    assert _safe_collect_guard(caught.value, _class_collect_guard_allowlist(crawler)) == guard
+    assert collector.issued_count("IBKB010102") == requests
+    assert len(collector.hits) == responses
+    assert collector.by_endpoint("IBKB010102") == []
+    assert reads == body_reads * min(responses, 1)
 
 
 def test_ubot_history_stops_on_opaque_dialog_latch(monkeypatch) -> None:

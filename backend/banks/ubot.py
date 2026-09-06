@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import os
 import sys
@@ -316,6 +317,7 @@ class UbotCrawler(BankCrawler):
         "ubot-twd-history-range",
         "ubot-twd-history-response",
         "ubot-twd-history-response-cardinality",
+        "ubot-twd-history-response-unreadable",
         "ubot-twd-history-result",
     })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
@@ -529,11 +531,20 @@ class UbotCrawler(BankCrawler):
         ):
             raise RuntimeError(error)
         try:
-            pairs = parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
-        except ValueError:
+            if len(hit.req_body.encode("utf-8")) > 16_384:
+                raise RuntimeError(error)
+            # Native JSON objects and legacy forms must retain duplicate fields.
+            pairs = (
+                json.loads(hit.req_body, object_pairs_hook=lambda pairs: pairs)
+                if hit.req_body.lstrip().startswith("{") else
+                parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
+            )
+        except (ValueError, RecursionError):
             raise RuntimeError(error) from None
         form: dict[str, list[str]] = {}
         for key, value in pairs:
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise RuntimeError(error)
             form.setdefault(key, []).append(value)
         expected_form = {"acctNo", "beginDate", "endDate", "sessionId", "sid"}
         if (
@@ -655,11 +666,35 @@ class UbotCrawler(BankCrawler):
             [...document.querySelectorAll('table')].map(table => [table, table.innerHTML])
           );
           window.__thothUbotHistoryLastMutation = performance.now();
-          window.__thothUbotHistoryObserver = new MutationObserver(() => {
-            window.__thothUbotHistoryLastMutation = performance.now();
+          // Scope quiet time to results and the global snapshot's blocking controls,
+          // not portal clocks. Controls include hidden paging metadata.
+          const selector = 'table,a,button,input,select,[role=button],nav,' +
+            '[class*=pagination i],[class*=paginator i],[aria-label*=pagination i],[aria-label*=pages i],' +
+            'progress,[role=progressbar],[aria-busy],[class*=loading i],[class*=spinner i],[class*=busy i],' +
+            'dialog,[role=dialog],[aria-modal],.modal,[role=alert],.alert,.error';
+          const containsResult = node => node.nodeType === Node.ELEMENT_NODE &&
+            (node.matches(selector) || node.querySelector(selector));
+          window.__thothUbotHistoryObserver = new MutationObserver(records => {
+            const relevant = records.some(record => {
+              const target = record.target.nodeType === Node.ELEMENT_NODE
+                ? record.target : record.target.parentElement;
+              if (target?.closest(selector)) return true;
+              if (record.type === 'attributes') {
+                // Disappearing blocker classes/roles still restart the quiet window.
+                const before = target.cloneNode(false);
+                if (record.oldValue !== null) before.setAttribute(record.attributeName, record.oldValue);
+                else before.removeAttribute(record.attributeName);
+                if (before.matches(selector)) return true;
+                if (['class', 'style', 'hidden', 'aria-hidden'].includes(record.attributeName) &&
+                    target.querySelector(selector)) return true;
+              }
+              // Result/blocker roots may be inserted or removed outside existing tables.
+              return [...record.addedNodes, ...record.removedNodes].some(containsResult);
+            });
+            if (relevant) window.__thothUbotHistoryLastMutation = performance.now();
           });
           window.__thothUbotHistoryObserver.observe(document.documentElement, {
-            subtree: true, childList: true, attributes: true, characterData: true,
+            subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true,
           });
         }""")
 
@@ -753,7 +788,7 @@ class UbotCrawler(BankCrawler):
         if mode not in {"full", "incremental"}:
             raise RuntimeError("ubot-twd-history-mode")
         endpoint = "IBKB010102"
-        response_before = len(collector.by_endpoint(endpoint))
+        response_before = len(collector.hits)
         issued_before = collector.issued_count(endpoint)
 
         self._goto(page, "/B0101001", wait=6500)
@@ -798,6 +833,7 @@ class UbotCrawler(BankCrawler):
                     raise RuntimeError("ubot-twd-history-form")
 
                 before = len(collector.by_endpoint(endpoint))
+                raw_before = len(collector.hits)
                 request_boundary = collector.request_sequence
                 window_issued_before = collector.issued_count(endpoint)
                 ensure_no_dialog()
@@ -807,12 +843,14 @@ class UbotCrawler(BankCrawler):
                     if len(collector.by_endpoint(endpoint)) > before:
                         break
                     page.wait_for_timeout(500)
-                hits = collector.by_endpoint(endpoint)[before:]
+                hits = [hit for hit in collector.hits[raw_before:] if hit.endpoint == endpoint]
                 if (
                     len(hits) != 1
                     or collector.issued_count(endpoint) - window_issued_before != 1
                 ):
                     raise RuntimeError("ubot-twd-history-response-cardinality")
+                if hits[0].resp_json is None:
+                    raise RuntimeError("ubot-twd-history-response-unreadable")
                 ensure_no_dialog()
                 validated = self._validate_history_hit(
                     hits[0], identity=item["identity"], start=window_start,
@@ -849,7 +887,7 @@ class UbotCrawler(BankCrawler):
                     for key in ("identity", "start", "end", "status", "pages")
                 })
 
-        fresh_hits = collector.by_endpoint(endpoint)[response_before:]
+        fresh_hits = [hit for hit in collector.hits[response_before:] if hit.endpoint == endpoint]
         fresh_sizes = [hit.body_size for hit in fresh_hits if type(hit.body_size) is int]
         if (
             len(fresh_hits) != expected_queries
