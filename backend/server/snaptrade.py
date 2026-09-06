@@ -38,6 +38,10 @@ class SnapTradeNotRegistered(RuntimeError):
     pass
 
 
+class SnapTradeConnectionNotFound(RuntimeError):
+    pass
+
+
 class SnapTradeBusy(RuntimeError):
     pass
 
@@ -292,13 +296,16 @@ class SnapTradeSDKGateway:
         user_id: str,
         user_secret: str,
         redirect_uri: str,
+        reconnect: str | None = None,
     ) -> str:
+        extra: dict[str, Any] = {"reconnect": reconnect} if reconnect is not None else {}
         response = _response(self.client.authentication.login_snap_trade_user(
             user_id=user_id,
             user_secret=user_secret,
             connection_type="read",
             show_close_button=True,
             custom_redirect=redirect_uri,
+            **extra,
         ))
         url = (
             response.get("redirectURI") or response.get("redirect_uri")
@@ -470,18 +477,37 @@ class SnapTradeService:
     def status(self, user_id: int) -> dict[str, Any]:
         configured = _configured()
         credentials = self._credentials(user_id) if configured else None
-        connection_count: int | None = None
+        connections: list[dict[str, Any]] | None = None
         if credentials:
-            connection_count = len(self._gateway().list_connections(*credentials))
+            connections = []
+            for connection in self._gateway().list_connections(*credentials):
+                authorization_id = connection.get("id")
+                name = _nested(connection, "brokerage", "name")
+                disabled = connection.get("disabled")
+                connections.append({
+                    "id": authorization_id if isinstance(authorization_id, str) and authorization_id else None,
+                    "brokerage_name": name if isinstance(name, str) and name else None,
+                    "disabled": disabled if type(disabled) is bool else None,
+                })
         return {
             "configured": configured,
             "registered": credentials is not None,
-            "connection_count": connection_count,
+            "connection_count": len(connections) if connections is not None else None,
+            "connections": connections,
             "last_synced_at": self.snapshot(user_id)["last_synced_at"],
         }
 
-    def connection_url(self, user_id: int, redirect_uri: str) -> str:
+    def connection_url(self, user_id: int, redirect_uri: str, reconnect: str | None = None) -> str:
         redirect_uri = _validate_redirect_uri(redirect_uri)
+        if reconnect is not None:
+            self._require_configured()
+            credentials = self._credentials(user_id)
+            if not credentials or not any(
+                connection.get("id") == reconnect
+                for connection in self._gateway().list_connections(*credentials)
+            ):
+                raise SnapTradeConnectionNotFound("找不到 SnapTrade 連線")
+            return self._gateway().connection_url(*credentials, redirect_uri, reconnect=reconnect)
         credentials = self._ensure_credentials(user_id)
         return self._gateway().connection_url(*credentials, redirect_uri)
 

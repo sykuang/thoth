@@ -527,10 +527,17 @@ export type PortfolioSummary = {
   skipped: string[];
 };
 
+export type SnapTradeConnection = {
+  id: string | null;
+  brokerage_name: string | null;
+  disabled: boolean | null;
+};
+
 export type SnapTradeStatus = {
   configured: boolean;
   registered: boolean;
   connection_count: number | null;
+  connections?: SnapTradeConnection[] | null;
   last_synced_at: string | null;
 };
 

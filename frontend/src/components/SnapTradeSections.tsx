@@ -8,7 +8,8 @@ import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { formatApiError } from '@/lib/api';
 import { formatAbsoluteDecimalCurrency, formatDecimalCurrency } from '@/lib/currency';
 import { formatDecimal } from '@/lib/decimal';
-import { formatSnapTradeUiError } from '@/lib/snaptradeUi';
+import { assertReplicaOwnerEpoch } from '@/lib/replica';
+import { formatSnapTradeConnectionStatus, formatSnapTradeUiError, shouldSyncAfterSnapTradePortal } from '@/lib/snaptradeUi';
 import type {
   BrokerageAccount,
   SnapTradePortfolio,
@@ -52,60 +53,77 @@ export function SnapTradeConnectionSettings() {
     },
   });
   const portal = useMutation({
-    mutationFn: ({ redirect_uri, callbackUri }: { redirect_uri: string; callbackUri: string }) =>
+    mutationFn: ({ redirect_uri, callbackUri }: {
+      redirect_uri: string; callbackUri: string; reconnect?: string; ownerKey: string; ownerEpoch: number;
+    }) =>
       WebBrowser.openAuthSessionAsync(redirect_uri, callbackUri),
-    onSuccess: async (result) => {
-      await queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] });
-      if (result.type === 'success') {
+    onSuccess: async (result, connection) => {
+      assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch);
+      const refreshed = await statusQuery.refetch({ throwOnError: true });
+      assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch);
+      if (shouldSyncAfterSnapTradePortal(result.type, refreshed.data, connection.reconnect)) {
         await sync.mutateAsync();
+        assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch);
         router.replace('/(tabs)/cards');
       }
     },
   });
   const connect = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (reconnect?: string) => {
       const callbackUri = ExpoLinking.createURL('/investments', { isTripleSlashed: true });
       const response = await ownerApi<{ redirect_uri: string }>('/snaptrade/connect', {
         method: 'POST',
-        body: JSON.stringify({ redirect_uri: callbackUri }),
+        body: JSON.stringify({ redirect_uri: callbackUri, ...(reconnect ? { reconnect } : {}) }),
       });
-      return { ...response, callbackUri, createdAt: Date.now() };
+      return { ...response, callbackUri, reconnect, ownerKey, ownerEpoch, createdAt: Date.now() };
     },
     onSuccess: (connection) => {
+      assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch);
       if (Platform.OS !== 'web') portal.mutate(connection);
     },
   });
   const status = statusQuery.data;
   const error = connect.error ?? portal.error ?? sync.error ?? statusQuery.error;
+  const readyPortal = connect.data?.ownerKey === ownerKey && connect.data?.ownerEpoch === ownerEpoch
+    ? connect.data : undefined;
+  const openPortal = (reconnect?: string) => {
+    if (
+      Platform.OS !== 'web' || !readyPortal || readyPortal.reconnect !== reconnect
+      || Date.now() - readyPortal.createdAt >= PORTAL_URL_MAX_AGE_MS
+    ) {
+      connect.mutate(reconnect);
+      return;
+    }
+    assertReplicaOwnerEpoch(readyPortal.ownerKey, readyPortal.ownerEpoch);
+    connect.reset();
+    portal.mutate(readyPortal);
+  };
   const statusMessage = statusQuery.isPending
     ? '讀取連線狀態…'
     : statusQuery.isError || !status
       ? '無法讀取連線狀態，請稍後重試'
-      : !status.configured
-        ? '伺服器尚未設定 SnapTrade'
-        : status.connection_count
-          ? `已連結 ${status.connection_count} 個券商；帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」`
-          : status.registered
-            ? '已建立 SnapTrade 使用者，尚未連結券商'
-            : '尚未開始連結';
+      : formatSnapTradeConnectionStatus(status);
 
   return (
-    <View>
+    <View testID="snaptrade-connection-settings">
       <View className="flex-row items-center justify-between gap-3 py-3">
         <View className="flex-1">
           <Text className="text-ink-900 dark:text-ink-50 text-h3">SnapTrade 券商連結</Text>
           <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
             {statusMessage}
           </Text>
+          <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
+            帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」
+          </Text>
         </View>
         <ActionButton
           label={
             statusQuery.isError
               ? '重試'
-              : Platform.OS === 'web' && connect.data
+              : Platform.OS === 'web' && readyPortal && !readyPortal.reconnect
               ? '開啟 SnapTrade'
               : status?.registered
-                ? '管理連結'
+                ? '新增連結'
                 : '連結券商'
           }
           onPress={() => {
@@ -113,17 +131,7 @@ export function SnapTradeConnectionSettings() {
               void statusQuery.refetch();
               return;
             }
-            if (Platform.OS !== 'web' || !connect.data) {
-              connect.mutate();
-              return;
-            }
-            if (Date.now() - connect.data.createdAt >= PORTAL_URL_MAX_AGE_MS) {
-              connect.mutate();
-              return;
-            }
-            const connection = connect.data;
-            connect.reset();
-            portal.mutate(connection);
+            openPortal();
           }}
           disabled={
             statusQuery.isFetching
@@ -133,6 +141,22 @@ export function SnapTradeConnectionSettings() {
           }
         />
       </View>
+      {status?.connections?.map((connection, index) => (
+        <View key={connection.id ?? index} className="flex-row items-center justify-between gap-3 pb-3">
+          <Text className="flex-1 text-ink-500 dark:text-ink-400 text-small">
+            {connection.brokerage_name ?? '券商'} · {connection.disabled === true
+              ? '待修復' : connection.disabled === false ? '有效' : '狀態未知'}
+          </Text>
+          {connection.disabled === true && connection.id && (
+            <ActionButton
+              label={Platform.OS === 'web' && readyPortal?.reconnect === connection.id ? '開啟修復連線' : '修復連線'}
+              onPress={() => openPortal(connection.id!)}
+              disabled={!status.configured || statusQuery.isFetching || statusQuery.isError
+                || connect.isPending || portal.isPending || sync.isPending}
+            />
+          )}
+        </View>
+      ))}
       {error && (
         <Text className="text-red-600 text-small pb-3">
           {formatSnapTradeUiError(error, formatApiError(error), false)}
@@ -169,6 +193,7 @@ export function SnapTradeAccountsSection() {
   const portfolio = portfolioQuery.data ?? EMPTY_PORTFOLIO;
   const hasConnection = Boolean(status?.connection_count);
   const hasSnapshot = portfolio.accounts.length > 0;
+  const hasDisabledConnection = status?.connections?.some((connection) => connection.disabled === true) ?? false;
 
   if (
     statusQuery.isSuccess
@@ -192,6 +217,14 @@ export function SnapTradeAccountsSection() {
           secondary
         />
       </View>
+      {hasDisabledConnection && (
+        <View className="gap-3 mb-3">
+          <Text className="text-amber-600 dark:text-amber-400 text-small">
+            券商連線已停用，請先至設定修復連線。{hasSnapshot ? '資料未更新；目前顯示上次成功同步的快照。' : '尚無快照資料。'}
+          </Text>
+          <ActionButton label="前往設定修復" onPress={() => router.push('/(tabs)/settings')} disabled={false} secondary />
+        </View>
+      )}
       {error && (
         <Text className="text-red-600 text-small mb-3">
           {formatSnapTradeUiError(error, formatApiError(error), hasSnapshot)}
@@ -209,7 +242,7 @@ export function SnapTradeAccountsSection() {
           })}
         />
       ))}
-      {portfolioQuery.isSuccess && hasConnection && portfolio.accounts.length === 0 && (
+      {portfolioQuery.isSuccess && hasConnection && !hasDisabledConnection && portfolio.accounts.length === 0 && (
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
           <Text className="text-ink-500 dark:text-ink-400 text-body text-center">
             券商已連結，尚無快照資料。請按「同步券商」。

@@ -85,6 +85,24 @@ def test_brokerage_account_row_opens_holdings_detail_not_transactions():
     assert "transactions_first_transaction_date" not in holdings_section
 
 
+def test_connection_health_and_accounts_repair_use_existing_settings_surface():
+    sections = SECTIONS.read_text()
+    settings = sections[:sections.index("export function SnapTradeAccountsSection")]
+    accounts = sections[sections.index("export function SnapTradeAccountsSection"):sections.index("function ActionButton")]
+    assert 'testID="snaptrade-connection-settings"' in settings
+    assert "formatSnapTradeConnectionStatus(status)" in settings
+    assert "status?.connections?.map" in settings
+    assert "connection.disabled === true" in settings
+    assert "connection.disabled === false" in settings
+    assert "onPress={() => openPortal(connection.id!)}" in settings
+    assert "修復連線" in settings
+    assert "connection.disabled === true" in accounts
+    assert "券商連線已停用" in accounts
+    assert "上次成功同步的快照" in accounts
+    assert "router.push('/(tabs)/settings')" in accounts
+    assert "label=\"前往設定修復\"" in accounts
+
+
 def test_brokerage_detail_reports_query_errors_without_global_unsupported_banner():
     sections = SECTIONS.read_text()
     transactions = TRANSACTIONS.read_text()
@@ -92,6 +110,21 @@ def test_brokerage_detail_reports_query_errors_without_global_unsupported_banner
     assert "if (!accountId) return null" not in sections
     assert "部分券商帳戶目前未提供交易明細" not in transactions
     assert "券商交易讀取失敗" in transactions
+
+
+def test_portal_repair_refreshes_health_before_sync_and_keeps_target_scoped():
+    settings = SECTIONS.read_text().split("export function SnapTradeAccountsSection")[0]
+    assert "...(reconnect ? { reconnect } : {})" in settings
+    assert "readyPortal.reconnect !== reconnect" in settings
+    assert "connect.data?.ownerKey === ownerKey" in settings
+    assert "connect.data?.ownerEpoch === ownerEpoch" in settings
+    assert "assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch)" in settings
+    assert settings.count("assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch)") >= 3
+    assert "assertReplicaOwnerEpoch(readyPortal.ownerKey, readyPortal.ownerEpoch)" in settings
+    assert "const refreshed = await statusQuery.refetch({ throwOnError: true })" in settings
+    assert "shouldSyncAfterSnapTradePortal(result.type, refreshed.data, connection.reconnect)" in settings
+    assert settings.index("shouldSyncAfterSnapTradePortal(result.type") < settings.index("await sync.mutateAsync()")
+    assert "if (result.type === 'success')" not in settings
 
 
 def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
