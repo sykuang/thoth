@@ -266,12 +266,17 @@ def _evaluate_rule(
             rule_name=rule.name,
             interaction=_interaction(rule.kind),
         )
-    if rule.kind is CheckpointKind.DISMISSIBLE_NOTICE:
+    if rule.kind in {CheckpointKind.DISMISSIBLE_NOTICE, CheckpointKind.DUPLICATE_SESSION}:
         for container, _ in matched:
             form_controls = container.locator(
                 "input, select, textarea, [contenteditable]:not([contenteditable='false'])"
             )
-            if any(item.is_visible() for item in bounded_locator_matches(form_controls)):
+            # Duplicate confirmation must not submit even hidden credentials/OTP:
+            # native form submissions are outside the reducer's credential budget.
+            if any(
+                rule.kind is CheckpointKind.DUPLICATE_SESSION or item.is_visible()
+                for item in bounded_locator_matches(form_controls)
+            ):
                 return CheckpointOutcome(
                     CheckpointKind.UNKNOWN_BLOCKER,
                     rule_name=rule.name,
@@ -301,6 +306,13 @@ def _evaluate_rule(
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
 
     container, fingerprint, action, label = eligible[0]
+    # Native form ownership includes ancestors and external form= targets.
+    # A duplicate confirmation must never bypass the credential budget.
+    if rule.kind is CheckpointKind.DUPLICATE_SESSION and action.evaluate(
+        "el => (el instanceof HTMLButtonElement || el instanceof HTMLInputElement)"
+        " && el.form !== null && ['submit', 'image'].includes(el.type)"
+    ):
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
     was_enabled = action.is_enabled()
     was_selected = _action_selected(action)
     try:

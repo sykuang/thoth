@@ -9,7 +9,9 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
+import time
 import json
 import math
 import os
@@ -380,6 +382,180 @@ class ApiHit:
         return self.url.split("?")[0].rsplit("/", 1)[-1]
 
 
+_HISTORY_OBSERVER_URLS = {
+    "ubot.com.tw": "https://www.ubot.com.tw/MyBank/IBKB010102",
+    "taishinbank.com.tw": "https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query",
+}
+
+
+class _HistoryBodyObserver:
+    """Read-only CDP size proof; bounds admitted decoded bytes, not browser RSS."""
+
+    LIMIT = 5_000_000
+    MAX_RECORDS = 64
+    WAIT_SECONDS = 10
+
+    def __init__(self, page, url):
+        self.page, self.url = page, url
+        self.records = {}
+        self.native_requests = []
+        self.total = 0
+        self.bad = False
+        self.session = page.context.new_cdp_session(page)
+        self.handlers = {"Network.requestWillBeSent": self._request}
+        for name in ("responseReceived", "dataReceived", "loadingFinished", "loadingFailed"):
+            self.handlers["Network." + name] = lambda event, kind=name: self._event(kind, event)
+        try:
+            for name, handler in self.handlers.items():
+                self.session.on(name, handler)
+            self.session.send("Network.enable", {"maxPostDataSize": 16_384})
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        self.bad = True
+        for name, handler in self.handlers.items():
+            with contextlib.suppress(Exception):
+                self.session.remove_listener(name, handler)
+        with contextlib.suppress(Exception):
+            self.session.detach()
+        self.records.clear()
+        self.native_requests.clear()
+
+    def _request(self, event):
+        request_id = event.get("requestId")
+        if request_id in self.records:
+            self.records[request_id]["bad"] = True  # Redirect/reused ID.
+            return
+        request = event.get("request", {})
+        if request.get("url") != self.url:
+            return
+        if len(self.records) >= self.MAX_RECORDS:
+            self.bad = True
+            return
+        post = request.get("postData")
+        if (request.get("method") != "POST" or not isinstance(post, str)
+                or len(post.encode("utf-8")) > 16_384 or not event.get("frameId")):
+            self.bad = True
+            return
+        self.records[request_id] = {
+            "key": (request["url"], request["method"], post, event["frameId"]),
+            "loader": event.get("loaderId"), "document_url": event.get("documentURL", ""),
+            "bytes": 0, "done": False, "bad": "redirectResponse" in event,
+            "response": False, "used": False,
+        }
+
+    def _event(self, kind, event):
+        record = self.records.get(event.get("requestId"))
+        if record is None:
+            return
+        if kind == "dataReceived":
+            size = event.get("dataLength")
+            if type(size) is not int or size < 0 or record["done"] or "data" in event:
+                record["bad"] = True
+                return
+            record["bytes"] = min(self.LIMIT + 1, record["bytes"] + size)
+            self.total = min(self.LIMIT + 1, self.total + size)
+            self.bad |= self.total > self.LIMIT
+        elif kind == "loadingFinished":
+            record["bad"] |= record["done"]
+            record["done"] = True
+        elif kind == "loadingFailed":
+            record["bad"] = True
+        else:
+            response = event.get("response", {})
+            record["response"] = (
+                response.get("status") == 200 and response.get("url") == self.url
+                and not response.get("fromServiceWorker")
+                and not response.get("fromDiskCache")
+                and not response.get("fromPrefetchCache")
+                and bool(record["loader"]) and event.get("loaderId") == record["loader"]
+                and event.get("frameId") == record["key"][3]
+            )
+            record["bad"] |= not record["response"]
+
+    def _document(self, frame, frame_url):
+        """Bind a native Frame to its current CDP document, never by URL alone."""
+        if frame is None:
+            return None
+        tree = self.session.send("Page.getFrameTree")["frameTree"]
+        # Read the native URL AFTER CDP dispatch: SPA routing may run during send.
+        current_url = frame.url
+        if (not any(native is frame for native in self.page.frames)
+                or urlparse(current_url)[:2] != urlparse(frame_url)[:2]):
+            return None
+        if frame is self.page.main_frame:
+            matches = [tree["frame"]]
+        else:
+            native = [f for f in self.page.frames if f.url == current_url]
+            if len(native) != 1 or native[0] is not frame:
+                return None
+            pending, matches = [tree], []
+            while pending:
+                node = pending.pop()
+                if node["frame"]["url"] + node["frame"].get("urlFragment", "") == current_url:
+                    matches.append(node["frame"])
+                pending.extend(node.get("childFrames", []))
+        if (len(matches) != 1
+                or matches[0]["url"] + matches[0].get("urlFragment", "") != current_url
+                or not matches[0].get("loaderId")):
+            return None
+        return matches[0]["id"], matches[0]["loaderId"]
+
+    def read(self, resp, frame, frame_url, remaining, minimum, admit=None):
+        req = resp.request
+        if (self.bad or resp.status != 200 or req.url != self.url or resp.url != self.url
+                or req.method != "POST" or req.frame is not frame
+                or getattr(req, "redirected_from", None) is not None
+                or getattr(req, "redirected_to", None) is not None):
+            return None
+        if (any(native is req for native in self.native_requests)
+                or len(self.native_requests) >= self.MAX_RECORDS):
+            return None
+        self.native_requests.append(req)
+        document = self._document(frame, frame_url)
+        if document is None:
+            return None
+        key = (req.url, req.method, req.post_data, document[0])
+        deadline = time.monotonic() + min(30, self.WAIT_SECONDS)
+        while not self.bad:
+            matches = [(rid, r) for rid, r in self.records.items() if r["key"] == key and not r["used"]]
+            if len(matches) > 1:
+                return None
+            if matches:
+                request_id, record = matches[0]
+                if (record["bad"] or record.get("native_request", req) is not req
+                        or record["loader"] != document[1]
+                        or urlparse(record["document_url"])[:2] != urlparse(frame_url)[:2]):
+                    return None
+                record["native_request"] = req
+                if record["done"]:
+                    available = remaining() if callable(remaining) else remaining
+                    if not record["response"] or not minimum <= record["bytes"] <= available:
+                        return None
+                    if admit is not None and not admit(record["bytes"]):
+                        return None
+                    if (self._document(frame, frame_url) != document or self.bad or record["bad"]
+                            or sum(r["key"] == key and not r["used"] for r in self.records.values()) != 1):
+                        return None
+                    # Direct observer buffer read cannot enter Patchright's
+                    # Network.loadNetworkResource replay fallback (even with CL).
+                    result = self.session.send("Network.getResponseBody", {"requestId": request_id})
+                    body = (base64.b64decode(result["body"], validate=True)
+                            if result.get("base64Encoded") else result["body"].encode("utf-8"))
+                    if (self._document(frame, frame_url) == document
+                            and not self.bad and not record["bad"] and len(body) == record["bytes"]
+                            and sum(r["key"] == key and not r["used"] for r in self.records.values()) == 1):
+                        record["used"] = True
+                        return body
+                    return None
+            if time.monotonic() >= deadline:
+                return None
+            self.page.wait_for_timeout(20)
+        return None
+
+
 class ResponseCollector:
     """掛在 Playwright page 上，攔截所有 XHR/fetch 的 request+response。"""
 
@@ -410,13 +586,22 @@ class ResponseCollector:
         self._response_handler = self._on_response
         self._request_handler = self._on_request
         self._request_failed_handler = self._on_request_failed
+        self._history_observer = None
 
     def attach(self, page):
+        if self.host_filter in _HISTORY_OBSERVER_URLS and self._history_observer is None:
+            with contextlib.suppress(Exception):
+                self._history_observer = _HistoryBodyObserver(
+                    page, _HISTORY_OBSERVER_URLS[self.host_filter]
+                )
         page.on("request", self._request_handler)
         page.on("requestfailed", self._request_failed_handler)
         page.on("response", self._response_handler)
 
     def detach(self, page) -> None:
+        if self._history_observer is not None:
+            self._history_observer.close()
+            self._history_observer = None
         remove = getattr(page, "remove_listener", None)
         if callable(remove):
             remove("request", self._request_handler)
@@ -477,10 +662,11 @@ class ResponseCollector:
             self._request_main_frame[id(req)] = main_frame_request
             self._request_frame_urls[id(req)] = "" if metadata_only else frame_url
             self._request_frames[id(req)] = None if metadata_only else frame
-            endpoint = parsed.path.rsplit("/", 1)[-1]
-            self._issued_endpoint_counts[endpoint] = (
-                self._issued_endpoint_counts.get(endpoint, 0) + 1
-            )
+            # Preserve basename callers; full paths distinguish same-named APIs.
+            for endpoint in {parsed.path, parsed.path.rsplit("/", 1)[-1]}:
+                self._issued_endpoint_counts[endpoint] = (
+                    self._issued_endpoint_counts.get(endpoint, 0) + 1
+                )
             if metadata_only:
                 return
             auth = req.headers.get("authorization", "")
@@ -634,6 +820,9 @@ class ResponseCollector:
                     if is_bounded_json:
                         if len(pd.encode("utf-8")) > 16_384:
                             req_body = {"__oversize__": True}
+                        elif is_ubot_history:
+                            # Preserve duplicate fields for the history validator.
+                            req_body = pd
                         else:
                             try:
                                 parsed_body = json.loads(pd)
@@ -655,7 +844,27 @@ class ResponseCollector:
             if "json" in ct and not metadata_only:
                 if is_bounded_json:
                     minimum_size = 64 if is_ubot_history else 0
-                    if (
+                    if is_ubot_history or is_taishin_history:
+                        # Every history body requires native CDP proof. In particular,
+                        # identity + Content-Length must not enter resp.body()'s replay fallback.
+                        identity_encoding = content_encoding.lower() in {"", "identity"}
+                        declared_ok = not content_length or (
+                            body_size is not None
+                            and (minimum_size if identity_encoding else 0) <= body_size <= 5_000_000
+                        )
+                        if self._history_observer is not None and request_sequence > 0 and declared_ok:
+                            with contextlib.suppress(Exception):
+                                remaining = lambda: 5_000_000 - (self._taishin_json_bytes if is_taishin_json else 0)
+                                raw_body = self._history_observer.read(
+                                    resp, request_frame, request_frame_url, remaining, minimum_size,
+                                    self._reserve_taishin_body if is_taishin_json else None,
+                                )
+                                if raw_body is not None:
+                                    declared_size = body_size
+                                    body_size = len(raw_body)
+                                    if not content_length or not identity_encoding or body_size == declared_size:
+                                        resp_json = json.loads(raw_body)
+                    elif (
                         content_encoding.lower() in {"", "identity"}
                         and body_size is not None
                         and minimum_size <= body_size <= 5_000_000
@@ -706,6 +915,14 @@ class ResponseCollector:
             ))
         except Exception:
             pass
+
+    def _reserve_taishin_body(self, size):
+        if self._taishin_json_responses >= 64 or self._taishin_json_bytes + size > 5_000_000:
+            return False
+        # Reserve before the CDP call can dispatch another response callback.
+        self._taishin_json_responses += 1
+        self._taishin_json_bytes += size
+        return True
 
     def by_endpoint(self, name: str) -> list[ApiHit]:
         return [h for h in self.hits if h.endpoint == name and h.resp_json is not None]
@@ -1701,12 +1918,12 @@ class BankCrawler(ABC):
         result: dict = {}
 
         def page_action(page):
-            collector.attach(page)
-            self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
-            self._shared_dialog_blocked = False
-            self.attach_shared_dialog_handler(page)
             logged_in = False
             try:
+                collector.attach(page)
+                self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
+                self._shared_dialog_blocked = False
+                self.attach_shared_dialog_handler(page)
                 try:
                     ok = self._shared_login(page)
                 except Exception as e:
@@ -1842,6 +2059,7 @@ class BankCrawler(ABC):
                             "(details withheld; best-effort, swallow)",
                             file=_sys.stderr,
                         )
+                collector.detach(page)
             return page
 
         # 所有 crawler 從 base 繼承同一套 macOS fingerprint spoof。

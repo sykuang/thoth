@@ -61,6 +61,10 @@ class Locator:
     def get_attribute(self, name: str):
         return self.nodes[0].attrs.get(name)
 
+    def evaluate(self, expression):
+        # These synthetic actions have no native form owner; real DOM tests cover it.
+        return False
+
     def click(self):
         node = self.nodes[0]
         node.clicks += 1
