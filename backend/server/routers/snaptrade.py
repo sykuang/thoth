@@ -10,6 +10,7 @@ from backend.server.deps import current_user
 from backend.server.dashboard_cache import clear_dashboard_cache
 from backend.server.snaptrade import (
     SnapTradeBusy,
+    SnapTradeConnectionNotFound,
     SnapTradeInvalidCallback,
     SnapTradeNotConfigured,
     SnapTradeNotRegistered,
@@ -38,6 +39,7 @@ _SYNC_ERROR_MARKERS = (
 
 class ConnectRequest(BaseModel):
     redirect_uri: str = Field(min_length=8, max_length=2048)
+    reconnect: str | None = Field(default=None, min_length=1, max_length=256, strict=True)
 
 
 def get_service() -> SnapTradeService:
@@ -55,6 +57,8 @@ def _sync_error_code(error: Exception) -> str:
 
 
 def _raise_http(error: Exception, *, sync_error_code: str | None = None) -> NoReturn:
+    if isinstance(error, SnapTradeConnectionNotFound):
+        raise HTTPException(status_code=404, detail="找不到 SnapTrade 連線") from error
     if isinstance(error, SnapTradeNotConfigured):
         raise HTTPException(status_code=503, detail=str(error)) from error
     if isinstance(error, (SnapTradeBusy, SnapTradeNotRegistered)):
@@ -68,7 +72,11 @@ def _raise_http(error: Exception, *, sync_error_code: str | None = None) -> NoRe
     )
     raise HTTPException(
         status_code=502,
-        detail="SnapTrade 上游暫時無法使用",
+        detail=(
+            "SnapTrade 券商連線已停用，請至「設定」修復連線後再同步；資料未更新，保留上次成功同步的快照。"
+            if sync_error_code == "connection_disabled"
+            else "SnapTrade 上游暫時無法使用"
+        ),
         headers=headers,
     ) from error
 
@@ -88,7 +96,10 @@ def connect(
 ) -> dict[str, str]:
     try:
         return {
-            "redirect_uri": get_service().connection_url(user["id"], body.redirect_uri),
+            "redirect_uri": get_service().connection_url(
+                user["id"], body.redirect_uri,
+                **({"reconnect": body.reconnect} if body.reconnect is not None else {}),
+            ),
         }
     except Exception as error:
         _raise_http(error)

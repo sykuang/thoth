@@ -208,9 +208,101 @@ def test_connect_registers_user_encrypts_secret_and_returns_read_only_portal(cli
         "configured": True,
         "registered": True,
         "connection_count": 1,
+        "connections": [{"id": "auth-1", "brokerage_name": None, "disabled": False}],
         "last_synced_at": None,
     }
     assert "secret" not in json.dumps(status.json()).lower()
+
+
+@pytest.mark.parametrize("disabled", [True, False, None, "false", 0, 1])
+def test_status_exposes_only_safe_connection_health(client, monkeypatch, disabled):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-health@example.com")
+    assert client.get("/snaptrade/status", headers=headers).json().get("connections") is None
+    assert _connect(client, headers).status_code == 200
+    monkeypatch.setattr(fake, "list_connections", lambda *_: [{
+        "id": "auth-owned", "disabled": disabled,
+        "brokerage": {"name": "Synthetic Brokerage", "secret": "SENSITIVE_SENTINEL"},
+        "userSecret": "SENSITIVE_SENTINEL",
+    }, {"id": {"secret": "SENSITIVE_SENTINEL"}, "brokerage": {"name": []}}])
+
+    response = client.get("/snaptrade/status", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["connection_count"] == 2
+    assert response.json()["connections"] == [
+        {"id": "auth-owned", "brokerage_name": "Synthetic Brokerage",
+         "disabled": disabled if type(disabled) is bool else None},
+        {"id": None, "brokerage_name": None, "disabled": None},
+    ]
+    assert "SENSITIVE_SENTINEL" not in response.text
+
+
+@pytest.mark.parametrize("target", ["auth-owned", "auth-foreign", " auth-owned "])
+def test_reconnect_is_owner_verified_and_read_only(client, monkeypatch, target):
+    from backend.server.snaptrade import SnapTradeSDKGateway
+
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-reconnect@example.com")
+    other = _register(client, "snaptrade-reconnect-other@example.com")
+    assert _connect(client, headers).status_code == 200
+    assert _connect(client, other).status_code == 200
+    owner = fake.registered[0]
+    monkeypatch.setattr(fake, "list_connections", lambda user_id, _: [{
+        "id": "auth-owned" if user_id == owner else "auth-foreign", "disabled": True,
+    }])
+    calls = []
+    gateway: Any = object.__new__(SnapTradeSDKGateway)
+    gateway.client = SimpleNamespace(authentication=SimpleNamespace(
+        login_snap_trade_user=lambda **kwargs: calls.append(kwargs) or {
+            "redirectURI": "https://connect.snaptrade.example/repair",
+        },
+    ))
+    monkeypatch.setattr(fake, "connection_url", gateway.connection_url)
+
+    response = client.post("/snaptrade/connect", headers=headers, json={
+        "redirect_uri": REDIRECT_URI, "reconnect": target,
+    })
+
+    assert response.status_code == (200 if target == "auth-owned" else 404)
+    assert len(fake.registered) == 2
+    assert fake.deleted == []
+    if target == "auth-owned":
+        assert calls == [{
+            "user_id": owner, "user_secret": f"secret-{owner}",
+            "connection_type": "read", "show_close_button": True,
+            "custom_redirect": REDIRECT_URI, "reconnect": target,
+        }]
+    else:
+        assert calls == []
+        assert target not in response.text
+
+
+@pytest.mark.parametrize("redirect_uri, expected", [(REDIRECT_URI, 404), ("https://attacker.example/callback", 400)])
+def test_reconnect_never_registers_missing_user(client, monkeypatch, redirect_uri, expected):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-reconnect-missing@example.com")
+    response = client.post("/snaptrade/connect", headers=headers, json={
+        "redirect_uri": redirect_uri, "reconnect": "auth-missing",
+    })
+    assert response.status_code == expected
+    assert fake.registered == []
+    assert fake.deleted == []
+
+
+@pytest.mark.parametrize("target", ["", 123, [], "x" * 257])
+def test_reconnect_rejects_invalid_request(client, monkeypatch, target):
+    fake = FakeSnapTradeGateway()
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-reconnect-invalid@example.com")
+    response = client.post("/snaptrade/connect", headers=headers, json={
+        "redirect_uri": REDIRECT_URI, "reconnect": target,
+    })
+    assert response.status_code == 422
+    assert fake.registered == []
 
 
 def test_sync_clears_portfolio_summary_cache(client, monkeypatch):
@@ -300,6 +392,10 @@ def test_disabled_connection_preserves_previous_snapshot(client, monkeypatch):
     failed = client.post("/snaptrade/sync", headers=headers)
 
     assert failed.status_code == 502
+    assert failed.headers["X-SnapTrade-Error-Code"] == "connection_disabled"
+    assert failed.json()["detail"] == (
+        "SnapTrade 券商連線已停用，請至「設定」修復連線後再同步；資料未更新，保留上次成功同步的快照。"
+    )
     assert client.get("/snaptrade/portfolio", headers=headers).json() == before
 
 
