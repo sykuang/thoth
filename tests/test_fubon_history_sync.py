@@ -180,6 +180,37 @@ def test_fubon_dom_layout_table_is_not_a_duplicate_grid(fubon_dom_snapshot, head
     assert FubonCrawler._validated_twd_history_result(result)["status"] == "complete"
 
 
+@pytest.mark.parametrize('hidden_duplicate', [False, True])
+def test_fubon_header_sort_scripts_are_not_labels(fubon_dom_snapshot, hidden_duplicate):
+    result = fubon_dom_snapshot(mutate="""() => {
+        document.querySelectorAll('th').forEach(cell => {
+            const label=document.createElement('a'); label.textContent=cell.textContent;
+            const script=document.createElement('script'); script.textContent='window.syntheticSortInit = true;';
+            const input=document.createElement('input');input.type='hidden';input.value='fixture-sort';
+            cell.replaceChildren(script,label,input);
+        });
+        """ + ("const clone=document.querySelector('#transactions').cloneNode(true);clone.hidden=true;document.querySelector('section').append(clone);" if hidden_duplicate else "") + "}")
+    assert result['snapshot']['gridCandidateCount'] == 1
+    assert result['snapshot']['hiddenGridDataRowCount'] == int(hidden_duplicate)
+    if hidden_duplicate:
+        with pytest.raises(RuntimeError, match='fubon-twd-history-result'):
+            FubonCrawler._validated_twd_history_result(result)
+    else:
+        assert FubonCrawler._validated_twd_history_result(result)['status'] == 'complete'
+
+
+def test_fubon_script_only_headers_do_not_supply_visible_labels(fubon_dom_snapshot):
+    result = fubon_dom_snapshot(mutate="""() => {
+        document.querySelectorAll('th').forEach(cell=>{
+            const script=document.createElement('script');script.type='text/plain';script.textContent=cell.textContent;
+            cell.replaceChildren(script);
+        });
+    }""")
+    assert result['snapshot']['gridCandidateCount'] == 0
+    with pytest.raises(RuntimeError, match='fubon-twd-history-result'):
+        FubonCrawler._validated_twd_history_result(result)
+
+
 @pytest.mark.parametrize("mutate", [
     "document.querySelector('thead tr').append(document.querySelector('th'))",
     "document.querySelector('th').prepend('其他')",
@@ -561,9 +592,9 @@ def test_fubon_window_rereads_native_controls_after_ajax_settle():
     assert "control_pending or control_failed or stable_ticks < 10" in source
     assert 'settled["presetValue"]' in source
     assert 'settled["viewState"]' in source
-    assert "dates.length===0&&headers.every" in source
+    assert "dates.length===0&&isHeaderRow(row)" in source
     assert "rawDataRowCount++;" in source
-    assert source.index("dates.length===0&&headers.every") < source.index("rawDataRowCount++;")
+    assert source.index("dates.length===0&&isHeaderRow(row)") < source.index("rawDataRowCount++;")
     assert source.index("stable_ticks < 10") < source.index('settled["presetValue"]')
 
 

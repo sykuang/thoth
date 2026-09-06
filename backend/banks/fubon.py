@@ -1162,10 +1162,12 @@ class FubonCrawler(BankCrawler):
             const directRows=(table)=>[...table.querySelectorAll(':scope > tr,:scope > thead > tr,:scope > tbody > tr,:scope > tfoot > tr')];
             const directCells=(row)=>[...row.querySelectorAll(':scope > th,:scope > td')];
             const cellTexts=(row)=>directCells(row).map(c=>(c.textContent||'').trim().replaceAll('\u3000',''));
-            const hasHeaders=(table)=>directRows(table).some(row=>{
+            const headerCellText=cell=>{const copy=cell.cloneNode(true);copy.querySelectorAll('script,style').forEach(node=>node.remove());return headerText(copy.textContent);};
+            const isHeaderRow=row=>{
                 const cells=directCells(row);
-                return cells.length===headers.length&&cells.every((cell,index)=>!cell.querySelector('table')&&headerText(cell.textContent)===headers[index]);
-            });
+                return cells.length===headers.length&&cells.every((cell,index)=>!cell.querySelector('table')&&headerCellText(cell)===headers[index]);
+            };
+            const hasHeaders=table=>directRows(table).some(isHeaderRow);
             const allCandidates=[...document.querySelectorAll('table')].filter(hasHeaders);
             const candidates=allCandidates.filter(visible);
             const hiddenGridCount=allCandidates.length-candidates.length;
@@ -1180,7 +1182,7 @@ class FubonCrawler(BankCrawler):
                 for(const row of rows){const cells=[...row.querySelectorAll(':scope > th,:scope > td')], values=cellTexts(row);
                     if(!values.some(Boolean))continue;
                     const dates=values.filter(value=>/^\*?20\d{2}\/\d{1,2}\/\d{1,2}$/.test(value));
-                    const headerOnly=dates.length===0&&headers.every(header=>headerText(row.textContent).includes(header));
+                    const headerOnly=dates.length===0&&isHeaderRow(row);
                     if(headerOnly)continue;
                     rawDataRowCount++;
                     if(!visible(row)){hiddenRowCount++;continue;} const hidden=cells.filter(c=>!visible(c)).length; hiddenCellCount+=hidden;
