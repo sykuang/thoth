@@ -12,11 +12,11 @@ session 持久化（user_data_dir）→ 首次綁定裝置後免 OTP（實測首
 設計規範：dump 真值不猜測 → collect 先 dump endpoint，摸清明細 API 再補 parse。
 """
 from __future__ import annotations
-import contextlib
 import json
 import os
 import re
 import sys
+import time
 from calendar import monthrange
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -37,7 +37,10 @@ from backend.core.creds import CtbcCreds
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
+    LoginBudget,
+    LoginCheckpointBlocked,
     LoginCheckpointRule,
+    evaluate_login_checkpoint,
 )
 
 
@@ -108,9 +111,10 @@ JS_LOGGED_IN_POSITIVE = """
               '台幣存款','外幣存款','基金','投資','貸款','繳費','個人設定','安全'];
   const hit = KW.filter(k => body.includes(k)).length;
   const kwOk = hit >= 2;
+  const noBlockingModal = ![...document.querySelectorAll('.modal.show,[role="dialog"]')].some(visible);
   return {
-    ok: urlOk && lenOk && kwOk && noLoginForm,
-    urlOk, lenOk, kwOk, noLoginForm,
+    ok: urlOk && lenOk && kwOk && noLoginForm && noBlockingModal,
+    urlOk, lenOk, kwOk, noLoginForm, noBlockingModal,
     url: location.href, txt_len: body.length, hit
   };
 }
@@ -172,6 +176,25 @@ _PG_INTEGER_MAX = 2_147_483_647
 
 def _valid_bearer(value) -> bool:
     return isinstance(value, str) and re.fullmatch(r"Bearer [^\s]+", value) is not None
+
+
+def _ctbc_request_envelope_valid(body, resource: str) -> bool:
+    if not isinstance(body, dict) or body.get('resource') != resource or not isinstance(body.get('rqData'), dict):
+        return False
+    strings = {'deviceIxd', 'trackingIxd', 'txnIxd', 'model', 'platform', 'version',
+               'runtime', 'network', 'appVer', 'clientNo', 'token', 'locale',
+               'fromSys', 'seed', 'deviceToken'}
+    integers = {'runtimeVer', 'clientTime'}
+    if set(body) != {'resource', 'rqData'} and (
+        set(body) != strings | integers | {'resource', 'rqData'}
+        or any(type(body[key]) is not str for key in strings)
+        or any(type(body[key]) is not int for key in integers)
+    ):
+        return False
+    try:
+        return len(json.dumps(body, ensure_ascii=False).encode('utf-8')) <= 16_384
+    except (TypeError, ValueError, RecursionError):
+        return False
 
 
 def _ctbc_raw_url_matches(stored, raw) -> bool:
@@ -361,6 +384,47 @@ class CtbcCrawler(BankCrawler):
     def is_authenticated(self, page) -> bool:
         return self._logged_in(page)
 
+    def _recover_late_authentication(self, page, error: Exception) -> bool:
+        # A dismissed duplicate-session modal can precede Angular's home render.
+        # Only observe the existing submission; never dismiss another checkpoint.
+        if (
+            not isinstance(error, LoginCheckpointBlocked)
+            or error.phase is not CheckpointPhase.POST_SUBMIT
+            or error.budget != LoginBudget(credential_submissions=1)
+            or error.outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER
+            or error.outcome.rule_name is not None
+        ):
+            return False
+        deadline = time.monotonic() + 20
+        rules = self.login_checkpoint_rules()
+        while time.monotonic() < deadline:
+            if (
+                getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)
+            ):
+                return False
+            outcome = evaluate_login_checkpoint(
+                page,
+                bank=self.name,
+                phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                rules=rules,
+                is_authenticated=self.is_authenticated,
+                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                can_act=lambda: False,
+            )
+            if (
+                time.monotonic() >= deadline
+                or getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)
+            ):
+                return False
+            if outcome.kind is CheckpointKind.AUTHENTICATED:
+                return True
+            if outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER or outcome.rule_name is not None:
+                return False
+            page.wait_for_timeout(250)
+        return False
+
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         post_phases = (
             CheckpointPhase.POST_SUBMIT,
@@ -393,7 +457,11 @@ class CtbcCrawler(BankCrawler):
                 kind=CheckpointKind.DUPLICATE_SESSION,
                 container_selector=".modal.show",
                 action_texts=("確認登入",),
-                required_body_pattern=re.compile(r"^\s*確認訊息[\s\S]*確認登入\s*$"),
+                # Only the declared duplicate fixture authorizes an action;
+                # unknown surrounding prose must remain a terminal checkpoint.
+                required_body_pattern=re.compile(
+                    r"^\s*確認訊息\s*前次工作階段仍存在\s*確認登入\s*$"
+                ),
             ),
             LoginCheckpointRule(
                 name="ctbc-unknown-modal",
@@ -541,13 +609,15 @@ class CtbcCrawler(BankCrawler):
 
     @classmethod
     def _validated_twd_inventory(
-        cls, collector: ResponseCollector, page,
+        cls, collector: ResponseCollector, page, *, after_sequence: int = -1,
     ) -> tuple[dict, set[str]]:
-        hit = next((
-            item for item in reversed(collector.hits)
+        hits = [
+            item for item in collector.hits
             if isinstance(item.req_body, dict)
             and item.req_body.get("resource") == "/twrbc-deposit/qu001/010"
-        ), None)
+            and type(item.request_sequence) is int and item.request_sequence > after_sequence
+        ]
+        hit = hits[0] if len(hits) == 1 else None
         parsed = urlparse(hit.url) if hit else None
         parsed_raw = urlparse(hit.raw_url) if hit else None
         parsed_frame = urlparse(hit.request_frame_url) if hit else None
@@ -573,11 +643,10 @@ class CtbcCrawler(BankCrawler):
             or hit.main_frame_request is not True
             or hit.request_frame is not main_frame
             or current is None
-            or hit.request_frame_url != page.url
             or parsed is None
             or parsed_raw is None
             or parsed_frame is None
-            or parsed_frame != current
+            or current != parsed_frame._replace(path='/twrbc/twrbc-deposit/qu001/010')
             or parsed.scheme != "https"
             or parsed.hostname != "www.ctbcbank.com"
             or parsed.port not in (None, 443)
@@ -593,12 +662,14 @@ class CtbcCrawler(BankCrawler):
             or parsed_frame.port not in (None, 443)
             or parsed_frame.username is not None
             or parsed_frame.password is not None
-            or parsed_frame.path != "/twrbc/twrbc-deposit/qu001/010"
+            or parsed_frame.path not in {
+                '/twrbc/twrbc-home/qu000/010', '/twrbc/twrbc-deposit/qu001/010',
+            }
             or parsed_frame.params
             or parsed_frame.query
             or parsed_frame.fragment
             or media_type != "application/json"
-            or set(hit.req_body) != {"resource", "rqData"}
+            or not _ctbc_request_envelope_valid(hit.req_body, '/twrbc-deposit/qu001/010')
             or request_data != {}
             or not isinstance(response, dict)
             or response.get("code") != "0000"
@@ -648,10 +719,10 @@ class CtbcCrawler(BankCrawler):
         out["summary"] = (home or {}).get("ebAcctSummaryInq") if isinstance(home, dict) else None
 
         # 2) 台幣存款帳戶（點臺幣存款 link 觸發，或直接複用攔到的）
-        self._goto_twd_deposit(page)
-        page.wait_for_timeout(3000)
+        inventory_sequence = collector.request_sequence
+        self._goto_twd_deposit(page, collector)
         out["twd_deposit"], twd_identities = self._validated_twd_inventory(
-            collector, page,
+            collector, page, after_sequence=inventory_sequence,
         )
 
         # 2.5) 台幣逐筆交易明細 (2026-06-20: known TODO 補上)
@@ -1071,13 +1142,13 @@ class CtbcCrawler(BankCrawler):
             or parsed_frame.params
             or parsed_frame != current
             or media_type != "application/json"
-            or set(hit.req_body) != {"resource", "rqData"}
+            or not _ctbc_request_envelope_valid(hit.req_body, '/twrbc-deposit/qu002/011')
             or not isinstance(request_data, dict)
             or set(request_data) != {"accountId", "startDate", "endDate", "type"}
             or request_data.get("accountId") != account_id
             or request_data.get("startDate") != start.strftime("%Y%m%d")
             or request_data.get("endDate") != end.strftime("%Y%m%d")
-            or request_data.get("type") != "search"
+            or request_data.get("type") != "custom"
             or not isinstance(response, dict)
             or response.get("code") != "0000"
             or not isinstance(response_data, dict)
@@ -1111,9 +1182,7 @@ class CtbcCrawler(BankCrawler):
                 and not parsed.params
                 and not parsed.query
                 and not parsed.fragment
-                and isinstance(body, dict)
-                and set(body) == {"resource", "rqData"}
-                and body.get("resource") == "/twrbc-deposit/qu002/011"
+                and _ctbc_request_envelope_valid(body, '/twrbc-deposit/qu002/011')
                 and isinstance(request_data, dict)
                 and isinstance(request_data.get("accountId"), str)
                 and bool(request_data["accountId"])
@@ -1148,9 +1217,7 @@ class CtbcCrawler(BankCrawler):
             or parsed.params
             or parsed.query
             or parsed.fragment
-            or not isinstance(template_body, dict)
-            or set(template_body) != {"resource", "rqData"}
-            or template_body.get("resource") != "/twrbc-deposit/qu002/011"
+            or not _ctbc_request_envelope_valid(template_body, '/twrbc-deposit/qu002/011')
             or not isinstance(template_body.get("rqData"), dict)
             or not isinstance(account_id, str)
             or not account_id
@@ -1256,16 +1323,44 @@ class CtbcCrawler(BankCrawler):
             raise RuntimeError("count-mismatch")
         return detail_list
 
-    def _goto_twd_deposit(self, page):
-        """點首頁「臺幣存款」A.link 進存款頁（觸發 /twrbc-deposit/qu001/010）。"""
-        with contextlib.suppress(Exception):
-            page.evaluate(
-                "(() => { const a=[...document.querySelectorAll('a.link')]"
-                ".find(x=>x.offsetParent!==null && (x.textContent||'').trim()==='臺幣存款');"
-                " if(a){ a.click(); return true;}"
-                " const a2=[...document.querySelectorAll('a')].find(x=>x.offsetParent!==null"
-                "  && (x.textContent||'').trim()==='臺幣存款' && !/轉帳/.test(x.textContent||'')); if(a2) a2.click(); })()",
+    def _goto_twd_deposit(self, page, collector: ResponseCollector):
+        """Wait for the owned native link and its fresh inventory response."""
+        before = len(collector.hits)
+        baseline = collector.request_sequence
+        document = None
+        try:
+            target = page.locator("a.link:visible").filter(
+                has_text=re.compile(r"^\s*臺幣存款\s*$"),
             )
+            target.first.wait_for(state="visible", timeout=15000)
+            if target.count() != 1:
+                raise RuntimeError("ctbc-twd-history-inventory")
+            document = page.evaluate_handle('document')
+            target.click(timeout=8000)
+            page.wait_for_url(
+                "https://www.ctbcbank.com/twrbc/twrbc-deposit/qu001/010",
+                timeout=15000,
+            )
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                if any(
+                    isinstance(hit.req_body, dict)
+                    and hit.req_body.get("resource") == "/twrbc-deposit/qu001/010"
+                    and hit.request_sequence > baseline
+                    for hit in collector.hits[before:]
+                ):
+                    if page.evaluate('prior => prior === document', document) is not True:
+                        raise RuntimeError('ctbc-twd-history-inventory')
+                    return
+        except Exception:
+            raise RuntimeError("ctbc-twd-history-inventory") from None
+        finally:
+            if document is not None:
+                try:
+                    document.dispose()
+                except Exception:
+                    pass
+        raise RuntimeError("ctbc-twd-history-inventory")
 
     def _goto_credit_card(self, page, target_text: str = "消費明細") -> dict:
         """設計規範：每家都要抓信用卡明細。

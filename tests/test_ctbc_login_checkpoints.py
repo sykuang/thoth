@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -9,10 +10,14 @@ import pytest
 
 import backend.banks.ctbc as ctbc_module
 from backend.banks.ctbc import CtbcCrawler, CtbcLoginError
+from backend.core.base import BankCollectResult
 from backend.core.login_checkpoints import (
     CheckpointKind,
+    CheckpointOutcome,
     CheckpointPhase,
+    LoginBudget,
     LoginCheckpointBlocked,
+    LoginInteractionRequired,
     evaluate_login_checkpoint,
 )
 
@@ -230,6 +235,14 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
             "確認訊息<br><button>確定</button>",
             "請確認訊息<br><button>確認登入</button>",
             "確認登入<br><button>確認訊息</button>",
+            "確認訊息<br>密碼已到期，請變更密碼<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在，但密碼已到期<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在，但密碼錯誤<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在<br>登入失敗，帳號已鎖定<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在<br>請先完成安全設定<br><button>確認登入</button>",
+            "確認訊息<br>未知訊息<br>前次工作階段仍存在<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在<br>OTP<br><button>確認登入</button>",
+            "確認訊息<br>請先完成安全設定<br><button>確認登入</button>",
         ):
             page.set_content(
                 f"""
@@ -263,6 +276,111 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
         outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
         assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
         assert secret not in repr(outcome)
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("control", [
+    '<input type="password" autocomplete="current-password" value="synthetic-only">',
+    '<input type="password" hidden value="synthetic-only">',
+    '<input autocomplete="one-time-code" value="000000">',
+    '<input autocomplete="one-time-code" hidden value="000000">',
+    '<input name="username" value="synthetic-only">',
+    '<textarea></textarea>',
+    '<select><option></option></select>',
+    '<div contenteditable="true"><br></div>',
+])
+@pytest.mark.parametrize("owner", ["inside", "external", "inherited"])
+def test_duplicate_form_never_submits_outside_credential_budget(control, owner) -> None:
+    manager, browser = _launch_browser()
+    try:
+        context = browser.new_context(offline=True, service_workers="block")
+        requests = []
+        context.route("**/*", lambda route: (
+            requests.append(route.request.url),
+            route.fulfill(body="<html><body></body></html>", content_type="text/html"),
+        ))
+        page = context.new_page()
+        page.goto(ctbc_module.BASE)
+        modal = f'''
+            <div class="modal show" id="modal" hidden>
+              確認訊息<br>前次工作階段仍存在<br>
+              {control if owner == "inside" else ""}
+              <button type="submit" {'form="challenge"' if owner == 'external' else ''}>確認登入</button>
+            </div>
+        '''
+        page.set_content(
+            f'<form id="challenge">{modal}</form>' if owner == "inside" else
+            f'<form id="challenge">{control}</form>{modal}' if owner == "external" else
+            f'<form id="challenge">{control}{modal}</form>'
+        )
+        page.evaluate('''() => {
+            document.body.dataset.initial = '0';
+            document.body.dataset.clicks = '0';
+            document.body.dataset.submits = '0';
+            document.querySelector('button').onclick = () => document.body.dataset.clicks++;
+            document.querySelector('form').onsubmit = event => {
+                event.preventDefault();
+                document.body.dataset.submits++;
+                document.querySelector('#modal').hidden = true;
+            };
+        }''')
+        crawler = _crawler()
+        del crawler._credential_origin_allowed
+        crawler.prepare_login_page = lambda _page: None
+        crawler.is_authenticated = lambda _page: False
+        crawler.submit_credentials_once = lambda p: p.evaluate('''() => {
+            document.body.dataset.initial++;
+            document.querySelector('#modal').hidden = false;
+        }''')
+
+        with pytest.raises(LoginCheckpointBlocked) as error:
+            crawler._shared_login(page)
+
+        assert page.locator('body').get_attribute('data-initial') == '1'
+        assert page.locator('body').get_attribute('data-submits') == '0'
+        assert page.locator('body').get_attribute('data-clicks') == '0'
+        assert error.value.outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert error.value.outcome.rule_name == 'ctbc-duplicate-session'
+        assert error.value.budget == LoginBudget(credential_submissions=1)
+        assert crawler._recover_late_authentication(page, error.value) is False
+        assert requests == [ctbc_module.BASE]
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("action", [
+    '<button type="button" form="challenge">確認登入</button>',
+    '<a href="#">確認登入</a>',
+])
+def test_duplicate_non_submitting_action_with_external_credentials_is_safe(action):
+    manager, browser = _launch_browser()
+    try:
+        context = browser.new_context(offline=True, service_workers="block")
+        page = context.new_page()
+        page.set_content(f'''
+            <form id="challenge"><input type="password" hidden>
+              <div class="modal show" id="modal">
+                確認訊息<br>前次工作階段仍存在<br>{action}
+              </div>
+            </form>
+            <script>
+              document.body.dataset.clicks = '0';
+              document.body.dataset.submits = '0';
+              document.querySelector('form').onsubmit = event => {{
+                event.preventDefault(); document.body.dataset.submits++;
+              }};
+              document.querySelector('#modal').lastElementChild.onclick = event => {{
+                event.preventDefault(); document.body.dataset.clicks++;
+                document.querySelector('#modal').hidden = true;
+              }};
+            </script>
+        ''')
+        assert _evaluate(page, CheckpointPhase.POST_SUBMIT).kind is CheckpointKind.DUPLICATE_SESSION
+        assert page.locator('body').get_attribute('data-clicks') == '1'
+        assert page.locator('body').get_attribute('data-submits') == '0'
     finally:
         browser.close()
         manager.__exit__(None, None, None)
@@ -624,3 +742,142 @@ def test_authentication_requires_exact_https_ctbc_origin() -> None:
     ):
         page.url = unsafe
         assert crawler._logged_in(page) is False
+
+
+@pytest.mark.parametrize("transition", ["authenticated", "otp", "expiry", "duplicate", "ambiguous", "foreign", "dialog", "never"])
+def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(monkeypatch, transition) -> None:
+    manager, browser = _launch_browser()
+    try:
+        context = browser.new_context(offline=True)
+        requests = []
+
+        def serve(route):
+            requests.append(route.request.url)
+            route.fulfill(body="<html><body></body></html>", content_type="text/html")
+
+        context.route("**/*", serve)
+        page = context.new_page()
+        page.goto(ctbc_module.BASE)
+        transition_script = """
+            history.pushState({}, '', '/twrbc/twrbc-home/qu000/010');
+            document.body.innerHTML = '<p>帳戶總覽 存款 登出 ' + '測試'.repeat(300) + '</p>';
+        """
+        if transition in {"otp", "expiry", "duplicate", "ambiguous"}:
+            text = {
+                "otp": "OTP 驗證",
+                "expiry": "密碼已到期",
+                "duplicate": "前次工作階段仍存在",
+                "ambiguous": "前次工作階段仍存在",
+            }[transition]
+            buttons = "<button>確認登入</button>" * (2 if transition == "ambiguous" else 1)
+            transition_script += f"""
+                document.body.insertAdjacentHTML('beforeend', '<div class="modal show">確認訊息<br>{text}<br>{buttons}</div>');
+                document.querySelectorAll('.modal button').forEach(button => {{
+                    button.onclick = () => document.body.dataset.confirmations++;
+                }});
+            """
+        elif transition == "foreign":
+            transition_script = "location.href = 'https://foreign.invalid/twrbc-home';"
+        elif transition == "dialog":
+            transition_script += "alert('synthetic blocked dialog');"
+        elif transition == "never":
+            transition_script = ""
+        page.set_content("""
+            <input formcontrolname="custIxd">
+            <input formcontrolname="userIxd">
+            <input formcontrolname="pxd">
+            <a class="btn_submit">登入</a>
+            <div class="modal show" id="duplicate" hidden>
+              確認訊息<br>前次工作階段仍存在<br><button>確認登入</button>
+            </div>
+            <script>
+              document.body.dataset.submits = '0';
+              document.body.dataset.confirmations = '0';
+              document.querySelector('.btn_submit').onclick = () => {
+                document.body.dataset.submits++;
+                duplicate.hidden = false;
+              };
+              duplicate.querySelector('button').onclick = () => {
+                document.body.dataset.confirmations++;
+                duplicate.hidden = true;
+                setTimeout(() => {
+                  TRANSITION
+                }, 3500);
+              };
+            </script>
+        """.replace("TRANSITION", transition_script))
+        crawler = _crawler()
+        del crawler._credential_origin_allowed  # Exercise the real origin guard.
+        crawler.creds = ctbc_module.CtbcCreds(national_id="TEST-ID", user_code="TEST-USER", password="TEST-PASSWORD")
+        monkeypatch.setattr(crawler, "_enforce_session_freshness", lambda: None)
+        monkeypatch.setattr(crawler, "_build_fetch_kwargs", lambda: {})
+        monkeypatch.setattr(crawler, "prepare_login_page", lambda _page: None)
+        monkeypatch.setattr(crawler, "_execute_browser_flow", lambda *args, **kwargs: kwargs["page_action"](page))
+        collect = Mock(return_value=BankCollectResult(card_bill_facts_ok=False))
+        monkeypatch.setattr(crawler, "collect", collect)
+        logout = Mock(return_value=True)
+        monkeypatch.setattr(crawler, "logout", logout)
+        recovery_errors = []
+        recovery_elapsed = []
+        recover = crawler._recover_late_authentication
+
+        def record_recovery(real_page, error):
+            recovery_errors.append(error)
+            assert real_page.locator("body").get_attribute("data-submits") == "1"
+            assert real_page.locator("body").get_attribute("data-confirmations") == "1"
+            started = time.monotonic()
+            recovered = recover(real_page, error)
+            recovery_elapsed.append(time.monotonic() - started)
+            return recovered
+
+        monkeypatch.setattr(crawler, "_recover_late_authentication", record_recovery)
+        result = crawler.run(ctbc_module.BASE, headless=True)
+
+        if transition == "authenticated":
+            assert "error" not in result
+            collect.assert_called_once()
+        else:
+            assert "kind=unknown_blocker" in result["error"]
+            collect.assert_not_called()
+            logout.assert_not_called()
+        assert len(recovery_errors) == 1
+        assert len(recovery_elapsed) == 1
+        assert recovery_elapsed[0] < 25
+        if transition == "never":
+            assert recovery_elapsed[0] >= 20
+        error = recovery_errors[0]
+        assert error.outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+        assert error.outcome.rule_name is None
+        assert error.budget.credential_submissions == 1
+        assert error.budget.protocol_resubmits == error.budget.captcha_resubmits == error.budget.reloads == 0
+        if transition == "foreign":
+            assert requests == [ctbc_module.BASE, "https://foreign.invalid/twrbc-home"]
+        else:
+            assert page.locator("body").get_attribute("data-submits") == "1"
+            assert page.locator("body").get_attribute("data-confirmations") == "1"
+            assert requests == [ctbc_module.BASE]
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("phase,budget,kind,rule", [
+    (CheckpointPhase.PRE_SUBMIT, LoginBudget(), CheckpointKind.UNKNOWN_BLOCKER, None),
+    (CheckpointPhase.POST_SUBMIT_SETTLE, LoginBudget(credential_submissions=1), CheckpointKind.UNKNOWN_BLOCKER, None),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=2, protocol_resubmits=1), CheckpointKind.UNKNOWN_BLOCKER, None),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1, reloads=1), CheckpointKind.UNKNOWN_BLOCKER, None),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1), CheckpointKind.UNKNOWN_BLOCKER, "ctbc-duplicate-session"),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1), CheckpointKind.UNKNOWN_BLOCKER, "ctbc-unknown-modal"),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1), CheckpointKind.EXPLICIT_LOGIN_ERROR, None),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1), CheckpointKind.OTP_REQUIRED, "ctbc-otp-required"),
+    (CheckpointPhase.POST_SUBMIT, LoginBudget(credential_submissions=1), CheckpointKind.PASSWORD_CHANGE_REQUIRED, None),
+])
+def test_late_auth_never_reopens_terminal_checkpoints(phase, budget, kind, rule) -> None:
+    error_type = LoginInteractionRequired if kind in {
+        CheckpointKind.OTP_REQUIRED, CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+    } else LoginCheckpointBlocked
+    error = error_type(budget, CheckpointOutcome(kind, rule_name=rule), phase=phase)
+    page = Mock()
+
+    assert _crawler()._recover_late_authentication(page, error) is False
+    assert page.mock_calls == []

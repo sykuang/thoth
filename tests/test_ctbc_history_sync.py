@@ -53,6 +53,43 @@ def _inventory_hit(accounts: list[str]) -> ApiHit:
     )
 
 
+def _native_envelope(body):
+    # Field names/types only from the bounded native probe; values are synthetic.
+    return {
+        **dict.fromkeys(('deviceIxd', 'trackingIxd', 'txnIxd', 'model', 'platform',
+                         'version', 'runtime', 'network', 'appVer', 'clientNo',
+                         'token', 'locale', 'fromSys', 'seed', 'deviceToken'), 'synthetic'),
+        'runtimeVer': 1, 'clientTime': 1, **body,
+    }
+
+
+def test_ctbc_inventory_accepts_exact_native_envelope():
+    hit = _inventory_hit(['acct-a'])
+    hit.req_body = _native_envelope(hit.req_body)
+    collector = ResponseCollector()
+    collector.hits.append(hit)
+    assert CtbcCrawler._validated_twd_inventory(collector, _inventory_page(collector))[1] == {'acct-a'}
+
+
+def test_ctbc_inventory_allows_native_home_to_deposit_spa_transition():
+    hit = _inventory_hit(['acct-a'])
+    page = SimpleNamespace(url=hit.request_frame_url, main_frame=hit.request_frame)
+    hit.req_body = _native_envelope(hit.req_body)
+    hit.request_frame_url = 'https://www.ctbcbank.com/twrbc/twrbc-home/qu000/010'
+    hit.request_sequence = 2
+    collector = ResponseCollector()
+    collector.hits.append(hit)
+    assert CtbcCrawler._validated_twd_inventory(collector, page)[1] == {'acct-a'}
+
+
+def test_ctbc_inventory_rejects_duplicate_matching_responses():
+    collector = ResponseCollector()
+    hit = _inventory_hit(['acct-a'])
+    collector.hits.extend([hit, hit])
+    with pytest.raises(RuntimeError, match='ctbc-twd-history-inventory'):
+        CtbcCrawler._validated_twd_inventory(collector, _inventory_page(collector))
+
+
 def _inventory_page(collector: ResponseCollector):
     hit = next(
         (
@@ -231,7 +268,7 @@ class _NativeHistoryPage:
                 "resource": "/twrbc-deposit/qu002/011",
                 "rqData": {
                     "accountId": "acct-a",
-                    "type": "search",
+                    "type": "custom",
                     "startDate": self.values["startDt"].replace("/", ""),
                     "endDate": self.values["endDt"].replace("/", ""),
                 },
@@ -257,6 +294,52 @@ class _NativeHistoryPage:
             self.collector.hits.append(ApiHit(**hit.__dict__))
 
 
+@pytest.mark.parametrize('path', ['seed', 'native', 'month'])
+def test_ctbc_history_callers_accept_native_envelope(path):
+    collector = ResponseCollector()
+    if path == 'native':
+        page = _NativeHistoryPage(collector, mutate_hit=lambda h: setattr(h, 'req_body', _native_envelope(h.req_body)))
+        assert CtbcCrawler._fetch_native_history_window(page, collector, 'acct-a', date(2026, 8, 1), date(2026, 8, 30)) == []
+    else:
+        hit = _template()
+        hit.req_body = _native_envelope(hit.req_body)
+        collector.hits.append(hit)
+        if path == 'seed':
+            assert CtbcCrawler._latest_qu002_011_hit(collector) is hit
+        else:
+            assert CtbcCrawler._fetch_qu002_011(_FetchPage(empty=True), hit.url, hit.req_body, 'acct-a', 'm0', 'Bearer synthetic') == []
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda b: b.update(extra='unexpected'), lambda b: b.pop('deviceIxd'),
+    lambda b: b.update(runtimeVer=True), lambda b: b.update(clientTime='1'),
+    lambda b: b.update(token={}), lambda b: b.update(token='x' * 16_384),
+    lambda b: b.update(rqData={'unexpected':True}),
+])
+def test_ctbc_native_inventory_envelope_remains_strict(mutation):
+    hit = _inventory_hit(['acct-a'])
+    hit.req_body = _native_envelope(hit.req_body)
+    mutation(hit.req_body)
+    collector = ResponseCollector()
+    collector.hits.append(hit)
+    with pytest.raises(RuntimeError, match='ctbc-twd-history-inventory'):
+        CtbcCrawler._validated_twd_inventory(collector, _inventory_page(collector))
+
+
+def test_ctbc_inventory_requires_fresh_request_sequence():
+    hit = _inventory_hit(['acct-a'])
+    hit.request_sequence = 1
+    collector = ResponseCollector()
+    collector.hits.append(hit)
+    with pytest.raises(RuntimeError, match='ctbc-twd-history-inventory'):
+        CtbcCrawler._validated_twd_inventory(collector, _inventory_page(collector), after_sequence=1)
+    fresh = _inventory_hit(['acct-b'])
+    fresh.request_frame = hit.request_frame
+    fresh.request_sequence = 2
+    collector.hits.append(fresh)
+    assert CtbcCrawler._validated_twd_inventory(collector, _inventory_page(collector), after_sequence=1)[1] == {'acct-b'}
+
+
 def _collector(accounts: list[str]) -> ResponseCollector:
     collector = ResponseCollector()
     setattr(collector, "auth_token", "Bearer synthetic-token")
@@ -279,6 +362,53 @@ def test_ctbc_six_month_capability_windows_are_exact():
         ("m1", date(2026, 7, 1), date(2026, 7, 31)),
         ("m0", date(2026, 8, 1), date(2026, 8, 30)),
     ]
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_ctbc_deposit_navigation_waits_for_native_hydration_and_fresh_inventory(replacement):
+    from tests.test_ctbc_login_checkpoints import _launch_browser
+
+    manager, browser = _launch_browser()
+    try:
+        page = browser.new_page()
+        home = "https://www.ctbcbank.com/twrbc/twrbc-home/qu000/010"
+        deposit = "https://www.ctbcbank.com/twrbc/twrbc-deposit/qu001/010"
+        page.route("**/*", lambda route: route.fulfill(body="<body></body>", content_type="text/html"))
+        page.goto(home)
+        page.evaluate("""replacement => {
+          window.clicks = 0;
+          setTimeout(() => {
+            const a = document.createElement('a');
+            a.className = 'link'; a.textContent = '臺幣存款';
+            a.onclick = () => { window.clicks++;
+              if (replacement) location.href = '/twrbc/twrbc-deposit/qu001/010';
+              else setTimeout(() => history.pushState({}, '', '/twrbc/twrbc-deposit/qu001/010'), 200);
+            };
+            document.body.append(a);
+          }, 200);
+        }""", replacement)
+        collector = ResponseCollector()
+        stale = _inventory_hit(["acct-a"])
+        collector.hits.append(stale)
+        original_wait = page.wait_for_timeout
+        def wait(milliseconds):
+            original_wait(milliseconds)
+            if page.url == deposit and len(collector.hits) == 1:
+                fresh = _inventory_hit(["acct-a"])
+                fresh.request_sequence = 1
+                collector.hits.append(fresh)
+        page.wait_for_timeout = wait
+        if replacement:
+            with pytest.raises(RuntimeError, match='ctbc-twd-history-inventory'):
+                CtbcCrawler.__new__(CtbcCrawler)._goto_twd_deposit(page, collector)
+            return
+        CtbcCrawler.__new__(CtbcCrawler)._goto_twd_deposit(page, collector)
+        assert page.url == deposit
+        assert page.evaluate("window.clicks") == 1
+        assert len(collector.hits) == 2
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
 
 
 def test_ctbc_inventory_requires_exact_owned_success_response():
@@ -431,6 +561,7 @@ def test_ctbc_cookie_session_uses_native_search_form(monkeypatch):
         lambda hit: setattr(hit, "main_frame_request", False),
         lambda hit: hit.req_body["rqData"].update({"extra": "unexpected"}),
         lambda hit: hit.req_body["rqData"].update(type="unexpected"),
+        lambda hit: hit.req_body["rqData"].update(type="search"),
         lambda hit: hit.req_body.update(unexpected="PRIVATE"),
     ],
 )
