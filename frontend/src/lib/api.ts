@@ -364,6 +364,61 @@ async function getOrStartBiometricReLogin(
   });
 }
 
+/** Only the anonymous probe is retryable; never wrap the sync mutation in a retry. */
+async function warmUpSync(baseUrl: string, signal: AbortSignal | null | undefined, assertActive: () => void): Promise<void> {
+  const aborted = () => signal?.reason ?? new DOMException('Aborted', 'AbortError');
+  if (signal?.aborted) throw aborted();
+  const controller = new AbortController();
+  const deadline = Date.now() + 120_000;
+  const timeoutError = new ApiError(0, { detail: '伺服器暖機超過 120 秒，未送出同步' });
+  let interrupt!: (reason: unknown) => void;
+  const interrupted = new Promise<never>((_, reject) => { interrupt = reject; });
+  const onAbort = () => {
+    controller.abort();
+    interrupt(signal?.aborted ? aborted() : timeoutError);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(onAbort, 120_000);
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    for (;;) {
+      assertActive();
+      if (signal?.aborted) throw aborted();
+      if (controller.signal.aborted || Date.now() >= deadline) throw timeoutError;
+      try {
+        const health = await Promise.race([fetch(`${baseUrl}/healthz`, {
+          method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'manual',
+          headers: { Accept: 'application/json' }, signal: controller.signal,
+        }), interrupted]);
+        if (![502, 503, 504].includes(health.status)) {
+          if (!health.ok) throw new ApiError(health.status, { detail: '伺服器尚未就緒，未送出同步' });
+          const data: unknown = await Promise.race([health.json(), interrupted]);
+          if (signal?.aborted) throw aborted();
+          if (Date.now() >= deadline) throw timeoutError;
+          if (!data || typeof data !== 'object' || !('status' in data) || data.status !== 'ok') {
+            throw new ApiError(502, { detail: '伺服器健康檢查格式錯誤，未送出同步' });
+          }
+          return;
+        }
+      } catch (error) {
+        // Expo native FetchError extends Error, unlike browser fetch's TypeError.
+        const transportError = error instanceof TypeError ||
+          (error instanceof Error && error.message.startsWith('fetch failed: '));
+        if (controller.signal.aborted || !transportError) throw error;
+      }
+      await Promise.race([
+        new Promise((resolve) => { retryTimer = setTimeout(resolve, 2000); }),
+        interrupted,
+      ]);
+    }
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(retryTimer);
+    signal?.removeEventListener('abort', onAbort);
+    controller.abort();
+  }
+}
+
 export async function api<T = unknown>(path: string, init: ApiInit = {}): Promise<T> {
   let requestAuthSessionKey = init.skipAuth ? null : currentAuthSessionKey();
   const assertRequestAuthSession = () => {
@@ -376,6 +431,18 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
     init.authRetryGuard?.();
     requestAuthSessionKey = currentAuthSessionKey();
   };
+  const baseUrl = getBaseUrl();
+  const isSync = init.method?.toUpperCase() === 'POST' && /^\/sync\/(all|account\/[^/?#]+)$/.test(path);
+  const assertSyncReady = () => {
+    if (init.signal?.aborted) throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    if (getBaseUrl() !== baseUrl) throw new ApiError(409, { detail: 'server changed during sync warmup' });
+    assertRequestAuthSession();
+  };
+  if (isSync) {
+    assertSyncReady();
+    await warmUpSync(baseUrl, init.signal, assertSyncReady);
+    assertSyncReady();
+  }
   const headers: Record<string, string> = {
     Accept: 'application/json',
     ...(init.headers as Record<string, string> | undefined),
@@ -414,7 +481,8 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
 
   let res: Response;
   try {
-    res = await fetch(`${getBaseUrl()}${path}`, {
+    if (isSync) assertSyncReady();
+    res = await fetch(`${baseUrl}${path}`, {
       ...init,
       headers,
       body: reqBody,
