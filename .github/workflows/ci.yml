@@ -52,6 +52,9 @@ jobs:
         # `uv sync` 讀 pyproject.toml 建 .venv，含 prod + dev 依賴。
         run: uv sync --all-extras --dev
 
+      - name: Install Chromium for offline browser contract tests
+        run: uv run patchright install --with-deps chromium
+
       - name: Ruff lint (informational for now — will become strict)
         # Currently informational: pre-existing WIP files have F401/F841 that
         # will be fixed in upcoming commits. Once the WIP lands, flip
