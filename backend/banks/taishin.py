@@ -208,16 +208,27 @@ class TaishinCrawler(BankCrawler):
             last_index = select["index"]
             options = select.get("options")
             if not isinstance(options, list) or any(
-                not isinstance(option, dict) or option.get("index") != index
+                not isinstance(option, dict)
+                or type(option.get("index")) is not int
+                or option["index"] != index
+                or not isinstance(option.get("text"), str)
+                or not isinstance(option.get("value"), str)
                 for index, option in enumerate(options)
             ):
                 raise RuntimeError(error)
-            pairs = [(option.get("text"), option.get("value")) for option in options]
-            if pairs == expected_periods:
-                period_selects.append(select["index"])
-                continue
-            if pairs == expected_sort:
-                sort_selects.append(select["index"])
+            matched = False
+            for expected, matches in ((expected_periods, period_selects), (expected_sort, sort_selects)):
+                if len(options) == len(expected) and all(
+                    option["text"] == text
+                    and option["value"] in ((value, "[object Object]") if value else ("",))
+                    for option, (text, value) in zip(options, expected)
+                ):
+                    matches.append((select["index"], [
+                        {**option, "identity": value}
+                        for option, (_, value) in zip(options, expected)
+                    ]))
+                    matched = True
+            if matched:
                 continue
             if len(options) == 1:
                 first = options[0]
@@ -231,29 +242,22 @@ class TaishinCrawler(BankCrawler):
             if len(options) < 2:
                 continue
             first = options[0]
-            accounts, identities, values = [], set(), set()
+            accounts, identities = [], set()
             for option in options[1:]:
                 text, value = option.get("text"), option.get("value")
                 digits = re.findall(r"(?<!\d)\d(?:[\d-]*\d)?(?!\d)", text or "")
-                matching = (
-                    [re.sub(r"\D", "", token) for token in digits
-                     if re.sub(r"\D", "", token) == value]
-                    if isinstance(value, str)
-                    else []
-                )
+                matching = [re.sub(r"\D", "", token) for token in digits
+                            if re.fullmatch(r"\d{12,14}", re.sub(r"\D", "", token))]
                 identity = matching[0] if len(matching) == 1 else ""
                 if (
-                    not isinstance(value, str)
-                    or not re.fullmatch(r"\d{12,14}", value)
-                    or identity != value
+                    not identity
+                    or value not in (identity, "[object Object]")
                     or identity in identities
-                    or value in values
                 ):
                     accounts = []
                     break
                 identities.add(identity)
-                values.add(value)
-                accounts.append({"index": option["index"], "identity": identity, "value": value})
+                accounts.append({**option, "identity": identity})
             if (
                 accounts
                 and first.get("value") == ""
@@ -265,23 +269,59 @@ class TaishinCrawler(BankCrawler):
         account_select, accounts = account_selects[0]
         return {
             "account_select": account_select,
-            "period_select": period_selects[0],
-            "sort_select": sort_selects[0],
+            "period_select": period_selects[0][0],
+            "sort_select": sort_selects[0][0],
             "query_button": snapshot["query_button"],
             "accounts": accounts,
+            "periods": period_selects[0][1],
+            "sorts": sort_selects[0][1],
         }
 
     @classmethod
     def _require_history_inventory(
         cls,
         snapshot: dict,
-        expected: list[tuple[str, str]],
+        expected: dict,
     ) -> dict:
         form = cls._validate_history_form(snapshot)
-        actual = [(item["identity"], item["value"]) for item in form["accounts"]]
-        if actual != expected:
+        if form != expected:
             raise RuntimeError("taishin-twd-history-inventory")
         return form
+
+    @staticmethod
+    def _history_selected_options(snapshot: dict, form: dict) -> dict:
+        selected = {}
+        for name, options, key in (
+            ("account", "accounts", "selected_identity"),
+            ("period", "periods", "selected_period"),
+            ("sort", "sorts", "selected_sort"),
+        ):
+            control = next(item for item in snapshot["selects"] if item["index"] == form[f"{name}_select"])
+            index = control.get("selected_index")
+            selected[key] = next((
+                option["identity"] for option in form[options]
+                if type(index) is int and option["index"] == index
+            ), "")
+        return selected
+
+    @classmethod
+    def _select_history_options(cls, frame, form: dict, *, identity: str, period: str) -> None:
+        cls._require_history_inventory(cls._history_form_snapshot(frame), form)
+        for name, options, value in (
+            ("account", "accounts", identity), ("period", "periods", period),
+            ("sort", "sorts", "forward"),
+        ):
+            option = next((item for item in form[options] if item["identity"] == value), None)
+            if option is None:
+                raise RuntimeError("taishin-twd-history-selection")
+            # Native object-valued options share .value; only the validated index is unique.
+            frame.locator("select").nth(form[f"{name}_select"]).select_option(index=option["index"])
+        snapshot = cls._history_form_snapshot(frame)
+        cls._require_history_inventory(snapshot, form)
+        if cls._history_selected_options(snapshot, form) != {
+            "selected_identity": identity, "selected_period": period, "selected_sort": "forward",
+        }:
+            raise RuntimeError("taishin-twd-history-selection")
 
     def _require_history_network_quiescence(
         self,
@@ -290,7 +330,6 @@ class TaishinCrawler(BankCrawler):
         *,
         submitted_frame,
         boundary: int,
-        request_sequence: int,
         issued_count: int,
     ):
         matching = []
@@ -305,8 +344,7 @@ class TaishinCrawler(BankCrawler):
                 == "/TIBNetBank/svc/web1/rb0102/query"
             ]
             if (
-                collector.request_sequence != request_sequence
-                or collector.issued_count("query") != issued_count
+                collector.issued_count("/TIBNetBank/svc/web1/rb0102/query") != issued_count
                 or len(matching) != 1
             ):
                 raise RuntimeError("taishin-twd-history-response")
@@ -802,9 +840,7 @@ class TaishinCrawler(BankCrawler):
             raise RuntimeError("taishin-twd-history-frame")
         return matches[0]
 
-    @staticmethod
-    def _history_form_snapshot(frame) -> dict:
-        return frame.evaluate(r"""() => {
+    _HISTORY_FORM_JS = r"""() => {
             const visible = el => {
                 if (!el || el.hidden || (el.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
                 for (let p = el; p; p = p.parentElement) {
@@ -825,6 +861,7 @@ class TaishinCrawler(BankCrawler):
                 query_button: queryButtons.length === 1 ? queryButtons[0].index : -1,
                 selects: selects.map(item => ({
                     index: item.index,
+                    selected_index: item.select.selectedIndex,
                     options: [...item.select.options].map((option, optionIndex) => ({
                         index: optionIndex,
                         text: (option.textContent || '').replace(/\s+/g, ' ').trim(),
@@ -832,11 +869,15 @@ class TaishinCrawler(BankCrawler):
                     })),
                 })),
             };
-        }""")
+        }"""
 
-    @staticmethod
-    def _history_result_snapshot(frame) -> dict:
-        return frame.evaluate(r"""() => {
+    @classmethod
+    def _history_form_snapshot(cls, frame) -> dict:
+        return frame.evaluate(cls._HISTORY_FORM_JS)
+
+    @classmethod
+    def _history_result_snapshot(cls, frame, *, expected_form: dict | None = None) -> dict:
+        snapshot = frame.evaluate("() => { const form = (" + cls._HISTORY_FORM_JS + r""")();
             const visible = el => {
                 if (!el || el.hidden || (el.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
                 for (let p = el; p; p = p.parentElement) {
@@ -849,16 +890,7 @@ class TaishinCrawler(BankCrawler):
                 return box.width > 0 && box.height > 0;
             };
             const norm = value => (value || '').replace(/\s+/g, ' ').trim();
-            const selects = [...document.querySelectorAll('select')].filter(visible);
-            const byOptions = labels => selects.find(select => {
-                const texts = [...select.options].map(option => norm(option.textContent));
-                return labels.every(label => texts.includes(label));
-            });
-            const accountSelect = selects.find(select =>
-                [...select.options].some(option => /^\d(?:[\d-]*\d)?(?:\s|$)/.test(norm(option.textContent)))
-            );
-            const periodSelect = byOptions(['7天', '12個月', '申請查詢逾一年以上']);
-            const sortSelect = byOptions(['由新到舊', '由舊到新']);
+
             const tables = [...document.querySelectorAll('#savingAccountTransactionTable')].filter(visible);
             const table = tables.length === 1 ? tables[0] : null;
             let container = table && table.parentElement;
@@ -893,9 +925,7 @@ class TaishinCrawler(BankCrawler):
                 quiet_ms: mutation?.count ? Math.max(0, Date.now() - mutation.last) : 0,
                 route_bound: /^#\/RB0102\/0100(?:\?ts=\d+)?$/.test(location.hash),
                 result_scope_bound: Boolean(resultRoot),
-                selected_identity: accountSelect ? accountSelect.value : '',
-                selected_period: periodSelect ? periodSelect.value : '',
-                selected_sort: sortSelect ? sortSelect.value : '',
+                form,
                 busy_count: [...document.querySelectorAll(
                     "[aria-busy='true'], [role='progressbar'], .loading, .loader, .spinner"
                 )].filter(visible).length,
@@ -918,6 +948,20 @@ class TaishinCrawler(BankCrawler):
                 no_result_count: noResults.length,
             };
         }""")
+        raw_form = snapshot.pop("form")
+        try:
+            form = (
+                cls._require_history_inventory(raw_form, expected_form)
+                if expected_form is not None else cls._validate_history_form(raw_form)
+            )
+        except RuntimeError:
+            if expected_form is not None:
+                raise
+            # Structural snapshots remain usable, but no identity is trusted without the full form.
+            snapshot.update(selected_identity="", selected_period="", selected_sort="")
+        else:
+            snapshot.update(cls._history_selected_options(raw_form, form))
+        return snapshot
 
     def _collect_attested_twd_history(
         self,
@@ -944,16 +988,14 @@ class TaishinCrawler(BankCrawler):
                 inventory_signature = None
                 inventory_stable_count = 0
                 continue
-            current_signature = [
-                (item["identity"], item["value"]) for item in current_form["accounts"]
-            ]
+            current_signature = current_form
             if current_signature == inventory_signature:
                 inventory_stable_count += 1
             else:
                 inventory_signature = current_signature
                 inventory_stable_count = 0
             form = current_form
-            if inventory_stable_count >= 2 and current_signature:
+            if inventory_stable_count >= 2 and current_form["accounts"]:
                 break
         if form is None or inventory_stable_count < 2:
             raise RuntimeError("taishin-twd-history-form")
@@ -974,7 +1016,7 @@ class TaishinCrawler(BankCrawler):
                 raise RuntimeError("taishin-twd-history-empty-inventory")
         results, expected, receipts = [], [], []
         response_bytes = 0
-        inventory_signature = [(item["identity"], item["value"]) for item in inventory]
+        inventory_signature = form
 
         for position, account in enumerate(inventory):
             if position:
@@ -986,36 +1028,47 @@ class TaishinCrawler(BankCrawler):
                         form = self._validate_history_form(self._history_form_snapshot(frame))
                     except RuntimeError:
                         continue
-                    if [(item["identity"], item["value"]) for item in form["accounts"]] == inventory_signature:
+                    if form == inventory_signature:
                         break
                 else:
                     raise RuntimeError("taishin-twd-history-inventory")
             window = self._history_window(account["identity"], as_of)
-            selects = frame.locator("select")
-            selects.nth(form["account_select"]).select_option(value=account["value"])
-            selects.nth(form["period_select"]).select_option(value=window["period"])
-            selects.nth(form["sort_select"]).select_option(value="forward")
-            selected = frame.evaluate("""indices => indices.map(index =>
-                [...document.querySelectorAll('select')][index].value
-            )""", [form["account_select"], form["period_select"], form["sort_select"]])
-            if selected != [account["value"], window["period"], "forward"]:
-                raise RuntimeError("taishin-twd-history-selection")
+            self._select_history_options(
+                frame, form, identity=account["identity"], period=window["period"],
+            )
 
-            before_result = self._history_result_snapshot(frame)
-            if (
-                before_result["table_count"] != 0
-                or before_result["no_result_count"] != 0
-                or before_result["busy_count"] != 0
-                or before_result["dialog_count"] != 0
-                or before_result["error_count"] != 0
-            ):
-                raise RuntimeError("taishin-twd-history-stale-before-query")
+            # Selection can briefly show a loader before any history submission.
+            for attempt in range(21):
+                if self._history_frame(page) is not frame:
+                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                before_result = self._history_result_snapshot(frame, expected_form=inventory_signature)
+                if any(type(before_result.get(key)) is not int or before_result[key] != 0
+                       for key in ('table_count', 'no_result_count', 'dialog_count', 'error_count')):
+                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                busy = before_result.get('busy_count')
+                if type(busy) is not int or busy < 0:
+                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                if busy == 0:
+                    break
+                if attempt == 20:
+                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                page.wait_for_timeout(500)
             frame.evaluate("""() => {
                 window.__thothTaishinHistoryObserver?.disconnect();
                 const state = {count: 0, last: 0};
                 window.__thothTaishinHistoryMutation = state;
+                const selector = '#savingAccountTransactionTable, ._section_inquiry-result--noresult, ._table_more';
                 window.__thothTaishinHistoryObserver = new MutationObserver(records => {
-                    state.count += records.length;
+                    // Watch insertion/removal too: the result need not exist before query.
+                    const relevant = records.filter(record => {
+                        const target = record.target.nodeType === Node.ELEMENT_NODE
+                            ? record.target : record.target.parentElement;
+                        return target?.closest(selector) || [...record.addedNodes, ...record.removedNodes]
+                            .some(node => node.nodeType === Node.ELEMENT_NODE &&
+                                (node.matches(selector) || node.querySelector(selector)));
+                    });
+                    if (!relevant.length) return;
+                    state.count += relevant.length;
                     state.last = Date.now();
                 });
                 window.__thothTaishinHistoryObserver.observe(document.body, {
@@ -1023,7 +1076,7 @@ class TaishinCrawler(BankCrawler):
                 });
             }""")
             boundary = collector.request_sequence
-            issued_before = collector.issued_count("query")
+            issued_before = collector.issued_count("/TIBNetBank/svc/web1/rb0102/query")
             query = frame.locator("input[value='查詢']")
             if query.count() <= form["query_button"]:
                 raise RuntimeError("taishin-twd-history-query")
@@ -1056,7 +1109,7 @@ class TaishinCrawler(BankCrawler):
             for _ in range(min(response["row_count"] + 2, 10_002)):
                 if self._history_frame(page) is not submitted_frame:
                     raise RuntimeError("taishin-twd-history-frame")
-                snapshot = self._history_result_snapshot(frame)
+                snapshot = self._history_result_snapshot(frame, expected_form=inventory_signature)
                 if snapshot["more_button_count"] == 0:
                     break
                 before = len(snapshot["rows"])
@@ -1065,7 +1118,7 @@ class TaishinCrawler(BankCrawler):
                     raise RuntimeError("taishin-twd-history-pagination")
                 buttons.nth(0).click(timeout=5000)
                 page.wait_for_timeout(300)
-                if len(self._history_result_snapshot(frame)["rows"]) <= before:
+                if len(self._history_result_snapshot(frame, expected_form=inventory_signature)["rows"]) <= before:
                     raise RuntimeError("taishin-twd-history-pagination")
             else:
                 raise RuntimeError("taishin-twd-history-pagination")
@@ -1077,7 +1130,7 @@ class TaishinCrawler(BankCrawler):
                 frame = self._history_frame(page)
                 if frame is not submitted_frame:
                     raise RuntimeError("taishin-twd-history-frame")
-                snapshot = self._history_result_snapshot(frame)
+                snapshot = self._history_result_snapshot(frame, expected_form=inventory_signature)
                 signature = repr({**snapshot, "evidence_fresh": False, "quiet_ms": 0})
                 if signature == stable and snapshot["busy_count"] == 0:
                     stable_count += 1
@@ -1100,19 +1153,18 @@ class TaishinCrawler(BankCrawler):
                 if hit.request_sequence > boundary
                 and urlparse(hit.raw_url or hit.url).path == "/TIBNetBank/svc/web1/rb0102/query"
             ]
-            if len(matching) != 1 or collector.issued_count("query") != issued_before + 1:
+            if len(matching) != 1 or collector.issued_count("/TIBNetBank/svc/web1/rb0102/query") != issued_before + 1:
                 raise RuntimeError("taishin-twd-history-response")
             quiescent_hit = self._require_history_network_quiescence(
                 page,
                 collector,
                 submitted_frame=submitted_frame,
                 boundary=boundary,
-                request_sequence=collector.request_sequence,
                 issued_count=issued_before + 1,
             )
             if quiescent_hit is not matching[0]:
                 raise RuntimeError("taishin-twd-history-response")
-            snapshot = self._history_result_snapshot(submitted_frame)
+            snapshot = self._history_result_snapshot(submitted_frame, expected_form=inventory_signature)
             snapshot["evidence_fresh"] = True
             submitted_frame.evaluate("window.__thothTaishinHistoryObserver?.disconnect()")
             self._require_history_inventory(

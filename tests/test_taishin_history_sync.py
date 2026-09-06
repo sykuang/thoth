@@ -122,7 +122,8 @@ def _form_snapshot() -> dict:
     }
 
 
-def test_taishin_form_snapshot_returns_absolute_visible_control_indexes() -> None:
+@pytest.mark.parametrize("object_values", [False, True])
+def test_taishin_form_snapshot_returns_absolute_visible_control_indexes(object_values) -> None:
     from patchright.sync_api import sync_playwright
 
     manager = sync_playwright()
@@ -133,6 +134,15 @@ def test_taishin_form_snapshot_returns_absolute_visible_control_indexes() -> Non
     browser = playwright.chromium.launch(headless=True)
     page = browser.new_page()
     try:
+        source = _form_snapshot()
+        source["selects"][1]["options"].append({
+            "index": 2, "text": "987-65-432109-8-76 Second", "value": "98765432109876",
+        })
+        if object_values:
+            for select in source["selects"][1:]:
+                for option in select["options"]:
+                    if option["value"]:
+                        option["value"] = "[object Object]"
         page.set_content("<main></main>")
         page.evaluate("""snapshot => {
             for (const opacity of ['0', '1']) {
@@ -153,10 +163,48 @@ def test_taishin_form_snapshot_returns_absolute_visible_control_indexes() -> Non
                 root.appendChild(query);
                 document.body.appendChild(root);
             }
-        }""", _form_snapshot())
+        }""", source)
         form = TaishinCrawler._validate_history_form(
             TaishinCrawler._history_form_snapshot(page.main_frame),
         )
+        for period in form["periods"][1:8]:
+            TaishinCrawler._select_history_options(
+                page.main_frame, form, identity="98765432109876", period=period["identity"],
+            )
+            assert page.evaluate("[...document.querySelectorAll('select')].map(s => s.selectedIndex)") == [
+                0, 0, 0, 2, period["index"], 0,
+            ]
+            state = TaishinCrawler._history_result_snapshot(page.main_frame, expected_form=form)
+            assert [state[key] for key in ("selected_identity", "selected_period", "selected_sort")] == [
+                "98765432109876", period["identity"], "forward",
+            ]
+        page.evaluate("""() => {
+            const selects = document.querySelectorAll('select');
+            selects[5].onchange = () => { selects[4].selectedIndex = 1; };
+        }""")
+        with pytest.raises(RuntimeError, match="taishin-twd-history-selection"):
+            TaishinCrawler._select_history_options(
+                page.main_frame, form, identity="98765432109876", period="12_months",
+            )
+        page.evaluate("document.querySelectorAll('select')[5].onchange = null")
+        TaishinCrawler._select_history_options(
+            page.main_frame, form, identity="98765432109876", period="12_months",
+        )
+        # A valid replacement native value still violates the bound original inventory.
+        page.evaluate("""value => {
+            document.querySelectorAll('select')[3].options[2].value = value;
+        }""", "98765432109876" if object_values else "[object Object]")
+        with pytest.raises(RuntimeError, match="taishin-twd-history-inventory"):
+            TaishinCrawler._history_result_snapshot(page.main_frame, expected_form=form)
+        page.evaluate("""value => {
+            document.querySelectorAll('select')[3].options[2].value = value;
+        }""", "[object Object]" if object_values else "98765432109876")
+        # Selected label/value remain plausible; another option invalidates the complete inventory.
+        page.evaluate("document.querySelectorAll('select')[4].options[9].textContent = 'unknown'")
+        state = TaishinCrawler._history_result_snapshot(page.main_frame)
+        assert state["selected_identity"] == state["selected_period"] == state["selected_sort"] == ""
+        with pytest.raises(RuntimeError, match="taishin-twd-history-form"):
+            TaishinCrawler._history_result_snapshot(page.main_frame, expected_form=form)
     finally:
         browser.close()
         manager.__exit__(None, None, None)
@@ -304,12 +352,15 @@ def test_taishin_empty_account_inventory_emits_and_persists_explicit_coverage(
 
 
 def test_taishin_inventory_finds_semantic_controls_and_canonical_account() -> None:
-    assert TaishinCrawler._validate_history_form(_form_snapshot()) == {
+    snapshot = _form_snapshot()
+    assert TaishinCrawler._validate_history_form(snapshot) == {
         "account_select": 1,
         "period_select": 2,
         "sort_select": 3,
         "query_button": 0,
-        "accounts": [{"index": 1, "identity": ACCOUNT, "value": ACCOUNT}],
+        "accounts": [{**snapshot["selects"][1]["options"][1], "identity": ACCOUNT}],
+        "periods": [{**option, "identity": option["value"]} for option in snapshot["selects"][2]["options"]],
+        "sorts": [{**option, "identity": option["value"]} for option in snapshot["selects"][3]["options"]],
     }
 
 
@@ -324,8 +375,42 @@ def test_taishin_inventory_recheck_rejects_late_account() -> None:
     with pytest.raises(RuntimeError, match="taishin-twd-history-inventory"):
         TaishinCrawler._require_history_inventory(
             snapshot,
-            [(ACCOUNT, ACCOUNT)],
+            TaishinCrawler._validate_history_form(_form_snapshot()),
         )
+
+
+@pytest.mark.parametrize("select_index", [1, 2, 3])
+@pytest.mark.parametrize("value", ["[object object]", " [object Object]", "[object Object] ", "object:1", "", "wrong", {}])
+def test_taishin_inventory_rejects_unknown_native_option_values(select_index, value) -> None:
+    snapshot = _form_snapshot()
+    snapshot["selects"][select_index]["options"][1]["value"] = value
+    with pytest.raises(RuntimeError, match="taishin-twd-history-form"):
+        TaishinCrawler._validate_history_form(snapshot)
+
+
+@pytest.mark.parametrize("text", ["nickname", "01234567890", "012345678901234", f"{ACCOUNT} 98765432109876", f"{ACCOUNT} {ACCOUNT}"])
+def test_taishin_object_value_requires_unique_account_label_token(text) -> None:
+    snapshot = _form_snapshot()
+    snapshot["selects"][1]["options"][1].update(text=text, value="[object Object]")
+    with pytest.raises(RuntimeError, match="taishin-twd-history-form"):
+        TaishinCrawler._validate_history_form(snapshot)
+
+
+@pytest.mark.parametrize("change", ["account_label", "control_index", "query_index", "native_value"])
+def test_taishin_inventory_binds_labels_native_values_and_absolute_indexes(change) -> None:
+    snapshot = _form_snapshot()
+    expected = TaishinCrawler._validate_history_form(snapshot)
+    if change == "account_label":
+        snapshot["selects"][1]["options"][1]["text"] += " changed"
+    elif change == "control_index":
+        for select in snapshot["selects"]:
+            select["index"] += 1
+    elif change == "query_index":
+        snapshot["query_button"] += 1
+    else:
+        snapshot["selects"][2]["options"][7]["value"] = "[object Object]"
+    with pytest.raises(RuntimeError, match="taishin-twd-history-inventory"):
+        TaishinCrawler._require_history_inventory(snapshot, expected)
 
 
 def _history_hit() -> ApiHit:
@@ -529,6 +614,19 @@ def test_taishin_history_hit_rejects_disagreeing_normalized_url() -> None:
         )
 
 
+@pytest.mark.parametrize("field,value", [
+    ("account", "[object Object]"), ("account", f"{ACCOUNT} "),
+    ("start", "12_months"), ("end", "[object Object]"),
+])
+def test_taishin_history_hit_still_requires_canonical_request(field, value) -> None:
+    hit = _history_hit()
+    hit.req_body[field] = value
+    with pytest.raises(RuntimeError, match="taishin-twd-history-response"):
+        TaishinCrawler._validate_history_hit(
+            hit, identity=ACCOUNT, start=date(2025, 9, 2), end=date(2026, 9, 2), boundary=0,
+        )
+
+
 def test_taishin_history_hit_rejects_main_frame_transport() -> None:
     hit = _history_hit()
     hit.main_frame_request = True
@@ -712,42 +810,23 @@ def test_taishin_response_collector_discards_nonallowlisted_json_before_decode()
     assert collector._auth_requests == {}
 
 
-def test_taishin_response_collector_measures_actual_body_before_json_parse() -> None:
-    body = json.dumps({"padding": "x" * 5_000_001}).encode()
+def test_taishin_history_requires_size_proof_before_body_read() -> None:
     page = SimpleNamespace(main_frame=None)
     request = SimpleNamespace(
         url="https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query",
-        method="POST",
-        headers={},
-        post_data=json.dumps({"account": ACCOUNT, "start": "20250902", "end": "20260902"}),
-        frame=SimpleNamespace(page=page),
-        redirected_from=None,
+        method="POST", headers={}, post_data="{}",
+        frame=SimpleNamespace(page=page), redirected_from=None,
     )
-
-    class Response:
-        url = request.url
-        status = 200
-        headers = {
-            "content-type": "application/json",
-            "content-length": "1",
-            "content-encoding": "",
-        }
-
-        def __init__(self) -> None:
-            self.request = request
-
-        def body(self) -> bytes:
-            return body
-
-        def json(self) -> dict:
-            return json.loads(body)
-
     collector = ResponseCollector("taishinbank.com.tw")
     collector._on_request(request)
-    collector._on_response(Response())
-
+    collector._on_response(SimpleNamespace(
+        url=request.url, request=request, status=200,
+        headers={"content-type": "application/json", "content-length": "1"},
+        body=lambda: pytest.fail("missing proof must not read/replay the body"),
+        json=lambda: pytest.fail("missing proof must not parse JSON"),
+    ))
     assert len(collector.hits) == 1
-    assert collector.hits[0].body_size == len(body)
+    assert collector.hits[0].body_size == 1  # Declared only, never decoded.
     assert collector.hits[0].resp_json is None
 
 
@@ -959,6 +1038,101 @@ def test_taishin_snapshot_detects_structural_alert_and_numeric_next_control() ->
     assert snapshot["pager_count"] >= 1
 
 
+def test_taishin_result_observer_tracks_only_result_mutations_from_absent_root() -> None:
+    from patchright.sync_api import sync_playwright
+
+    # Exercise the installed production observer, not a duplicate JS implementation.
+    setup = next(
+        value for value in TaishinCrawler._collect_attested_twd_history.__code__.co_consts
+        if isinstance(value, str) and "new MutationObserver" in value
+    )
+    with sync_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content('<main id="result"></main><aside id="clock">0</aside>')
+            page.evaluate(setup)
+            page.evaluate("""() => {
+                clock.firstChild.data = '1';
+                clock.textContent = '2';
+                document.body.insertAdjacentHTML('beforeend', '<aside>unrelated</aside>');
+                document.body.lastElementChild.remove();
+            }""")
+            assert page.evaluate("window.__thothTaishinHistoryMutation") == {"count": 0, "last": 0}
+            assert TaishinCrawler._history_result_snapshot(page.main_frame)["quiet_ms"] == 0
+
+            page.evaluate("""() => {
+                result.innerHTML = `<section>
+                    <table id="savingAccountTransactionTable"><tbody><tr><td>row</td></tr></tbody></table>
+                    <div class="_table_more"><span class="_table_more__nomore">沒有更多資料了</span></div>
+                </section>`;
+            }""")
+            page.wait_for_timeout(1600)
+            state = TaishinCrawler._history_result_snapshot(page.main_frame)
+            assert state["mutation_count"] > 0
+            assert state["quiet_ms"] >= 1500
+            # Same displayed text still represents a render mutation and must reset quiet time.
+            for script in (
+                "document.querySelector('td').firstChild.data = 'row'",
+                "document.querySelector('td').textContent = 'changed'",
+                "document.querySelector('tbody').insertAdjacentHTML('beforeend', '<tr><td>next</td></tr>')",
+                "document.querySelector('tbody').lastElementChild.remove()",
+                "document.querySelector('._table_more').innerHTML = '<button class=_table_more__btn>更多</button>'",
+                "document.querySelector('._table_more__btn').remove()",
+                "result.firstElementChild.remove()",
+                "result.innerHTML = '<section><div class=_section_inquiry-result--noresult>查無資料</div></section>'",
+                "document.querySelector('._section_inquiry-result--noresult').firstChild.data = '查無資料'",
+                "document.querySelector('._section_inquiry-result--noresult').remove()",
+                "result.firstElementChild.insertAdjacentHTML('beforeend', '<div class=_section_inquiry-result--noresult>查無資料</div>')",
+            ):
+                page.evaluate(script)
+                changed = TaishinCrawler._history_result_snapshot(page.main_frame)
+                assert changed["mutation_count"] > state["mutation_count"], script
+                assert changed["quiet_ms"] < 1500, script
+                state = changed
+
+            # Scoping freshness does not scope away page-level blockers or result pagers.
+            page.evaluate("""() => {
+                document.body.insertAdjacentHTML('beforeend',
+                    '<aside role="alert">資料讀取失敗</aside><div role="dialog">notice</div><div class="loading">wait</div>');
+                result.firstElementChild.insertAdjacentHTML('beforeend', '<button>2</button>');
+            }""")
+            state = TaishinCrawler._history_result_snapshot(page.main_frame)
+            assert state["error_count"] > 0
+            assert state["busy_count"] == state["dialog_count"] == state["pager_count"] == 1
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('extra_path', ['/TIBNetBank/svc/web1/rb0100/query', '/TIBNetBank/svc/heartbeat', '/TIBNetBank/svc/web1/rb0102/query'])
+def test_taishin_quiescence_counts_only_history_requests(monkeypatch, extra_path):
+    collector = ResponseCollector('taishinbank.com.tw')
+    frame = SimpleNamespace(url='https://my.taishinbank.com.tw/TIBNetBank/svc/rwd/')
+    sent = []
+    def request(path):
+        req = SimpleNamespace(url='https://my.taishinbank.com.tw'+path, method='POST', headers={}, post_data='{}', frame=frame)
+        sent.append(req)
+        collector._on_request(req)
+    request('/TIBNetBank/svc/web1/rb0102/query')
+    hit = _history_hit()
+    hit.request_sequence = collector.request_sequence
+    collector.hits.append(hit)
+    def wait(_ms):
+        if len(sent) == 1:
+            request(extra_path)
+    page = SimpleNamespace(wait_for_timeout=wait)
+    crawler = _crawler()
+    monkeypatch.setattr(crawler, '_history_frame', lambda _page: frame)
+    args = dict(submitted_frame=frame, boundary=0, issued_count=1)
+    if extra_path.endswith('/rb0102/query'):
+        with pytest.raises(RuntimeError, match='taishin-twd-history-response'):
+            crawler._require_history_network_quiescence(page, collector, **args)
+    else:
+        assert crawler._require_history_network_quiescence(page, collector, **args) is hit
+
+
 def test_taishin_network_quiescence_rejects_delayed_duplicate(monkeypatch) -> None:
     frame = object()
     hit = _history_hit()
@@ -985,7 +1159,7 @@ def test_taishin_network_quiescence_rejects_delayed_duplicate(monkeypatch) -> No
     with pytest.raises(RuntimeError, match="taishin-twd-history-response"):
         crawler._require_history_network_quiescence(
             Page(), collector, submitted_frame=frame,
-            boundary=4, request_sequence=5, issued_count=1,
+            boundary=4, issued_count=1,
         )
 
 
@@ -1200,8 +1374,23 @@ def test_taishin_result_snapshot_rejects_same_count_stale_dom() -> None:
         )
 
 
+def test_taishin_real_history_allows_independent_balance_refresh(monkeypatch):
+    test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
+        monkeypatch, True, False, background_refresh=True,
+    )
+
+
+@pytest.mark.parametrize('state', ['transient', 'stuck', 'error'])
+def test_taishin_prequery_busy_wait_never_retries_submission(monkeypatch, state):
+    test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
+        monkeypatch, True, False, prequery_state=state,
+    )
+
+
+@pytest.mark.parametrize("object_values", [False, True])
+@pytest.mark.parametrize("outside_ticker", [False, True])
 def test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
-    monkeypatch,
+    monkeypatch, object_values, outside_ticker, prequery_state='clear', background_refresh=False,
 ) -> None:
     from patchright.sync_api import sync_playwright
 
@@ -1229,7 +1418,23 @@ def test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
     <select id="sort"><option value="forward">由新到舊</option><option value="reverse">由舊到新</option></select>
     <input id="query" type="button" value="查詢">
     <div id="result"></div>
+    <aside id="clock">0</aside>
     <script>
+    if ({json.dumps(outside_ticker)}) {{
+      setInterval(() => {{
+        const tick = Number(clock.textContent) + 1;
+        if (tick % 2) clock.firstChild.data = String(tick);
+        else clock.textContent = String(tick);
+      }}, 100);
+    }}
+    // Native values need not be the framework's submitted account value.
+    for (const select of [account, period, sort]) {{
+      for (const option of select.options) {{
+        option.dataset.canonical = option.value;
+        if ({json.dumps(object_values)} && option.value) option.value = '[object Object]';
+      }}
+    }}
+    sort.selectedIndex = 1;
     const stale = document.createElement('div');
     stale.style.opacity = '0';
     for (const node of [account, period, sort, query]) {{
@@ -1238,12 +1443,22 @@ def test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
       stale.appendChild(clone);
     }}
     document.body.prepend(stale);
+    account.onchange = () => {{
+      const mode = {json.dumps(prequery_state)};
+      if (mode === 'clear') return;
+      const marker = document.createElement('div');
+      marker.className = mode === 'error' ? 'error' : 'loading';
+      marker.textContent = mode === 'error' ? '系統錯誤' : '載入中';
+      document.body.append(marker);
+      if (mode === 'transient') setTimeout(() => marker.remove(), 1200);
+    }};
     query.onclick = async () => {{
       const response = await fetch('/TIBNetBank/svc/web1/rb0102/query', {{
         method: 'POST', headers: {{'content-type': 'application/json'}},
-        body: JSON.stringify({{account: account.value, start: '20250902', end: '20260902'}})
+        body: JSON.stringify({{account: account.selectedOptions[0].dataset.canonical, start: '20250902', end: '20260902'}})
       }});
       await response.json();
+      if ({json.dumps(background_refresh)}) setTimeout(() => fetch('/TIBNetBank/svc/web1/rb0100/query', {{method:'POST', body:'{{}}'}}), 2500);
       result.innerHTML = `<h2>交易明細</h2>
         <table id="savingAccountTransactionTable"><thead><tr>
           <th>交易日</th><th>帳務日</th><th>摘要</th><th>金額</th><th>餘額</th><th>備註</th><th></th>
@@ -1269,6 +1484,8 @@ def test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
                     }]},
                 }),
             )
+        elif route.request.url.endswith('/rb0100/query'):
+            route.fulfill(content_type='application/json', body='{}')
         elif route.request.url.endswith("/svc/rwd/index.html"):
             route.fulfill(
                 status=200,
@@ -1289,9 +1506,31 @@ def test_taishin_collects_attested_history_from_exact_response_and_fresh_dom(
     crawler = _crawler()
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
     try:
+        if prequery_state in {'stuck', 'error'}:
+            with pytest.raises(RuntimeError, match='taishin-twd-history-stale-before-query'):
+                crawler._collect_attested_twd_history(page, collector, as_of=date(2026, 9, 2))
+            assert collector.issued_count('query') == 0
+            return
         result = crawler._collect_attested_twd_history(
             page, collector, as_of=date(2026, 9, 2),
         )
+        frame = crawler._history_frame(page)
+        assert frame.evaluate("[account.selectedIndex, period.selectedIndex, sort.selectedIndex]") == [1, 7, 0]
+        assert frame.evaluate("[...document.querySelectorAll('select')].slice(0, 3).map(s => s.selectedIndex)") == [0, 0, 0]
+        receipt = result["twd_txn_results"][0]
+        assert receipt["snapshot"]["evidence_fresh"] is True
+        assert receipt["snapshot"]["mutation_count"] > 0
+        assert receipt["snapshot"]["quiet_ms"] >= 1500
+        if outside_ticker:
+            assert frame.evaluate("Number(clock.textContent)") > 20
+        assert receipt["transport"]["request_body"] == {
+            "account": ACCOUNT, "start": "20250902", "end": "20260902",
+        }
+        assert [receipt["snapshot"][key] for key in (
+            "selected_identity", "selected_period", "selected_sort",
+        )] == [ACCOUNT, "12_months", "forward"]
+        assert collector.issued_count("query") == (2 if background_refresh else 1)
+        assert collector.issued_count('/TIBNetBank/svc/web1/rb0102/query') == 1
     finally:
         collector.detach(page)
         browser.close()
