@@ -561,7 +561,7 @@ class SinopacCrawler(BankCrawler):
         )
 
     @classmethod
-    def _twd_inventory(
+    def _debit_inventory(
         cls, collector: ResponseCollector, *, after_sequence: int = 0,
     ) -> list[dict]:
         candidates = [
@@ -572,6 +572,25 @@ class SinopacCrawler(BankCrawler):
         if len(candidates) != 1:
             raise RuntimeError("sinopac-twd-history-inventory-cardinality")
         hit = candidates[0]
+        if hit.req_body not in (None, ""):
+            error = "sinopac-twd-history-inventory-envelope"
+            try:
+                form = parse_qs(
+                    hit.req_body, keep_blank_values=True, strict_parsing=True,
+                    max_num_fields=len(cls._HISTORY_FORM_KEYS),
+                ) if isinstance(hit.req_body, str) else {}
+            except ValueError:
+                raise RuntimeError(error) from None
+            date_keys = {"BusinessDate", "StartDate", "EndDate"}
+            if (
+                set(form) != cls._HISTORY_FORM_KEYS
+                or any(form[key] != [""] for key in cls._HISTORY_FORM_KEYS - date_keys)
+                or any(len(form[key]) != 1 for key in date_keys)
+            ):
+                raise RuntimeError(error)
+            dates = {key: cls._yyyymmdd(form[key][0], error) for key in date_keys}
+            if dates["StartDate"] > dates["EndDate"]:
+                raise RuntimeError(error)
         payload = hit.resp_json if hit else None
         body = payload[0] if isinstance(payload, list) and len(payload) == 1 else None
         rows = body.get("SubInfo") if isinstance(body, dict) else None
@@ -581,7 +600,6 @@ class SinopacCrawler(BankCrawler):
             or hit.request_sequence <= after_sequence
             or hit.main_frame_request is not True
             or hit.method != "POST"
-            or hit.req_body not in (None, "")
             or hit.status != 200
             or hit.redirected
             or type(hit.body_size) is not int
@@ -596,8 +614,8 @@ class SinopacCrawler(BankCrawler):
         ):
             raise RuntimeError("sinopac-twd-history-inventory-envelope")
         inventory = []
-        seen_labels: set[str] = set()
-        seen_identities: set[str] = set()
+        seen_labels: set[tuple[str, str]] = set()
+        seen_identities: set[tuple[str, str]] = set()
         for row in rows:
             if not isinstance(row, dict) or set(row) != {"DataText", "DataValue", "DisplayText"}:
                 raise RuntimeError("sinopac-twd-history-inventory-row")
@@ -607,12 +625,12 @@ class SinopacCrawler(BankCrawler):
             if (
                 not isinstance(label, str) or not label or label != label.strip()
                 or not isinstance(identity, str) or re.fullmatch(r"\d{14}", identity) is None
-                or currency != "TWD"
-                or label in seen_labels or identity in seen_identities
+                or not isinstance(currency, str) or re.fullmatch(r"[A-Z]{3}", currency) is None
+                or (label, currency) in seen_labels or (identity, currency) in seen_identities
             ):
                 raise RuntimeError("sinopac-twd-history-inventory-identity")
-            seen_labels.add(label)
-            seen_identities.add(identity)
+            seen_labels.add((label, currency))
+            seen_identities.add((identity, currency))
             inventory.append({"label": label, "identity": identity, "currency": currency})
         return inventory
 
@@ -703,7 +721,7 @@ class SinopacCrawler(BankCrawler):
             or params.get("BusinessDate") != [business_date]
             or not isinstance(body, dict)
             or set(body) != cls._HISTORY_RESPONSE_KEYS
-            or body.get("Header") != "SUCCESS"
+            or body.get("Header") not in {"SUCCESS", "FAIL"}
             or body.get("MaxMonth") != "3"
         ):
             raise RuntimeError(error)
@@ -716,11 +734,16 @@ class SinopacCrawler(BankCrawler):
             parsed_business_date > as_of
             or begin > start
             or response_end < end
-            or not begin <= default_begin <= default_end <= response_end
+            or not default_begin <= default_end <= as_of
             or body.get("isOBU") not in (None, "Y", "N")
         ):
             raise RuntimeError(error)
         head_info = body.get("HeadInfo")
+        if (
+            head_info is None and body.get("SubInfo") == []
+            and body.get("Message") == "查無資料" and body.get("RecordCount") is None
+        ):
+            return {"records": [], "status": "explicit_empty", "rows": 0}
         if (
             not isinstance(head_info, list)
             or len(head_info) != 9
@@ -730,27 +753,31 @@ class SinopacCrawler(BankCrawler):
                 "HeadText", "MainShow", "OrderIndex",
             } for item in head_info)
             or any(not all(isinstance(value, str) for value in item.values()) for item in head_info)
-            or [item.get("FieldKey") for item in head_info] != [
+            or {item.get("FieldKey") for item in head_info} != {
                 f"DataText{i}" for i in range(1, 10)
-            ]
+            }
         ):
             raise RuntimeError(error)
-        orders = [item["OrderIndex"] for item in head_info]
-        if orders not in (
-            [str(i) for i in range(9)],
-            [str(i) for i in range(1, 10)],
+        layout = [(item["FieldKey"], item["OrderIndex"]) for item in head_info]
+        fields = [f"DataText{i}" for i in range(1, 10)]
+        native_fields = [f"DataText{i}" for i in (1, 2, 3, 9, 4, 5, 6, 7, 8)]
+        if layout not in (
+            list(zip(fields, map(str, range(9)), strict=True)),
+            list(zip(fields, map(str, range(1, 10)), strict=True)),
+            list(zip(native_fields, ("01", "02", "03", "04", "04", "05", "06", "07", "08"), strict=True)),
         ):
             raise RuntimeError(error)
         for item in head_info:
             if (
-                item["DataAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
-                or item["HeadAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
+                item["DataAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center", "2", "3"}
+                or item["HeadAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center", "2", "3"}
                 or item["MainShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
                 or item["DetailShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
                 or not item["FieldWidth"].isdigit()
                 or not 0 <= int(item["FieldWidth"]) <= 1000
-                or not item["HeadText"].strip()
-                or len(item["HeadText"]) > 50
+                or not _plain_text(item["HeadText"])
+                or len(item["HeadText"]) > 2_000
+                or len(_plain_text(item["HeadText"])) > 50
             ):
                 raise RuntimeError(error)
         rows = body.get("SubInfo")
@@ -760,7 +787,11 @@ class SinopacCrawler(BankCrawler):
             if body.get("Message") != "查無資料" or body.get("RecordCount") is not None:
                 raise RuntimeError(error)
             return {"records": [], "status": "explicit_empty", "rows": 0}
-        if body.get("Message") not in (None, "") or body.get("RecordCount") != "0":
+        if (
+            body.get("Header") != "SUCCESS"
+            or body.get("Message") not in (None, "")
+            or body.get("RecordCount") != str(len(rows) - 1)
+        ):
             raise RuntimeError(error)
         seen_rows = set()
         for row in rows:
@@ -929,9 +960,10 @@ class SinopacCrawler(BankCrawler):
         page.wait_for_timeout(500)
         if collector.issued_count("ws_debitacct.ashx") - inventory_issued_before != 1:
             raise RuntimeError("sinopac-twd-history-inventory")
-        inventory = self._twd_inventory(
+        native_inventory = self._debit_inventory(
             collector, after_sequence=inventory_boundary,
         )
+        inventory = [item for item in native_inventory if item["currency"] == "TWD"]
         inventory_hit = collector.latest("ws_debitacct.ashx")
         inventory_body_size = getattr(inventory_hit, "body_size", None)
         if type(inventory_body_size) is not int:
@@ -942,12 +974,12 @@ class SinopacCrawler(BankCrawler):
             """() => [...document.querySelectorAll('#divDebitAccount [onclick]')]
               .map(e => e.getAttribute('onclick') || '')"""
         )
-        if not isinstance(handlers, list) or len(handlers) != len(inventory):
+        if not isinstance(handlers, list) or len(handlers) != len(native_inventory):
             raise RuntimeError("sinopac-twd-history-account-control")
         pattern = re.compile(
             r"^setDebitAccount\('([^'\r\n]*)',\s*'(\d{14})',\s*'([A-Z]{3})'\)\s*;?$"
         )
-        for handler, item in zip(handlers, inventory, strict=True):
+        for handler, item in zip(handlers, native_inventory, strict=True):
             match = pattern.fullmatch(handler) if isinstance(handler, str) else None
             if match is None or match.groups() != (
                 item["label"], item["identity"], item["currency"],
@@ -962,7 +994,9 @@ class SinopacCrawler(BankCrawler):
         expected = []
         windows_out = []
         operation_rows = 0
-        for index, item in enumerate(inventory):
+        for index, item in enumerate(native_inventory):
+            if item["currency"] != "TWD":
+                continue
             ensure_deadline()
             toggle = page.locator("#spanDebitAccount")
             if toggle.count() != 1 or not toggle.nth(0).is_visible():
@@ -973,7 +1007,7 @@ class SinopacCrawler(BankCrawler):
             visible = [
                 options.nth(i) for i in range(options.count()) if options.nth(i).is_visible()
             ]
-            if len(visible) != len(inventory):
+            if len(visible) != len(native_inventory):
                 raise RuntimeError("sinopac-twd-history-account-control")
             visible[index].click(timeout=8_000)
             page.wait_for_timeout(300)
@@ -1024,7 +1058,8 @@ class SinopacCrawler(BankCrawler):
                     """() => { window.__hermesSinopacObserver?.disconnect();
                       clearTimeout(window.__hermesSinopacObserverTimer);
                       const isEmpty=e => e?.nodeType===1 && e.children.length===0 && (e.textContent||'').trim()==='查無資料';
-                      const stale=new WeakSet([...document.querySelectorAll('body *')].filter(isEmpty));
+                      const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                      const stale=new WeakSet([...document.querySelectorAll('body *')].filter(e=>isEmpty(e)&&visible(e)));
                       const state={mutations:0,freshEmpty:false}; window.__hermesSinopacState=state;
                       window.__hermesSinopacObserver=new MutationObserver(records => {
                         state.mutations+=records.length;
@@ -1035,8 +1070,11 @@ class SinopacCrawler(BankCrawler):
                           for(const node of nodes){
                             if(node.nodeType!==1)continue;
                             const candidates=[node,...node.querySelectorAll('*')];
-                            if(candidates.some(e => isEmpty(e) &&
-                              (record.type==='characterData' || !stale.has(e)))) state.freshEmpty=true;
+                            for(const e of candidates){
+                              if(!isEmpty(e))continue;
+                              if(!visible(e)){stale.delete(e);continue;}
+                              if(record.type==='characterData' || !stale.has(e))state.freshEmpty=true;
+                            }
                           }
                         }
                       });
@@ -1095,7 +1133,8 @@ class SinopacCrawler(BankCrawler):
                     ],
                 )
                 dom_probe = r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
-                  const pagers=[...document.querySelectorAll(
+                  const scopes=document.querySelectorAll('#tr_mma'); if(scopes.length!==1)return {bound:false};
+                  const pagers=[...scopes[0].querySelectorAll(
                     '.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')]
                     .filter(e => e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
                       /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
@@ -1118,15 +1157,23 @@ class SinopacCrawler(BankCrawler):
                   const errors=notices.filter(e =>
                     (e.textContent||'').trim()!=='查無資料' || e.matches('dialog,[role=dialog],[aria-modal=true],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay]')).length + textErrors;
                   const expected=window.__hermesSinopacExpectedRows||[];
-                  const normalize=value => { const node=document.createElement('div'); node.innerHTML=String(value||'');
+                  const normalize=value => { const node=document.createElement('div'); node.innerHTML=String(value||'').replace(/<br\s*\/?>/gi,' ');
                     return (node.textContent||'').replace(/\s+/g,' ').trim(); };
                   const tables=[...document.querySelectorAll('#ListingTable')];
                   if(tables.length!==1)return {tables:tables.length,rows:0,visibleRows:0,pagers,errors,visible:false,emptyMarker,freshEmpty:window.__hermesSinopacState?.freshEmpty===true,bound:expected.length===0,signature:null,mutations:window.__hermesSinopacState?.mutations||0};
-                  const table=tables[0]; const rows=[...table.querySelectorAll('tbody tr')];
-                  const bound=expected.length>0 && rows.length===expected.length*2 && expected.every((row,rowIndex) => {
-                    const cells=[...rows[rowIndex*2].querySelectorAll('td')].map(cell => normalize(cell.innerHTML));
-                    return cells.length===row.length && row.every((value,index) => {
-                      const text=normalize(value); return cells[index]===text; }); });
+                  const table=tables[0]; if(!scopes[0].contains(table))return {bound:false};
+                  const allRows=[...table.querySelectorAll(':scope > tbody > tr')];
+                  const emptyRows=allRows.filter(row => row.children.length===1 && row.children[0].matches('td') && normalize(row.innerHTML)==='查無資料');
+                  const rows=allRows.filter(row => !emptyRows.includes(row));
+                  const shapeOk=table.querySelectorAll('tbody tr').length===allRows.length && emptyRows.length<=1;
+                  const bound=shapeOk && (expected.length===0 ? rows.length===0 && emptyRows.length===1 && visible(table) && visible(emptyRows[0]) && emptyMarker :
+                    rows.length===expected.length && emptyRows.every(row=>!visible(row)) && [...expected].reverse().every((row,rowIndex) => {
+                      const cells=[...rows[rowIndex].children];
+                      if(!visible(rows[rowIndex]) || cells.length!==8 || cells.some(cell=>!cell.matches('td') || !visible(cell)))return false;
+                      const signed=normalize(row[3]).replace(/,/g,''); const amount=signed.replace(/^[+-]/,'');
+                      const projected=[normalize(row[0]),normalize(row[1]),normalize(row[2]),signed.startsWith('-')?amount:'',signed.startsWith('-')?'':amount,normalize(row[4]).replace(/,/g,''),normalize(row[6]),normalize(row[7])];
+                      return cells.every((cell,index)=>{const value=normalize(cell.innerHTML); return (index>=3&&index<=5?value.replace(/,/g,''):value)===projected[index];});
+                    }));
                   const value=table.innerHTML; let hash=2166136261;
                   for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i);hash=Math.imul(hash,16777619);}
                   return {tables:1,rows:rows.length,visibleRows:rows.filter(visible).length,
@@ -1153,7 +1200,7 @@ class SinopacCrawler(BankCrawler):
                             or dom_state.get("emptyMarker") is not False
                             or dom_state.get("freshEmpty") is not False
                             or type(dom_state.get("rows")) is not int
-                            or dom_state["rows"] != validated["rows"] * 2
+                            or dom_state["rows"] != validated["rows"]
                             or dom_state.get("visibleRows") != dom_state["rows"]
                             or not isinstance(dom_state.get("signature"), list)
                             or len(dom_state["signature"]) != 2
@@ -1163,12 +1210,18 @@ class SinopacCrawler(BankCrawler):
                     else:
                         invalid = (
                             common_invalid
-                            or dom_state.get("tables") != 0
+                            or dom_state.get("tables") not in (0, 1)
+                            or dom_state.get("visible") is not (dom_state.get("tables") == 1)
                             or dom_state.get("rows") != 0
                             or dom_state.get("visibleRows") != 0
                             or dom_state.get("emptyMarker") is not True
                             or dom_state.get("freshEmpty") is not True
-                            or dom_state.get("signature") is not None
+                            or (dom_state.get("tables") == 0 and dom_state.get("signature") is not None)
+                            or (dom_state.get("tables") == 1 and (
+                                not isinstance(dom_state.get("signature"), list)
+                                or len(dom_state["signature"]) != 2
+                                or any(type(value) is not int for value in dom_state["signature"])
+                            ))
                         )
                     if invalid:
                         stable_dom = None
@@ -1223,7 +1276,8 @@ class SinopacCrawler(BankCrawler):
         if not inventory:
             blockers = page.evaluate(
                 r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
-                  const pagers=[...document.querySelectorAll('.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')].filter(e =>
+                  const scopes=document.querySelectorAll('#tr_mma'); if(scopes.length!==1)return 1;
+                  const pagers=[...scopes[0].querySelectorAll('.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')].filter(e =>
                     e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
                     /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
                     /next|previous|prev|first|last|下一|上一|page/i.test(e.getAttribute('aria-label')||'') ||
@@ -1234,8 +1288,11 @@ class SinopacCrawler(BankCrawler):
                   const notices=[...document.querySelectorAll('dialog[open],[aria-modal=true],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay],[role=alert],[role=dialog],.alert,.error,.loading,.busy,[aria-busy=true]')].filter(visible).length;
                   const textNotices=[...document.querySelectorAll('body *')].filter(e => visible(e) &&
                     e.children.length===0 && /系統錯誤|查詢失敗|請稍後|重試|重新整理|連線中斷|disconnected|retry|error|failed/i.test((e.textContent||'').trim())).length;
-                  const tables=document.querySelectorAll('table').length;
-                  return pagers+notices+textNotices+tables; }"""
+                  const tables=[...document.querySelectorAll('#ListingTable')];
+                  const resultBlocked=tables.length>1 || tables.some(table=>!scopes[0].contains(table) ||
+                    table.querySelectorAll('tbody tr').length>1 || [...table.querySelectorAll('tbody tr')].some(row=>
+                      row.children.length!==1 || !row.children[0].matches('td') || (row.textContent||'').trim()!=='查無資料'));
+                  return pagers+notices+textNotices+Number(resultBlocked); }"""
             )
             ensure_deadline()
             if blockers != 0:

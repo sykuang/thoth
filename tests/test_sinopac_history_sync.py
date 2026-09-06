@@ -3,7 +3,6 @@ from __future__ import annotations
 from calendar import monthrange
 from copy import deepcopy
 from datetime import date, timedelta
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -239,7 +238,7 @@ def test_sinopac_inventory_is_exact_authoritative_set(mutation, guard) -> None:
     elif mutation == "duplicate":
         hit.resp_json[0]["SubInfo"].append(deepcopy(hit.resp_json[0]["SubInfo"][0]))
     elif mutation == "currency":
-        hit.resp_json[0]["SubInfo"][0]["DisplayText"] = "USD"
+        hit.resp_json[0]["SubInfo"][0]["DisplayText"] = "invalid"
     elif mutation == "identity":
         hit.resp_json[0]["SubInfo"][0]["DataValue"] = "1234"
     elif mutation == "sequence":
@@ -252,13 +251,63 @@ def test_sinopac_inventory_is_exact_authoritative_set(mutation, guard) -> None:
     collector.hits = [hit]
 
     with pytest.raises(RuntimeError, match=f"^{guard}$"):
-        SinopacCrawler._twd_inventory(collector)
+        SinopacCrawler._debit_inventory(collector)
+
+
+def test_sinopac_inventory_accepts_native_initial_form() -> None:
+    hit = _inventory_hit()
+    hit.req_body = (
+        "Acct=&AcctValue=&CurrName=&QueryType=&AcctName=&Curr=&TextType=&"
+        "BusinessDate=20260831&StartDate=20260801&EndDate=20260831"
+    )
+    collector = ResponseCollector(host_filter="sinopac.com")
+    collector.hits = [hit]
+    assert SinopacCrawler._debit_inventory(collector) == [
+        {"label": LABEL, "identity": ACCOUNT, "currency": "TWD"},
+    ]
+
+
+@pytest.mark.parametrize("change", [
+    lambda body: body + "&Acct=",
+    lambda body: body + "&extra=",
+    lambda body: body.replace("Acct=&", "Acct=selected&"),
+    lambda body: body.replace("QueryType=&", "QueryType=3&"),
+    lambda body: body.replace("StartDate=20260801", "StartDate=20260832"),
+    lambda body: body.replace("StartDate=20260801", "StartDate=20260901"),
+    lambda body: body.replace("BusinessDate=20260831", "BusinessDate="),
+    lambda body: body.replace("EndDate=20260831", "EndDate=2026-08-31"),
+    lambda body: body.replace("CurrName=&", ""),
+    lambda body: {},
+])
+def test_sinopac_inventory_rejects_unbound_initial_form(change) -> None:
+    hit = _inventory_hit()
+    hit.req_body = change(
+        "Acct=&AcctValue=&CurrName=&QueryType=&AcctName=&Curr=&TextType=&"
+        "BusinessDate=20260831&StartDate=20260801&EndDate=20260831"
+    )
+    collector = ResponseCollector(host_filter="sinopac.com")
+    collector.hits = [hit]
+    with pytest.raises(RuntimeError, match="^sinopac-twd-history-inventory-envelope$"):
+        SinopacCrawler._debit_inventory(collector)
+
+
+def test_sinopac_inventory_accepts_currency_scoped_identities() -> None:
+    hit = _inventory_hit()
+    hit.resp_json[0]["SubInfo"] = [
+        {"DataText": f"測試{currency}", "DataValue": ACCOUNT, "DisplayText": currency}
+        for currency in ("USD", "JPY", "TWD")
+    ]
+    collector = ResponseCollector("sinopac.com")
+    collector.hits = [hit]
+    assert [r["currency"] for r in SinopacCrawler._debit_inventory(collector)] == [
+        "USD", "JPY", "TWD",
+    ]
 
 
 def test_sinopac_inventory_returns_exact_live_contract() -> None:
     collector = ResponseCollector("sinopac.com")
     collector.hits = [_inventory_hit()]
-    assert SinopacCrawler._twd_inventory(collector) == [{
+    assert SinopacCrawler._debit_inventory(collector) == [{
         "label": LABEL, "identity": ACCOUNT, "currency": "TWD",
     }]
 
@@ -268,7 +317,7 @@ def test_sinopac_inventory_accepts_authoritative_empty_set() -> None:
     hit.resp_json[0]["SubInfo"] = []
     collector = ResponseCollector("sinopac.com")
     collector.hits = [hit]
-    assert SinopacCrawler._twd_inventory(collector) == []
+    assert SinopacCrawler._debit_inventory(collector) == []
 
 
 def test_sinopac_inventory_rejects_multiple_authoritative_responses() -> None:
@@ -281,7 +330,7 @@ def test_sinopac_inventory_rejects_multiple_authoritative_responses() -> None:
     with pytest.raises(
         RuntimeError, match="^sinopac-twd-history-inventory-cardinality$"
     ):
-        SinopacCrawler._twd_inventory(collector)
+        SinopacCrawler._debit_inventory(collector)
 
 
 def test_response_collector_records_non_bearer_request_issuance_sequence() -> None:
@@ -578,6 +627,74 @@ def test_sinopac_history_response_fails_closed(mutation) -> None:
         )
 
 
+def _native_head_info():
+    fields = [1, 2, 3, 9, 4, 5, 6, 7, 8]
+    orders = ["01", "02", "03", "04", "04", "05", "06", "07", "08"]
+    return [
+        {**_history_hit().resp_json[0]["HeadInfo"][field - 1],
+         "OrderIndex": order, "HeadAlign": "3" if field in (4, 9) else "2",
+         "DataAlign": "3" if field in (4, 9) else "2",
+         "MainShow": "Y" if field in (1, 3, 9) else "N",
+         "DetailShow": "N" if field in (6, 9) else "Y"}
+        for field, order in zip(fields, orders, strict=True)
+    ]
+
+
+def test_sinopac_history_accepts_native_responsive_header_layout():
+    hit = _history_hit()
+    hit.resp_json[0]["HeadInfo"] = _native_head_info()
+    hit.resp_json[0]["HeadInfo"][0]["HeadText"] = '<span class="responsive-statement-column-heading">交易日期</span>'
+    assert SinopacCrawler._validate_history_hit(
+        hit, label=LABEL, identity=ACCOUNT, currency="TWD",
+        start=date(2026, 8, 1), end=date(2026, 8, 31),
+        business_date="20260831", as_of=date(2026, 8, 31),
+    )["rows"] == 1
+
+
+def test_sinopac_history_accepts_only_explicit_empty_failure_envelope():
+    hit = _history_hit(rows=[])
+    hit.resp_json[0]["Header"] = "FAIL"
+    args: dict = dict(label=LABEL, identity=ACCOUNT, currency="TWD",
+                start=date(2026, 8, 1), end=date(2026, 8, 31),
+                business_date="20260831", as_of=date(2026, 8, 31))
+    assert SinopacCrawler._validate_history_hit(hit, **args)["status"] == "explicit_empty"
+    hit.resp_json[0]["HeadInfo"] = None
+    assert SinopacCrawler._validate_history_hit(hit, **args)["status"] == "explicit_empty"
+    for changes in ({"Message": "系統錯誤"}, {"SubInfo": [_row()]}, {"RecordCount": "0"}, {"HeadInfo": {}}):
+        changed = deepcopy(hit)
+        changed.resp_json[0].update(changes)
+        with pytest.raises(RuntimeError, match="sinopac-twd-history-response"):
+            SinopacCrawler._validate_history_hit(changed, **args)
+
+
+def test_sinopac_history_record_count_is_last_row_index():
+    hit = _history_hit(rows=[_row(), _row(when="2026/08/31<br />12:35")])
+    hit.resp_json[0]["RecordCount"] = "1"
+    assert SinopacCrawler._validate_history_hit(
+        hit, label=LABEL, identity=ACCOUNT, currency="TWD",
+        start=date(2026, 8, 1), end=date(2026, 8, 31),
+        business_date="20260831", as_of=date(2026, 8, 31),
+    )["rows"] == 2
+
+
+def test_sinopac_history_defaults_are_independent_of_requested_month() -> None:
+    hit = _history_hit(start="20250901", end="20250930", rows=[])
+    hit.resp_json[0].update(BeginDate="20250901", EndDate="20250930")
+    result = SinopacCrawler._validate_history_hit(
+        hit, label=LABEL, identity=ACCOUNT, currency="TWD",
+        start=date(2025, 9, 1), end=date(2025, 9, 30),
+        business_date="20260831", as_of=date(2026, 8, 31),
+    )
+    assert result["status"] == "explicit_empty"
+    hit.resp_json[0]["DefEndDate"] = "20260901"
+    with pytest.raises(RuntimeError, match="sinopac-twd-history-response"):
+        SinopacCrawler._validate_history_hit(
+            hit, label=LABEL, identity=ACCOUNT, currency="TWD",
+            start=date(2025, 9, 1), end=date(2025, 9, 30),
+            business_date="20260831", as_of=date(2026, 8, 31),
+        )
+
+
 def test_sinopac_history_accepts_nonempty_and_exact_empty() -> None:
     complete = SinopacCrawler._validate_history_hit(
         _history_hit(), label=LABEL, identity=ACCOUNT, currency="TWD",
@@ -598,16 +715,18 @@ def test_sinopac_history_accepts_nonempty_and_exact_empty() -> None:
     ("empty", "dom_bound"),
     [(False, True), (True, True), (False, False)],
 )
+@pytest.mark.parametrize("mixed", [False, True])
 def test_sinopac_collect_uses_native_account_date_and_query_controls(
-    monkeypatch, empty, dom_bound,
+    monkeypatch, empty, dom_bound, mixed,
 ) -> None:
     collector = ResponseCollector("sinopac.com")
     crawler = object.__new__(SinopacCrawler)
     crawler.transaction_cursors = {}
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
-    monkeypatch.setattr(crawler, "_twd_inventory", lambda _collector, **_kwargs: [{
+    native_inventory = ([{"label": "測試外幣", "identity": ACCOUNT, "currency": "USD"}] if mixed else []) + [{
         "label": LABEL, "identity": ACCOUNT, "currency": "TWD",
-    }])
+    }]
+    monkeypatch.setattr(crawler, "_debit_inventory", lambda _collector, **_kwargs: native_inventory)
     monkeypatch.setattr(
         crawler, "_history_range",
         lambda _identity, *, end, mode: (date(2026, 8, 1), date(2026, 8, 31)),
@@ -617,14 +736,15 @@ def test_sinopac_collect_uses_native_account_date_and_query_controls(
     clicks = []
 
     class Locator:
-        def __init__(self, kind):
+        def __init__(self, kind, index=0):
             self.kind = kind
+            self.index = index
 
         def count(self):
-            return 1
+            return len(native_inventory) if self.kind == "option" else 1
 
-        def nth(self, _index):
-            return self
+        def nth(self, index):
+            return Locator(self.kind, index)
 
         def is_visible(self):
             return True
@@ -634,6 +754,8 @@ def test_sinopac_collect_uses_native_account_date_and_query_controls(
 
         def click(self, **_kwargs):
             clicks.append(self.kind)
+            if self.kind == "option":
+                assert self.index == (1 if mixed else 0)
             if self.kind == "query":
                 collector._issued_endpoint_counts["ws_transdetailMerge.ashx"] = 1
                 collector.hits.append(_history_hit(
@@ -669,7 +791,11 @@ def test_sinopac_collect_uses_native_account_date_and_query_controls(
             if "__hermesSinopacExpectedRows = rows" in script:
                 return None
             if "map(e => e.getAttribute('onclick')" in script:
-                return [f"setDebitAccount('{LABEL}', '{ACCOUNT}', 'TWD')"]
+                return [
+                    "setDebitAccount('{}', '{}', '{}')".format(
+                        item["label"], item["identity"], item["currency"],
+                    ) for item in native_inventory
+                ]
             if "Object.fromEntries" in script:
                 return {
                     "Acct": LABEL,
@@ -696,8 +822,8 @@ def test_sinopac_collect_uses_native_account_date_and_query_controls(
                     }
                 return {
                     "tables": 1,
-                    "rows": 2,
-                    "visibleRows": 2,
+                    "rows": 1,
+                    "visibleRows": 1,
                     "pagers": 0,
                     "errors": 0,
                     "visible": True,
@@ -716,6 +842,8 @@ def test_sinopac_collect_uses_native_account_date_and_query_controls(
 
     result = crawler._collect_transactions(Page(), collector)
 
+    assert result["inventory"] == [native_inventory[-1]]
+    assert len(result["results"]) == 1
     assert values == {"start": "20260801", "end": "20260831"}
     assert clicks == ["toggle", "option", "query"]
     assert result["results"][0]["receipt"]["status"] == (
@@ -742,7 +870,7 @@ def test_sinopac_collect_publishes_explicit_empty_inventory_coverage(monkeypatch
             return None
 
         def evaluate(self, script):
-            return 0 if "const tables=document.querySelectorAll('table')" in script else []
+            return 0 if "return pagers+notices+textNotices+" in script else []
 
     result = crawler._collect_transactions(Page(), collector)
     domain = result["coverage"]["domains"][0]
@@ -756,7 +884,7 @@ def test_sinopac_collect_publishes_explicit_empty_inventory_coverage(monkeypatch
 
 @pytest.mark.parametrize(
     "blocker_token",
-    ["document.querySelectorAll('table')", ".modal.in", "[aria-modal=true]", "[class*=loading-overlay]"],
+    ["document.querySelectorAll('#ListingTable')", ".modal.in", "[aria-modal=true]", "[class*=loading-overlay]"],
 )
 def test_sinopac_empty_inventory_rejects_result_or_overlay_blocker(
     monkeypatch, blocker_token,
@@ -776,7 +904,7 @@ def test_sinopac_empty_inventory_rejects_result_or_overlay_blocker(
             return None
 
         def evaluate(self, script):
-            if "const tables=document.querySelectorAll('table')" in script:
+            if "return pagers+notices+textNotices+" in script:
                 return 1 if blocker_token in script else 0
             return []
 
@@ -801,7 +929,7 @@ def test_sinopac_empty_inventory_rechecks_dialog_after_dom_probe(monkeypatch) ->
             return None
 
         def evaluate(self, script):
-            if "const tables=document.querySelectorAll('table')" in script:
+            if "return pagers+notices+textNotices+" in script:
                 crawler._shared_dialog_blocked = True
                 return 0
             return []
@@ -941,12 +1069,92 @@ def test_sinopac_card_expiry_uses_canonical_year_month() -> None:
     assert sinopac_persist_module._mmyy_expired("0926", "2026-10") is True
 
 
-def test_sinopac_dom_binding_is_positional_not_substring_only() -> None:
-    source = inspect.getsource(SinopacCrawler._collect_transactions)
-    assert "cells.length===row.length" in source
-    assert "cells[index]===text" in source
-    assert "連線中斷|disconnected|retry" in source
-    assert "!e.closest('#ListingTable')" not in source
+
+def test_sinopac_zero_twd_dom_ignores_layout_but_rejects_history_rows():
+    from pathlib import Path
+    from patchright.sync_api import sync_playwright
+
+    probe = next(value for value in SinopacCrawler._collect_transactions.__code__.co_consts
+                 if isinstance(value, str) and "return pagers+notices+textNotices+" in value)
+    with sync_playwright() as pw:
+        if not Path(pw.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = pw.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content('<table><tr><td>站台版面</td></tr></table><form id="tr_mma"></form>')
+            assert page.evaluate(probe) == 0
+            page.locator("#tr_mma").evaluate('''e=>e.insertAdjacentHTML('beforeend',
+                '<table id="ListingTable"><tbody><tr hidden><td>查無資料</td></tr></tbody></table>')''')
+            assert page.evaluate(probe) == 0
+            page.locator("#ListingTable td").evaluate("e=>e.textContent='stale transaction'")
+            assert page.evaluate(probe) > 0
+        finally:
+            browser.close()
+
+
+def test_sinopac_native_dom_binds_reversed_rows_and_scoped_pagers():
+    from pathlib import Path
+    from patchright.sync_api import sync_playwright
+
+    probe = next(
+        value for value in SinopacCrawler._collect_transactions.__code__.co_consts
+        if isinstance(value, str) and "const expected=window.__hermesSinopacExpectedRows" in value
+    )
+    expected = [_row(), {
+        **_row(when="2026/08/31<br />12:35"), "DataText3": "手機轉帳",
+        "DataText4": "-20", "DataText5": "1,010",
+    }]
+    with sync_playwright() as pw:
+        if not Path(pw.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = pw.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content('''
+                <nav hidden><a onclick="redirectto('somePage')">1</a></nav>
+                <form id="tr_mma"><section class="trans-content"><span id="PrintContent">
+                <table id="ListingTable"><thead><tr><th>日期</th></tr></thead><tbody>
+                <tr><td>2026/08/31<br>12:35</td><td>2026/08/31</td><td>手機轉帳</td>
+                  <td>20</td><td></td><td>1,010</td><td>測試票號</td><td>測試備註</td></tr>
+                <tr><td>2026/08/31<br>12:34</td><td>2026/08/31</td><td>利息存入</td>
+                  <td></td><td>30</td><td>1,030</td><td>測試票號</td><td>測試備註</td></tr>
+                <tr hidden><td colspan="8">查無資料</td></tr>
+                </tbody></table></span></section></form>
+            ''')
+            page.evaluate("rows => { window.__hermesSinopacExpectedRows=rows; window.__hermesSinopacState={mutations:1,freshEmpty:false}; }", [
+                [row[f"DataText{i}"] for i in range(1, 10)] for row in expected
+            ])
+            state = page.evaluate(probe)
+            assert state["bound"] is True
+            assert state["rows"] == state["visibleRows"] == 2
+            assert state["pagers"] == state["errors"] == 0
+            page.locator("#tr_mma").evaluate("e => e.insertAdjacentHTML('beforeend','<a rel=next hidden>Next</a>')")
+            assert page.evaluate(probe)["pagers"] > 0
+            page.locator("[rel=next]").evaluate("e => e.remove()")
+            page.locator("#ListingTable").evaluate("e=>document.body.append(e)")
+            assert page.evaluate(probe)["bound"] is False
+            page.locator("#ListingTable").evaluate("e=>document.querySelector('#PrintContent').append(e)")
+            page.locator("tbody tr").nth(0).locator("td").nth(3).evaluate("e=>e.textContent='21'")
+            assert page.evaluate(probe)["bound"] is False
+            setup = next(
+                value for value in SinopacCrawler._collect_transactions.__code__.co_consts
+                if isinstance(value, str) and "window.__hermesSinopacObserver=new MutationObserver" in value
+            )
+            page.evaluate(setup)
+            page.evaluate('''() => {
+                document.querySelectorAll('tbody tr:not([hidden])').forEach(e=>e.remove());
+                document.querySelector('tbody tr[hidden]').hidden=false;
+                window.__hermesSinopacExpectedRows=[];
+            }''')
+            page.wait_for_timeout(50)
+            empty = page.evaluate(probe)
+            assert empty["bound"] is True
+            assert empty["freshEmpty"] is True
+            assert empty["tables"] == 1 and empty["rows"] == 0
+            assert empty["visible"] is True and empty["emptyMarker"] is True
+        finally:
+            browser.close()
 
 
 def test_sinopac_persistence_rejects_html_only_description(tmp_path, monkeypatch) -> None:
