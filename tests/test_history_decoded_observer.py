@@ -11,6 +11,15 @@ from patchright.sync_api import sync_playwright
 from backend.core import base
 
 
+def _append_loaded_iframe(page, url, *, replace=False):
+    with page.expect_event('frameattached', predicate=lambda frame: frame.parent_frame is page.main_frame, timeout=5000) as attached:
+        page.evaluate("arg => {if(arg.replace)document.querySelector('iframe').remove();const f=document.createElement('iframe');f.src=arg.url;document.body.append(f)}", {'url':url,'replace':replace})
+    frame = attached.value
+    frame.wait_for_url(url, wait_until='load', timeout=5000)
+    assert frame.url == url
+    return frame
+
+
 @pytest.mark.parametrize('bank,url', list(base._HISTORY_OBSERVER_URLS.items()))
 @pytest.mark.parametrize('fault', ['missing', 'rejected', 'untracked', 'invalid_length', 'mismatch', 'valid'])
 def test_declared_history_requires_observer_proof(bank, url, fault):
@@ -53,6 +62,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith('/child'):
+            time.sleep(.25)  # Expose the initial about:blank readiness race.
         body = b'<html>synthetic history</html>'
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
@@ -131,12 +142,8 @@ def test_real_gzip_collector(monkeypatch, bank, path, mode):
             page.goto(root + ('/#main' if mode == 'main_hash' else ''))
             frame = page.main_frame
             if mode in {'iframe_hash', 'iframe_duplicate'}:
-                page.evaluate("url => {let f = document.createElement('iframe'); f.src = url; document.body.append(f);}", root + '/child#history')
-                page.wait_for_function("document.querySelector('iframe').contentDocument?.readyState === 'complete'")
-                frame = page.frames[1]
-                assert frame.url == root + '/child#history'
-                page.evaluate("url => {let f = document.createElement('iframe'); f.src = url; document.body.append(f);}", root + ('/child#history' if mode == 'iframe_duplicate' else '/child#other'))
-                page.wait_for_function("document.querySelectorAll('iframe')[1].contentDocument?.readyState === 'complete'")
+                frame = _append_loaded_iframe(page, root + '/child#history')
+                _append_loaded_iframe(page, root + ('/child#history' if mode == 'iframe_duplicate' else '/child#other'))
             collector = base.ResponseCollector(bank)
             collector.attach(page)
             observer = collector._history_observer
@@ -324,10 +331,7 @@ def test_real_xhr_document_provenance(monkeypatch, iframe, change, phase):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(root)
-            if iframe:
-                page.evaluate("url => {let f=document.createElement('iframe'); f.src=url; document.body.append(f)}", root + '/child#original')
-                page.wait_for_function("document.querySelector('iframe').contentDocument?.readyState === 'complete'")
-            frame = page.frames[1] if iframe else page.main_frame
+            frame = _append_loaded_iframe(page, root + '/child#original') if iframe else page.main_frame
             original_url = frame.url
             observer = base._HistoryBodyObserver(page, root + '/history')
             observer.WAIT_SECONDS = 2
@@ -360,8 +364,7 @@ def test_real_xhr_document_provenance(monkeypatch, iframe, change, phase):
                     elif change == 'foreign':
                         frame.goto(original_url.replace('127.0.0.1', 'localhost'))
                     else:
-                        page.evaluate("url => {document.querySelector('iframe').remove(); let f=document.createElement('iframe'); f.src=url; document.body.append(f)}", original_url)
-                        page.wait_for_function("document.querySelector('iframe').contentDocument?.readyState === 'complete'")
+                        _append_loaded_iframe(page, original_url, replace=True)
                     after = document()
                     provenance.append((before['id'], before['loaderId'], after['id'], after['loaderId']))
                     server.release.set()
