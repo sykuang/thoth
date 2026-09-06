@@ -1153,8 +1153,8 @@ class FubonCrawler(BankCrawler):
         ):
             raise RuntimeError("fubon-twd-history-transport")
         snapshot = bounded_evaluate(result_frame, r"""(args) => {
-            const visible=(el)=>{const r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
-                for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0||n.hidden||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true')return false;}return true;};
+            const styleVisible=(el)=>{for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0||n.hidden||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true')return false;}return true;};
+            const visible=(el)=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0&&styleVisible(el);};
             const labels=new Set(['查無相關資料','查無交易資料']);
             const empty=[...document.querySelectorAll('*')].filter(el=>visible(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
             const headers=['帳務日期','交易時間','摘要','支出金額','存入金額','即時餘額','附註'];
@@ -1162,7 +1162,10 @@ class FubonCrawler(BankCrawler):
             const directRows=(table)=>[...table.querySelectorAll(':scope > tr,:scope > thead > tr,:scope > tbody > tr,:scope > tfoot > tr')];
             const directCells=(row)=>[...row.querySelectorAll(':scope > th,:scope > td')];
             const cellTexts=(row)=>directCells(row).map(c=>(c.textContent||'').trim().replaceAll('\u3000',''));
-            const hasHeaders=(table)=>headers.every(header=>headerText(table.textContent).includes(header));
+            const hasHeaders=(table)=>directRows(table).some(row=>{
+                const cells=directCells(row);
+                return cells.length===headers.length&&cells.every((cell,index)=>!cell.querySelector('table')&&headerText(cell.textContent)===headers[index]);
+            });
             const allCandidates=[...document.querySelectorAll('table')].filter(hasHeaders);
             const candidates=allCandidates.filter(visible);
             const hiddenGridCount=allCandidates.length-candidates.length;
@@ -1171,7 +1174,7 @@ class FubonCrawler(BankCrawler):
                 const dates=values.filter(value=>/^\*?20\d{2}\/\d{1,2}\/\d{1,2}$/.test(value));
                 return values.length===7&&dates.length===1;
             }).length;
-            const grid=candidates.length===1?candidates[0]:null, projected=[];
+            const grid=candidates.length===1?candidates[0]:null, projected=[], dataRows=new Set();
             let rawDataRowCount=0, malformedRowCount=0, hiddenRowCount=0, hiddenCellCount=0;
             if(grid){const rows=directRows(grid);
                 for(const row of rows){const cells=[...row.querySelectorAll(':scope > th,:scope > td')], values=cellTexts(row);
@@ -1182,6 +1185,11 @@ class FubonCrawler(BankCrawler):
                     rawDataRowCount++;
                     if(!visible(row)){hiddenRowCount++;continue;} const hidden=cells.filter(c=>!visible(c)).length; hiddenCellCount+=hidden;
                     if(hidden||values.length!==7||dates.length!==1){malformedRowCount++;continue;} projected.push(values);
+                    const absent=value=>value===''||value==='-';
+                    const money=value=>/^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.0{1,2})?$/.test(value);
+                    if(/^\*?20\d{2}\/\d{1,2}\/\d{1,2}$/.test(values[0])&&/^20\d{2}\/\d{1,2}\/\d{1,2} \d{1,2}:\d{2}:\d{2}$/.test(values[1])
+                        &&values[2]&&absent(values[3])!==absent(values[4])
+                        &&values.slice(3,5).every(value=>absent(value)||(money(value)&&Number(value.replaceAll(',',''))>=0))&&money(values[5]))dataRows.add(row);
                 }}
             const pagerControls=[...document.querySelectorAll('a,button,[role="button"],[rel="next"],[data-page]')].filter(el=>{
                 const raw=(el.textContent||el.value||'').trim();
@@ -1198,7 +1206,19 @@ class FubonCrawler(BankCrawler):
             const selectedIds=selected?(selected.textContent||'').match(/(?<!\d)\d{10,16}(?!\d)/g)||[]:[];
             const own=(el)=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE).map(n=>n.textContent||'').join(' ');
             const evidence=grid||(empty.length===1?empty[0]:null);
-            const text=document.body?.innerText||'';
+            // Transaction descriptions/memos are data, not operation status. Keep malformed
+            // rows in the text scan; structural error/busy nodes are checked even inside data rows.
+            // A boxless container (e.g. display:contents) can still have visible status text.
+            const statusText=el=>{
+                if(dataRows.has(el)||!styleVisible(el))return '';
+                return [...el.childNodes].map(node=>{
+                    if(node.nodeType===Node.TEXT_NODE)return node.textContent||'';
+                    if(node.nodeType!==Node.ELEMENT_NODE)return '';
+                    const value=statusText(node);
+                    return /^(?:inline|contents)/.test(getComputedStyle(node).display)?value:'\n'+value+'\n';
+                }).join('');
+            };
+            const text=document.body?statusText(document.body):'';
             const totalAdjacentToGrid=(el)=>{
                 if(!grid)return false;
                 let node=el;
@@ -1212,8 +1232,8 @@ class FubonCrawler(BankCrawler):
             const nativeTotalFound=nativeTotals.length===1;
             const totalCount=nativeTotalFound?nativeTotals[0]:(grid?rawDataRowCount:(empty.length===1?0:-1));
             const busyText=/(?:資料(?:載入|查詢|處理)中|載入中|查詢中|處理中|請稍候|請稍待|系統忙碌|system is busy|loading|processing|querying|waiting|\bbusy\b)/i.test(text);
-            const busy=busyText||[document.documentElement,...document.querySelectorAll('*')].some(el=>visible(el)&&((el.getAttribute('aria-busy')||'').toLowerCase()==='true'||(el.getAttribute('role')||'').toLowerCase()==='progressbar'||el.tagName.toLowerCase()==='progress'||/(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([el.id,el.getAttribute('class')].filter(Boolean).join(' '))));
-            const structuralErrors=[...document.querySelectorAll('.error,.errorMessage,.alert,.ui-message-error,.ui-messages-error,[role="alert"],dialog,[role="dialog"],[aria-invalid="true"]')].filter(visible);
+            const busy=busyText||[document.documentElement,...document.querySelectorAll('*')].some(el=>styleVisible(el)&&((el.getAttribute('aria-busy')||'').toLowerCase()==='true'||(el.getAttribute('role')||'').toLowerCase()==='progressbar'||el.tagName.toLowerCase()==='progress'||/(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([el.id,el.getAttribute('class')].filter(Boolean).join(' '))));
+            const structuralErrors=[...document.querySelectorAll('.error,.errorMessage,.alert,.ui-message-error,.ui-messages-error,[role="alert"],dialog,[role="dialog"],[aria-invalid="true"]')].filter(styleVisible);
             const failed=structuralErrors.length>0||/(?:錯誤|失敗|異常|逾時|失效|重新登入|請重新查詢|請稍後再試|連線中斷|連線失敗|無法處理|system error|\berror\b|timeout|expired|failed|retry|try again|disconnected)/i.test(text);
             return {href:location.href,failed,busy,documentFresh,documentReady,selectedValue:selected?.value||'',selectedIdentity:selectedIds.length===1?selectedIds[0]:'',evidenceFresh:grid?!grid.hasAttribute('data-hermes-stale-evidence'):empty.length===1&&!empty[0].hasAttribute('data-hermes-stale-evidence'),hasGrid:!!grid,gridCandidateCount:candidates.length,hiddenGridCount,hiddenGridDataRowCount,pagerNodeCount:pagerNodes.length,structuralErrorCount:structuralErrors.length,gridRows:projected,gridRowCount:projected.length,rawDataRowCount,malformedRowCount,hiddenRowCount,hiddenCellCount,totalCount,nativeTotalFound,nativeTotalMarkerCount:nativeTotalMarkers.length,gridText:grid?'structured':'',emptyMarker:empty.length===1?(empty[0].textContent||'').trim():null,pager:{present:pagerNodes.length>0,actionableNext:pagerNodes.length}};
         }""")

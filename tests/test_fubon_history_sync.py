@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 from datetime import date
+from html import escape
 import inspect
+import textwrap
 import json
 from pathlib import Path
 import subprocess
@@ -106,6 +108,245 @@ def _payload():
         ),
         "card_bill_facts_ok": False,
     }
+
+
+@pytest.fixture(scope="module")
+def fubon_dom_snapshot():
+    """Execute the collector's actual inline JS; no bank navigation or network."""
+    from patchright.sync_api import sync_playwright
+    from backend.banks.fubon import bounded_evaluate
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(FubonCrawler._collect_twd_window)))
+    sources = [
+        node.value.args[1].value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and len(node.value.args) > 1
+        and isinstance(node.value.args[1], ast.Constant)
+        and isinstance(node.value.args[1].value, str)
+        and any(isinstance(target, ast.Name) and target.id == "snapshot" for target in node.targets)
+    ]
+    assert len(sources) == 1
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(service_workers="block")
+            page.route("**/*", lambda route: route.abort())
+
+            def snapshot(*, description="利息", memo="", layout=False, mutate=None):
+                result = _result("2026-02-28", "2026-08-30", "2026-08-29")
+                row = result["snapshot"]["gridRows"][0]
+                row[2], row[6] = description, memo
+                headers = ("帳務日期", "交易時間", "摘要", "支出金額", "存入金額", "即時餘額", "附註")
+                page.set_content(
+                    '<style>td,th {min-width:20px;padding:2px}</style><form id="form1">'
+                    f'<select id="form1:comboAccount"><option value="{result["account_value"]}">'
+                    f'{ACCOUNT}</option></select><section><table id="transactions"><thead><tr>'
+                    + "".join(f"<th>{header}</th>" for header in headers)
+                    + '</tr></thead><tbody><tr id="transaction">'
+                    + "".join(f"<td>{escape(cell)}</td>" for cell in row)
+                    + '</tr></tbody></table><div id="total">共 1 筆</div></section></form>'
+                )
+                if layout:
+                    page.evaluate("""() => {
+                        const section=document.querySelector('section'), outer=document.createElement('table');
+                        section.before(outer); outer.insertRow().insertCell().append(section);
+                    }""")
+                if mutate:
+                    page.evaluate(mutate)
+                result["snapshot"] = bounded_evaluate(page, sources[0])
+                # about:blank tests DOM only; transport/URL are separate unit fixtures.
+                assert result["snapshot"].pop("href") == "about:blank"
+                return result
+
+            yield snapshot
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("header_tag", ["th", "td"])
+def test_fubon_dom_layout_table_is_not_a_duplicate_grid(fubon_dom_snapshot, header_tag):
+    baseline = fubon_dom_snapshot(description="failed retry", memo="loading")
+    result = fubon_dom_snapshot(
+        description="failed retry", memo="loading", layout=True,
+        mutate="() => {document.querySelectorAll('th').forEach(cell=>{"
+        + f"const replacement=document.createElement('{header_tag}');"
+        + "replacement.textContent=[...cell.textContent].join(' \\u3000\\n');cell.replaceWith(replacement);});}",
+    )
+    assert result["snapshot"]["gridCandidateCount"] == 1
+    assert result["snapshot"] == baseline["snapshot"]
+    assert FubonCrawler._validated_twd_history_result(result)["status"] == "complete"
+
+
+@pytest.mark.parametrize("mutate", [
+    "document.querySelector('thead tr').append(document.querySelector('th'))",
+    "document.querySelector('th').prepend('其他')",
+    "() => {const row=document.querySelector('thead tr');row.innerHTML='<td>'+row.textContent+'</td>';}",
+    "document.querySelectorAll('th').forEach(cell=>cell.innerHTML='<table><tr><td>'+cell.textContent+'</td></tr></table>')",
+])
+def test_fubon_dom_requires_exact_table_local_headers(fubon_dom_snapshot, mutate):
+    result = fubon_dom_snapshot(mutate=mutate)
+    assert result["snapshot"]["gridCandidateCount"] == 0
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(result)
+
+
+@pytest.mark.parametrize("hidden, visible_count, hidden_rows", [(False, 2, 0), (True, 1, 1)])
+def test_fubon_dom_layout_keeps_actual_duplicate_grids(fubon_dom_snapshot, hidden, visible_count, hidden_rows):
+    result = fubon_dom_snapshot(
+        layout=True,
+        mutate="() => {const grid=document.querySelector('#transactions'), clone=grid.cloneNode(true);"
+        + f"clone.hidden={json.dumps(hidden)};grid.after(clone);}}",
+    )
+    assert result["snapshot"]["gridCandidateCount"] == visible_count
+    assert result["snapshot"]["hiddenGridDataRowCount"] == hidden_rows
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(result)
+
+
+def test_fubon_dom_transaction_text_is_not_operation_status(fubon_dom_snapshot):
+    baseline = fubon_dom_snapshot()
+    assert FubonCrawler._validated_twd_history_result(baseline)["status"] == "complete"
+    result = fubon_dom_snapshot(description="failed transfer retry", memo="loading 請稍候 系統錯誤")
+    assert result["snapshot"]["failed"] is False
+    assert result["snapshot"]["busy"] is False
+    assert result["snapshot"]["gridRows"][0][2:] == [
+        "failed transfer retry", "", "5.00", "84.00", "loading 請稍候 系統錯誤",
+    ]
+    assert FubonCrawler._validated_twd_history_result(result)["status"] == "complete"
+
+
+@pytest.mark.parametrize('marker, flag', [
+    ('class="error"', 'failed'), ('role="alert"', 'failed'),
+    ('role="dialog"', 'failed'), ('aria-busy="true"', 'busy'),
+    ('class="spinner"', 'busy'),
+])
+@pytest.mark.parametrize('hidden', [False, True])
+def test_fubon_boxless_structural_blocker_without_error_keywords(fubon_dom_snapshot, marker, flag, hidden):
+    html = '<div style="display:contents" ' + marker + (' hidden' if hidden else '') + '><span>請確認</span></div>'
+    result = fubon_dom_snapshot(mutate='() => document.body.insertAdjacentHTML("beforeend", ' + json.dumps(html) + ')')
+    assert result['snapshot'][flag] is not hidden
+    if hidden:
+        assert FubonCrawler._validated_twd_history_result(result)['status'] == 'complete'
+    else:
+        with pytest.raises(RuntimeError, match='fubon-twd-history-result'):
+            FubonCrawler._validated_twd_history_result(result)
+
+
+@pytest.mark.parametrize("style", ["display:contents", "width:0;height:0;overflow:visible"])
+@pytest.mark.parametrize("marker, flag", [("failed retry", "failed"), ("loading 請稍候", "busy")])
+def test_fubon_dom_boxless_ancestors_keep_operational_text(fubon_dom_snapshot, style, marker, flag):
+    result = fubon_dom_snapshot(
+        description="failed retry", memo="loading",
+        mutate="() => {const section=document.querySelector('section');"
+        + f"section.style.cssText={json.dumps(style)};"
+        + f"section.insertAdjacentHTML('beforeend', {json.dumps('<p>' + marker + '</p>')});}}",
+    )
+    assert result["snapshot"]["gridCandidateCount"] == 1
+    assert result["snapshot"][flag] is True
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(result)
+
+
+@pytest.mark.parametrize("hidden", [
+    'style="display:none"', 'style="visibility:hidden"', 'style="visibility:collapse"',
+    'style="opacity:0"', 'hidden', 'aria-hidden="true"',
+])
+def test_fubon_dom_boxless_ancestors_ignore_hidden_status(fubon_dom_snapshot, hidden):
+    result = fubon_dom_snapshot(
+        description="failed retry", memo="loading",
+        mutate="() => {const section=document.querySelector('section');section.style.display='contents';"
+        + f"section.insertAdjacentHTML('beforeend', {json.dumps('<div ' + hidden + '><p>failed retry loading 請稍候</p></div>')});}}",
+    )
+    assert result["snapshot"]["failed"] is False
+    assert result["snapshot"]["busy"] is False
+    assert FubonCrawler._validated_twd_history_result(result)["status"] == "complete"
+
+
+@pytest.mark.parametrize("amounts", [
+    ["-", "+5.00", "84.00"],
+    ["5", "-", "-84.00"],
+    ["", "-0.00", "+1,084.00"],
+])
+def test_fubon_dom_status_exclusion_accepts_persistable_money(fubon_dom_snapshot, amounts):
+    result = fubon_dom_snapshot(
+        description="failed retry", memo="loading",
+        mutate="() => { const cells=document.querySelector('#transaction').cells;"
+        + f"{json.dumps(amounts)}.forEach((value,index)=>cells[index+3].textContent=value); }}",
+    )
+    assert result["snapshot"]["failed"] is False
+    assert result["snapshot"]["busy"] is False
+    assert FubonCrawler._validated_twd_history_result(result)["status"] == "complete"
+
+
+@pytest.mark.parametrize("mutate, flag", [
+    ("document.body.insertAdjacentHTML('beforeend', '<p>failed retry</p>')", "failed"),
+    ("document.body.insertAdjacentHTML('afterbegin', '<p>loading 請稍候</p>')", "busy"),
+    ("document.body.insertAdjacentHTML('beforeend', '<p>fail<span>ed</span></p>')", "failed"),
+    ("document.body.insertAdjacentHTML('beforeend', 'load<span>ing</span>')", "busy"),
+    ("document.querySelector('section').insertAdjacentHTML('beforeend', '<p>系統錯誤</p>')", "failed"),
+    ("document.querySelector('tbody').insertAdjacentHTML('beforeend', '<tr><td colspan=7>failed</td></tr>')", "failed"),
+    ("document.querySelector('tbody').insertAdjacentHTML('afterbegin', '<tr><td colspan=7>loading</td></tr>')", "busy"),
+    ("document.querySelector('tbody').insertAdjacentHTML('beforeend', '<tr><td>2026/08/29</td><td></td><td>failed</td><td></td><td></td><td></td><td></td></tr>')", "failed"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<span role=alert>問題</span>'", "failed"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<span class=errorMessage>問題</span>'", "failed"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<span aria-invalid=true>問題</span>'", "failed"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<dialog open>問題</dialog>'", "failed"),
+    ("document.querySelector('#transaction').setAttribute('aria-busy', 'true')", "busy"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<span role=progressbar>進行</span>'", "busy"),
+    ("document.querySelector('#transaction td:nth-child(7)').innerHTML = '<span class=spinner>進行</span>'", "busy"),
+])
+def test_fubon_dom_keeps_operational_markers_inside_and_outside_grid(fubon_dom_snapshot, mutate, flag):
+    result = fubon_dom_snapshot(description="failed transfer retry", memo="loading", mutate=mutate)
+    assert result["snapshot"][flag] is True
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(result)
+
+
+@pytest.mark.parametrize("layout", [False, True])
+@pytest.mark.parametrize("mutate", [
+    "document.querySelector('th').textContent='其他欄名'",
+    "document.querySelector('#total').textContent='共 2 筆'",
+    "document.querySelector('#total').insertAdjacentHTML('afterend', '<div>共 1 筆</div>')",
+    "document.querySelector('#total').insertAdjacentHTML('beforebegin', '<div>其他內容</div>')",
+    "document.querySelector('#transaction td').textContent='2025/01/01'",
+    "document.querySelector('option').textContent='90000000267054'",
+    "document.querySelector('option').value='012-000-90000000267054-X-TW'",
+    "document.querySelector('form').setAttribute('data-hermes-pre-submit-form','1')",
+    "document.querySelector('#transactions').setAttribute('data-hermes-stale-evidence','1')",
+    "document.querySelector('#transaction').hidden=true",
+    "document.querySelector('#transaction td:nth-child(7)').hidden=true",
+    "document.querySelector('#transaction td:nth-child(7)').remove()",
+    "document.querySelector('#transactions').insertAdjacentHTML('afterend', '<a rel=next>下一頁</a>')",
+    "document.querySelector('#transactions').insertAdjacentHTML('afterend', '<div>查無相關資料</div>')",
+    "document.querySelector('#transactions').insertAdjacentHTML('afterend', document.querySelector('#transactions').outerHTML)",
+    "() => {const clone=document.querySelector('#transactions').cloneNode(true);clone.hidden=true;document.querySelector('section').append(clone);}",
+])
+def test_fubon_dom_data_text_exclusion_preserves_attestation_guards(fubon_dom_snapshot, mutate, layout):
+    result = fubon_dom_snapshot(description="failed retry", memo="loading", layout=layout, mutate=mutate)
+    with pytest.raises(RuntimeError, match="fubon-twd-history-result"):
+        FubonCrawler._validated_twd_history_result(result)
+
+
+def test_fubon_dom_memos_survive_persistence(fubon_dom_snapshot, tmp_path, monkeypatch):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    data = _payload()
+    data["deposit_txn_results"][1] = fubon_dom_snapshot(
+        description="failed transfer retry", memo="loading 請稍候 系統錯誤",
+    )
+    store = BankStore("fubon", user_id=7, source_account_id=97)
+    try:
+        assert persist_collected("fubon", data, store)["twd_txn_new"] == 2
+        row = store.conn.execute(
+            "SELECT raw_description, memo FROM twd_transactions WHERE account_date='2026-08-29'"
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("failed transfer retry", "loading 請稍候 系統錯誤")
+        assert store.latest_twd_transaction_dates() == {ACCOUNT: date(2026, 8, 30)}
+    finally:
+        store.close()
 
 
 def test_fubon_opts_into_twd_history_only():
