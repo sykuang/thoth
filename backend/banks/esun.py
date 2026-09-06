@@ -32,6 +32,7 @@ from backend.core.base import (
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
+    _HistoryBodyObserver,
     _OriginGuardProxy,
 )
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
@@ -106,8 +107,11 @@ def _is_esun_twd_transport_url(value: str) -> bool:
 
 
 class _EsunTwdGridParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, revealed_container=None):
         super().__init__(convert_charrefs=True)
+        self.revealed_container = revealed_container
+        self.reveal_count = 0
+        self.grid_ancestors = []
         self.candidates = 0
         self.table_depth = 0
         self.rows: list[list[str]] = []
@@ -120,7 +124,7 @@ class _EsunTwdGridParser(HTMLParser):
         self.busy_nodes = 0
         self.structural_errors = 0
         self.cell_tag: str | None = None
-        self.visibility_stack: list[tuple[str, bool]] = []
+        self.visibility_stack: list[tuple] = []
         self.hidden_rows = 0
         self.hidden_grid_nodes = 0
         self.target_tags: list[str] = []
@@ -129,6 +133,13 @@ class _EsunTwdGridParser(HTMLParser):
         prior_table_depth = self.table_depth
         attributes = {key: value or "" for key, value in attrs}
         style = re.sub(r"\s+", "", attributes.get("style", "")).lower()
+        if self.revealed_container:
+            container_id = self.revealed_container.get("id")
+            if (container_id and attributes.get("id") == container_id
+                    or not container_id and attributes == self.revealed_container):
+                self.reveal_count += 1
+            if tag == "div" and attributes == self.revealed_container:
+                style = ""
         classes = set(attributes.get("class", "").lower().split())
         opacity = re.search(r"(?:^|;)opacity:([^;]+)", style)
         opacity_hidden = False
@@ -150,7 +161,7 @@ class _EsunTwdGridParser(HTMLParser):
         inherited_hidden = self.visibility_stack[-1][1] if self.visibility_stack else False
         current_hidden = own_hidden or inherited_hidden
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
-            self.visibility_stack.append((tag, current_hidden))
+            self.visibility_stack.append((tag, current_hidden, own_hidden, attributes))
         if tag in {"script", "style"}:
             self.ignored_depth += 1
         pager_meta = " ".join(
@@ -169,6 +180,7 @@ class _EsunTwdGridParser(HTMLParser):
             candidate = attributes.get("id") == "fao01002:grid_DataGridBody"
             if candidate:
                 self.candidates += 1
+                self.grid_ancestors = self.visibility_stack[:-1]
                 if current_hidden:
                     self.hidden_candidates += 1
             if self.table_depth:
@@ -247,12 +259,26 @@ class _EsunTwdGridParser(HTMLParser):
                 break
 
 
-def _parse_esun_twd_html_response(body: str) -> dict:
+def _parse_esun_twd_html_response(body: str, *, allow_initial_hidden=False) -> dict:
     if not isinstance(body, str) or not body:
         raise ValueError("invalid E.SUN TWD HTML")
     parser = _EsunTwdGridParser()
     parser.feed(body)
     parser.close()
+    revealed_container = None
+    if allow_initial_hidden and parser.candidates == 1 and parser.hidden_candidates == 1:
+        hidden = [(index, tag, attrs) for index, (tag, _, own_hidden, attrs) in enumerate(parser.grid_ancestors) if own_hidden]
+        if len(hidden) == 1:
+            index, tag, attrs = hidden[0]
+            depth = len(parser.grid_ancestors) - index
+            if (tag == "div" and len(attrs.get("id", "")) <= 128
+                    and re.sub(r"\s+", "", attrs.get("style", "")).lower().rstrip(";") == "display:none"):
+                parser = _EsunTwdGridParser(attrs)
+                parser.feed(body)
+                parser.close()
+                if parser.reveal_count != 1:
+                    raise ValueError("invalid E.SUN TWD reveal cardinality")
+                revealed_container = {"depth": depth, "attributes": {k: v for k, v in attrs.items() if k != "style"}}
     if (
         parser.candidates != 1
         or parser.hidden_candidates
@@ -271,13 +297,14 @@ def _parse_esun_twd_html_response(body: str) -> dict:
         raise ValueError("invalid E.SUN TWD state")
     date_cell = re.compile(r"\*?20\d{2}/\d{2}/\d{2}(?:\s+\d{2}:\d{2}:\d{2})?")
     total_cell = re.compile(r"(?:共|總計|總筆數|資料筆數)\s*[\d,]+\s*筆")
-    empty_labels = {"查無交易資料", "查無資料", "無交易明細"}
+    empty_labels = {"查無交易資料", "查無資料", "無交易明細", "查無符合資料！"}
     grid_rows = []
     empty_markers = []
     header_rows = 0
     allowed_headers = {
         ("交易日期/時間", "摘要", "支出", "存入", "帳戶餘額"),
         ("交易日期", "交易時間", "摘要", "支出金額", "存入金額", "帳戶餘額", "附註"),
+        ("交易日期時間", "摘要", "提", "存", "帳戶餘額", "存摺備註對方銀行代碼/帳號", "轉帳留言"),
     }
     for row in parser.rows:
         if not row or not any(row):
@@ -311,6 +338,7 @@ def _parse_esun_twd_html_response(body: str) -> dict:
     )
     total_count = totals[0] if totals else (0 if empty_markers else None)
     return {
+        **({"initialHiddenContainer": revealed_container} if revealed_container else {}),
         "hasGrid": bool(grid_rows),
         "gridCandidateCount": 1 if grid_rows else 0,
         "gridText": grid_text,
@@ -358,6 +386,12 @@ class EsunCrawler(BankCrawler):
         "esun-twd-history-account",
         "esun-twd-history-bank-date",
         "esun-twd-history-form",
+        "esun-twd-history-form-ambiguous",
+        "esun-twd-history-form-contract",
+        "esun-twd-history-form-evaluation",
+        "esun-twd-history-form-frame-url",
+        "esun-twd-history-form-missing",
+        "esun-twd-history-form-timeout",
         "esun-twd-history-inventory",
         "esun-twd-history-mode",
         "esun-twd-history-navigation",
@@ -618,9 +652,16 @@ class EsunCrawler(BankCrawler):
     @staticmethod
     def _twd_form_contract(frame) -> dict:
         contract = frame.evaluate(r"""() => {
-            const all = (selector) => [...document.querySelectorAll(selector)];
+            const accounts = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+            const form = accounts.length === 1 && accounts[0].form?.contains(accounts[0]) ? accounts[0].form : null;
+            const all = (selector) => form ? [...form.querySelectorAll(selector)] : [];
+            const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                const st = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+            };
             const controls = {
-                account: all('select[id="fao01002:dract"]'),
+                account: accounts,
                 start: all('input[id="fao01002:startDate"]'),
                 end: all('input[id="fao01002:endDate"]'),
                 action: all('input[name="fao01002:linkCommand"]'),
@@ -628,17 +669,13 @@ class EsunCrawler(BankCrawler):
                 period: all('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]'),
                 sort: all('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]'),
             };
-            const forms = [...document.querySelectorAll('form')].filter((form) =>
-                Object.values(controls).some((nodes) => nodes.some((node) => form.contains(node)))
-            );
-            const form = forms.length === 1 ? forms[0] : null;
             const query = form ? [...form.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')].filter((el) =>
-                (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim() === '查詢'
+                (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim() === '查詢' && visible(el)
             ) : [];
             let action = '';
             try { action = form ? new URL(form.getAttribute('action') || form.action, location.href).href : ''; } catch (_e) {}
             return {
-                formCount: forms.length,
+                formCount: form ? 1 : 0,
                 method: form?.method?.toUpperCase() || '',
                 action,
                 accountCount: controls.account.length,
@@ -650,8 +687,8 @@ class EsunCrawler(BankCrawler):
                 sortCount: controls.sort.length,
                 queryCount: query.length,
                 sameForm: !!form && Object.values(controls).every((nodes) =>
-                    nodes.length === 1 && form.contains(nodes[0])
-                ),
+                    nodes.length === 1 && nodes[0].form === form && form.contains(nodes[0])
+                ) && query.every((el) => !('form' in el) || el.form === form),
                 actionValue: controls.action.length === 1 ? controls.action[0].value || '' : '',
                 viewState: controls.viewState.length === 1 ? controls.viewState[0].value || '' : '',
             };
@@ -660,14 +697,17 @@ class EsunCrawler(BankCrawler):
             not isinstance(contract, dict)
             or contract.get("formCount") != 1
             or contract.get("method") != "POST"
-            or not _is_esun_twd_transport_url(contract.get("action") or "")
+            or not (
+                _is_esun_twd_transport_url(contract.get("action") or "")
+                or contract.get("action") == BASE + _ESUN_TWD_AJAX_PATH
+            )
             or any(contract.get(key) != 1 for key in (
                 "accountCount", "startCount", "endCount", "actionCount",
                 "viewStateCount", "periodCount", "sortCount", "queryCount",
             ))
             or contract.get("sameForm") is not True
             or not isinstance(contract.get("actionValue"), str)
-            or not contract["actionValue"]
+            or (not contract["actionValue"] and contract.get("action") != BASE + _ESUN_TWD_AJAX_PATH)
             or len(contract["actionValue"]) > 256
             or not isinstance(contract.get("viewState"), str)
             or not 1 <= len(contract["viewState"]) <= 8_192
@@ -685,19 +725,23 @@ class EsunCrawler(BankCrawler):
             except ValueError:
                 continue
             except Exception:
-                raise RuntimeError("esun-twd-history-form") from None
+                raise RuntimeError("esun-twd-history-form-evaluation") from None
+        if not matches:
+            raise RuntimeError("esun-twd-history-form-missing")
         if len(matches) != 1:
-            raise RuntimeError("esun-twd-history-form")
+            raise RuntimeError("esun-twd-history-form-ambiguous")
         return matches[0]
 
     @classmethod
     def _wait_for_twd_query_frame(cls, page):
-        for _ in range(100):
+        for attempt in range(100):
             try:
                 return cls._unique_twd_query_frame(page.frames)
             except RuntimeError:
                 page.wait_for_timeout(100)
-        raise RuntimeError("esun-twd-history-form")
+                if attempt == 99:
+                    raise RuntimeError("esun-twd-history-form-timeout") from None
+        raise RuntimeError("esun-twd-history-form-timeout")
 
     @staticmethod
     def _validated_twd_options(options) -> list[dict]:
@@ -754,6 +798,12 @@ class EsunCrawler(BankCrawler):
     ) -> None:
         try:
             expected_frame = _OriginGuardProxy._unwrap(expected_frame)
+            # Native JSF click adds AJAX routing and the command; the idle form does not.
+            if expected_url == BASE + _ESUN_TWD_AJAX_PATH:
+                if action_value not in ("", "fao01002:linkCommand"):
+                    return
+                expected_url += "?ajax=true"
+                action_value = "fao01002:linkCommand"
             post_data = request.post_data or ""
             fields = parse_qsl(post_data, keep_blank_values=True)
             values = lambda name: [value for key, value in fields if key == name]
@@ -782,7 +832,7 @@ class EsunCrawler(BankCrawler):
             return
 
     @staticmethod
-    def _capture_twd_response(response, hits: list[ApiHit], requests: list) -> None:
+    def _capture_twd_response(response, hits: list[ApiHit], requests: list, observer=None) -> None:
         try:
             request = response.request
             headers = response.headers
@@ -794,22 +844,52 @@ class EsunCrawler(BankCrawler):
                 and candidate.get("url") == response.url
             ]
             if (
-                len(matched_requests) != 1
+                observer is None
+                or len(matched_requests) != 1
                 or request.url != response.url
                 or request.method != "POST"
                 or not _is_esun_twd_transport_url(response.url or "")
                 or type(response.status) is not int
                 or response.status != 200
                 or content_type not in {"text/html", "application/xhtml+xml", "text/xml", "application/xml"}
-                or not isinstance(declared_size, str)
-                or not declared_size.isdigit()
-                or int(declared_size) > _ESUN_TWD_MAX_RESPONSE_BYTES
+                or (declared_size is not None and (
+                    not isinstance(declared_size, str)
+                    or not declared_size.isdigit()
+                    or int(declared_size) > _ESUN_TWD_MAX_RESPONSE_BYTES
+                ))
             ):
                 return
-            body = response.text()
-            if not isinstance(body, str) or len(body.encode("utf-8")) > _ESUN_TWD_MAX_RESPONSE_BYTES:
+            raw = observer.read(response, request.frame, request.frame.url, _ESUN_TWD_MAX_RESPONSE_BYTES, 1)
+            if not isinstance(raw, bytes) or not 1 <= len(raw) <= _ESUN_TWD_MAX_RESPONSE_BYTES:
                 return
-            snapshot = {**_parse_esun_twd_html_response(body), "evidenceFresh": True}
+            snapshot = {**_parse_esun_twd_html_response(raw.decode("utf-8"), allow_initial_hidden=True), "evidenceFresh": True}
+            if getattr(request, "is_navigation_request", lambda: False)():
+                # Chromium document request IDs are loader IDs. Require the
+                # consumed observer record AND the currently committed loader.
+                records = [(rid, r) for rid, r in observer.records.items()
+                           if r.get("native_request") is request and r.get("used")
+                           and r.get("done") and not r.get("bad")]
+                if len(records) != 1:
+                    return
+                rid, record = records[0]
+                def owns_document():
+                    pending = [observer.session.send("Page.getFrameTree")["frameTree"]]
+                    while pending:
+                        node = pending.pop()
+                        current = node["frame"]
+                        if current["id"] == record["key"][3]:
+                            return (current.get("loaderId") == rid
+                                    and current.get("url") == response.url
+                                    and not current.get("urlFragment"))
+                        pending.extend(node.get("childFrames", []))
+                    return False
+                if not owns_document():
+                    return
+                document = request.frame.evaluate_handle("document")
+                if not owns_document():
+                    document.dispose()
+                    return
+                snapshot["_nativeDocument"] = document
             hits.append(ApiHit(
                 url=response.url,
                 method=request.method,
@@ -868,6 +948,77 @@ class EsunCrawler(BankCrawler):
         if len(matches) != 1:
             raise RuntimeError("esun-twd-history-transport")
         return matches[0]
+
+    @staticmethod
+    def _mark_twd_render(frame) -> None:
+        frame.evaluate("""() => {
+            window.__thothEsunOldNodes = new WeakSet(document.querySelectorAll('*'));
+        }""")
+
+    @staticmethod
+    def _bind_twd_render(frame, snapshot) -> None:
+        document = snapshot.pop("_nativeDocument", None)
+        try:
+            rendered = frame.evaluate(r"""({container, nativeDocument}) => {
+                const old = window.__thothEsunOldNodes || (nativeDocument === document ? new WeakSet() : null);
+                const grids = [...document.querySelectorAll('[id="fao01002:grid_DataGridBody"]')];
+                if (!old || grids.length !== 1 || old.has(grids[0])) return null;
+                const grid = grids[0];
+                let surface = grid.parentElement || grid;
+                // Include the first retained owner, even across fresh wrappers.
+                while (!old.has(surface) && surface.parentElement &&
+                       surface.parentElement.tagName !== 'HTML') surface = surface.parentElement;
+                const visible = el => {
+                    for (let node = el; node; node = node.parentElement) {
+                        const s = getComputedStyle(node);
+                        if (node.hidden || node.getAttribute('aria-hidden') === 'true' ||
+                            s.display === 'none' || ['hidden', 'collapse'].includes(s.visibility) ||
+                            Number(s.opacity) <= 0) return false;
+                    }
+                    return true;
+                };
+                // Global operational UI can invalidate an otherwise fresh grid.
+                // Inspect structure only; do not copy unrelated account text.
+                if ([...document.querySelectorAll('*')].some(el => visible(el) && (
+                    el.matches('[role="alert"],[role="dialog"],[aria-modal="true"],dialog[open],.error,.errorMessage,.alert,.ui-message-error,.ui-messages-error,[aria-invalid="true"],.modal.show,.modal.in') ||
+                    el.getAttribute('aria-busy')?.toLowerCase() === 'true' ||
+                    el.getAttribute('role')?.toLowerCase() === 'progressbar' || el.tagName === 'PROGRESS' ||
+                    /(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test(
+                        [el.id, el.getAttribute('class')].filter(Boolean).join(' '))
+                ))) return null;
+                if (![grid, ...grid.querySelectorAll('*')].every(visible) ||
+                    ![grid, ...grid.querySelectorAll('tr,td,th')].every(el =>
+                        el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0)) return null;
+                if (container) {
+                    let ancestor = grid;
+                    for (let i = 0; i < container.depth; i++) ancestor = ancestor?.parentElement;
+                    if (!ancestor || ancestor.tagName !== 'DIV' || old.has(ancestor) || !visible(ancestor)) return null;
+                    const attrs = Object.fromEntries([...ancestor.attributes].filter(a => a.name !== 'style').map(a => [a.name, a.value]));
+                    if (Object.keys(attrs).length !== Object.keys(container.attributes).length ||
+                        Object.entries(container.attributes).some(([k, v]) => attrs[k] !== v)) return null;
+                    if (ancestor.id && [...document.querySelectorAll('[id]')].filter(el => el.id === ancestor.id).length !== 1) return null;
+                }
+                const html = surface.outerHTML;
+                return new TextEncoder().encode(html).length <= 1000000 ? html : null;
+            }""", {"container": snapshot.get("initialHiddenContainer"), "nativeDocument": document})
+        except Exception:
+            raise RuntimeError("esun-twd-history-stale-result") from None
+        finally:
+            if document is not None:
+                document.dispose()
+        if not isinstance(rendered, str):
+            raise RuntimeError("esun-twd-history-stale-result")
+        try:
+            current = _parse_esun_twd_html_response(rendered)
+        except ValueError:
+            raise RuntimeError("esun-twd-history-stale-result") from None
+        if any(current[key] != snapshot[key] for key in (
+            "hasGrid", "gridCandidateCount", "gridRows", "gridRowCount", "gridText", "emptyMarker",
+        )) or current["pager"]["present"] or (
+            current["totalCount"] is not None
+            and current["totalCount"] != current["gridRowCount"]
+        ):
+            raise RuntimeError("esun-twd-history-stale-result")
 
     @staticmethod
     def _fresh_twd_result(candidates) -> dict:
@@ -1020,7 +1171,7 @@ class EsunCrawler(BankCrawler):
                 or snapshot.get("gridRowCount") != 0
                 or total_count != 0
                 or snapshot.get("emptyMarker") not in {
-                    "查無交易資料", "查無資料", "無交易明細",
+                    "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
                 }
             ):
                 raise RuntimeError("esun-twd-history-result")
@@ -1103,7 +1254,7 @@ class EsunCrawler(BankCrawler):
                     or form_url.query
                     or form_url.fragment
                 ):
-                    raise RuntimeError("esun-twd-history-form")
+                    raise RuntimeError("esun-twd-history-form-frame-url")
                 bank_today_raw = query_frame.evaluate(r"""() =>
                     (document.querySelector('#sysInfo')?.textContent || '')
                         .match(/"today":"(\d{4}\/\d{2}\/\d{2})"/)?.[1] || ''
@@ -1115,11 +1266,8 @@ class EsunCrawler(BankCrawler):
                 if query_frame is not None:
                     try:
                         acct_options = query_frame.evaluate(r"""() => {
-                            const forms = [...document.querySelectorAll('form')].filter((form) =>
-                                form.querySelector('select[id="fao01002:dract"]')
-                            );
                             const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
-                            const s = forms.length === 1 && xs.length === 1 && forms[0].contains(xs[0]) ? xs[0] : null;
+                            const s = xs.length === 1 && xs[0].form?.contains(xs[0]) ? xs[0] : null;
                             if (!s) return [];
                             return [...s.options].map((o, index) => ({
                                 index,
@@ -1141,9 +1289,8 @@ class EsunCrawler(BankCrawler):
                             query_frame.locator("select[id='fao01002:dract']").select_option(index=int(opt["index"]), timeout=8000)
                             page.wait_for_timeout(800)
                             selected = query_frame.evaluate(r"""() => {
-                                const forms = [...document.querySelectorAll('form')];
                                 const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
-                                const s = forms.length === 1 && xs.length === 1 && forms[0].contains(xs[0]) ? xs[0] : null;
+                                const s = xs.length === 1 && xs[0].form?.contains(xs[0]) ? xs[0] : null;
                                 const o = s?.options[s.selectedIndex];
                                 return s && o ? {
                                     index: s.selectedIndex,
@@ -1167,13 +1314,14 @@ class EsunCrawler(BankCrawler):
                                 "end": history_end.strftime("%Y/%m/%d"),
                             }
                             clicked_period = query_frame.evaluate(r"""(period) => {
-                                const forms = [...document.querySelectorAll('form')];
-                                const radios = [...document.querySelectorAll('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]')];
-                                const starts = [...document.querySelectorAll('input[id="fao01002:startDate"]')];
-                                const ends = [...document.querySelectorAll('input[id="fao01002:endDate"]')];
-                                const form = forms.length === 1 ? forms[0] : null;
+                                const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+                                const form = xs.length === 1 && xs[0].form?.contains(xs[0]) ? xs[0].form : null;
+                                if (!form) return {ok: false, error: 'invalid controls'};
+                                const radios = [...form.querySelectorAll('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]')];
+                                const starts = [...form.querySelectorAll('input[id="fao01002:startDate"]')];
+                                const ends = [...form.querySelectorAll('input[id="fao01002:endDate"]')];
                                 const r = form && radios.length === 1 && starts.length === 1 && ends.length === 1
-                                    && [radios[0], starts[0], ends[0]].every((node) => form.contains(node)) ? radios[0] : null;
+                                    && [radios[0], starts[0], ends[0]].every((node) => node.form === form) ? radios[0] : null;
                                 if (!r) return {ok: false, error: 'invalid controls'};
                                 const label = r.closest('label');
                                 if (label) {
@@ -1182,11 +1330,11 @@ class EsunCrawler(BankCrawler):
                                 r.checked = true;
                                 r.dispatchEvent(new Event('change', {bubbles: true}));
                                 r.dispatchEvent(new Event('click', {bubbles: true}));
-                                for (const other of document.querySelectorAll('input[name="fao01002:intervalrdo"]')) {
-                                    if (other !== r) other.checked = false;
+                                for (const other of form.querySelectorAll('input[name="fao01002:intervalrdo"]')) {
+                                    if (other !== r && other.form === form) other.checked = false;
                                 }
-                                for (const lbl of document.querySelectorAll('.radiobutton-group label')) {
-                                    lbl.classList.toggle('checked', lbl.contains(r));
+                                for (const lbl of form.querySelectorAll('.radiobutton-group label')) {
+                                    if (!lbl.control || lbl.control.form === form) lbl.classList.toggle('checked', lbl.contains(r));
                                 }
                                 const s = starts[0];
                                 const e = ends[0];
@@ -1204,9 +1352,10 @@ class EsunCrawler(BankCrawler):
                                 raise RuntimeError("esun-twd-history-period")
                             page.wait_for_timeout(500)
                             sort_selected = query_frame.evaluate(r"""() => {
-                                const forms = [...document.querySelectorAll('form')];
-                                const radios = [...document.querySelectorAll('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]')];
-                                const r = forms.length === 1 && radios.length === 1 && forms[0].contains(radios[0]) ? radios[0] : null;
+                                const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+                                const form = xs.length === 1 && xs[0].form?.contains(xs[0]) ? xs[0].form : null;
+                                const radios = form ? [...form.querySelectorAll('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]')] : [];
+                                const r = radios.length === 1 && radios[0].form === form ? radios[0] : null;
                                 if (!r) return false;
                                 r.checked = true;
                                 r.dispatchEvent(new Event('change', {bubbles: true}));
@@ -1214,33 +1363,41 @@ class EsunCrawler(BankCrawler):
                             }""")
                             if sort_selected is not True:
                                 raise RuntimeError("esun-twd-history-sort")
-                            operation_contract = self._twd_form_contract(query_frame)
+                            try:
+                                operation_contract = self._twd_form_contract(query_frame)
+                            except ValueError:
+                                raise RuntimeError("esun-twd-history-form-contract") from None
                             operation_requests = []
                             operation_hits: list[ApiHit] = []
+                            self._mark_twd_render(query_frame)
+                            transport_url = operation_contract["action"]
+                            if transport_url == BASE + _ESUN_TWD_AJAX_PATH:
+                                transport_url += "?ajax=true"
+                            observer = _HistoryBodyObserver(_OriginGuardProxy._unwrap(page), transport_url)
                             request_listener = lambda request: self._capture_twd_request(
                                 request, operation_requests, query_frame, operation_contract["action"],
                                 opt["value"], history_start, history_end,
                                 operation_contract["actionValue"], operation_contract["viewState"],
                             )
                             response_listener = lambda response: self._capture_twd_response(
-                                response, operation_hits, operation_requests,
+                                response, operation_hits, operation_requests, observer,
                             )
-                            page.on("request", request_listener)
-                            page.on("response", response_listener)
                             try:
+                                page.on("request", request_listener)
+                                page.on("response", response_listener)
                                 submit_info = query_frame.evaluate(r"""() => {
                                     const visible = (el) => {
                                         const r = el.getBoundingClientRect();
                                         const st = window.getComputedStyle(el);
                                         return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
                                     };
-                                    const forms = [...document.querySelectorAll('form')];
-                                    const form = forms.length === 1 ? forms[0] : null;
+                                    const xs = [...document.querySelectorAll('select[id="fao01002:dract"]')];
+                                    const form = xs.length === 1 && xs[0].form?.contains(xs[0]) ? xs[0].form : null;
                                     const matches = form ? [...form.querySelectorAll('button,a,input[type="button"],input[type="submit"],input[type="image"]')].filter((el) => {
                                         const t = (el.textContent || el.value || el.title || '').replace(/\s+/g, '').trim();
                                         return t === '查詢' && visible(el);
                                     }) : [];
-                                    if (matches.length !== 1) return {clicked: null};
+                                    if (matches.length !== 1 || ('form' in matches[0] && matches[0].form !== form)) return {clicked: null};
                                     const el = matches[0];
                                     el.click();
                                     return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: '查詢'};
@@ -1257,9 +1414,10 @@ class EsunCrawler(BankCrawler):
                                     page, operation_requests, operation_hits,
                                 )
                             finally:
+                                observer.close()
                                 page.remove_listener("request", request_listener)
                                 page.remove_listener("response", response_listener)
-                            # Parse the exact request/response pair; the widget DOM may stay stale.
+                            # Exact response rows must also be freshly rendered, never stale templates.
                             bound_hit = self._validated_twd_transport(
                                 operation_hits,
                                 result_url=query_frame.url,
@@ -1267,6 +1425,7 @@ class EsunCrawler(BankCrawler):
                             response_snapshot = bound_hit.resp_json
                             if not isinstance(response_snapshot, dict):
                                 raise RuntimeError("esun-twd-history-result")
+                            self._bind_twd_render(query_frame, response_snapshot)
                             result_candidates = [{
                                 **response_snapshot,
                                 "bound": True,

@@ -32,6 +32,51 @@ def _form_contract() -> dict:
     }
 
 
+def test_esun_native_initial_form_binds_click_generated_ajax(offline_twd_page):
+    from urllib.parse import urlencode
+
+    page = offline_twd_page
+    initial = _form_contract()['action'].removesuffix('?ajax=true')
+    page.locator('#form1').evaluate('(form, action) => form.action = action', initial)
+    page.locator('[name="fao01002:linkCommand"]').evaluate('el => el.value = ""')
+    contract = EsunCrawler._twd_form_contract(page)
+    assert contract['action'] == initial
+    assert contract['actionValue'] == ''
+    frame = type('Frame', (), {'url': 'https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces'})()
+    fields = {
+        'fao01002:dract': 'opaque-a', 'fao01002:startDate': '2025/08/31',
+        'fao01002:endDate': '2026/08/30',
+        'fao01002:linkCommand': 'fao01002:linkCommand', 'javax.faces.ViewState': 'state',
+    }
+    request = type('Request', (), {
+        'method': 'POST', 'url': initial + '?ajax=true', 'frame': frame,
+        'post_data': urlencode(fields), 'redirected_from': None,
+    })()
+    requests = []
+    EsunCrawler._capture_twd_request(
+        request, requests, frame, contract['action'], 'opaque-a',
+        date(2025, 8, 31), date(2026, 8, 30), contract['actionValue'], contract['viewState'],
+    )
+    assert len(requests) == 1
+    response = type('Response', (), {
+        'request': request, 'url': request.url, 'status': 200,
+        'headers': {'content-type': 'text/html'}, 'text': lambda self: _live_ajax_html(),
+    })()
+    hits = []
+    observer = type('Observer', (), {'read': lambda *_: _live_ajax_html().encode()})()
+    EsunCrawler._capture_twd_response(response, hits, requests, observer)
+    assert len(hits) == 1
+    for key, wrong in [('fao01002:linkCommand', ''), ('fao01002:linkCommand', 'other'),
+                       ('javax.faces.ViewState', 'stale'), ('fao01002:dract', 'foreign')]:
+        request.post_data = urlencode({**fields, key: wrong})
+        rejected = []
+        EsunCrawler._capture_twd_request(
+            request, rejected, frame, initial, 'opaque-a', date(2025, 8, 31),
+            date(2026, 8, 30), '', 'state',
+        )
+        assert rejected == []
+
+
 def test_esun_opts_in_only_twd_transactions():
     assert EsunCrawler.HISTORY_COVERAGE_REQUIRED is True
     assert frozenset({"twd_transactions"}) == EsunCrawler.HISTORY_COVERAGE_DOMAINS
@@ -100,6 +145,211 @@ def test_esun_query_form_requires_unique_same_form_canonical_controls():
             EsunCrawler._twd_form_contract(Frame({**_form_contract(), key: value}))
 
 
+@pytest.fixture
+def offline_twd_page():
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(offline=True)
+            context.route("**/*", lambda route: route.abort())
+            page = context.new_page()
+            page.set_content(f"""
+                <form id="form1" method="post" action="{_form_contract()['action']}">
+                  <select id="fao01002:dract"><option>fixture</option></select>
+                  <input id="fao01002:startDate">
+                  <input id="fao01002:endDate">
+                  <input type="hidden" name="fao01002:linkCommand" value="query">
+                  <input type="hidden" name="javax.faces.ViewState" value="state">
+                  <input type="radio" id="fao01002:j_id_intervalrdo4">
+                  <input type="radio" id="fao01002:j_id_sort1">
+                  <button type="button" id="query">查詢</button>
+                </form>
+            """)
+            page.evaluate("""() => {
+                window.queryClicks = [];
+                document.addEventListener('click', event => queryClicks.push(event.target.id));
+            }""")
+            yield page
+        finally:
+            browser.close()
+
+
+@pytest.fixture
+def two_form_twd_page(offline_twd_page):
+    page = offline_twd_page
+    page.locator("body").evaluate("""body => body.insertAdjacentHTML('afterbegin', `
+        <form id="other-form" method="post" action="https://example.invalid/unrelated">
+          <input type="hidden" name="javax.faces.ViewState" value="other-state">
+          <div class="radiobutton-group"><label class="checked">
+            <input type="radio" name="fao01002:intervalrdo" value="4" checked>
+          </label></div>
+          <input type="radio" name="fao01002:txDateOrder" value="1">
+          <button type="button" id="other-query">查詢</button>
+        </form>
+    `)""")
+    return page
+
+
+def test_esun_real_dom_contract_uses_account_owner_not_other_jsf_form(two_form_twd_page):
+    page = two_form_twd_page
+    assert page.locator("form").count() == 2
+    assert page.locator('[name="javax.faces.ViewState"]').count() == 2
+    assert EsunCrawler._twd_form_contract(page) == _form_contract()
+    assert EsunCrawler._unique_twd_query_frame([page]) is page
+    assert page.evaluate("queryClicks") == []
+
+
+def _twd_collect_script(marker):
+    import ast
+    import inspect
+    import textwrap
+
+    # Execute production JS, not a test reimplementation of its selectors.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(EsunCrawler.collect)))
+    scripts = [
+        node.args[0].value for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "evaluate" and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and marker in node.args[0].value
+    ]
+    assert len(scripts) == 1
+    return scripts[0]
+
+
+@pytest.mark.parametrize("marker, expected", [
+    ("[...s.options]", [{"index": 0, "value": "fixture", "text": "fixture"}]),
+    ("const o = s?.options", {"index": 0, "value": "fixture", "text": "fixture"}),
+    ("(period) =>", {"ok": True, "checked": True, "start": "2025/08/31", "end": "2026/08/30"}),
+    ("return r.checked;", True),
+    ("clicked: 'visible-query'", {"clicked": "visible-query", "tag": "BUTTON", "id": "query", "name": "", "text": "查詢"}),
+])
+def test_esun_real_dom_operations_use_only_account_form(two_form_twd_page, marker, expected):
+    page = two_form_twd_page
+    other_before = page.locator("#other-form").evaluate("form => form.outerHTML")
+    assert page.evaluate(
+        _twd_collect_script(marker), {"start": "2025/08/31", "end": "2026/08/30"},
+    ) == expected
+    assert page.locator("#other-form").evaluate("form => form.outerHTML") == other_before
+    assert page.locator('#other-form input[name="fao01002:intervalrdo"]').is_checked()
+    assert not page.locator('#other-form input[name="fao01002:txDateOrder"]').is_checked()
+    assert "other-query" not in page.evaluate("queryClicks")
+    if "visible-query" in marker:
+        assert page.evaluate("queryClicks") == ["query"]
+
+
+@pytest.mark.parametrize("selector", [
+    '[id="fao01002:dract"]',
+    '[id="fao01002:startDate"]',
+    '[id="fao01002:endDate"]',
+    '[name="fao01002:linkCommand"]',
+    '[name="javax.faces.ViewState"]',
+    '[id="fao01002:j_id_intervalrdo4"]',
+    '[id="fao01002:j_id_sort1"]',
+    '#query',
+])
+@pytest.mark.parametrize("mutation", ["remove", "move", "reassign", "duplicate"])
+def test_esun_real_dom_owned_controls_fail_closed(two_form_twd_page, selector, mutation):
+    page = two_form_twd_page
+    page.locator("#form1").locator(selector).evaluate("""(el, mutation) => {
+        if (mutation === 'remove') el.remove();
+        if (mutation === 'move') document.querySelector('#other-form').append(el);
+        if (mutation === 'reassign') el.setAttribute('form', 'other-form');
+        if (mutation === 'duplicate') el.parentNode.append(el.cloneNode(true));
+    }""", mutation)
+    with pytest.raises(ValueError, match="esun-twd-history-form"):
+        EsunCrawler._twd_form_contract(page)
+    assert page.evaluate("queryClicks") == []
+
+
+@pytest.mark.parametrize("marker, selector, expected", [
+    ("[...s.options]", '[id="fao01002:dract"]', []),
+    ("const o = s?.options", '[id="fao01002:dract"]', None),
+    ("(period) =>", '[id="fao01002:startDate"]', {"ok": False, "error": "invalid controls"}),
+    ("return r.checked;", '[id="fao01002:j_id_sort1"]', False),
+    ("clicked: 'visible-query'", '#query', {"clicked": None}),
+])
+def test_esun_real_dom_operations_reject_foreign_form_owner(two_form_twd_page, marker, selector, expected):
+    page = two_form_twd_page
+    page.locator("#form1").locator(selector).evaluate("el => el.setAttribute('form', 'other-form')")
+    assert page.evaluate(
+        _twd_collect_script(marker), {"start": "2025/08/31", "end": "2026/08/30"},
+    ) == expected
+    assert page.evaluate("queryClicks") == []
+
+
+def test_esun_real_dom_period_does_not_mutate_foreign_owned_radio(two_form_twd_page):
+    page = two_form_twd_page
+    page.locator('#other-form input[name="fao01002:intervalrdo"]').evaluate("""radio => {
+        radio.setAttribute('form', 'other-form');
+        radio.value = '1';
+        document.querySelector('#form1').append(radio.closest('.radiobutton-group'));
+    }""")
+    assert page.evaluate(
+        _twd_collect_script("(period) =>"), {"start": "2025/08/31", "end": "2026/08/30"},
+    )["ok"] is True
+    assert page.locator('input[form="other-form"]').is_checked()
+    assert page.locator('.radiobutton-group label').get_attribute("class") == "checked"
+
+
+def test_esun_real_dom_duplicate_account_form_is_not_authoritative(two_form_twd_page):
+    page = two_form_twd_page
+    page.locator("#form1").evaluate("form => document.body.append(form.cloneNode(true))")
+    with pytest.raises(ValueError, match="esun-twd-history-form"):
+        EsunCrawler._twd_form_contract(page)
+    for marker, expected in [
+        ("[...s.options]", []), ("const o = s?.options", None),
+        ("(period) =>", {"ok": False, "error": "invalid controls"}),
+        ("return r.checked;", False), ("clicked: 'visible-query'", {"clicked": None}),
+    ]:
+        assert page.evaluate(_twd_collect_script(marker), {}) == expected
+    assert page.evaluate("queryClicks") == []
+
+
+def test_esun_real_dom_hidden_query_does_not_disagree_with_submit(offline_twd_page):
+    page = offline_twd_page
+    page.locator("#form1").evaluate("""form => form.insertAdjacentHTML('beforeend', `
+        <button hidden type="button" id="hidden-query">查詢</button>
+        <a style="visibility:hidden" id="invisible-query">查詢</a>
+        <input style="display:none" type="submit" value="查詢">
+    `)""")
+    assert EsunCrawler._twd_form_contract(page)["queryCount"] == 1
+    script = _twd_collect_script("clicked: 'visible-query'")
+    assert page.evaluate(script)["clicked"] == "visible-query"
+    assert page.evaluate("queryClicks") == ["query"]
+
+    page.locator("#hidden-query").evaluate("el => el.hidden = false")
+    with pytest.raises(ValueError, match="esun-twd-history-form"):
+        EsunCrawler._twd_form_contract(page)
+    assert page.evaluate(script) == {"clicked": None}
+    assert page.evaluate("queryClicks") == ["query"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "document.querySelector('#query').hidden = true",
+    "document.querySelector('#query').remove()",
+    "document.querySelector('#form1').method = 'GET'",
+    "document.querySelector('#form1').action = 'https://attacker.example/query'",
+    "document.querySelector('[name=\"javax.faces.ViewState\"]').value = ''",
+    "document.querySelector('[name=\"fao01002:linkCommand\"]').value = ''",
+    "document.querySelector('#form1').append(document.querySelector('[name=\"javax.faces.ViewState\"]').cloneNode())",
+    "document.body.append(document.querySelector('[id=\"fao01002:dract\"]').cloneNode(true))",
+    "document.body.append(document.createElement('form')); document.forms[1].append(document.querySelector('[id=\"fao01002:endDate\"]'))",
+])
+def test_esun_real_dom_rejects_missing_query_and_invalid_canonical_controls(offline_twd_page, mutation):
+    page = offline_twd_page
+    assert EsunCrawler._twd_form_contract(page)["sameForm"] is True
+    page.evaluate(mutation)
+    with pytest.raises(ValueError, match="esun-twd-history-form"):
+        EsunCrawler._twd_form_contract(page)
+    with pytest.raises(RuntimeError, match="esun-twd-history-form-missing"):
+        EsunCrawler._unique_twd_query_frame([page])
+    assert page.evaluate("queryClicks") == []
+
+
 def test_esun_waits_for_home_widget_form_after_navigation():
     class Frame:
         def evaluate(self, _script):
@@ -121,6 +371,42 @@ def test_esun_waits_for_home_widget_form_after_navigation():
     page = Page()
     assert isinstance(EsunCrawler._wait_for_twd_query_frame(page), Frame)
     assert page.waits == [100, 100]
+
+
+@pytest.mark.parametrize("frames, guard", [
+    ([], "esun-twd-history-form-missing"),
+    ([True, True], "esun-twd-history-form-ambiguous"),
+    ([True, "error"], "esun-twd-history-form-evaluation"),
+])
+def test_esun_frame_guards_survive_wait_and_safe_collection_wrappers(frames, guard):
+    from backend.core.base import _safe_collect_guard
+
+    class Frame:
+        def __init__(self, state):
+            self.state = state
+
+        def evaluate(self, _script):
+            if self.state == "error":
+                raise RuntimeError("untrusted browser exception fixture")
+            return _form_contract()
+
+    class Page:
+        def __init__(self):
+            self.frames = [Frame(state) for state in frames]
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    page = Page()
+    with pytest.raises(RuntimeError) as direct:
+        EsunCrawler._unique_twd_query_frame(page.frames)
+    assert str(direct.value) == guard
+    with pytest.raises(RuntimeError) as timeout:
+        EsunCrawler._wait_for_twd_query_frame(page)
+    assert str(timeout.value) == "esun-twd-history-form-timeout"
+    assert page.waits == [100] * 100
+    assert _safe_collect_guard(timeout.value, EsunCrawler.SAFE_COLLECT_GUARDS) == guard
 
 
 def test_esun_query_inventory_is_authoritative_and_unique():
@@ -248,6 +534,274 @@ def test_esun_live_ajax_html_projects_operation_bound_grid_without_total_label()
     assert snapshot["pager"] == {"present": False, "actionableNext": 0}
 
 
+def test_esun_real_dom_two_forms_do_not_weaken_response_grid_gates(two_form_twd_page):
+    page = two_form_twd_page
+    page.locator("#form1").evaluate(
+        "(form, html) => form.insertAdjacentHTML('beforeend', html)", _live_ajax_html(),
+    )
+    # Results remain scoped to the bound response, not to a live query-form snapshot.
+    assert _parse_esun_twd_html_response(page.content()) == _parse_esun_twd_html_response(_live_ajax_html())
+    page.locator("#other-form").evaluate(
+        "form => form.insertAdjacentHTML('beforeend', '<a rel=next>Next</a>')",
+    )
+    assert _parse_esun_twd_html_response(page.content())["pager"]["present"] is True
+    page.locator("#other-form").evaluate(
+        "(form, html) => form.insertAdjacentHTML('beforeend', html)", _live_ajax_html(),
+    )
+    with pytest.raises(ValueError, match="invalid E.SUN TWD grid cardinality"):
+        _parse_esun_twd_html_response(page.content())
+
+
+@pytest.mark.parametrize('corrupt_header', [False, True])
+def test_esun_native_seven_column_header_preserves_money_and_notes(offline_twd_page, corrupt_header):
+    headers = ['交易日期時間', '摘要', '提', '存', '帳戶餘額', '存摺備註對方銀行代碼/帳號', '轉帳留言']
+    if corrupt_header:
+        headers[2], headers[3] = headers[3], headers[2]
+    cells = ['2026/08/20 12:00:00', '利息', '', '2', '84', 'fixture note', 'fixture message']
+    body = '<div id="resultPanel" style="display:none"><table id="fao01002:grid_DataGridBody"><tr>'
+    body += ''.join('<th>' + cell + '</th>' for cell in headers) + '</tr><tr>'
+    body += ''.join('<td>' + cell + '</td>' for cell in cells) + '</tr></table></div>'
+    if corrupt_header:
+        with pytest.raises(ValueError):
+            _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+        return
+    snapshot = _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+    assert snapshot['gridRows'] == [cells]
+    page = offline_twd_page
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    page.locator('#resultPanel').evaluate("e => e.style.display='block'")
+    EsunCrawler._bind_twd_render(page, snapshot)
+    from backend.core.persist.esun import _parse_esun_twd_txn_results
+    row = _parse_esun_twd_txn_results([{'account_no':'0900000087022', 'snapshot':snapshot}])[0]
+    assert (row['expend'], row['income'], row['balance']) == (None, 2, 84)
+    assert row['memo'] == 'fixture note fixture message'
+
+
+@pytest.mark.parametrize('extra', ['', '<div>系統錯誤</div>', '<a rel="next">下一頁</a>'])
+def test_esun_native_empty_label_is_attested_before_cursor(offline_twd_page, tmp_path, monkeypatch, extra):
+    from contextlib import closing
+    from backend.core.store import BankStore
+    from backend.core.persist import persist_collected
+    label = '查無符合資料！'
+    body = _live_ajax_html()
+    body = body[:body.index('<tr><td>')] + '<tr><td colspan="5">' + label + '</td></tr></table>' + extra
+    if extra:
+        try:
+            snapshot = _parse_esun_twd_html_response(body)
+        except ValueError:
+            return
+        result = _bound_result(grid=False, empty=True)
+        result.update(snapshot={**snapshot, 'evidenceFresh':True}, text=label)
+        with pytest.raises(RuntimeError):
+            EsunCrawler._validated_twd_history_result(result, identity=result['account_no'], start=date(2025,8,31), end=date(2026,8,30))
+        return
+    snapshot = _parse_esun_twd_html_response(body)
+    page = offline_twd_page
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    EsunCrawler._bind_twd_render(page, snapshot)
+    result = _bound_result(grid=False, empty=True)
+    result.update(snapshot={**snapshot, 'evidenceFresh':True}, text=label)
+    assert EsunCrawler._validated_twd_history_result(result, identity=result['account_no'], start=date(2025,8,31), end=date(2026,8,30))['status'] == 'explicit_empty'
+    monkeypatch.setenv('BANK_DATA_ROOT', str(tmp_path))
+    monkeypatch.setenv('DB_BACKEND', 'sqlite')
+    with closing(BankStore('esun', user_id=1, source_account_id=1)) as store:
+        persist_collected('esun', {'twd_txn_results':[result], 'history_coverage':_bound_coverage(status='explicit_empty')}, store)
+        assert store.latest_twd_transaction_dates() == {result['account_no']: date(2026,8,30)}
+        assert store.conn.execute('SELECT COUNT(*) FROM twd_transactions').fetchone()[0] == 0
+
+
+def test_esun_initial_hidden_response_requires_fresh_visible_native_render(offline_twd_page):
+    page = offline_twd_page
+    body = _live_ajax_html().replace('<table ', '<div id="resultPanel" style="display:none"><table ').replace('</table>', '</table></div>')
+    # Public fixture models the observed single hidden DIV ancestor, not a guessed bank ID.
+    with pytest.raises(ValueError):
+        _parse_esun_twd_html_response(body)
+    snapshot = _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+    assert snapshot['initialHiddenContainer'] == {'depth': 1, 'attributes': {'id': 'resultPanel'}}
+    page.set_content(body)
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, snapshot)
+    page.locator('#resultPanel').evaluate("e => e.style.display = 'block'")
+    EsunCrawler._bind_twd_render(page, snapshot)
+    EsunCrawler._mark_twd_render(page)
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, snapshot)
+
+
+@pytest.mark.parametrize('extra', [
+    '<a rel="next">下一頁</a>',
+    '<div role="alert">系統錯誤</div>',
+    '<div aria-busy="true">載入中</div>',
+    '<div>共 2 筆</div>',
+])
+@pytest.mark.parametrize('hidden', [False, True])
+def test_esun_render_rejects_operational_siblings(offline_twd_page, extra, hidden):
+    page = offline_twd_page
+    style = ' style="display:none"' if hidden else ''
+    body = _live_ajax_html().replace('<table ', f'<div id="resultPanel"{style}><table ').replace('</table>', '</table></div>')
+    snapshot = _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    page.locator('#resultPanel').evaluate(
+        '(e, extra) => { e.style.display="block"; e.insertAdjacentHTML("beforeend", extra); }', extra,
+    )
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, snapshot)
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_esun_render_checks_existing_owned_container_siblings(offline_twd_page, wrapped):
+    page = offline_twd_page
+    page.set_content('<div id="resultPanel"></div>')
+    EsunCrawler._mark_twd_render(page)
+    html = _live_ajax_html()
+    if wrapped:
+        html = '<div>' + html + '</div>'
+    page.locator('#resultPanel').evaluate(
+        '(e, html) => e.innerHTML = html', html + '<a rel="next">下一頁</a>',
+    )
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, _parse_esun_twd_html_response(_live_ajax_html()))
+
+
+@pytest.mark.parametrize('extra', [
+    '<div role="alert">系統錯誤</div>',
+    '<div aria-busy="true">載入中</div>',
+    '<div role="dialog">請確認</div>',
+    '<div style="display:contents"><div class="error">系統錯誤</div></div>',
+])
+@pytest.mark.parametrize('hidden', [False, True])
+def test_esun_render_checks_global_operational_evidence(offline_twd_page, extra, hidden):
+    page = offline_twd_page
+    page.set_content('<main><div id="resultPanel"></div></main>')
+    EsunCrawler._mark_twd_render(page)
+    page.locator('#resultPanel').evaluate('(e, html) => e.innerHTML=html', _live_ajax_html())
+    page.locator('body').evaluate(
+        '(e, html) => e.insertAdjacentHTML("beforeend", html)',
+        '<div hidden>' + extra + '</div>' if hidden else extra,
+    )
+    snapshot = _parse_esun_twd_html_response(_live_ajax_html())
+    if hidden:
+        EsunCrawler._bind_twd_render(page, snapshot)
+    else:
+        with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+            EsunCrawler._bind_twd_render(page, snapshot)
+
+
+@pytest.mark.parametrize('navigate_before_bind', [False, True])
+def test_esun_native_document_post_binds_only_its_observed_document(offline_twd_page, navigate_before_bind):
+    from backend.core.base import _HistoryBodyObserver
+
+    page = offline_twd_page
+    url = 'https://ebank.esunbank.com.tw/fco/fao01002/FAO01002.faces'
+    form = f'''<form id="form1" method="post" action="{url}">
+        <select id="fao01002:dract" name="fao01002:dract"><option value="opaque-a">fixture</option></select>
+        <input id="fao01002:startDate" name="fao01002:startDate" value="2025/08/31">
+        <input id="fao01002:endDate" name="fao01002:endDate" value="2026/08/30">
+        <input type="hidden" name="fao01002:linkCommand" value="query">
+        <input type="hidden" name="javax.faces.ViewState" value="state">
+        <input type="radio" id="fao01002:j_id_intervalrdo4">
+        <input type="radio" id="fao01002:j_id_sort1">
+        <button>查詢</button></form>'''
+    body = _live_ajax_html()
+    page.context.route('**/*', lambda route: route.fulfill(
+        body=body if route.request.method == 'POST' else form, content_type='text/html; charset=utf-8',
+    ))
+    page.goto(url)
+    page.locator('#form1').evaluate('(f, url) => { f.action=url; f.method="POST"; }', url)
+    page.locator('[id="fao01002:startDate"]').fill('2025/08/31')
+    page.locator('[id="fao01002:endDate"]').fill('2026/08/30')
+
+    contract = EsunCrawler._twd_form_contract(page)
+    assert contract['sameForm'] is True
+    requests, hits = [], []
+    observer = _HistoryBodyObserver(page, url)
+    on_request = lambda req: EsunCrawler._capture_twd_request(
+        req, requests, page.main_frame, url, 'opaque-a', date(2025, 8, 31),
+        date(2026, 8, 30), contract['actionValue'], contract['viewState'],
+    )
+    on_response = lambda resp: EsunCrawler._capture_twd_response(resp, hits, requests, observer)
+    page.on('request', on_request)
+    page.on('response', on_response)
+    try:
+        EsunCrawler._mark_twd_render(page)
+        with page.expect_navigation():
+            page.locator('#form1 button').click()
+        page.wait_for_timeout(100)
+        assert len(requests) == len(hits) == 1
+        hit = EsunCrawler._validated_twd_transport(hits, result_url=page.url)
+        observer.close()  # collect closes its transport observer before render binding.
+        assert page.evaluate('typeof window.__thothEsunOldNodes') == 'undefined'
+        if navigate_before_bind:
+            page.goto(url)
+            page.set_content(body)
+            with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+                EsunCrawler._bind_twd_render(page, hit.resp_json)
+            return
+        EsunCrawler._bind_twd_render(page, hit.resp_json)
+        # A later same-URL GET must not borrow the prior POST's freshness proof.
+        page.goto(url)
+        page.set_content(body)
+        with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+            EsunCrawler._bind_twd_render(page, hit.resp_json)
+    finally:
+        page.remove_listener('request', on_request)
+        page.remove_listener('response', on_response)
+        observer.close()
+
+
+def test_esun_native_hidden_div_without_id_is_bound_by_ancestry(offline_twd_page):
+    page = offline_twd_page
+    body = _live_ajax_html().replace('<table ', '<div class="query-result" style="display:none"><table ').replace('</table>', '</table></div>')
+    snapshot = _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    page.locator('.query-result').evaluate("e => e.style.display = 'block'")
+    EsunCrawler._bind_twd_render(page, snapshot)
+    page.locator('.query-result').evaluate("e => e.className = 'different-result'")
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, snapshot)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda b: b.replace('<tr><td>', '<tr hidden><td>'),
+    lambda b: b.replace('<td>2</td>', '<td><span hidden>2</span></td>'),
+    lambda b: b.replace('display:none', 'display:none;opacity:0'),
+    lambda b: '<div hidden>' + b + '</div>',
+    lambda b: b + '<div id="resultPanel"></div>',
+    lambda b: '<!--' + b + '-->',
+    lambda b: b.replace('<div id="resultPanel"', '<div hidden id="resultPanel"'),
+])
+def test_esun_native_reveal_never_unhides_other_evidence(mutation):
+    body = _live_ajax_html().replace('<table ', '<div id="resultPanel" style="display:none"><table ').replace('</table>', '</table></div>')
+    with pytest.raises(ValueError):
+        _parse_esun_twd_html_response(mutation(body), allow_initial_hidden=True)
+
+
+@pytest.mark.parametrize('mutation', [
+    "document.querySelector('tr:last-child').hidden=true",
+    "document.querySelector('tr:last-child td:nth-child(4)').style.opacity='0'",
+    "document.querySelector('tr:last-child td:nth-child(4)').textContent='3'",
+    "document.querySelector('#resultPanel').id='differentPanel'",
+    "document.querySelector('#resultPanel').insertAdjacentHTML('beforeend', document.querySelector('table').outerHTML)",
+    "document.querySelector('table').insertAdjacentHTML('beforeend', '<tr><td><a rel=next>Next</a></td></tr>')",
+])
+def test_esun_native_render_rejects_hidden_changed_duplicate_rows(offline_twd_page, mutation):
+    page = offline_twd_page
+    body = _live_ajax_html().replace('<table ', '<div id="resultPanel" style="display:none"><table ').replace('</table>', '</table></div>')
+    snapshot = _parse_esun_twd_html_response(body, allow_initial_hidden=True)
+    EsunCrawler._mark_twd_render(page)
+    page.set_content(body)
+    page.locator('#resultPanel').evaluate("e => e.style.display = 'block'")
+    page.evaluate(mutation)
+    with pytest.raises(RuntimeError, match='esun-twd-history-stale-result'):
+        EsunCrawler._bind_twd_render(page, snapshot)
+
+
 def test_esun_ajax_html_rejects_failed_malformed_duplicate_or_paginated_results():
     header = (
         '<tr><th>交易日期/時間</th><th>摘要</th><th>支出</th>'
@@ -313,6 +867,26 @@ def test_esun_ajax_html_binds_footer_total_and_explicit_empty():
     assert empty["emptyMarker"] == "查無交易資料"
 
 
+def test_esun_capture_requires_decoded_proof_before_any_body_read():
+    from types import SimpleNamespace
+    from backend.banks.esun import BASE
+    frame = SimpleNamespace(url=BASE + '/fco/fco08001/FCO08001_Home.faces')
+    request = SimpleNamespace(method='POST', url=BASE + '/fao/fao01002/FAO01002_Home.faces?ajax=true', frame=frame)
+    response = SimpleNamespace(request=request, url=request.url, status=200, headers={'content-type': 'text/html'})
+    response.text = lambda: pytest.fail('unbounded response.text must never be called')
+    requests = [{'requestId': id(request), 'url': request.url, **dict.fromkeys(('fieldsExact','actionExact','viewStateExact','frameExact'), True)}]
+    hits = []
+    EsunCrawler._capture_twd_response(response, hits, requests)
+    assert hits == []
+    class Observer:
+        def read(self, resp, actual_frame, frame_url, maximum, minimum):
+            assert resp is response and actual_frame is frame and frame_url == frame.url
+            assert maximum == 1_000_000 and minimum == 1
+            return _live_ajax_html().encode()
+    EsunCrawler._capture_twd_response(response, hits, requests, Observer())
+    assert len(hits) == 1
+
+
 def test_esun_response_capture_requires_owned_request_and_bounded_body():
     class Request:
         method = "POST"
@@ -329,7 +903,7 @@ def test_esun_response_capture_requires_owned_request_and_bounded_body():
             self.frame = frame
             self.url = "https://ebank.esunbank.com.tw/fao/fao01002/FAO01002_Home.faces?ajax=true"
 
-    frame = object()
+    frame = type('Frame', (), {'url': 'https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces'})()
     owned = Request(frame)
     requests = []
     proxy = _OriginGuardProxy(frame, lambda: None)
@@ -356,8 +930,12 @@ def test_esun_response_capture_requires_owned_request_and_bounded_body():
         def text():
             return _live_ajax_html()
 
+    class Observer:
+        def read(self, response, *_):
+            return response.text().encode()
+    observer = Observer()
     hits = []
-    EsunCrawler._capture_twd_response(Response(), hits, requests)
+    EsunCrawler._capture_twd_response(Response(), hits, requests, observer)
     assert len(hits) == 1
     EsunCrawler._capture_twd_response(
         type("Oversize", (), {
@@ -366,6 +944,7 @@ def test_esun_response_capture_requires_owned_request_and_bounded_body():
         })(),
         hits,
         requests,
+        observer,
     )
     assert len(hits) == 1
 
@@ -377,11 +956,11 @@ def test_esun_response_capture_requires_owned_request_and_bounded_body():
         @staticmethod
         def text():
             missing_length_calls.append(True)
-            return _live_ajax_html()
+            return 'x' * 1_000_001
 
-    EsunCrawler._capture_twd_response(MissingLength(), hits, requests)
+    EsunCrawler._capture_twd_response(MissingLength(), hits, requests, observer)
     assert len(hits) == 1
-    assert missing_length_calls == []
+    assert missing_length_calls == [True]
 
     for status, redirected_from in ((206, None), (200, object())):
         redirected = Request(frame)
@@ -395,7 +974,7 @@ def test_esun_response_capture_requires_owned_request_and_bounded_body():
         response = Response()
         response.status = status
         response.request = redirected
-        EsunCrawler._capture_twd_response(response, hits, owned_requests)
+        EsunCrawler._capture_twd_response(response, hits, owned_requests, observer)
     assert len(hits) == 1
 
 
@@ -437,7 +1016,7 @@ def test_esun_operation_wait_requires_quiet_ticks_after_final_poll_hit():
 
 
 def test_esun_operation_listener_keeps_only_required_fields_from_long_form():
-    frame = object()
+    frame = type('Frame', (), {'url': 'https://ebank.esunbank.com.tw/fco/fco08001/FCO08001_Home.faces'})()
 
     class Request:
         method = "POST"
@@ -470,7 +1049,8 @@ def test_esun_operation_listener_keeps_only_required_fields_from_long_form():
         date(2025, 8, 31), date(2026, 8, 30),
         "query", "x" * 2000,
     )
-    EsunCrawler._capture_twd_response(Response(), hits, requests)
+    observer = type('Observer', (), {'read': lambda *_: _live_ajax_html().encode()})()
+    EsunCrawler._capture_twd_response(Response(), hits, requests, observer)
     assert len(hits) == 1
     assert hits[0].req_body == {
         "fieldsExact": True,
@@ -1082,7 +1662,8 @@ def test_persist_collected_validates_coverage_before_any_write(tmp_path, monkeyp
             store.close()
 
 
-def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", [None, "frame-url", "contract"])
+def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeypatch, failure):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
     collector = ResponseCollector()
@@ -1091,6 +1672,14 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
     request_listeners = []
     response_listeners = []
     state = {"dom_ready": False}
+    class Observer:
+        def __init__(self, *_):
+            self.closed = False
+        def read(self, response, *_):
+            return response.text().encode()
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr('backend.banks.esun._HistoryBodyObserver', Observer)
 
     class Request:
         method = "POST"
@@ -1126,13 +1715,19 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
     class Frame:
         name = "history"
         url = frame_url
+        contract_calls = 0
 
         def locator(self, selector):
             assert selector == "select[id='fao01002:dract']"
             return Locator()
 
         def evaluate(self, script, arg=None):
+            if 'const old = window.__thothEsunOldNodes' in script:
+                return _live_ajax_html()
             if "formCount" in script and "sameForm" in script:
+                self.contract_calls += 1
+                if failure == "contract" and self.contract_calls == 2:
+                    return {**_form_contract(), "queryCount": 2}
                 return _form_contract()
             if "[...s.options]" in script:
                 return [{"index": 1, "text": f"臺幣綜存 {account}", "value": "opaque-a"}]
@@ -1245,6 +1840,18 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
     monkeypatch.setattr(crawler, "_navigate_menu", navigate)
     monkeypatch.setattr(crawler, "_navigate_credit_card_bill", lambda *_args: {"frames": []})
     page = Page()
+    if failure is not None:
+        from backend.core.base import _safe_collect_guard
+
+        if failure == "frame-url":
+            page.frames[1].url = _form_contract()["action"]
+        with pytest.raises(RuntimeError) as caught:
+            crawler.collect(page, collector)
+        assert _safe_collect_guard(caught.value, EsunCrawler.SAFE_COLLECT_GUARDS) == (
+            f"esun-twd-history-form-{failure}"
+        )
+        assert request_listeners == response_listeners == []
+        return
     result = crawler.collect(page, collector).to_dict()
     assert 9000 not in page.waits
     assert result["history_coverage"]["domains"][0]["windows"] == [{

@@ -740,6 +740,8 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     ).encode()
 
+    # Reviewed history hardening: account-owned controls, bounded observer,
+    # and response/render binding in collect; following helpers are unchanged.
     assert hashlib.sha256(payload).hexdigest() == (
-        "913dd139b544684351a3da275f24fb4bf8d5b7c0ef382c292b214c225c297318"
+        "3ffa3e2d7e2939753ae4269c1954abe871e5a4c5770ff680fefc3f7bbc1aae76"
     )

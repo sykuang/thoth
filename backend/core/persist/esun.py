@@ -270,7 +270,7 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
                 or type(snapshot.get("totalCount")) is not int
                 or snapshot["totalCount"] != 0
                 or snapshot.get("emptyMarker") not in {
-                    "查無交易資料", "查無資料", "無交易明細",
+                    "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
                 }
                 or _parse_esun_twd_txn_results([result]) != []
             ):
