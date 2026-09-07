@@ -2034,6 +2034,7 @@ dependencies = [
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
@@ -2058,7 +2059,6 @@ push-apns = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -2074,6 +2074,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx", extras = ["http2"], marker = "extra == 'push-all'", specifier = ">=0.27" },
     { name = "httpx", extras = ["http2"], marker = "extra == 'push-apns'", specifier = ">=0.27" },
+    { name = "httpx2", specifier = ">=0.0.1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'push-all'", specifier = ">=2.8" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'push-apns'", specifier = ">=2.8" },
@@ -2091,7 +2092,6 @@ provides-extras = ["push-apns", "push-all"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = ">=0.0.1" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "ruff", specifier = ">=0.15.0" },
 ]

@@ -4,7 +4,7 @@
 # 5 stage flow:
 #   1. RG (idempotent)
 #   2. ACR with deterministic name; passed into Bicep as param
-#   3. az acr build (cloud Docker build; no local docker needed)
+#   3. az acr build worker + API images (no local docker needed)
 #   4. Bicep deploy (CAE + storage + MI + Container App)
 #   5. Print URL + how to follow logs
 #
@@ -96,11 +96,19 @@ echo "    Login server: $ACR_LOGIN_SERVER"
 
 # -------- 3. az acr build (cloud build + push) --------
 IMAGE_REF="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+API_IMAGE_REF="${ACR_LOGIN_SERVER}/${IMAGE_NAME}-api:${IMAGE_TAG}"
 echo "==> [3/5] az acr build $IMAGE_REF - uploads context to Azure"
 az acr build \
   --registry "$ACR_NAME" \
   --image "${IMAGE_NAME}:${IMAGE_TAG}" \
   --file Dockerfile \
+  .
+
+echo "    az acr build $API_IMAGE_REF - browser-free API"
+az acr build \
+  --registry "$ACR_NAME" \
+  --image "${IMAGE_NAME}-api:${IMAGE_TAG}" \
+  --file Dockerfile.api \
   .
 
 # -------- 4. Bicep deploy --------
@@ -133,7 +141,7 @@ echo "    Deployer IP allow: $DEPLOYER_IP_CIDR"
 # The Python parameter-file writer reads os.environ. Bash assignments and
 # sourced .env values are not exported by default, so export the deployment
 # inputs explicitly (without echoing secret values).
-export NAME_PREFIX LOCATION ACR_LOGIN_SERVER IMAGE_REF \
+export NAME_PREFIX LOCATION ACR_LOGIN_SERVER IMAGE_REF API_IMAGE_REF \
   JWT_SECRET SERVER_FERNET_KEY SERVER_API_KEY ADMIN_API_KEY PG_ADMIN_PASSWORD DEPLOYER_OID \
   SNAPTRADE_CLIENT_ID SNAPTRADE_CONSUMER_KEY DEPLOYER_IP_CIDR BOOTSTRAP_NETWORK_ONLY
 
@@ -151,6 +159,7 @@ params = {
     "location": {"value": os.environ["LOCATION"]},
     "acrLoginServer": {"value": os.environ["ACR_LOGIN_SERVER"]},
     "containerImage": {"value": os.environ["IMAGE_REF"]},
+    "apiContainerImage": {"value": os.environ["API_IMAGE_REF"]},
     "jwtSecret": {"value": os.environ["JWT_SECRET"]},
     "serverFernetKey": {"value": os.environ["SERVER_FERNET_KEY"]},
     "serverApiKey": {"value": os.environ["SERVER_API_KEY"]},

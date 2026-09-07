@@ -1,0 +1,32 @@
+# API-only image. Keep Python 3.12 + Bookworm while tracking patch updates.
+# Python deps remain identical to the worker: enqueue capability checks still
+# import crawlers. Only browser binaries and their system payload are omitted.
+FROM python:3.12-slim-bookworm AS builder
+
+ENV UV_PYTHON_DOWNLOADS=never \
+    PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+RUN pip install --no-cache-dir uv==0.5.11
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+COPY backend/ ./backend/
+COPY cli/ ./cli/
+COPY migrations/ ./migrations/
+RUN uv sync --frozen --no-dev
+
+FROM python:3.12-slim-bookworm
+
+# Native numeric/OCR wheels remain Python dependencies in this first stage.
+# Linux uses opencv-python-headless, so no graphics/windowing libraries needed.
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --user-group --uid 10001 thoth
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    SYNC_EXECUTION_MODE=external
+WORKDIR /app
+COPY --from=builder --chown=thoth:thoth /app /app
+USER thoth
+EXPOSE 8000
+CMD ["/app/.venv/bin/uvicorn", "backend.server.app:app", "--host", "0.0.0.0", "--port", "8000"]

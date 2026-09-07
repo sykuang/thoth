@@ -28,8 +28,11 @@ param location string = 'eastasia'
 @description('Pre-created ACR login server (e.g. thothacr<hash>.azurecr.io).')
 param acrLoginServer string
 
-@description('Container image full ref including registry.')
+@description('Worker/standalone container image full ref including registry. Used by every Job.')
 param containerImage string
+
+@description('API-only image. Defaults to the worker image for existing single-image callers.')
+param apiContainerImage string = containerImage
 
 @description('JWT signing secret. Generate locally with: openssl rand -hex 32')
 @secure()
@@ -429,7 +432,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'backend'
-          image: containerImage
+          image: apiContainerImage
           resources: {
             cpu: json('1.0')
             memory: '2.0Gi'
