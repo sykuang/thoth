@@ -31,6 +31,7 @@ import { type UserPreferences } from '@/types/api';
 export const DEFAULT_PREFERENCES: UserPreferences = {
   fx_display_mode: 'auto',
   card_date_basis: 'consume',
+  show_snaptrade_transactions: false,
 };
 
 type PreferencesMutationVariables = {

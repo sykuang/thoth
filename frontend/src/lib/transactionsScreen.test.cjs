@@ -20,8 +20,9 @@ stubModule('react-native', {
 let params;
 stubModule('expo-router', { useLocalSearchParams: () => params });
 stubModule('../hooks/useBreakpoint', { useBreakpoint: () => ({ isMd: true }) });
-const preferences = { fx_display_mode: 'original', card_date_basis: 'consume' };
-stubModule('../hooks/usePreferences', { usePreferences: () => ({ data: preferences, hasServerData: true }) });
+let preferences;
+let hasServerData;
+stubModule('../hooks/usePreferences', { usePreferences: () => ({ data: preferences, hasServerData }) });
 for (const [file, name] of [
   ['BulkEditSheet', 'BulkEditSheet'], ['BankBadge', 'BankBadge'],
   ['transactions/MonthCarousel', 'MonthCarousel'], ['transactions/TxnDetailModal', 'TxnDetailModal'],
@@ -62,6 +63,8 @@ const emptyPortfolio = { accounts: [], activities: [], positions: [], balances: 
 let client;
 beforeEach(() => {
   params = {};
+  preferences = { fx_display_mode: 'original', card_date_basis: 'consume', show_snaptrade_transactions: true };
+  hasServerData = true;
   ownerCalls = [];
   client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
   client.setQueryData(datasetKey, { transactions: [transaction], preferences });
@@ -76,10 +79,14 @@ function nodes(tree) {
 function render(actions = []) {
   function Driver() {
     const step = React.useRef(0);
+    const [, rerender] = React.useState(0);
     // Invoke during this render so React applies screen callbacks to its real
     // useState hooks, without a DOM dependency or hook-index overrides.
     const tree = TransactionsScreen();
-    if (step.current < actions.length) actions[step.current++](nodes(tree));
+    if (step.current < actions.length) {
+      actions[step.current++](nodes(tree));
+      rerender(step.current);
+    }
     return tree;
   }
   return renderToStaticMarkup(React.createElement(QueryClientProvider, { client }, React.createElement(Driver)));
@@ -90,6 +97,78 @@ const press = (id) => (tree) => {
   node.props.onPress();
 };
 const has = (html, id) => html.includes(`data-testid="${id}"`);
+
+const cachedPortfolio = () => ({
+  ...emptyPortfolio,
+  accounts: [{ id: 'broker', institution_name: 'Test broker' }],
+  activities: [{ id: 'trade', account_id: 'broker', type: 'BUY', symbol: 'CACHED', trade_date: transaction.date, amount: '-100', currency: 'USD' }],
+});
+const refreshControl = (tree) => tree.find((node) => node.props.refreshControl).props.refreshControl.props;
+
+for (const value of [undefined, false, 'true', 1]) {
+  test(`only boolean true opts in: ${String(value)} hides cached rows and counts`, () => {
+    if (value === undefined) delete preferences.show_snaptrade_transactions;
+    else preferences.show_snaptrade_transactions = value;
+    client.setQueryData(brokerageKey, cachedPortfolio());
+    const html = render();
+    assert.equal(brokerageOptions.enabled, false);
+    assert.ok(html.includes(transaction.description));
+    assert.ok(!html.includes('CACHED'));
+    assert.match(html, /共 <div[^>]*>1<\/div> 筆/);
+    assert.ok(!html.includes('該期間 2 筆'));
+    assert.equal(client.getQueryData(brokerageKey).activities.length, 1, 'shared cache must remain intact');
+  });
+}
+
+for (const state of ['pending', 'error', 'refetching']) {
+  test(`off suppresses brokerage ${state} and explicit refresh`, async () => {
+    preferences.show_snaptrade_transactions = false;
+    if (state === 'error') await failQuery(brokerageKey);
+    if (state === 'refetching') {
+      client.setQueryData(brokerageKey, cachedPortfolio());
+      void client.fetchQuery({ queryKey: brokerageKey, staleTime: 0, queryFn: pending }).catch(() => {});
+    }
+    let refresh;
+    const html = render([(tree) => { refresh = refreshControl(tree); }]);
+    assert.ok(!has(html, 'txn-brokerage-loading'));
+    assert.ok(!has(html, 'txn-brokerage-error'));
+    assert.ok(!has(html, 'spinner'));
+    assert.equal(refresh.refreshing, false);
+    refresh.onRefresh();
+    assert.ok(!ownerCalls.includes('/snaptrade/portfolio'));
+    assert.equal(brokerageOptions.enabled, false);
+  });
+}
+
+for (const view of ['list', 'category']) {
+  test(`off ${view} empty scope does not call intentionally disabled brokerage unknown`, () => {
+    preferences.show_snaptrade_transactions = false;
+    client.setQueryData(datasetKey, { transactions: [], preferences });
+    client.setQueryData(accountsKey, []);
+    const html = render(view === 'category' ? [press('txn-view-category')] : []);
+    assert.ok(has(html, 'txn-empty'));
+    assert.ok(!has(html, 'txn-sources-unknown'));
+    assert.ok(!has(html, 'spinner'));
+    assert.ok(html.includes('目前顯示範圍沒有交易來源'));
+    assert.ok(!html.includes('還沒有任何交易來源'));
+    assert.ok(html.includes('設定'));
+  });
+
+  test(`off ${view} unknown inventory pull-to-refresh never fetches brokerage`, async () => {
+    preferences.show_snaptrade_transactions = false;
+    client.setQueryData(datasetKey, { transactions: [], preferences });
+    client.removeQueries({ queryKey: accountsKey });
+    await failQuery(accountsKey);
+    let refresh;
+    const actions = view === 'category' ? [press('txn-view-category')] : [];
+    const html = render([...actions, (tree) => { refresh = refreshControl(tree); }]);
+    assert.ok(has(html, 'txn-sources-unknown'), 'bank inventory genuinely remains unknown');
+    assert.equal(brokerageOptions.enabled, false);
+    refresh.onRefresh();
+    assert.ok(ownerCalls.includes('/accounts'));
+    assert.ok(!ownerCalls.includes('/snaptrade/portfolio'), 'explicit inventory fallback must respect off');
+  });
+}
 
 const text = (tree) => React.Children.toArray(tree).map((node) => React.isValidElement(node)
   ? text(node.props.children) : String(node)).join('');
@@ -121,6 +200,75 @@ test('search remains brokerage-relevant until its matching rows are known', () =
   assert.ok(!has(html, 'txn-empty'), 'pending search source is not a confirmed no-match');
   assert.ok(has(html, 'spinner'));
   assert.equal(brokerageOptions.enabled, true);
+});
+
+test('on → off → on recomputes the mounted screen without clearing shared cache', () => {
+  client.setQueryData(brokerageKey, cachedPortfolio());
+  const brokerageRows = (tree) => tree.filter((node) => node.props.activity);
+  const html = render([
+    (tree) => {
+      assert.equal(brokerageRows(tree).length, 1);
+      preferences = { ...preferences, show_snaptrade_transactions: false };
+    },
+    (tree) => {
+      assert.equal(brokerageRows(tree).length, 0);
+      assert.equal(brokerageOptions.enabled, false);
+      refreshControl(tree).onRefresh();
+      assert.ok(!ownerCalls.includes('/snaptrade/portfolio'));
+      preferences = { ...preferences, show_snaptrade_transactions: true };
+    },
+    (tree) => {
+      assert.equal(brokerageRows(tree).length, 1);
+      assert.equal(brokerageOptions.enabled, true);
+    },
+  ]);
+  assert.ok(html.includes('CACHED'));
+  assert.equal(client.getQueryData(brokerageKey).activities.length, 1);
+});
+
+test('a brokerage response completing after opt-out stays cached but cannot reveal rows', async () => {
+  let complete;
+  const request = client.fetchQuery({ queryKey: brokerageKey, queryFn: () => new Promise((resolve) => { complete = resolve; }) });
+  assert.ok(has(render(), 'txn-brokerage-loading'));
+  preferences = { ...preferences, show_snaptrade_transactions: false };
+  assert.ok(!has(render(), 'txn-brokerage-loading'));
+  complete(cachedPortfolio());
+  await request;
+  const html = render();
+  assert.ok(!html.includes('CACHED'));
+  assert.equal(brokerageOptions.enabled, false);
+  assert.equal(client.getQueryData(brokerageKey).activities.length, 1);
+});
+
+for (const saved of [undefined, false, true]) {
+  test(`replica fallback preserves opt-in ${String(saved)} until authoritative preferences arrive`, () => {
+    hasServerData = false;
+    preferences = { fx_display_mode: 'auto' };
+    client.setQueryData(datasetKey, { transactions: [transaction], preferences: { ...preferences, show_snaptrade_transactions: saved } });
+    client.setQueryData(brokerageKey, cachedPortfolio());
+    assert.equal(render().includes('CACHED'), saved === true);
+    hasServerData = true;
+    preferences = { ...preferences, show_snaptrade_transactions: false };
+    assert.ok(!render().includes('CACHED'), 'explicit server false must win over replica true');
+  });
+}
+
+test('opt-in retains search, period filtering, count and refresh behavior', () => {
+  const portfolio = cachedPortfolio();
+  portfolio.activities.push({ ...portfolio.activities[0], id: 'older', symbol: 'OLD', trade_date: '2000-01-01' });
+  client.setQueryData(brokerageKey, portfolio);
+  let html = render();
+  assert.ok(html.includes('CACHED'));
+  assert.ok(!html.includes('OLD'));
+  assert.match(html, /共 <div[^>]*>2<\/div> 筆/);
+  html = render([press('txn-filter-open'), searchFor('BUY'), press('txn-filter-done')]);
+  assert.ok(html.includes('CACHED'));
+  assert.ok(!html.includes(transaction.description));
+  assert.ok(has(render([press('txn-filter-open'), searchFor('absent'), press('txn-filter-done')]), 'txn-empty'));
+  let refresh;
+  render([(tree) => { refresh = refreshControl(tree); }]);
+  refresh.onRefresh();
+  assert.ok(ownerCalls.includes('/snaptrade/portfolio'));
 });
 
 // Tracer bullet: the existing global gate renders only a spinner here.

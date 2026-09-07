@@ -81,6 +81,19 @@ excludes(accounts, 'borderLeftWidth: 4', 'normal bank groups must not use warnin
 excludes(brokerageTransaction, 'w-1 bg-brand-500', 'normal brokerage transactions must not use status-style side stripes');
 includes(accounts, "flexBasis: '48%', flexGrow: 0", 'desktop bank groups must keep stable two-column width');
 
+const displaySettings = settings.slice(settings.indexOf('<SettingsGroup title="資料與顯示">'), settings.indexOf('</SettingsGroup>'));
+includes(displaySettings, '<SnapTradeTransactionsToggle />', 'SnapTrade display opt-in belongs under 資料與顯示');
+const snaptradeToggle = settings.slice(settings.indexOf('function SnapTradeTransactionsToggle()'), settings.indexOf('function PushNotificationSetting()'));
+for (const token of [
+  'usePreferences()', '<Switch', '顯示 SnapTrade 交易明細', '不影響帳戶持倉',
+  'value={prefs.show_snaptrade_transactions === true}',
+  'isLoading || !hasServerData || isMutating', 'disabled={disabled}',
+  'if (!disabled) mutate({ show_snaptrade_transactions: next })',
+  'accessibilityLabel="顯示 SnapTrade 交易明細"',
+  'error &&', 'formatApiError(error)', 'mutationError &&', 'formatApiError(mutationError)',
+]) includes(snaptradeToggle, token, `SnapTrade toggle missing contract: ${token}`);
+includes(source('src/hooks/usePreferences.ts'), 'show_snaptrade_transactions: false', 'hook default must match backend opt-out');
+
 includes(settings, 'accessibilityState={{ expanded }}', 'settings disclosures must expose expanded accessibility state');
 includes(categoryRules, 'AccessibilityInfo.announceForAccessibility', 'rule search must announce result changes');
 includes(categoryRules, 'min-h-11', 'rule search clear action must keep a 44pt touch target');

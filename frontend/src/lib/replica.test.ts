@@ -175,7 +175,18 @@ const dataset = projectReplicaDataset(envelope as ReplicaEnvelope);
 deepEqual(dataset.preferences, {
   fx_display_mode: 'always_original',
   card_date_basis: 'post',
+  show_snaptrade_transactions: false,
 });
+for (const value of [true, false, undefined, null, 'true', 'false', 1, 0]) {
+  const restored: ReplicaEnvelope = JSON.parse(JSON.stringify({
+    ...envelope,
+    partitions: { ...envelope.partitions, user: { preferences: { show_snaptrade_transactions: value } } },
+  }));
+  equal(projectReplicaDataset(restored).preferences.show_snaptrade_transactions, value === true);
+}
+for (const user of [undefined, {}, { preferences: null }]) {
+  equal(projectReplicaDataset({ ...envelope, partitions: { user } }).preferences.show_snaptrade_transactions, false);
+}
 equal(dataset.transactions.length, 5);
 const children = dataset.transactions.filter((row) => row.split_of === 1);
 deepEqual(children.map((row) => row.id), ['1#0', '1#1']);

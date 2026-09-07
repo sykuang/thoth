@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 from backend.server.deps import current_user
 from backend.server import preferences_repo
@@ -39,6 +39,7 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # 信用卡明細/統計使用哪個日期 — 'consume' (消費日, 預設) / 'post' (入帳日).
     # 會影響 /transactions 的日期篩選、排序、月份歸屬與 list row 顯示。
     "card_date_basis": "consume",
+    "show_snaptrade_transactions": False,
 }
 
 VALID_FX_MODES = ("auto", "always_twd", "always_original")
@@ -50,6 +51,7 @@ class PreferencesPayload(BaseModel):
 
     fx_display_mode: Literal["auto", "always_twd", "always_original"] | None = None
     card_date_basis: Literal["consume", "post"] | None = None
+    show_snaptrade_transactions: StrictBool | None = None
 
 
 def _load_with_defaults(user_id: int) -> dict[str, Any]:

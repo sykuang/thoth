@@ -112,6 +112,7 @@ export default function TransactionsScreen() {
     : (datasetQ.data?.preferences ?? preferencesQ.data);
   const fxMode = prefs.fx_display_mode;
   const cardDateBasis = prefs.card_date_basis ?? 'consume';
+  const showSnaptradeTransactions = prefs.show_snaptrade_transactions === true;
   const [selectedBanks, setSelectedBanks] = useState<string[]>(initialBank ? [initialBank] : []);
   const [activeAccountNo, setActiveAccountNo] = useState(accountNo);
   const [activeCardNo, setActiveCardNo] = useState(cardNo);
@@ -216,7 +217,7 @@ export default function TransactionsScreen() {
   );
   const effectiveAccountNo = drilldownScopeActive ? activeAccountNo : '';
   const effectiveCardNo = drilldownScopeActive ? activeCardNo : '';
-  const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
+  const brokerageScopeActive = showSnaptradeTransactions && selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
   const brokerageRelevant = brokerageScopeActive && viewMode === 'list'
     && !category && !subcategory && direction === 'all' && !selectionMode;
   const brokerageQ = useQuery({
@@ -380,7 +381,8 @@ export default function TransactionsScreen() {
     + Number(search.trim().length > 0);
   const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;
   const noKnownSources = availableBanks.length === 0 && brokerageAccountCount === 0;
-  const sourceInventoryUnknown = noKnownSources && (bankAccountsQ.data === undefined || brokerageQ.data === undefined);
+  const sourceInventoryUnknown = noKnownSources && (bankAccountsQ.data === undefined
+    || (showSnaptradeTransactions && brokerageQ.data === undefined));
   const sourcesPending = datasetQ.isPending || (brokerageRelevant && brokerageQ.isPending);
   const brokerageUnavailable = brokerageRelevant && brokerageQ.isError && !brokerageQ.data;
   const isUnsupportedAccountDrilldown = Boolean(
@@ -407,7 +409,7 @@ export default function TransactionsScreen() {
           refreshing={transactionRefreshing}
           onRefresh={() => {
             void datasetQ.refreshSnapshot();
-            if (brokerageRelevant || (sourceInventoryUnknown && brokerageQ.data === undefined)) void brokerageQ.refetch();
+            if (showSnaptradeTransactions && (brokerageRelevant || (sourceInventoryUnknown && brokerageQ.data === undefined))) void brokerageQ.refetch();
             if (sourceInventoryUnknown) void bankAccountsQ.refetch();
           }}
           tintColor="#7c3aed"
@@ -652,7 +654,7 @@ export default function TransactionsScreen() {
                 : sourceInventoryUnknown
                   ? '此篩選沒有任何交易，交易來源尚未確認'
                 : noKnownSources
-                  ? '還沒有任何交易來源'
+                  ? showSnaptradeTransactions ? '還沒有任何交易來源' : '目前顯示範圍沒有交易來源'
                 : isUnsupportedAccountDrilldown
                   ? '此銀行尚未支援存款交易明細同步'
                   : '此篩選沒有任何交易'}
@@ -661,7 +663,9 @@ export default function TransactionsScreen() {
               {brokerageUnavailable || sourceInventoryUnknown
                 ? '請下拉重新整理'
                 : noKnownSources
-                  ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                  ? showSnaptradeTransactions
+                    ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                    : '可到「帳戶」新增銀行帳戶，或在「設定」開啟「顯示 SnapTrade 交易明細」'
                 : isUnsupportedAccountDrilldown
                   ? '目前這家銀行只同步到帳戶餘額，尚未同步存款交易明細；清除篩選也不會出現此帳戶的明細。'
                   : '試試清除篩選或執行同步'}
