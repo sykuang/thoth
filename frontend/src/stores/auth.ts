@@ -17,6 +17,8 @@ import { replicaStore } from '@/lib/replicaStore';
 import { migrateServerUrl } from '@/lib/serverUrlMigration';
 
 type AuthState = {
+  /** In-memory login lifecycle; token rotation does not replace the session. */
+  sessionEpoch: number;
   token: string | null;
   /** L9 (2026-06-21): long-lived refresh token (DB-backed, rotation chain).
    * Used by lib/api.ts on 401 to silently refresh access token without user re-login.
@@ -96,6 +98,7 @@ const DEFAULT_SERVER_URL = Platform.OS === 'web'
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
+      sessionEpoch: 0,
       token: null,
       refreshToken: null,
       email: null,
@@ -108,7 +111,7 @@ export const useAuthStore = create<AuthState>()(
           void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
         }
         activateReplicaOwner(makeReplicaOwnerKey(state.serverUrl, email));
-        return { token, email, refreshToken };
+        return { token, email, refreshToken, sessionEpoch: state.sessionEpoch + 1 };
       }),
       setTokens: (accessToken, refreshToken) =>
         set({ token: accessToken, refreshToken }),
@@ -117,13 +120,15 @@ export const useAuthStore = create<AuthState>()(
           void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
         }
         if (state.email) activateReplicaOwner(makeReplicaOwnerKey(serverUrl, state.email));
-        return { serverUrl };
+        return { serverUrl, sessionEpoch: state.sessionEpoch + Number(state.serverUrl !== serverUrl) };
       }),
-      setApiKey: (apiKey) => set({ apiKey }),
+      setApiKey: (apiKey) => set((state) => ({
+        apiKey, sessionEpoch: state.sessionEpoch + Number(state.apiKey !== apiKey),
+      })),
       setBiometricEnabled: (biometricEnabled) => set({ biometricEnabled }),
       logout: () => set((state) => {
         void clearReplicaOwner(replicaStore, state.serverUrl, state.email);
-        return { token: null, refreshToken: null, email: null };
+        return { token: null, refreshToken: null, email: null, sessionEpoch: state.sessionEpoch + 1 };
       }),
       _setHydrated: (v) => set({ hydrated: v }),
     }),

@@ -11,9 +11,11 @@ function stubModule(id, exports) {
 stubModule('react-native', { Platform: { OS: 'web' } });
 stubModule('expo-secure-store', {});
 stubModule('expo-router', { router: { replace: () => assert.fail('unexpected navigation') } });
+let hasSavedCredentials = async () => false;
+let loadSavedCredentials = async () => assert.fail('unexpected credential access');
 stubModule('./credentials', {
-  hasCredentials: async () => false,
-  loadCredentials: async () => assert.fail('unexpected credential access'),
+  hasCredentials: () => hasSavedCredentials(),
+  loadCredentials: () => loadSavedCredentials(),
 });
 const { api, ApiError } = require('./api');
 const { useAuthStore } = require('../stores/auth');
@@ -33,6 +35,8 @@ const flush = () => setImmediate();
 let testId = 0;
 beforeEach(() => {
   calls.length = 0;
+  hasSavedCredentials = async () => false;
+  loadSavedCredentials = async () => assert.fail('unexpected credential access');
   useAuthStore.setState({
     serverUrl: 'https://warmup.invalid/api/', email: `test-${++testId}@example.invalid`,
     token: 'test-access', refreshToken: 'test-refresh', apiKey: 'test-key', hydrated: true,
@@ -180,7 +184,7 @@ function ownerInit() {
   };
 }
 
-for (const change of ['server', 'account', 'logout-login', 'token']) {
+for (const change of ['server', 'account', 'logout-login']) {
   test(`${change} during health prevents POST and body capture`, async () => {
     const health = deferred();
     transport = async ({ url }) => url.endsWith('/healthz') ? health.promise : json({ queued: 1 }, 202);
@@ -198,7 +202,6 @@ for (const change of ['server', 'account', 'logout-login', 'token']) {
       state.logout();
       state.setAuth(state.token, state.email, state.refreshToken);
     }
-    if (change === 'token') state.setTokens('rotated-access', 'rotated-refresh');
     await flush();
     health.resolve(json({ status: 'ok' }));
     await rejected;
@@ -356,3 +359,238 @@ for (const path of ['/sync/all', '/sync/account/17']) {
     assert.equal(new Headers(post.init.headers).get('X-Request-ID'), 'test-request');
   });
 }
+
+test('sibling refresh preserves an accepted sync response without replay', async () => {
+  const pending = deferred();
+  transport = async ({ url, init }) => {
+    if (url.endsWith('/healthz')) return json({ status: 'ok' });
+    if (url.endsWith('/sync/all')) return pending.promise;
+    if (url.endsWith('/auth/refresh')) return json({ access_token: 'rotated-access', refresh_token: 'rotated-refresh' });
+    return new Headers(init.headers).get('Authorization') === 'Bearer test-access'
+      ? json({}, 401) : json({ ok: true });
+  };
+  const result = api('/sync/all', ownerInit());
+  await flush();
+  await api('/accounts');
+  pending.resolve(json({ queued: 13 }, 202));
+  assert.deepEqual(await result, { queued: 13 });
+  assert.equal(calls.filter((c) => c.url.endsWith('/sync/all')).length, 1);
+  assert.equal(calls.filter((c) => c.url.endsWith('/auth/refresh')).length, 1);
+});
+
+for (const phase of ['headers', 'body']) {
+  test(`same-session rotation during ${phase} preserves successful response`, async () => {
+    const pending = deferred();
+    transport = async () => {
+      if (phase === 'headers') return pending.promise;
+      const response = json({ ok: true });
+      response.text = () => pending.promise;
+      return response;
+    };
+    const result = api('/accounts');
+    await flush();
+    useAuthStore.getState().setTokens('rotated-access', 'rotated-refresh');
+    pending.resolve(phase === 'headers' ? json({ ok: true }) : '{"ok":true}');
+    assert.deepEqual(await result, { ok: true });
+    assert.equal(calls.length, 1);
+  });
+}
+
+test('late 401 reuses sibling credentials without rotating twice', async () => {
+  const pending = deferred();
+  transport = async ({ url, init }) => {
+    const old = new Headers(init.headers).get('Authorization') === 'Bearer test-access';
+    if (url.endsWith('/delayed') && old) return pending.promise;
+    if (url.endsWith('/auth/refresh')) return json({ access_token: 'rotated-access', refresh_token: 'rotated-refresh' });
+    return old ? json({}, 401) : json({ ok: true });
+  };
+  const result = api('/delayed');
+  await flush();
+  await api('/accounts');
+  pending.resolve(json({}, 401));
+  assert.deepEqual(await result, { ok: true });
+  assert.equal(calls.filter((c) => c.url.endsWith('/auth/refresh')).length, 1);
+});
+
+test('owner-bound and generic requests share the same refresh flight', async () => {
+  const pending = deferred();
+  transport = async ({ url, init }) => {
+    if (url.endsWith('/auth/refresh')) return pending.promise;
+    return new Headers(init.headers).get('Authorization') === 'Bearer test-access'
+      ? json({}, 401) : json({ ok: true });
+  };
+  const requests = [api('/accounts', ownerInit()), api('/cards')];
+  const result = Promise.allSettled(requests);
+  await flush();
+  const refreshes = calls.filter((c) => c.url.endsWith('/auth/refresh')).length;
+  pending.resolve(json({ access_token: 'rotated-access', refresh_token: 'rotated-refresh' }));
+  const settled = await result;
+  assert.equal(refreshes, 1);
+  assert.ok(settled.every((r) => r.status === 'fulfilled'));
+});
+
+test('rotation while health waits uses new credentials for the first POST', async () => {
+  const health = deferred();
+  transport = async ({ url }) => url.endsWith('/healthz') ? health.promise : json({ queued: 1 }, 202);
+  const result = api('/sync/all', ownerInit());
+  await flush();
+  useAuthStore.getState().setTokens('rotated-access', 'rotated-refresh');
+  health.resolve(json({ status: 'ok' }));
+  assert.deepEqual(await result, { queued: 1 });
+  assert.equal(calls.length, 2);
+  assert.equal(new Headers(calls[1].init.headers).get('Authorization'), 'Bearer rotated-access');
+});
+
+for (const transition of ['relogin', 'logout-login', 'server-roundtrip', 'key-roundtrip']) {
+  for (const phase of ['headers', 'body']) {
+    test(`${transition} invalidates an old ${phase} continuation even with identical credentials`, async () => {
+      const pending = deferred();
+      transport = async () => {
+        if (phase === 'headers') return pending.promise;
+        const response = json({ ok: true }); response.text = () => pending.promise; return response;
+      };
+      const result = assert.rejects(api('/accounts'), (e) => e.status === 409);
+      await flush();
+      const s = useAuthStore.getState();
+      if (transition === 'logout-login') s.logout();
+      if (transition === 'relogin' || transition === 'logout-login') s.setAuth(s.token, s.email, s.refreshToken);
+      if (transition === 'server-roundtrip') { s.setServerUrl('https://other.invalid'); s.setServerUrl(s.serverUrl); }
+      if (transition === 'key-roundtrip') { s.setApiKey('other-test-key'); s.setApiKey(s.apiKey); }
+      pending.resolve(phase === 'headers' ? json({ ok: true }) : '{"ok":true}');
+      await result;
+      assert.equal(calls.length, 1);
+      assert.equal(useAuthStore.getState().token, s.token);
+    });
+  }
+}
+
+for (const status of [200, 401]) {
+  test(`late refresh HTTP ${status} cannot overwrite or log out newer credentials`, async () => {
+    const refresh = deferred();
+    transport = async ({ url, init }) => url.endsWith('/auth/refresh') ? refresh.promise
+      : new Headers(init.headers).get('Authorization') === 'Bearer test-access' ? json({}, 401) : json({ ok: true });
+    const result = api('/accounts');
+    await flush();
+    useAuthStore.getState().setTokens('newer-access', 'newer-refresh');
+    refresh.resolve(json({ access_token: 'stale-access', refresh_token: 'stale-refresh' }, status));
+    assert.deepEqual(await result, { ok: true });
+    assert.equal(useAuthStore.getState().token, 'newer-access');
+  });
+}
+
+test('session replacement while checking saved credentials never opens Face ID', async () => {
+  const available = deferred();
+  hasSavedCredentials = () => available.promise;
+  transport = async () => json({}, 401);
+  useAuthStore.getState().setTokens('test-access', null);
+  const result = assert.rejects(api('/accounts'), (e) => e.status === 409);
+  await flush();
+  useAuthStore.getState().setAuth('other-access', 'other@example.invalid', 'other-refresh');
+  available.resolve(true);
+  await result;
+  assert.equal(calls.length, 1);
+  assert.equal(useAuthStore.getState().token, 'other-access');
+});
+
+for (const branch of ['no-refresh-token', 'after-refresh', 'refresh-failed']) {
+  test(`${branch}: sibling rotation in credential-check microtask skips Face ID`, async () => {
+    const available = deferred();
+    let checks = 0, prompts = 0;
+    hasSavedCredentials = () => ++checks === 1 ? available.promise : Promise.resolve(true);
+    const state = useAuthStore.getState();
+    loadSavedCredentials = async () => {
+      prompts++;
+      return { serverUrl: state.serverUrl, email: state.email, password: 'synthetic-password' };
+    };
+    if (branch === 'no-refresh-token') state.setTokens('test-access', null);
+    transport = async ({ url, init }) => {
+      if (url.endsWith('/auth/refresh')) return json({}, 401);
+      if (url.endsWith('/auth/login')) return json({ access_token: 'unnecessary-access', refresh_token: 'unnecessary-refresh' });
+      return new Headers(init.headers).get('Authorization') === 'Bearer test-access'
+        ? json({}, 401) : json({ ok: true });
+    };
+    const result = api('/accounts', { _retriedAfterRefresh: branch === 'after-refresh' });
+    await flush();
+    assert.equal(checks, 1);
+    // Queue rotation after the helper's await handler, but before its caller resumes.
+    available.promise.then(() => state.setTokens('valid-sibling-access', 'valid-sibling-refresh'));
+    available.resolve(true);
+    assert.deepEqual(await result, { ok: true });
+    assert.equal(prompts, 0);
+    assert.equal(useAuthStore.getState().token, 'valid-sibling-access');
+    assert.equal(useAuthStore.getState().refreshToken, 'valid-sibling-refresh');
+    assert.equal(calls.filter((c) => c.url.endsWith('/auth/login')).length, 0);
+    assert.equal(calls.filter((c) => c.url.endsWith('/auth/refresh')).length, branch === 'refresh-failed' ? 1 : 0);
+    assert.deepEqual(calls.filter((c) => c.url.endsWith('/accounts'))
+      .map((c) => new Headers(c.init.headers).get('Authorization')),
+    ['Bearer test-access', 'Bearer valid-sibling-access']);
+  });
+}
+
+test('skipAuthRetry also rejects an old owner after delayed error-body parsing', async () => {
+  const body = deferred();
+  transport = async () => { const response = json({}, 401); response.json = () => body.promise; return response; };
+  const result = assert.rejects(api('/accounts', { skipAuthRetry: true }), (e) => e.status === 409);
+  await flush();
+  useAuthStore.getState().setAuth('other-access', 'other@example.invalid', 'other-refresh');
+  body.resolve({ detail: 'old-owner-detail' });
+  await result;
+  assert.equal(calls.length, 1);
+});
+
+test('biometric recovery is single-flight and preserves the active lifecycle', async () => {
+  const prompt = deferred(), response = deferred();
+  let prompts = 0;
+  hasSavedCredentials = async () => true;
+  loadSavedCredentials = () => { prompts++; return prompt.promise; };
+  useAuthStore.getState().setTokens('test-access', null);
+  const state = useAuthStore.getState();
+  transport = async ({ url, init }) => {
+    if (url.endsWith('/auth/login')) return response.promise;
+    return new Headers(init.headers).get('Authorization') === 'Bearer test-access'
+      ? json({}, 401) : json({ ok: true });
+  };
+  const result = Promise.all([api('/accounts', ownerInit()), api('/cards')]);
+  await flush();
+  assert.equal(prompts, 1);
+  prompt.resolve({ serverUrl: state.serverUrl, email: state.email, password: 'synthetic-password' });
+  await flush();
+  assert.equal(calls.filter((c) => c.url.endsWith('/auth/login')).length, 1);
+  response.resolve(json({ access_token: 'biometric-access', refresh_token: 'biometric-refresh' }));
+  assert.deepEqual(await result, [{ ok: true }, { ok: true }]);
+  assert.equal(useAuthStore.getState().sessionEpoch, state.sessionEpoch);
+});
+
+for (const phase of ['refresh', 'prompt', 'login-response']) {
+  test(`same-owner replacement during ${phase} cannot publish or replay old recovery`, async () => {
+    const pending = deferred();
+    hasSavedCredentials = async () => true;
+    const state = useAuthStore.getState();
+    loadSavedCredentials = async () => phase === 'prompt' ? pending.promise
+      : { serverUrl: state.serverUrl, email: state.email, password: 'synthetic-password' };
+    if (phase !== 'refresh') state.setTokens(state.token, null);
+    transport = async ({ url }) => url.endsWith('/auth/refresh') || url.endsWith('/auth/login')
+      ? pending.promise : json({}, 401);
+    const result = assert.rejects(api('/accounts'), (e) => e.status === 409);
+    await flush();
+    state.setAuth(state.token, state.email, state.refreshToken);
+    pending.resolve(phase === 'prompt'
+      ? { serverUrl: state.serverUrl, email: state.email, password: 'synthetic-password' }
+      : json({ access_token: 'stale-access', refresh_token: 'stale-refresh' }));
+    await result;
+    assert.equal(useAuthStore.getState().token, state.token);
+    assert.equal(calls.length, phase === 'prompt' ? 1 : 2);
+  });
+}
+
+test('successive credential rotations cannot cause unbounded retries', async () => {
+  let attempts = 0;
+  transport = async () => {
+    attempts++;
+    useAuthStore.getState().setTokens(`rotated-${attempts}`, `refresh-${attempts}`);
+    return json({}, 401);
+  };
+  await assert.rejects(api('/accounts'), (e) => e.status === 401);
+  assert.equal(calls.length, 2);
+  assert.equal(useAuthStore.getState().token, 'rotated-2');
+});
