@@ -199,9 +199,9 @@ export default function CategoriesScreen() {
   });
 
   const recategorizeMut = useMutation<RecategorizeResult, ApiError, void>({
-    mutationFn: () => api<RecategorizeResult>('/rules/recategorize', { method: 'POST' }),
+    mutationFn: () => api<RecategorizeResult>('/rules/recategorize?force=false', { method: 'POST' }),
     onSuccess: (data) => {
-      // Phase C-fe Warning #1 (2026-06-17): backend rewrite 所有 txn category,
+      // 套用規則只更新未分類交易；同步失效相關列表與統計快取。
       // 必須 invalidate transactions + portfolio summary (current_month_spending
       // 按 category 算), 不然 user 切回 transactions tab 在 staleTime 30s 內看到舊 category。
       qc.invalidateQueries({ queryKey: ['transactions'] });
@@ -209,7 +209,7 @@ export default function CategoriesScreen() {
       qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] });
       setStatus({
         kind: 'ok',
-        msg: `重新分類完成：${data.updated}/${data.total_rows} 筆更新`,
+        msg: `套用完成：${data.updated} 筆未分類交易已更新`,
       });
     },
     onError: (e) => setStatus({ kind: 'err', msg: formatApiError(e) }),
@@ -684,8 +684,11 @@ export default function CategoriesScreen() {
           <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
             這些操作會大量改動既有規則或交易，執行前請先確認。
           </Text>
-        {/* Recat all + reset: 手機與桌機都用直列，避免危險操作搶寬。 */}
+        {/* 套用到未分類 + reset: 手機與桌機都用直列，避免操作搶寬。 */}
         <View className="gap-2 mt-4">
+          <Text className="text-ink-500 dark:text-ink-400 text-small">
+            僅套用已啟用的規則，已有分類的交易不會變更。
+          </Text>
           <Pressable
             className={`bg-ink-100 dark:bg-ink-800 active:bg-ink-200 dark:active:bg-ink-700 rounded-xl py-3 items-center ${
               recategorizeMut.isPending ? 'opacity-50' : ''
@@ -694,7 +697,7 @@ export default function CategoriesScreen() {
             disabled={recategorizeMut.isPending}
           >
             <Text className="text-ink-900 dark:text-ink-50 text-h3">
-              {recategorizeMut.isPending ? '處理中…' : '重新分類所有交易'}
+              {recategorizeMut.isPending ? '處理中…' : '套用所有規則到未分類'}
             </Text>
           </Pressable>
           {/* Phase 8 (2026-06-15 使用者指示): 一鍵恢復預設 */}

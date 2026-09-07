@@ -66,6 +66,23 @@ def test_settings_home_uses_grouped_rows_without_future_placeholders() -> None:
     assert "更多設定 (主題 / 語系 / 備份匯出) 之後加進來" not in home
 
 
+def test_rule_application_is_explicitly_limited_to_uncategorized_transactions() -> None:
+    screen = CATEGORIES_SCREEN.read_text(encoding="utf-8")
+    mutation = screen[screen.index("const recategorizeMut ="):screen.index("function runPreview()")]
+    advanced = screen[screen.index('testID="rules-advanced-actions"'):]
+
+    assert "套用所有規則到未分類" in advanced
+    assert "僅套用已啟用的規則，已有分類的交易不會變更。" in advanced
+    assert "重新分類所有交易" not in screen
+    assert "'/rules/recategorize?force=false', { method: 'POST' }" in mutation
+    assert "套用完成：${data.updated} 筆未分類交易已更新" in mutation
+    for key in ("['transactions']", "['frontend-dataset']", "['portfolio', 'summary']"):
+        assert f"invalidateQueries({{ queryKey: {key} }})" in mutation
+    assert "onPress={() => recategorizeMut.mutate()}" in advanced
+    assert "disabled={recategorizeMut.isPending}" in advanced
+    assert "formatApiError(e)" in mutation
+
+
 def test_labels_and_rule_engine_are_separate_screens() -> None:
     labels = LABELS_SCREEN.read_text(encoding="utf-8")
     rules = CATEGORIES_SCREEN.read_text(encoding="utf-8")
