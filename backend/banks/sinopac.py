@@ -21,6 +21,7 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import html
+import json
 import os
 import re
 import sys
@@ -32,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    _HistoryBodyObserver,
+    _OriginGuardProxy,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -64,6 +67,36 @@ def _plain_text(value: str) -> str:
 
 
 LOAN_DETAIL_URL = "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_detail.aspx"
+LOAN_REPAYMENT_PATH = "/ws/bank/loan/ws_loandetail.ashx"
+
+
+class _LoanRepaymentBodyObserver(_HistoryBodyObserver):
+    """Reuse bounded, non-replaying CDP reads for the native cache-busted URL."""
+
+    def _request(self, event):
+        url = event.get("request", {}).get("url", "")
+        parsed = urlparse(url)
+        if parsed.path != LOAN_REPAYMENT_PATH:
+            return
+        if (
+            parsed.scheme != "https" or parsed.netloc != "mma.sinopac.com"
+            or parsed.params or parsed.fragment
+            or (parsed.query and re.fullmatch(r"[0-9]{10,16}", parsed.query) is None)
+            or self.records
+        ):
+            self.bad = True
+            return
+        self.url = url
+        super()._request(event)
+
+    def read(self, response, *args, **kwargs):
+        # Event callbacks receive raw objects; preserve exact frame/request identity
+        # by joining the guarded page's existing cache, not comparing URLs instead.
+        if isinstance(self.page, _OriginGuardProxy):
+            response = self.page._wrap(response)
+        return super().read(response, *args, **kwargs)
+
+
 SEL_CAP_IMG = "#imgCode"
 
 
@@ -925,11 +958,156 @@ class SinopacCrawler(BankCrawler):
                 for record in records
             ):
                 raise RuntimeError("永豐貸款明細缺少必要欄位或銀行回覆失敗")
+            repayments = []
+            for record in records:
+                repayments.append(self._collect_loan_repayments(page, collector, account, record))
+                # Return once only after verified success. Never replay a POST or
+                # retry a failed query if history/selection cannot be restored.
+                page.go_back(wait_until="domcontentloaded", timeout=15_000)
+                if (page.url != "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_loandetail.aspx"
+                        or getattr(self, "_shared_dialog_blocked", False) or self._response_visible(page)):
+                    raise RuntimeError("sinopac-loan-repayments")
+                for key in ("AcctValue", "AcctValueFormat"):
+                    control = page.locator("#" + key)
+                    if control.count() != 1 or control.input_value() != account[key]:
+                        raise RuntimeError("sinopac-loan-repayments")
             details.append({
                 "account": account_no,
                 "records": records,
+                "repayments": repayments,
             })
         return {"details": details, "fetch_ok": True}
+
+    def _collect_loan_repayments(self, page, collector, account: dict, record: dict) -> dict:
+        """One native default period, not a retention/full-history assertion."""
+        from backend.core.persist.sinopac import _parse_sinopac_repayment
+
+        error = "sinopac-loan-repayments"
+
+        def ensure_page(url):
+            if page.url != url or getattr(self, "_shared_dialog_blocked", False) or self._response_visible(page):
+                raise RuntimeError(error)
+
+        try:
+            ensure_page("https://mma.sinopac.com/mma/bank/easy_index_loan/mma_loandetail.aspx")
+            for key in ("AcctValue", "AcctValueFormat"):
+                control = page.locator("#" + key)
+                if control.count() != 1 or control.input_value() != account[key]:
+                    raise RuntimeError(error)
+            links = page.locator("#tbDetails a[onclick]")
+            selected = []
+            pattern = re.compile(r"forQuery\(\s*'detail'\s*," + r"\s*'([^'\r\n]*)'\s*," * 5 + r"\s*'([^'\r\n]*)'\s*\)\s*;?")
+            expected = tuple(record[key] for key in ("Sub1_Sub2", "Currency", "LoanAmt", "LoanBalance", "LoanKind", "PayName"))
+            for i in range(links.count()):
+                link = links.nth(i)
+                match = pattern.fullmatch(link.get_attribute("onclick") or "")
+                if match and match.groups() == expected and "繳款明細" in link.inner_text() and link.is_visible():
+                    selected.append(link)
+            if len(selected) != 1:
+                raise RuntimeError(error)
+            # A native locator click can navigate; never replay after an evaluate-context error.
+            selected[0].click(timeout=8_000)
+            page.wait_for_url(LOAN_DETAIL_URL, wait_until="domcontentloaded", timeout=15_000)
+            ensure_page(LOAN_DETAIL_URL)
+            if page.locator("#tr_mma").count() != 1:
+                raise RuntimeError(error)
+            form = page.evaluate("""() => [...new FormData(document.querySelector('#tr_mma')).entries()]""")
+            params = {key: [value] for key, value in form}
+            start = self._yyyymmdd(params["StartDate"][0], error)
+            end = self._yyyymmdd(params["EndDate"][0], error)
+            text_type = params.get("TextType", [None])[0]
+            if not isinstance(text_type, str) or len(text_type) > 2_000:
+                raise RuntimeError(error)
+            bound = {"AcctValue": account["AcctValue"], "AcctValueFormat": account["AcctValueFormat"],
+                     "LNMAINACNO": account["AcctValue"], "LNALTNO": record["Sub1_Sub2"],
+                     "CURRENCY": record["Currency"], "TextType": text_type,
+                     **{key: record[key] for key in ("Sub1_Sub2", "LoanAmt", "LoanBalance", "LoanKind", "PayName")},
+                     "StartDate": start.strftime("%Y%m%d"), "EndDate": end.strftime("%Y%m%d")}
+            if len(form) != len(bound) or params != {key: [value] for key, value in bound.items()} or not start <= end <= _taipei_today():
+                raise RuntimeError(error)
+            for selector in ("#StartDate", "#EndDate", "#btnQuery"):
+                control = page.locator(selector)
+                if control.count() != 1 or not control.is_visible() or not control.is_enabled():
+                    raise RuntimeError(error)
+            button = page.locator("#btnQuery")
+            if button.inner_text().strip() != "查詢":
+                raise RuntimeError(error)
+            # The generic collector truncates request forms and may replay response.body().
+            # Detach only during this native query; use the existing read-only CDP observer.
+            collector.detach(page)
+            observer = _LoanRepaymentBodyObserver(page, "https://mma.sinopac.com" + LOAN_REPAYMENT_PATH)
+            responses = []
+            handler = lambda response: responses.append(response) if urlparse(response.url).path == LOAN_REPAYMENT_PATH else None
+            page.on("response", handler)
+            try:
+                button.click(timeout=8_000)
+                for _ in range(100):
+                    if responses:
+                        break
+                    page.wait_for_timeout(100)
+                if len(responses) != 1:
+                    raise RuntimeError(error)
+                response = responses[0]
+                request = response.request
+                if parse_qs(request.post_data, keep_blank_values=True) != params:
+                    raise RuntimeError(error)
+                if response.headers.get("content-type", "").split(";", 1)[0].lower().strip() != "application/json":
+                    raise RuntimeError(error)
+                raw = observer.read(response, page.main_frame, LOAN_DETAIL_URL, 5_000_000, 1)
+                if raw is None:
+                    raise RuntimeError(error)
+                payload = json.loads(raw)
+                if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+                    raise RuntimeError(error)
+                body = payload[0]
+                metadata = body.get("HeadInfo")
+                if (set(body) != {"HeadInfo", "SubInfo", "Header", "Message"}
+                        or body.get("Header") != "SUCCESS" or body.get("Message") != ""
+                        or not isinstance(metadata, list) or len(metadata) != 3
+                        or any(not isinstance(item, dict) or set(item) != {
+                            "HeadText", "HeadAlign", "DataAlign", "MainShow", "DetailShow", "FieldKey", "OrderIndex", "FieldWidth"
+                        } or any(not isinstance(v, str) or len(v) > 2_000 for v in item.values()) for item in metadata)):
+                    raise RuntimeError(error)
+                records = body["SubInfo"]
+                if not isinstance(records, list) or not 1 <= len(records) <= 10_000:
+                    raise RuntimeError(error)
+                dom = page.evaluate(r"""() => {
+                    const visible = e => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+                    const rows = [...document.querySelectorAll('#tbodyDetails tr')];
+                    return {
+                        rows: rows.map(row => [...row.cells].map(cell => cell.innerText.trim())),
+                        visible: rows.every(row => visible(row) && [...row.cells].every(visible)),
+                        unique: ['tbDetails','tbodyDetails','tbodyNoDetail','tr_mma'].every(id => document.querySelectorAll('#'+id).length===1),
+                        headers: [...document.querySelectorAll('#tbDetails th')].map(e=>e.innerText.trim()).filter(Boolean),
+                        empty: visible(document.querySelector('#tbodyNoDetail')),
+                        form: [...new FormData(document.querySelector('#tr_mma')).entries()],
+                        pager: [...document.querySelectorAll('a,button,input,select,[role=button]')].some(e =>
+                            /pager|pagination|nextpage|prevpage|pageindex|cursor/i.test([e.id,e.className,e.name,e.getAttribute('onclick'),e.getAttribute('href')].join(' ')) ||
+                            (e.matches('a,button,[role=button]') && /^(next|prev|previous|下一頁|上一頁|下頁|上頁|[0-9]+)$/i.test((e.innerText||'').trim())) || e.getAttribute('rel')==='next')
+                    };
+                }""")
+                ensure_page(LOAN_DETAIL_URL)
+                if (not dom["unique"] or not dom["visible"] or dom["empty"] or dom["pager"]
+                        or dom["headers"] != ["繳款日", "應繳日", "攤還本金", "繳息金額", "本金餘額", "違約金金額", "繳款金額", "交易狀態"]
+                        or dom["form"] != form or observer.bad or len(responses) != 1):
+                    raise RuntimeError(error)
+                if dom["rows"] != [[_plain_text(row[f"DataValue{i}"]) for i in (2, 1, 11, 4, 5, 6, 3, 10)] for row in records]:
+                    raise RuntimeError(error)
+                repayment = {
+                    "sub_account": record["Sub1_Sub2"], "currency": record["Currency"],
+                    "receipt": {"account": account["AcctValue"], "sub_account": record["Sub1_Sub2"],
+                                "currency": record["Currency"], "start": start.isoformat(), "end": end.isoformat(),
+                                "status": "complete", "period": "native_default", "pages": 1, "rows": len(records)},
+                    "records": records,
+                }
+                _parse_sinopac_repayment(account["AcctValue"], repayment)
+                return repayment
+            finally:
+                page.remove_listener("response", handler)
+                observer.close()
+                collector.attach(page)
+        except Exception:
+            raise RuntimeError(error) from None
 
     def _collect_transactions(self, page, collector: ResponseCollector) -> dict:
         """Collect every authoritative TWD account across complete month windows."""

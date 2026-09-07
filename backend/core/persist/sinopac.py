@@ -322,6 +322,69 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
     return next(iter(expected_ends))
 
 
+def _parse_sinopac_repayment(account: str, repayment: dict) -> list[dict]:
+    """Validate the native default-window receipt before any destructive write."""
+    error = "invalid SinoPac repayment"
+    if not isinstance(repayment, dict) or set(repayment) != {"sub_account", "currency", "receipt", "records"}:
+        raise ValueError(error)
+    sub, currency = repayment["sub_account"], repayment["currency"]
+    for value, pattern in ((account, r"[0-9]{1,64}"), (sub, r"[0-9-]{1,64}"), (currency, r"[A-Z]{3}")):
+        if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+            raise ValueError(error)
+    receipt, records = repayment["receipt"], repayment["records"]
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"account", "sub_account", "currency", "start", "end", "status", "period", "pages", "rows"}
+        or receipt.get("account") != account or receipt.get("sub_account") != sub
+        or receipt.get("currency") != currency or receipt.get("period") != "native_default"
+        or receipt.get("status") != "complete" or type(receipt.get("pages")) is not int
+        or receipt["pages"] != 1 or type(receipt.get("rows")) is not int
+        or not isinstance(records, list) or not 1 <= len(records) <= 10_000
+        or receipt["rows"] != len(records)
+    ):
+        # Empty-result semantics and retention have not been observed at the bank.
+        raise ValueError(error)
+    start, end = (_strict_date(receipt[k], "%Y-%m-%d", error) for k in ("start", "end"))
+    if start.isoformat() != receipt["start"] or end.isoformat() != receipt["end"] or not start <= end <= _today():
+        raise ValueError(error)
+    rows = []
+    encoded_bytes = 0
+    keys = {f"DataValue{i}" for i in range(1, 12)}
+    for raw in records:
+        if not isinstance(raw, dict) or set(raw) != keys or any(
+            not isinstance(value, str) or len(value) > 2_000 for value in raw.values()
+        ):
+            raise ValueError(error)
+        raw_json = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        encoded_bytes += len(raw_json.encode("utf-8"))
+        if encoded_bytes > 5_000_000:
+            raise ValueError(error)
+        row = {"raw_json": raw_json, "status": raw["DataValue10"]}
+        for key, field in (("due_date", 1), ("paid_on", 2)):
+            value = raw[f"DataValue{field}"]
+            parsed = _strict_date(value, "%Y/%m/%d", error)
+            if parsed.strftime("%Y/%m/%d") != value or (
+                key == "paid_on" and not start <= parsed <= end
+            ):
+                raise ValueError(error)
+            row[key] = parsed.isoformat()
+        amounts = {}
+        for key, field in (("principal", 11), ("interest", 4), ("penalty", 6),
+                           ("paid_total", 3), ("principal_balance", 5)):
+            value = raw[f"DataValue{field}"]
+            if len(value) > 64 or re.fullmatch(r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]{1,6})?", value) is None:
+                raise ValueError(error)
+            amount = Decimal(value.replace(",", ""))
+            if amount > Decimal("999999999999999999"):
+                raise ValueError(error)
+            amounts[key] = amount
+            row[key] = format(amount.normalize(), "f")
+        if amounts["principal"] + amounts["interest"] + amounts["penalty"] != amounts["paid_total"]:
+            raise ValueError(error)
+        rows.append(row)
+    return rows
+
+
 def _persist_sinopac(
     data: dict,
     store: BankStore,
@@ -341,6 +404,44 @@ def _persist_sinopac(
     as_of = as_of or _today()
     today = as_of.isoformat()
     delta: dict = {}
+
+    loan = data.get("loan") or {}
+    details = loan.get("details", []) if isinstance(loan, dict) else []
+    repayment_windows = []
+    # Old summary-only dumps carry no repayment authority and cannot clear history.
+    if any(isinstance(detail, dict) and "repayments" in detail for detail in details):
+        error = "invalid SinoPac repayment inventory"
+        if loan.get("fetch_ok") is not True or len(details) > 100:
+            raise ValueError(error)
+        seen_accounts = set()
+        for detail in details:
+            if not isinstance(detail, dict) or not isinstance(detail.get("account"), str):
+                raise ValueError(error)
+            account = detail["account"]
+            if account in seen_accounts:
+                raise ValueError(error)
+            seen_accounts.add(account)
+            records, repayments = detail.get("records"), detail.get("repayments")
+            if not isinstance(records, list) or not isinstance(repayments, list) or not 1 <= len(records) <= 100:
+                raise ValueError(error)
+            if any(not isinstance(row, dict) for row in records + repayments):
+                raise ValueError(error)
+            expected = [(row.get("Sub1_Sub2"), row.get("Currency")) for row in records]
+            actual = [(row.get("sub_account"), row.get("currency")) for row in repayments]
+            if any(not isinstance(v, str) for pair in expected + actual for v in pair):
+                raise ValueError(error)
+            if len(set(expected)) != len(expected) or len(set(actual)) != len(actual) or set(expected) != set(actual):
+                raise ValueError(error)
+            for repayment in repayments:
+                repayment_windows.append((account, repayment, _parse_sinopac_repayment(account, repayment)))
+    # Keep transaction-level identity locks in a stable order across concurrent syncs.
+    for account, repayment, rows in sorted(
+        repayment_windows, key=lambda item: (item[0], item[1]["sub_account"], item[1]["currency"])
+    ):
+        delta["loan_repayments"] = delta.get("loan_repayments", 0) + store.replace_loan_repayments(
+            account, repayment["sub_account"], repayment["currency"],
+            repayment["receipt"]["start"], repayment["receipt"]["end"], rows,
+        )
 
     # --- 銀行帳戶（含 TWD/USD/JPY 各幣別行）---
     bb = data.get("bank_balance") or []

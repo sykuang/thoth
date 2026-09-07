@@ -413,6 +413,29 @@ CREATE TABLE IF NOT EXISTS card_billed_txns (
 -- 2026-06-17 C: 同上, 複合 unique 由 _migrate 升級
 CREATE UNIQUE INDEX IF NOT EXISTS ux_card_billed_dedup ON card_billed_txns(dedup_key);
 
+-- Bank-native repayment facts, separate from manual liabilities and cashflows.
+CREATE TABLE IF NOT EXISTS loan_repayments (
+    user_id INTEGER NOT NULL,
+    source_account_id INTEGER NOT NULL,
+    account_no TEXT NOT NULL,
+    sub_account TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    row_key TEXT NOT NULL,
+    occurrence INTEGER NOT NULL,
+    due_date TEXT NOT NULL,
+    paid_on TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    interest TEXT NOT NULL,
+    penalty TEXT NOT NULL,
+    paid_total TEXT NOT NULL,
+    principal_balance TEXT NOT NULL,
+    status TEXT NOT NULL,
+    query_start TEXT NOT NULL,
+    query_end TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, source_account_id, account_no, sub_account, currency, row_key, occurrence)
+);
+
 -- Account-scoped cursor provenance. Transaction tables predate credential accounts,
 -- so this sidecar records which account actually observed each identity/date.
 CREATE TABLE IF NOT EXISTS history_transaction_cursors (
@@ -827,6 +850,43 @@ class BankStore:
 
     def close(self):
         self.conn.close()
+
+    def replace_loan_repayments(
+        self, account_no: str, sub_account: str, currency: str,
+        start: str, end: str, rows: list[dict],
+    ) -> int:
+        """Replace only a validated bank window; caller owns the sync transaction."""
+        from hashlib import sha256
+
+        # Zero is reserved for standalone CLI data, never a server credential ID.
+        scope = (self.user_id, self.source_account_id or 0, account_no, sub_account, currency)
+        if bank_pg.enabled():
+            # A waiting DELETE keeps its old MVCC snapshot and can miss newly inserted
+            # replacement rows. Lock the identity before that statement takes a snapshot.
+            lock_key = int.from_bytes(sha256(json.dumps(
+                ["loan_repayments", self.bank, *scope], separators=(",", ":")
+            ).encode()).digest()[:8], "big", signed=True)
+            self.conn.execute("SELECT pg_advisory_xact_lock(?)", (lock_key,))
+        self.conn.execute(
+            """DELETE FROM loan_repayments WHERE user_id = ? AND source_account_id = ?
+               AND account_no = ? AND sub_account = ? AND currency = ?
+               AND paid_on >= ? AND paid_on <= ?""", (*scope, start, end),
+        )
+        occurrences: Counter[str] = Counter()
+        for row in rows:
+            key = sha256(row["raw_json"].encode("utf-8")).hexdigest()
+            occurrences[key] += 1
+            self.conn.execute(
+                """INSERT INTO loan_repayments
+                   (user_id, source_account_id, account_no, sub_account, currency,
+                    row_key, occurrence, due_date, paid_on, principal, interest, penalty,
+                    paid_total, principal_balance, status, query_start, query_end, raw_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*scope, key, occurrences[key], row["due_date"], row["paid_on"],
+                 row["principal"], row["interest"], row["penalty"], row["paid_total"],
+                 row["principal_balance"], row["status"], start, end, row["raw_json"]),
+            )
+        return len(rows)
 
     def _record_transaction_cursor(
         self, domain: str, identity, *raw_dates, replace: bool = False,
