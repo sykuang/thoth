@@ -27,6 +27,7 @@ import {
   View,
 } from 'react-native';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
+import { RegexPatternInput } from '@/components/RegexPatternInput';
 
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { sortCategoryKeys } from '@/lib/category-color';
@@ -239,14 +240,12 @@ export default function CategoriesScreen() {
         value={editForm.name}
         onChangeText={(t) => setEditForm({ ...editForm, name: t })}
       />
-      <TextInput
+      <RegexPatternInput
+        testID="rules-edit-pattern"
         className={inputBase}
         placeholder="Regex pattern"
-        placeholderTextColor="#94a3b8"
         value={editForm.pattern}
         onChangeText={(t) => setEditForm({ ...editForm, pattern: t })}
-        autoCapitalize="none"
-        autoCorrect={false}
       />
       <TextInput
         className={inputBase}
@@ -404,14 +403,12 @@ export default function CategoriesScreen() {
               value={form.name}
               onChangeText={(t) => setForm({ ...form, name: t })}
             />
-            <TextInput
+            <RegexPatternInput
+              testID="rules-create-pattern"
               className={inputBase}
               placeholder="Regex pattern（如 北捷|台鐵|高鐵）"
-              placeholderTextColor="#94a3b8"
               value={form.pattern}
               onChangeText={(t) => setForm({ ...form, pattern: t })}
-              autoCapitalize="none"
-              autoCorrect={false}
             />
             {/* Phase 8 (2026-06-15 使用者指示): 分類改 dynamic chip pick + 自訂 input */}
             <View>
@@ -641,14 +638,12 @@ export default function CategoriesScreen() {
           <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">
             預覽 match（一行一筆範例文字）
           </Text>
-          <TextInput
+          <RegexPatternInput
+            testID="rules-preview-pattern"
             className={inputBase}
             placeholder="Regex pattern"
-            placeholderTextColor="#94a3b8"
             value={form.pattern}
             onChangeText={(pattern) => setForm({ ...form, pattern })}
-            autoCapitalize="none"
-            autoCorrect={false}
           />
           <TextInput
             className={`${inputBase} h-24 mt-3`}
