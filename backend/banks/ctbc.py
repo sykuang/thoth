@@ -457,10 +457,11 @@ class CtbcCrawler(BankCrawler):
                 kind=CheckpointKind.DUPLICATE_SESSION,
                 container_selector=".modal.show",
                 action_texts=("確認登入",),
-                # Only the declared duplicate fixture authorizes an action;
+                # Only CTBC's public duplicate-session wording authorizes an action;
                 # unknown surrounding prose must remain a terminal checkpoint.
                 required_body_pattern=re.compile(
-                    r"^\s*確認訊息\s*前次工作階段仍存在\s*確認登入\s*$"
+                    r"^\s*確認訊息\s*您可能先前未正常登出，若要繼續登入請按下「確認登入」，"
+                    r"同時其他位置將會自動登出。\s*確認登入\s*取消\s*$"
                 ),
             ),
             LoginCheckpointRule(

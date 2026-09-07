@@ -22,6 +22,22 @@ from backend.core.login_checkpoints import (
 )
 
 
+# Public CTBC translation general_ot001_010.lightbox.duplogin.msg (2026-09-07):
+# https://www.ctbcbank.com/default-src_app_ctbc_ib_ng_view_ib-security-notice_ib-security-notice_component_ts-src_app_tw-585651.d26f8cac1f618a1a.js
+# Wording from the public bundle; modal shape/labels were observed separately,
+# not a captured private DOM fixture.
+DUPLICATE_BODY = "您可能先前未正常登出，若要繼續登入請按下「確認登入」，同時其他位置將會自動登出。"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ctbc_data_and_environment(monkeypatch, tmp_path):
+    from backend.core import base, creds
+
+    monkeypatch.setattr(creds, "_ENV_LOADED", True)
+    monkeypatch.setattr(base, "DATA_ROOT", tmp_path)
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+
+
 def _crawler() -> CtbcCrawler:
     crawler = object.__new__(CtbcCrawler)
     crawler.name = "ctbc"
@@ -72,7 +88,7 @@ def test_ctbc_shared_login_api_and_ordered_rules() -> None:
     ("index", "positive", "negative"),
     [
         (0, "\n  重要公告\n系統維護", "非重要公告\n系統維護"),
-        (2, "確認訊息\n前次工作階段仍存在\n確認登入", "確認登入\n確認訊息"),
+        (2, f"\n確認訊息\t{DUPLICATE_BODY}\n確認登入\t取消\n", "確認登入\n確認訊息"),
         (1, "請完成一次性密碼後繼續", "請完成密碼後繼續"),
     ],
 )
@@ -191,6 +207,42 @@ def test_real_dom_announcement_is_narrow_and_hidden_static_modal_is_ignored() ->
         manager.__exit__(None, None, None)
 
 
+def test_real_dom_public_duplicate_modal_confirms_once_not_cancel() -> None:
+    manager, browser = _launch_browser()
+    try:
+        context = browser.new_context(offline=True, service_workers="block")
+        page = context.new_page()
+        page.set_content("""
+            <div class="modal show" id="duplicate">
+              <h2>確認訊息</h2><p>DUPLICATE_BODY</p>
+              <button id="confirm">確認登入</button> <button id="cancel">取消</button>
+            </div>
+            <script>
+              document.body.dataset.confirmations = '0';
+              document.body.dataset.cancellations = '0';
+              document.querySelector('#confirm').onclick = () => {
+                document.body.dataset.confirmations++;
+                duplicate.hidden = true;
+              };
+              cancel.onclick = () => document.body.dataset.cancellations++;
+            </script>
+        """.replace("DUPLICATE_BODY", DUPLICATE_BODY))
+
+        outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
+
+        assert outcome == CheckpointOutcome(
+            CheckpointKind.DUPLICATE_SESSION,
+            rule_name="ctbc-duplicate-session",
+            action_label="確認登入",
+        )
+        assert page.locator("body").get_attribute("data-confirmations") == "1"
+        assert page.locator("body").get_attribute("data-cancellations") == "0"
+        assert page.locator("#duplicate").is_hidden()
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
 def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -> None:
     manager, browser = _launch_browser()
     try:
@@ -198,7 +250,7 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
         page.set_content(
             """
             <div class="modal show" id="duplicate">
-              確認訊息<br>前次工作階段仍存在<br><button>確認登入</button>
+              確認訊息<br>DUPLICATE_BODY<br><button>確認登入</button> <button>取消</button>
             </div>
             <script>
               document.body.dataset.clicks = '0';
@@ -207,7 +259,7 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
                 duplicate.hidden = true;
               };
             </script>
-            """
+            """.replace("DUPLICATE_BODY", DUPLICATE_BODY)
         )
         outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
         assert outcome.kind is CheckpointKind.DUPLICATE_SESSION
@@ -217,14 +269,14 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
         page.set_content(
             """
             <div class="modal show" id="otp-collision">
-              確認訊息<br>請完成 OTP 驗證<br><button>確認登入</button>
+              確認訊息<br>DUPLICATE_BODY<br>請完成 OTP 驗證<br><button>確認登入</button> <button>取消</button>
             </div>
             <script>
               document.body.dataset.clicks = '0';
               document.querySelector('#otp-collision button').onclick = () =>
                 document.body.dataset.clicks++;
             </script>
-            """
+            """.replace("DUPLICATE_BODY", DUPLICATE_BODY)
         )
         outcome = _evaluate(page, CheckpointPhase.POST_SUBMIT)
         assert outcome.kind is CheckpointKind.OTP_REQUIRED
@@ -236,12 +288,13 @@ def test_real_dom_duplicate_otp_and_unknown_modals_never_use_generic_actions() -
             "請確認訊息<br><button>確認登入</button>",
             "確認登入<br><button>確認訊息</button>",
             "確認訊息<br>密碼已到期，請變更密碼<br><button>確認登入</button>",
-            "確認訊息<br>前次工作階段仍存在，但密碼已到期<br><button>確認登入</button>",
-            "確認訊息<br>前次工作階段仍存在，但密碼錯誤<br><button>確認登入</button>",
-            "確認訊息<br>前次工作階段仍存在<br>登入失敗，帳號已鎖定<br><button>確認登入</button>",
-            "確認訊息<br>前次工作階段仍存在<br>請先完成安全設定<br><button>確認登入</button>",
-            "確認訊息<br>未知訊息<br>前次工作階段仍存在<br><button>確認登入</button>",
-            "確認訊息<br>前次工作階段仍存在<br>OTP<br><button>確認登入</button>",
+            "確認訊息<br>前次工作階段仍存在<br><button>確認登入</button> <button>取消</button>",
+            f"確認訊息<br>{DUPLICATE_BODY}<br><button>確認登入</button>",
+            *(
+                f"確認訊息<br>{text}<br><button>確認登入</button> <button>取消</button>"
+                for marker in ("密碼已到期", "密碼錯誤", "登入失敗，帳號已鎖定", "請先完成安全設定", "未知訊息", "OTP")
+                for text in (f"{marker}<br>{DUPLICATE_BODY}", f"{DUPLICATE_BODY}<br>{marker}")
+            ),
             "確認訊息<br>請先完成安全設定<br><button>確認登入</button>",
         ):
             page.set_content(
@@ -305,9 +358,10 @@ def test_duplicate_form_never_submits_outside_credential_budget(control, owner) 
         page.goto(ctbc_module.BASE)
         modal = f'''
             <div class="modal show" id="modal" hidden>
-              確認訊息<br>前次工作階段仍存在<br>
+              確認訊息<br>{DUPLICATE_BODY}<br>
               {control if owner == "inside" else ""}
               <button type="submit" {'form="challenge"' if owner == 'external' else ''}>確認登入</button>
+              <button type="button">取消</button>
             </div>
         '''
         page.set_content(
@@ -363,7 +417,7 @@ def test_duplicate_non_submitting_action_with_external_credentials_is_safe(actio
         page.set_content(f'''
             <form id="challenge"><input type="password" hidden>
               <div class="modal show" id="modal">
-                確認訊息<br>前次工作階段仍存在<br>{action}
+                確認訊息<br>{DUPLICATE_BODY}<br>{action} <button type="button">取消</button>
               </div>
             </form>
             <script>
@@ -372,7 +426,7 @@ def test_duplicate_non_submitting_action_with_external_credentials_is_safe(actio
               document.querySelector('form').onsubmit = event => {{
                 event.preventDefault(); document.body.dataset.submits++;
               }};
-              document.querySelector('#modal').lastElementChild.onclick = event => {{
+              document.querySelector('#modal').querySelector('button, a').onclick = event => {{
                 event.preventDefault(); document.body.dataset.clicks++;
                 document.querySelector('#modal').hidden = true;
               }};
@@ -744,11 +798,14 @@ def test_authentication_requires_exact_https_ctbc_origin() -> None:
         assert crawler._logged_in(page) is False
 
 
-@pytest.mark.parametrize("transition", ["authenticated", "otp", "expiry", "duplicate", "ambiguous", "foreign", "dialog", "never"])
-def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(monkeypatch, transition) -> None:
+@pytest.mark.parametrize("transition,delay_ms", [
+    (transition, 3500)
+    for transition in ("authenticated", "otp", "expiry", "duplicate", "ambiguous", "foreign", "dialog", "never")
+] + [("authenticated", 0), ("otp", 0), ("unknown", 0)])
+def test_real_dom_run_after_duplicate_authenticates_or_stops_without_resubmit(monkeypatch, transition, delay_ms) -> None:
     manager, browser = _launch_browser()
     try:
-        context = browser.new_context(offline=True)
+        context = browser.new_context(offline=True, service_workers="block")
         requests = []
 
         def serve(route):
@@ -762,14 +819,16 @@ def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(mo
             history.pushState({}, '', '/twrbc/twrbc-home/qu000/010');
             document.body.innerHTML = '<p>帳戶總覽 存款 登出 ' + '測試'.repeat(300) + '</p>';
         """
-        if transition in {"otp", "expiry", "duplicate", "ambiguous"}:
+        if transition in {"otp", "expiry", "duplicate", "ambiguous", "unknown"}:
             text = {
                 "otp": "OTP 驗證",
                 "expiry": "密碼已到期",
-                "duplicate": "前次工作階段仍存在",
-                "ambiguous": "前次工作階段仍存在",
+                "duplicate": DUPLICATE_BODY,
+                "ambiguous": DUPLICATE_BODY,
+                "unknown": "未知訊息",
             }[transition]
             buttons = "<button>確認登入</button>" * (2 if transition == "ambiguous" else 1)
+            buttons += " <button>取消</button>"
             transition_script += f"""
                 document.body.insertAdjacentHTML('beforeend', '<div class="modal show">確認訊息<br>{text}<br>{buttons}</div>');
                 document.querySelectorAll('.modal button').forEach(button => {{
@@ -788,7 +847,7 @@ def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(mo
             <input formcontrolname="pxd">
             <a class="btn_submit">登入</a>
             <div class="modal show" id="duplicate" hidden>
-              確認訊息<br>前次工作階段仍存在<br><button>確認登入</button>
+              確認訊息<br>DUPLICATE_BODY<br><button>確認登入</button> <button>取消</button>
             </div>
             <script>
               document.body.dataset.submits = '0';
@@ -800,12 +859,15 @@ def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(mo
               duplicate.querySelector('button').onclick = () => {
                 document.body.dataset.confirmations++;
                 duplicate.hidden = true;
-                setTimeout(() => {
+                const transition = () => {
                   TRANSITION
-                }, 3500);
+                };
+                if (DELAY_MS === 0) transition();
+                else setTimeout(transition, DELAY_MS);
               };
             </script>
-        """.replace("TRANSITION", transition_script))
+        """.replace("DUPLICATE_BODY", DUPLICATE_BODY).replace("TRANSITION", transition_script)
+            .replace("DELAY_MS", str(delay_ms)))
         crawler = _crawler()
         del crawler._credential_origin_allowed  # Exercise the real origin guard.
         crawler.creds = ctbc_module.CtbcCreds(national_id="TEST-ID", user_code="TEST-USER", password="TEST-PASSWORD")
@@ -836,20 +898,31 @@ def test_real_dom_run_waits_for_delayed_auth_after_duplicate_without_resubmit(mo
         if transition == "authenticated":
             assert "error" not in result
             collect.assert_called_once()
+            logout.assert_called_once()
         else:
-            assert "kind=unknown_blocker" in result["error"]
+            kind = "otp_required" if transition == "otp" and delay_ms == 0 else "unknown_blocker"
+            assert f"kind={kind}" in result["error"]
             collect.assert_not_called()
             logout.assert_not_called()
-        assert len(recovery_errors) == 1
-        assert len(recovery_elapsed) == 1
-        assert recovery_elapsed[0] < 25
-        if transition == "never":
-            assert recovery_elapsed[0] >= 20
-        error = recovery_errors[0]
-        assert error.outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
-        assert error.outcome.rule_name is None
-        assert error.budget.credential_submissions == 1
-        assert error.budget.protocol_resubmits == error.budget.captcha_resubmits == error.budget.reloads == 0
+        if transition == "authenticated" and delay_ms == 0:
+            assert recovery_errors == recovery_elapsed == []
+        else:
+            assert len(recovery_errors) == len(recovery_elapsed) == 1
+            assert recovery_elapsed[0] < 25
+            if transition == "never":
+                assert recovery_elapsed[0] >= 20
+            error = recovery_errors[0]
+            assert error.budget == LoginBudget(credential_submissions=1)
+            if delay_ms == 0:
+                assert error.outcome.kind is (
+                    CheckpointKind.OTP_REQUIRED if transition == "otp" else CheckpointKind.UNKNOWN_BLOCKER
+                )
+                assert error.outcome.rule_name == (
+                    "ctbc-otp-required" if transition == "otp" else "ctbc-unknown-modal"
+                )
+            else:
+                assert error.outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+                assert error.outcome.rule_name is None
         if transition == "foreign":
             assert requests == [ctbc_module.BASE, "https://foreign.invalid/twrbc-home"]
         else:
