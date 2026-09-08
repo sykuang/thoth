@@ -97,12 +97,13 @@ def native_page():
 @pytest.mark.parametrize("attack", [
     "wrong_account_before", "wrong_path_before", "wrong_subaccount", "wrong_currency",
     "wrong_mainaccount", "wrong_formatted", "unexpected_field", "duplicate_field",
-    "bad_header", "bad_message", "bad_metadata", "pager", "modal", "changed_headers",
+    "bad_header", "bad_message_type", "bad_metadata", "pager", "modal", "changed_headers",
     "hidden_rows", "empty_visible", "changed_dates", "dialog",
 ])
 def test_native_repayment_rejects_unattested_results(native_page, attack):
     page, collector, state = native_page
     crawler = SinopacCrawler.__new__(SinopacCrawler)
+    state["response"]["Message"] = "synthetic nonempty notice"
     fields = {"wrong_subaccount": ("LNALTNO", "99-0002"), "wrong_currency": ("CURRENCY", "USD"),
               "wrong_mainaccount": ("LNMAINACNO", "999999999999"), "wrong_formatted": ("AcctValueFormat", "999-999-999999"),
               "unexpected_field": ("Unknown", "value")}
@@ -117,8 +118,8 @@ def test_native_repayment_rejects_unattested_results(native_page, attack):
         state["history_extra"] = '<input name="LNALTNO" value="99-0001" form="tr_mma">'
     elif attack == "bad_header":
         state["response"]["Header"] = "FAIL"
-    elif attack == "bad_message":
-        state["response"]["Message"] = "系統錯誤"
+    elif attack == "bad_message_type":
+        state["response"]["Message"] = {"unexpected": "系統錯誤"}
     elif attack == "bad_metadata":
         state["response"]["HeadInfo"] = []
     elif attack == "dialog":
@@ -136,10 +137,12 @@ def test_native_repayment_rejects_unattested_results(native_page, attack):
         crawler._collect_loan_repayments(page, collector, ACCOUNT, RECORD)
 
 
-def test_native_default_repayment_click_to_durable_fact(native_page, tmp_path, monkeypatch):
+@pytest.mark.parametrize("message", ["", "synthetic nonempty notice"], ids=["empty", "nonempty"])
+def test_native_default_repayment_click_to_durable_fact(native_page, tmp_path, monkeypatch, message):
     from backend.core import bank_pg, store as store_mod
     page, collector, state = native_page
     crawler = SinopacCrawler.__new__(SinopacCrawler)
+    state["response"]["Message"] = message
     repayment = crawler._collect_loan_repayments(page, collector, ACCOUNT, RECORD)
     assert repayment == _repayment()
     assert state["query_form"]["LNMAINACNO"] == [ACCOUNT["AcctValue"]]

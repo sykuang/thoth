@@ -580,9 +580,9 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     payload = "\n".join(
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     )
-    # Rebaseline for f987d42's reviewed native loan-repayment integration.
-    # Only _collect_loans and the new _collect_loan_repayments changed;
-    # preserve the exact guard over collect and every following helper.
+    # Rebaseline only for bounded nonempty repayment Message support.
+    # Browser/guard/persistence regressions cover this intentional contract change;
+    # preserve the exact AST of collect and every following helper.
     assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "85d1a330f48c2e50b29799064ebf489d0ceb2b29d29f3425e116f50d13d1018a"
+        "2b5a43373f90d87af884696aaa9e82fa71de4a6e63b3a8b51ee939166f1cd069"
     )

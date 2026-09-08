@@ -146,8 +146,12 @@ def query_requests(state):
     return [r for r in state["requests"] if urlparse(r[1]).path == LOAN_REPAYMENT_PATH]
 
 
-def test_guarded_native_response_identity_and_default_query(native):
+@pytest.mark.parametrize("message", ["", "synthetic nonempty notice", "x" * 2000],
+                         ids=["empty", "nonempty", "maximum-length"])
+def test_guarded_native_response_identity_and_default_query(native, message):
     crawler, page, collector, state = native
+    # Live evidence: nonempty Message plus two matching API/DOM rows. Text is synthetic.
+    state["response"]["Message"] = message
     repayment = crawler._collect_loan_repayments(page, collector, ACCOUNT, RECORD)
     assert repayment["records"] == state["response"]["SubInfo"]
     assert repayment["receipt"] == {"account": ACCOUNT["AcctValue"], "sub_account": RECORD["Sub1_Sub2"], "currency": "TWD", "start": "2026-08-01", "end": "2026-09-07", "status": "complete", "period": "native_default", "pages": 1, "rows": 2}
@@ -185,10 +189,13 @@ def test_outer_collects_each_account_and_subaccount(native):
     ("text_type_bound", 1), ("oversized_text_type", 0), ("http", 1), ("envelope", 1),
     ("empty", 1), ("pager", 1), ("dom", 1), ("hidden", 1), ("modal", 1),
     ("body_failure", 1), ("query_click_failure", 1), ("detail_click_failure", 0),
+    ("message_null", 1), ("message_bool", 1), ("message_number", 1),
+    ("message_object", 1), ("message_array", 1), ("message_oversized", 1),
 ])
 def test_outer_failure_never_retries_or_advances(native, attack, queries):
     crawler, page, collector, state = native
     state["records"].append({**RECORD, "Sub1_Sub2": "99-0002"})
+    state["response"]["Message"] = "synthetic nonempty notice"
     if attack in {"account", "subaccount", "currency", "extra_field"}:
         key, value = {"account": ("LNMAINACNO", "999999999999"), "subaccount": ("LNALTNO", "99-9999"), "currency": ("CURRENCY", "USD"), "extra_field": ("Unknown", "value")}[attack]
         state["bad_fields"] = {key: value}
@@ -211,6 +218,11 @@ def test_outer_failure_never_retries_or_advances(native, attack, queries):
         }[attack]
     elif attack == "body_failure":
         state["body_failure"] = True
+    elif attack.startswith("message_"):
+        state["response"]["Message"] = {
+            "message_null": None, "message_bool": False, "message_number": 0,
+            "message_object": {}, "message_array": [], "message_oversized": "x" * 2001,
+        }[attack]
     else:
         state["click_failure"] = attack.split("_")[0]
     with pytest.raises(RuntimeError, match="^sinopac-loan-repayments$"):

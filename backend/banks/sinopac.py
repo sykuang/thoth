@@ -1093,8 +1093,10 @@ class SinopacCrawler(BankCrawler):
                     raise RuntimeError("sinopac-loan-repayments-response-envelope")
                 body = payload[0]
                 metadata = body.get("HeadInfo")
+                # Native results can include message text; require validated rows/DOM below.
                 if (set(body) != {"HeadInfo", "SubInfo", "Header", "Message"}
-                        or body.get("Header") != "SUCCESS" or body.get("Message") != ""
+                        or body.get("Header") != "SUCCESS"
+                        or not isinstance(body.get("Message"), str) or len(body["Message"]) > 2_000
                         or not isinstance(metadata, list) or len(metadata) != 3
                         or any(not isinstance(item, dict) or set(item) != {
                             "HeadText", "HeadAlign", "DataAlign", "MainShow", "DetailShow", "FieldKey", "OrderIndex", "FieldWidth"

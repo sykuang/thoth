@@ -196,7 +196,7 @@ def test_repayment_rejections_retain_deep_guard_through_safe_sink(
     elif suffix == "response-envelope":
         c.state["payload"] = {}
     elif suffix == "response-metadata":
-        c.state["payload"][0]["Message"] = "PRIVATE-CUSTOMER"
+        c.state["payload"][0]["Message"] = {"unexpected": "PRIVATE-CUSTOMER"}
     elif suffix == "response-records":
         c.state["payload"][0]["SubInfo"] = []
     elif suffix == "result-state":
@@ -235,8 +235,10 @@ def test_repayment_rejections_retain_deep_guard_through_safe_sink(
     assert c.page.go_back.call_count == 0
 
 
-def test_repayment_success_keeps_native_result_and_single_query(repayment_case):
+@pytest.mark.parametrize("message", ["", "synthetic nonempty notice"], ids=["empty", "nonempty"])
+def test_repayment_success_keeps_native_result_and_single_query(repayment_case, message):
     c = repayment_case
+    c.state["payload"][0]["Message"] = message
     assert c.crawler._collect_loan_repayments(c.page, c.collector, c.account, c.record) == _repayment()
     c.link.click.assert_called_once_with(timeout=8_000)
     c.button.click.assert_called_once_with(timeout=8_000)
