@@ -1249,7 +1249,9 @@ def test_goto_twd_terminal_checkpoint_does_not_retry_or_leak_body(
     nav.click.assert_called_once_with(timeout=5000)
     evaluator.assert_called_once()
     assert secret not in str(raised.value)
-    assert "credential_submissions=1" in str(raised.value)
+    assert isinstance(raised.value, (LoginCheckpointBlocked, LoginInteractionRequired))
+    assert raised.value.budget == LoginBudget(credential_submissions=1)
+    assert str(raised.value) == "terminal login checkpoint; details withheld"
 
 
 def test_goto_twd_authenticated_outcome_rethrows_original_click_error(monkeypatch) -> None:
