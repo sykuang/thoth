@@ -537,6 +537,46 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         index for index, node in enumerate(crawler.body)
         if isinstance(node, ast.FunctionDef) and node.name == "collect"
     )
+    # Normalize only the reviewed diagnostic arguments, never predicates/calls/JS.
+    # The original fingerprint below remains unchanged.
+    from tests.test_sinopac_loan_diagnostics import LOAN_GUARDS, REPAYMENT_GUARDS
+
+    old_loan_messages = (
+        "永豐貸款帳號 API 未回傳預期結構", "永豐貸款帳號資料格式錯誤",
+        "永豐貸款帳號缺少 AcctValue/AcctValueFormat", "永豐貸款查詢控制項不存在",
+        "永豐貸款查詢未收到對應 API 回應", "永豐貸款明細 API HTTP 回應失敗",
+        "永豐貸款明細 API 未回傳預期結構", "永豐貸款明細缺少必要欄位或銀行回覆失敗",
+        "sinopac-loan-repayments", "sinopac-loan-repayments",
+    )
+    for method_name, expected, originals in (
+        ("_collect_loans", LOAN_GUARDS, old_loan_messages),
+        ("_collect_loan_repayments", (*(
+            "sinopac-loan-repayments-" + suffix for suffix in REPAYMENT_GUARDS
+            if suffix not in {"start-date", "end-date"}
+        ), None), (None,) * 18),
+    ):
+        method = next(node for node in crawler.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
+        raises = sorted((node for node in ast.walk(method) if isinstance(node, ast.Raise)), key=lambda node: node.lineno)
+        assert len(raises) == len(expected) == len(originals)
+        for node, guard, original in zip(raises, expected, originals, strict=True):
+            assert isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name)
+            assert node.exc.func.id == "RuntimeError" and len(node.exc.args) == 1 and not node.exc.keywords
+            argument = node.exc.args[0]
+            if guard is None:  # Keep the pre-existing suppressed-context wrapper.
+                assert isinstance(argument, ast.Name) and argument.id == "error"
+            else:
+                assert isinstance(argument, ast.Constant) and argument.value == guard
+                assert guard in SinopacCrawler.SAFE_COLLECT_GUARDS
+                node.exc.args[0] = ast.Constant(original) if original is not None else ast.Name(id="error", ctx=ast.Load())
+        if method_name == "_collect_loan_repayments":
+            dates = sorted((node for node in ast.walk(method) if isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Attribute) and node.func.attr == "_yyyymmdd"),
+                           key=lambda node: node.lineno)
+            assert len(dates) == 2
+            for node, suffix in zip(dates, ("start-date", "end-date"), strict=True):
+                assert isinstance(node.args[1], ast.Constant)
+                assert node.args[1].value == "sinopac-loan-repayments-" + suffix
+                node.args[1] = ast.Name(id="error", ctx=ast.Load())
     payload = "\n".join(
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     )

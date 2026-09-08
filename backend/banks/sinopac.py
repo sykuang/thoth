@@ -145,6 +145,36 @@ def _sinopac_card_bill_fact(out: dict):
 class SinopacCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
     SAFE_COLLECT_GUARDS = frozenset({
+        "sinopac-loan-inventory-envelope",
+        "sinopac-loan-inventory-row",
+        "sinopac-loan-inventory-identity",
+        "sinopac-loan-query-control",
+        "sinopac-loan-response-missing",
+        "sinopac-loan-response-http",
+        "sinopac-loan-response-envelope",
+        "sinopac-loan-response-records",
+        "sinopac-loan-restore-page",
+        "sinopac-loan-restore-account",
+        "sinopac-loan-repayments",
+        "sinopac-loan-repayments-page-state",
+        "sinopac-loan-repayments-account-control",
+        "sinopac-loan-repayments-link-cardinality",
+        "sinopac-loan-repayments-form-control",
+        "sinopac-loan-repayments-start-date",
+        "sinopac-loan-repayments-end-date",
+        "sinopac-loan-repayments-text-type",
+        "sinopac-loan-repayments-form-binding",
+        "sinopac-loan-repayments-query-control",
+        "sinopac-loan-repayments-query-label",
+        "sinopac-loan-repayments-response-cardinality",
+        "sinopac-loan-repayments-request-binding",
+        "sinopac-loan-repayments-response-type",
+        "sinopac-loan-repayments-response-body",
+        "sinopac-loan-repayments-response-envelope",
+        "sinopac-loan-repayments-response-metadata",
+        "sinopac-loan-repayments-response-records",
+        "sinopac-loan-repayments-result-state",
+        "sinopac-loan-repayments-result-rows",
         "sinopac-twd-history-account-control",
         "sinopac-twd-history-byte-budget",
         "sinopac-twd-history-cursor",
@@ -897,16 +927,16 @@ class SinopacCrawler(BankCrawler):
         if not (isinstance(account_raw, list) and account_raw
                 and isinstance(account_raw[0], dict)
                 and isinstance(account_raw[0].get("SubInfo"), list)):
-            raise RuntimeError("永豐貸款帳號 API 未回傳預期結構")
+            raise RuntimeError("sinopac-loan-inventory-envelope")
         accounts = account_raw[0]["SubInfo"]
         details = []
         for account in accounts:
             if not isinstance(account, dict):
-                raise RuntimeError("永豐貸款帳號資料格式錯誤")
+                raise RuntimeError("sinopac-loan-inventory-row")
             account_no = account.get("AcctValue")
             formatted = account.get("AcctValueFormat")
             if not account_no or not formatted:
-                raise RuntimeError("永豐貸款帳號缺少 AcctValue/AcctValueFormat")
+                raise RuntimeError("sinopac-loan-inventory-identity")
 
             before = len(collector.by_endpoint("ws_loaninfo.ashx"))
             clicked = page.evaluate(
@@ -927,7 +957,7 @@ class SinopacCrawler(BankCrawler):
                 {"account": account_no, "formatted": formatted},
             )
             if not clicked:
-                raise RuntimeError("永豐貸款查詢控制項不存在")
+                raise RuntimeError("sinopac-loan-query-control")
             page.wait_for_timeout(5000)
 
             hits = collector.by_endpoint("ws_loaninfo.ashx")[before:]
@@ -940,15 +970,15 @@ class SinopacCrawler(BankCrawler):
                         and params.get("AcctValueFormat") == [formatted]):
                     matching_hits.append(hit)
             if not matching_hits:
-                raise RuntimeError("永豐貸款查詢未收到對應 API 回應")
+                raise RuntimeError("sinopac-loan-response-missing")
             hit = matching_hits[-1]
             if not 200 <= hit.status < 300:
-                raise RuntimeError("永豐貸款明細 API HTTP 回應失敗")
+                raise RuntimeError("sinopac-loan-response-http")
             info_raw = hit.resp_json
             if not (isinstance(info_raw, list) and info_raw
                     and isinstance(info_raw[0], dict)
                     and isinstance(info_raw[0].get("SubInfo"), list)):
-                raise RuntimeError("永豐貸款明細 API 未回傳預期結構")
+                raise RuntimeError("sinopac-loan-response-envelope")
             body = info_raw[0]
             records = body["SubInfo"]
             required = ("LoanKind", "Currency", "LoanBalance")
@@ -957,7 +987,7 @@ class SinopacCrawler(BankCrawler):
                 or any(record.get(key) in (None, "") for key in required)
                 for record in records
             ):
-                raise RuntimeError("永豐貸款明細缺少必要欄位或銀行回覆失敗")
+                raise RuntimeError("sinopac-loan-response-records")
             repayments = []
             for record in records:
                 repayments.append(self._collect_loan_repayments(page, collector, account, record))
@@ -966,11 +996,11 @@ class SinopacCrawler(BankCrawler):
                 page.go_back(wait_until="domcontentloaded", timeout=15_000)
                 if (page.url != "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_loandetail.aspx"
                         or getattr(self, "_shared_dialog_blocked", False) or self._response_visible(page)):
-                    raise RuntimeError("sinopac-loan-repayments")
+                    raise RuntimeError("sinopac-loan-restore-page")
                 for key in ("AcctValue", "AcctValueFormat"):
                     control = page.locator("#" + key)
                     if control.count() != 1 or control.input_value() != account[key]:
-                        raise RuntimeError("sinopac-loan-repayments")
+                        raise RuntimeError("sinopac-loan-restore-account")
             details.append({
                 "account": account_no,
                 "records": records,
@@ -982,18 +1012,20 @@ class SinopacCrawler(BankCrawler):
         """One native default period, not a retention/full-history assertion."""
         from backend.core.persist.sinopac import _parse_sinopac_repayment
 
+        # Fallback for unexpected failures; the safe sink retains deeper guards
+        # from the suppressed context without exposing the exception message.
         error = "sinopac-loan-repayments"
 
         def ensure_page(url):
             if page.url != url or getattr(self, "_shared_dialog_blocked", False) or self._response_visible(page):
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-page-state")
 
         try:
             ensure_page("https://mma.sinopac.com/mma/bank/easy_index_loan/mma_loandetail.aspx")
             for key in ("AcctValue", "AcctValueFormat"):
                 control = page.locator("#" + key)
                 if control.count() != 1 or control.input_value() != account[key]:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-account-control")
             links = page.locator("#tbDetails a[onclick]")
             selected = []
             pattern = re.compile(r"forQuery\(\s*'detail'\s*," + r"\s*'([^'\r\n]*)'\s*," * 5 + r"\s*'([^'\r\n]*)'\s*\)\s*;?")
@@ -1004,34 +1036,34 @@ class SinopacCrawler(BankCrawler):
                 if match and match.groups() == expected and "繳款明細" in link.inner_text() and link.is_visible():
                     selected.append(link)
             if len(selected) != 1:
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-link-cardinality")
             # A native locator click can navigate; never replay after an evaluate-context error.
             selected[0].click(timeout=8_000)
             page.wait_for_url(LOAN_DETAIL_URL, wait_until="domcontentloaded", timeout=15_000)
             ensure_page(LOAN_DETAIL_URL)
             if page.locator("#tr_mma").count() != 1:
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-form-control")
             form = page.evaluate("""() => [...new FormData(document.querySelector('#tr_mma')).entries()]""")
             params = {key: [value] for key, value in form}
-            start = self._yyyymmdd(params["StartDate"][0], error)
-            end = self._yyyymmdd(params["EndDate"][0], error)
+            start = self._yyyymmdd(params["StartDate"][0], "sinopac-loan-repayments-start-date")
+            end = self._yyyymmdd(params["EndDate"][0], "sinopac-loan-repayments-end-date")
             text_type = params.get("TextType", [None])[0]
             if not isinstance(text_type, str) or len(text_type) > 2_000:
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-text-type")
             bound = {"AcctValue": account["AcctValue"], "AcctValueFormat": account["AcctValueFormat"],
                      "LNMAINACNO": account["AcctValue"], "LNALTNO": record["Sub1_Sub2"],
                      "CURRENCY": record["Currency"], "TextType": text_type,
                      **{key: record[key] for key in ("Sub1_Sub2", "LoanAmt", "LoanBalance", "LoanKind", "PayName")},
                      "StartDate": start.strftime("%Y%m%d"), "EndDate": end.strftime("%Y%m%d")}
             if len(form) != len(bound) or params != {key: [value] for key, value in bound.items()} or not start <= end <= _taipei_today():
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-form-binding")
             for selector in ("#StartDate", "#EndDate", "#btnQuery"):
                 control = page.locator(selector)
                 if control.count() != 1 or not control.is_visible() or not control.is_enabled():
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-query-control")
             button = page.locator("#btnQuery")
             if button.inner_text().strip() != "查詢":
-                raise RuntimeError(error)
+                raise RuntimeError("sinopac-loan-repayments-query-label")
             # The generic collector truncates request forms and may replay response.body().
             # Detach only during this native query; use the existing read-only CDP observer.
             collector.detach(page)
@@ -1046,19 +1078,19 @@ class SinopacCrawler(BankCrawler):
                         break
                     page.wait_for_timeout(100)
                 if len(responses) != 1:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-cardinality")
                 response = responses[0]
                 request = response.request
                 if parse_qs(request.post_data, keep_blank_values=True) != params:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-request-binding")
                 if response.headers.get("content-type", "").split(";", 1)[0].lower().strip() != "application/json":
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-type")
                 raw = observer.read(response, page.main_frame, LOAN_DETAIL_URL, 5_000_000, 1)
                 if raw is None:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-body")
                 payload = json.loads(raw)
                 if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-envelope")
                 body = payload[0]
                 metadata = body.get("HeadInfo")
                 if (set(body) != {"HeadInfo", "SubInfo", "Header", "Message"}
@@ -1067,10 +1099,10 @@ class SinopacCrawler(BankCrawler):
                         or any(not isinstance(item, dict) or set(item) != {
                             "HeadText", "HeadAlign", "DataAlign", "MainShow", "DetailShow", "FieldKey", "OrderIndex", "FieldWidth"
                         } or any(not isinstance(v, str) or len(v) > 2_000 for v in item.values()) for item in metadata)):
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-metadata")
                 records = body["SubInfo"]
                 if not isinstance(records, list) or not 1 <= len(records) <= 10_000:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-response-records")
                 dom = page.evaluate(r"""() => {
                     const visible = e => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
                     const rows = [...document.querySelectorAll('#tbodyDetails tr')];
@@ -1090,9 +1122,9 @@ class SinopacCrawler(BankCrawler):
                 if (not dom["unique"] or not dom["visible"] or dom["empty"] or dom["pager"]
                         or dom["headers"] != ["繳款日", "應繳日", "攤還本金", "繳息金額", "本金餘額", "違約金金額", "繳款金額", "交易狀態"]
                         or dom["form"] != form or observer.bad or len(responses) != 1):
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-result-state")
                 if dom["rows"] != [[_plain_text(row[f"DataValue{i}"]) for i in (2, 1, 11, 4, 5, 6, 3, 10)] for row in records]:
-                    raise RuntimeError(error)
+                    raise RuntimeError("sinopac-loan-repayments-result-rows")
                 repayment = {
                     "sub_account": record["Sub1_Sub2"], "currency": record["Currency"],
                     "receipt": {"account": account["AcctValue"], "sub_account": record["Sub1_Sub2"],

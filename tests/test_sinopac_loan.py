@@ -145,7 +145,7 @@ def test_sinopac_rejects_incomplete_loan_business_response(monkeypatch):
     monkeypatch.setattr("backend.banks.sinopac.SinopacCreds.load", lambda: object())
     collector = ResponseCollector("sinopac.com")
 
-    with pytest.raises(RuntimeError, match="必要欄位"):
+    with pytest.raises(RuntimeError, match="^sinopac-loan-response-records$"):
         SinopacCrawler()._collect_loans(_IncompleteLoanResponsePage(collector), collector)
 
 
@@ -153,7 +153,7 @@ def test_sinopac_rejects_failed_loan_api_response(monkeypatch):
     monkeypatch.setattr("backend.banks.sinopac.SinopacCreds.load", lambda: object())
     collector = ResponseCollector("sinopac.com")
 
-    with pytest.raises(RuntimeError, match="HTTP"):
+    with pytest.raises(RuntimeError, match="^sinopac-loan-response-http$"):
         SinopacCrawler()._collect_loans(_FailedLoanResponsePage(collector), collector)
 
 
@@ -162,7 +162,7 @@ def test_sinopac_rejects_delayed_response_from_previous_loan_account(monkeypatch
     monkeypatch.setattr(SinopacCrawler, "_collect_loan_repayments", lambda *args: _repayment())
     collector = ResponseCollector("sinopac.com")
 
-    with pytest.raises(RuntimeError, match="對應 API 回應"):
+    with pytest.raises(RuntimeError, match="^sinopac-loan-response-missing$"):
         SinopacCrawler()._collect_loans(_DelayedPreviousAccountPage(collector), collector)
 
 
