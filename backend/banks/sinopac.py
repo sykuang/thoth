@@ -26,15 +26,17 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
     _HistoryBodyObserver,
     _OriginGuardProxy,
+    _safe_state_value,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -56,6 +58,35 @@ from backend.core.login_checkpoints import (
 )
 
 BASE = "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
+LOGIN_RESPONSE_URL = "https://mma.sinopac.com/ws/member/login/ws_validatecaptcha.ashx"
+# First-party MMALogin.aspx (2026-09-09): failed validation alerts [0].Message;
+# the errorLabel also exists. Neither source proves an independent bank code.
+# Public HTML SHA-256: 9e34fdc7c5dfbe7e055a0a61545f702958fe641766299375c613b12252e73e50
+
+
+def _safe_login_message(value, creds):
+    if type(value) is not str or not 0 < len(value) <= 4096 or type(creds) is not SinopacCreds:
+        return None
+    state = object.__getattribute__(creds, "__dict__")
+    secrets = [_safe_state_value(state, key) for key in ("national_id", "user_code", "password")]
+    if any(type(secret) is not str or not 1 <= len(secret) <= 512 for secret in secrets):
+        return None
+
+    def normalize(text):
+        for _ in range(3):
+            text = unicodedata.normalize("NFKC", html.unescape(unquote(text)))
+        return "".join(c for c in text if unicodedata.category(c) not in {"Cf", "Cc", "Zl", "Zp"})
+
+    text = normalize(value)
+    secrets = [normalize(secret) for secret in secrets]
+    if any(not secret for secret in secrets):
+        return None
+    for secret in sorted(secrets, key=len, reverse=True):
+        text = re.sub(re.escape(secret), "[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s<>]+|www\.[^\s<>]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[A-Za-z][12]\d{8}|\+?\d[\d ()-]{5,}\d", "[REDACTED]", text, flags=re.IGNORECASE)
+    if any(secret.casefold() in text.casefold() for secret in secrets):
+        return None
+    return text.strip()[:512] or None
 
 
 def _taipei_today() -> date:
@@ -107,8 +138,9 @@ def _log(*a):
 class SinopacLoginError(RuntimeError):
     """永豐登入失敗，附可供 retry/UI 判斷的 machine-readable code。"""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, login_stage: str = "unknown"):
         self.code = code
+        self.login_stage = login_stage
         super().__init__(f"[{code}] {message}")
 
 
@@ -224,6 +256,46 @@ class SinopacCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "sinopac.com"
 
+    def log_login_failure_diagnostics(self, page) -> None:
+        message, source = None, "unknown"
+        try:
+            floor = getattr(self, "_login_diagnostic_floor", None)
+            hits = self.collector.hits if self.collector is not None else []
+            candidates = [hit for hit in hits if (
+                type(hit.raw_url) is str and hit.raw_url == LOGIN_RESPONSE_URL
+                and type(hit.method) is str and hit.method == "POST"
+                and type(hit.status) is int and hit.status == 200
+                and hit.main_frame_request is True and hit.redirected is False
+                and type(hit.request_frame_url) is str and hit.request_frame_url == BASE
+                and type(floor) is int and type(hit.request_sequence) is int
+                and hit.request_sequence > floor
+            )]
+            if len(candidates) == 1:
+                payload = candidates[0].resp_json
+                row = payload[0] if type(payload) is list and len(payload) == 1 else None
+                header = _safe_state_value(row, "Header")
+                if type(header) is str and 0 < len(header) <= 64 and header != "SUCCESS":
+                    message = _safe_login_message(_safe_state_value(row, "Message"), self.creds)
+                    if message is not None:
+                        source = "login_response.Message"
+            if message is None and type(page.url) is str and page.url == BASE:
+                label = page.locator("#ctl00_ctl00_ContentPlaceHolder1__errorLabel")
+                if label.count() == 1 and label.is_visible():
+                    text = label.inner_text(timeout=250)
+                    if page.url == BASE:
+                        message = _safe_login_message(text, self.creds)
+                        if message is not None:
+                            source = "login_page.errorLabel"
+        except Exception:
+            message, source = None, "unknown"
+        # Observed context only: does not classify an error or authorize a retry.
+        _log("[sinopac][login][WARNING] " + json.dumps({
+            "event": "bank_login_diagnostic", "bank": "sinopac",
+            "source": source, "message": message,
+            "message_status": "sanitized" if message is not None else "unavailable",
+            "bank_error_code": None, "bank_error_code_status": "not_verified",
+        }, ensure_ascii=False))
+
     @staticmethod
     def _page_scopes(page):
         return [
@@ -273,12 +345,14 @@ class SinopacCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._login_diagnostic_floor = None
         try:
             page.wait_for_timeout(8000)
         except Exception:
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入頁面無法安全準備；未送出登入",
+                login_stage="prepare_page",
             ) from None
 
     def is_authenticated(self, page) -> bool:
@@ -400,6 +474,7 @@ class SinopacCrawler(BankCrawler):
             raise SinopacLoginError(
                 SinopacCrawler.LOGIN_FAILED,
                 "永豐登入欄位輸入長度不符；未送出登入",
+                login_stage="input_length",
             )
 
     def prepare_captcha_resubmit(self, page) -> None:
@@ -409,6 +484,7 @@ class SinopacCrawler(BankCrawler):
                 raise SinopacLoginError(
                     self.CAPTCHA_INVALID,
                     "無法安全更新永豐驗證碼；未送出登入",
+                    login_stage="captcha_refresh",
                 )
             image.click()
             page.wait_for_timeout(1500)
@@ -418,6 +494,7 @@ class SinopacCrawler(BankCrawler):
             raise SinopacLoginError(
                 self.CAPTCHA_INVALID,
                 "無法安全更新永豐驗證碼；未送出登入",
+                login_stage="captcha_refresh",
             ) from None
 
     def _ocr_captcha(self, page, max_attempts=5):
@@ -470,8 +547,12 @@ class SinopacCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
+        collector = getattr(self, "collector", None)
+        self._login_diagnostic_floor = collector.request_sequence if type(collector) is ResponseCollector else None
+        stage = "captcha_image_wait"
         try:
             page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=10000)
+            stage = "input_inventory"
             inputs = page.locator("input")
             groups = {6: [], 11: [], 20: []}
             for index in range(inputs.count()):
@@ -485,7 +566,9 @@ class SinopacCrawler(BankCrawler):
                 raise SinopacLoginError(
                     self.LOGIN_FAILED,
                     "永豐登入欄位無法安全確認；未送出登入",
+                    login_stage=stage,
                 )
+            stage = "input_geometry"
             ordered_twenty = []
             for field in groups[20]:
                 box = field.bounding_box()
@@ -493,13 +576,16 @@ class SinopacCrawler(BankCrawler):
                     raise SinopacLoginError(
                         self.LOGIN_FAILED,
                         "永豐登入欄位無法安全確認；未送出登入",
+                        login_stage=stage,
                     )
                 ordered_twenty.append((box["y"], field))
+            stage = "input_order"
             ordered_twenty.sort(key=lambda item: item[0])
             if ordered_twenty[0][0] == ordered_twenty[1][0]:
                 raise SinopacLoginError(
                     self.LOGIN_FAILED,
                     "永豐登入欄位無法安全確認；未送出登入",
+                    login_stage=stage,
                 )
             fields = (
                 groups[11][0],
@@ -507,25 +593,32 @@ class SinopacCrawler(BankCrawler):
                 ordered_twenty[1][1],
                 groups[6][0],
             )
+            stage = "input_enabled"
             if any(not field.is_enabled() for field in fields):
                 raise SinopacLoginError(
                     self.LOGIN_FAILED,
                     "永豐登入欄位無法安全確認；未送出登入",
+                    login_stage=stage,
                 )
+            stage = "credential_fill"
             for field, value in zip(
                 fields[:3],
                 (self.creds.national_id, self.creds.user_code, self.creds.password),
                 strict=True,
             ):
                 self._keyboard_fill(page, field, value)
+            stage = "captcha_ocr"
             captcha = self._ocr_captcha(page, max_attempts=5)
             if captcha is None:
                 raise SinopacLoginError(
                     self.CAPTCHA_INVALID,
                     "永豐驗證碼辨識失敗；未送出登入",
+                    login_stage=stage,
                 )
+            stage = "captcha_fill"
             self._keyboard_fill(page, fields[3], captcha)
 
+            stage = "login_button"
             candidates = page.locator("#MMA_Login")
             eligible = []
             for index in range(candidates.count()):
@@ -541,6 +634,7 @@ class SinopacCrawler(BankCrawler):
                 raise SinopacLoginError(
                     self.LOGIN_FAILED,
                     "找不到唯一且可操作的永豐登入按鈕；未送出登入",
+                    login_stage=stage,
                 )
             button = eligible[0]
         except SinopacLoginError:
@@ -549,16 +643,20 @@ class SinopacCrawler(BankCrawler):
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入欄位無法安全填寫；未送出登入",
+                login_stage=stage,
             ) from None
 
+        stage = "credential_submit"
         try:
             button.click(timeout=8000)
         except Exception:
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入送出狀態不明；禁止自動重試",
+                login_stage=stage,
             ) from None
 
+        stage = "post_submit_check"
         try:
             for _ in range(8):
                 page.wait_for_timeout(1000)
@@ -568,6 +666,7 @@ class SinopacCrawler(BankCrawler):
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入送出後狀態無法安全確認；禁止自動重試",
+                login_stage=stage,
             ) from None
 
     # ---------- 抓取 ----------

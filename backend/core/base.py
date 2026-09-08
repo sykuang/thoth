@@ -346,6 +346,24 @@ def _safe_login_diagnostics(bank, exception_state, outcome_state):
     return f"phase={phase_label}, reason={reason_label}, rule={rule_label}"
 
 
+def _safe_native_login_diagnostics(bank, exception_state):
+    # Adapter classifications are not bank response codes and never authorize actions.
+    if type(bank) is not str or bank != "sinopac":
+        return ""
+    code = _safe_state_value(exception_state, "code")
+    code_label = next((label for label in (
+        "captcha_invalid", "credentials_invalid", "login_failed",
+    ) if type(code) is str and code == label), "unknown")
+    stage = _safe_state_value(exception_state, "login_stage")
+    stage_label = next((label for label in (
+        "prepare_page", "input_length", "captcha_refresh", "captcha_image_wait",
+        "input_inventory", "input_geometry", "input_order", "input_enabled",
+        "credential_fill", "captcha_ocr", "captcha_fill", "login_button",
+        "credential_submit", "post_submit_check",
+    ) if type(stage) is str and stage == label), "unknown")
+    return f"internal_error_code={code_label}, stage={stage_label}"
+
+
 def write_private_json(path: Path, payload: dict) -> None:
     """Atomically replace a private JSON file without following links."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +471,7 @@ class ApiHit:
 
 
 _HISTORY_OBSERVER_URLS = {
+    "sinopac.com": "https://mma.sinopac.com/ws/member/login/ws_validatecaptcha.ashx",
     "ubot.com.tw": "https://www.ubot.com.tw/MyBank/IBKB010102",
     "taishinbank.com.tw": "https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query",
 }
@@ -461,9 +480,9 @@ _HISTORY_OBSERVER_URLS = {
 class _HistoryBodyObserver:
     """Read-only CDP size proof; bounds admitted decoded bytes, not browser RSS."""
 
-    LIMIT = 5_000_000
-    MAX_RECORDS = 64
-    WAIT_SECONDS = 10
+    LIMIT: int = 5_000_000
+    MAX_RECORDS: int = 64
+    WAIT_SECONDS: float = 10
 
     def __init__(self, page, url):
         self.page, self.url = page, url
@@ -664,6 +683,10 @@ class ResponseCollector:
                 self._history_observer = _HistoryBodyObserver(
                     page, _HISTORY_OBSERVER_URLS[self.host_filter]
                 )
+                if self.host_filter == "sinopac.com":
+                    self._history_observer.LIMIT = 16_384
+                    self._history_observer.MAX_RECORDS = 4
+                    self._history_observer.WAIT_SECONDS = 0.25
         page.on("request", self._request_handler)
         page.on("requestfailed", self._request_failed_handler)
         page.on("response", self._response_handler)
@@ -884,8 +907,12 @@ class ResponseCollector:
             if not is_data:
                 return
             req_body = None
+            is_sinopac_login = (
+                self.host_filter == "sinopac.com"
+                and canonical_path == "/ws/member/login/ws_validatecaptcha.ashx"
+            )
             try:
-                pd = None if metadata_only else req.post_data
+                pd = None if metadata_only or is_sinopac_login else req.post_data
                 if pd:
                     if is_bounded_json:
                         if len(pd.encode("utf-8")) > 16_384:
@@ -911,7 +938,27 @@ class ResponseCollector:
             except Exception:
                 pass
             resp_json = None
-            if "json" in ct and not metadata_only:
+            if is_sinopac_login:
+                # Never use Response.json/body: Patchright may replay a bank POST.
+                req_body = None
+                if (url == _HISTORY_OBSERVER_URLS["sinopac.com"]
+                        and main_frame_request and request_sequence > 0
+                        and request_frame_url == "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
+                        and self._history_observer is not None):
+                    with contextlib.suppress(Exception):
+                        raw_body = self._history_observer.read(
+                            resp, request_frame, request_frame_url, 16_384, 1,
+                        )
+                        if raw_body is not None:
+                            body_size = len(raw_body)
+                            payload = json.loads(raw_body)
+                            row = payload[0] if type(payload) is list and len(payload) == 1 else None
+                            header = _safe_state_value(row, "Header")
+                            message = _safe_state_value(row, "Message")
+                            if (type(header) is str and 0 < len(header) <= 64
+                                    and type(message) is str and len(message) <= 4096):
+                                resp_json = [{"Header": header, "Message": message}]
+            elif "json" in ct and not metadata_only:
                 if is_bounded_json:
                     minimum_size = 64 if is_ubot_history else 0
                     if is_ubot_history or is_taishin_history:
@@ -1994,6 +2041,9 @@ class BankCrawler(ABC):
             **fetch_kwargs,
         )
 
+    def log_login_failure_diagnostics(self, page) -> None:
+        """Optional adapter-owned stderr diagnostics; never affects login decisions."""
+
     def run(self, login_url: str, headless: bool = False) -> dict:
         """完整流程：開瀏覽器 → 登入 → 抓取 → **登出** → 回傳資料。
 
@@ -2086,14 +2136,21 @@ class BankCrawler(ABC):
                             msg = f"{exception_type}: code=captcha_ocr_failed"
                         else:
                             msg = f"{exception_type}: login failed"
+                        native_diagnostics = _safe_native_login_diagnostics(self.name, exception_state)
+                        if native_diagnostics:
+                            msg += f", {native_diagnostics}"
                         print(
                             f"[{self.name}][login] raise → {msg}; details withheld",
                             file=_sys.stderr,
                         )
+                        with contextlib.suppress(Exception):
+                            self.log_login_failure_diagnostics(page)
                         result["error"] = msg
                         return page
 
                 if not ok:
+                    with contextlib.suppress(Exception):
+                        self.log_login_failure_diagnostics(page)
                     result["error"] = "login_failed"
                     return page
                 logged_in = True
