@@ -470,8 +470,8 @@ class ApiHit:
         return self.url.split("?")[0].rsplit("/", 1)[-1]
 
 
+_SINOPAC_LOGIN_RESPONSE_URL = "https://mma.sinopac.com/ws/member/login/ws_validatecaptcha.ashx"
 _HISTORY_OBSERVER_URLS = {
-    "sinopac.com": "https://mma.sinopac.com/ws/member/login/ws_validatecaptcha.ashx",
     "ubot.com.tw": "https://www.ubot.com.tw/MyBank/IBKB010102",
     "taishinbank.com.tw": "https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query",
 }
@@ -678,10 +678,14 @@ class ResponseCollector:
         self._history_observer = None
 
     def attach(self, page):
-        if self.host_filter in _HISTORY_OBSERVER_URLS and self._history_observer is None:
+        observer_url = (
+            _SINOPAC_LOGIN_RESPONSE_URL if self.host_filter == "sinopac.com"
+            else _HISTORY_OBSERVER_URLS.get(self.host_filter)
+        )
+        if observer_url is not None and self._history_observer is None:
             with contextlib.suppress(Exception):
                 self._history_observer = _HistoryBodyObserver(
-                    page, _HISTORY_OBSERVER_URLS[self.host_filter]
+                    page, observer_url
                 )
                 if self.host_filter == "sinopac.com":
                     self._history_observer.LIMIT = 16_384
@@ -941,7 +945,7 @@ class ResponseCollector:
             if is_sinopac_login:
                 # Never use Response.json/body: Patchright may replay a bank POST.
                 req_body = None
-                if (url == _HISTORY_OBSERVER_URLS["sinopac.com"]
+                if (url == _SINOPAC_LOGIN_RESPONSE_URL
                         and main_frame_request and request_sequence > 0
                         and request_frame_url == "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
                         and self._history_observer is not None):

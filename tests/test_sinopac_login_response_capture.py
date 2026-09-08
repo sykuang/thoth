@@ -10,6 +10,34 @@ from backend.core.creds import SinopacCreds
 from backend.banks.sinopac import BASE, LOGIN_RESPONSE_URL, SinopacCrawler, _safe_login_message
 
 
+def test_login_endpoint_is_not_a_history_contract():
+    from backend.core import base
+    assert LOGIN_RESPONSE_URL not in base._HISTORY_OBSERVER_URLS.values()
+
+
+@pytest.mark.parametrize('fault', ['missing', 'rejected', 'untracked', 'wrong_document', 'wrong_shape', 'valid'])
+def test_login_capture_requires_its_own_document_and_payload(fault):
+    from unittest.mock import Mock
+    frame = SimpleNamespace(url=LOGIN_RESPONSE_URL if fault == 'wrong_document' else BASE)
+    frame.page = SimpleNamespace(main_frame=frame)
+    request = SimpleNamespace(url=LOGIN_RESPONSE_URL, method='POST', post_data='synthetic=1',
+                              headers={}, frame=frame, redirected_from=None)
+    response = Mock(url=LOGIN_RESPONSE_URL, request=request, status=200,
+                    headers={'content-type': 'application/json'})
+    collector = ResponseCollector('sinopac.com')
+    payload = b'{"value": "not a login response"}' if fault == 'wrong_shape' else b'[{"Header":"FAIL","Message":"synthetic bank notice"}]'
+    observer = Mock()
+    observer.read.return_value = None if fault == 'rejected' else payload
+    if fault != 'missing': collector._history_observer = observer
+    if fault != 'untracked': collector._on_request(request)
+    collector._on_response(response)
+    response.body.assert_not_called()
+    response.json.assert_not_called()
+    assert len(collector.hits) == 1 and collector.hits[0].req_body is None
+    assert (collector.hits[0].resp_json is not None) == (fault == 'valid')
+    assert observer.read.call_count == (1 if fault in {'rejected', 'wrong_shape', 'valid'} else 0)
+
+
 @pytest.mark.parametrize('transport', ['fetch', 'sync_xhr_alert'])
 def test_native_login_capture_never_replays_and_drops_request_body(capsys, monkeypatch, transport):
     from patchright.sync_api import Response

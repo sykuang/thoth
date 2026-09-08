@@ -37,6 +37,7 @@ from backend.core.base import (
     _HistoryBodyObserver,
     _OriginGuardProxy,
     _safe_state_value,
+    _SINOPAC_LOGIN_RESPONSE_URL,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -58,7 +59,7 @@ from backend.core.login_checkpoints import (
 )
 
 BASE = "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
-LOGIN_RESPONSE_URL = "https://mma.sinopac.com/ws/member/login/ws_validatecaptcha.ashx"
+LOGIN_RESPONSE_URL = _SINOPAC_LOGIN_RESPONSE_URL
 # First-party MMALogin.aspx (2026-09-09): failed validation alerts [0].Message;
 # the errorLabel also exists. Neither source proves an independent bank code.
 # Public HTML SHA-256: 9e34fdc7c5dfbe7e055a0a61545f702958fe641766299375c613b12252e73e50
