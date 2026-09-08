@@ -718,7 +718,8 @@ def test_run_redacts_login_checkpoint_rule_name(monkeypatch, tmp_path, capsys) -
     stderr = capsys.readouterr().err
     assert result["error"] == (
         "LoginCheckpointBlocked: kind=unknown_blocker, credential_submissions=1, "
-        "protocol_resubmits=0, captcha_resubmits=0, reloads=0"
+        "protocol_resubmits=0, captcha_resubmits=0, reloads=0, "
+        "phase=unknown, reason=unspecified, rule=unknown"
     )
     assert "PRIVATE_ACCOUNT_987654" not in repr(result)
     assert "PRIVATE_ACCOUNT_987654" not in stderr
@@ -769,7 +770,8 @@ def test_run_revalidates_mutated_login_budget(monkeypatch, tmp_path, capsys) -> 
     stderr = capsys.readouterr().err
     assert result["error"] == (
         "LoginCheckpointBlocked: kind=unknown_blocker, credential_submissions=0, "
-        "protocol_resubmits=0, captcha_resubmits=0, reloads=0"
+        "protocol_resubmits=0, captcha_resubmits=0, reloads=0, "
+        "phase=unknown, reason=unspecified, rule=unknown"
     )
     assert "PRIVATE" not in repr(result)
     assert "PRIVATE" not in stderr
@@ -1073,7 +1075,8 @@ def test_run_redacts_collect_checkpoint_metadata(monkeypatch, tmp_path, capsys) 
 
     stderr = capsys.readouterr().err
     assert result["error"] == (
-        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint, "
+        "phase=unknown, reason=unspecified, rule=unknown"
     )
     assert "PRIVATE_ACCOUNT_987654" not in repr(result)
     assert "PRIVATE_ACCOUNT_987654" not in stderr
@@ -1288,7 +1291,8 @@ def test_collect_origin_drift_discards_data_and_skips_logout(
     assert "collect-origin-drift" not in crawler.events
     assert "data" not in result
     assert result["error"] == (
-        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+        "collect_failed: LoginCheckpointBlocked: code=collect_checkpoint, "
+        "phase=post_submit_settle, reason=collect_origin_or_dialog, rule=unknown"
     )
     assert "PRIVATE-URL-MARKER" not in repr(result)
     assert "logout" not in crawler.events

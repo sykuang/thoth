@@ -252,7 +252,6 @@ def test_unknown_state_never_requests_resubmit():
     assert raised.value.budget == budget
     assert raised.value.outcome.action_label is None
     assert raised.value.phase is CheckpointPhase.POST_SUBMIT
-    assert "phase=post_submit" in str(raised.value)
     assert "rule_name" not in str(raised.value)
 
 
@@ -475,12 +474,10 @@ def test_explicit_login_error_message_has_safe_diagnostic_evidence():
         reduce_login_checkpoint(CheckpointPhase.POST_SUBMIT, budget, outcome)
 
     message = str(raised.value)
-    assert "kind=explicit_login_error" in message
-    assert "rule_name=bad-password-rule" in message
-    assert "credential_submissions=2" in message
-    assert "protocol_resubmits=1" in message
-    assert "captcha_resubmits=0" in message
-    assert "reloads=1" in message
+    assert message == "terminal login checkpoint; details withheld"
+    assert raised.value.outcome is outcome
+    assert raised.value.budget is budget
+    assert raised.value.phase is CheckpointPhase.POST_SUBMIT
     assert "secret-action" not in message
     assert "secret-interaction" not in message
 

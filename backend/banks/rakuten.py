@@ -30,6 +30,7 @@ from backend.core.captcha import solve_captcha, wait_captcha_stable
 from backend.core.creds import RakutenCreds
 from backend.core.login_checkpoints import (
     CheckpointKind,
+    CheckpointReason,
     CheckpointOutcome,
     CheckpointPhase,
     LoginBudget,
@@ -1274,14 +1275,20 @@ class RakutenCrawler(BankCrawler):
         budget = LoginBudget(credential_submissions=1)
 
         def ensure_navigation_safe() -> None:
-            if (
-                getattr(self, "_shared_dialog_blocked", False)
-                or not self._credential_origin_allowed(page)
-                or _any_visible(page, "#ib_init_connect_error_popup")
-            ):
+            rule_name = None
+            if getattr(self, "_shared_dialog_blocked", False):
+                reason = self._dialog_failure_reason()
+            elif not self._credential_origin_allowed(page):
+                reason = self._origin_failure_reason(CheckpointReason.NAVIGATION_ORIGIN)
+            elif _any_visible(page, "#ib_init_connect_error_popup"):
+                reason = CheckpointReason.MATCHED_BLOCKER
+                rule_name = "rakuten-startup-connect-error"
+            else:
+                reason = None
+            if reason is not None:
                 raise LoginCheckpointBlocked(
                     budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule_name, reason=reason),
                     phase=CheckpointPhase.POST_SUBMIT_SETTLE,
                 ) from None
             if _any_visible(page, "input[name='otpCode']"):

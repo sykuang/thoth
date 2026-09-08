@@ -1,6 +1,6 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 import re
@@ -14,6 +14,41 @@ class CheckpointPhase(StrEnum):
     PRE_SUBMIT = "pre_submit"
     POST_SUBMIT = "post_submit"
     POST_SUBMIT_SETTLE = "post_submit_settle"
+
+
+class CheckpointReason(StrEnum):
+    UNSPECIFIED = "unspecified"
+    ACTION_CLICK_EXCEPTION = 'action_click_exception'
+    ACTION_GUARD_DENIED = 'action_guard_denied'
+    ACTION_GUARD_EXCEPTION = 'action_guard_exception'
+    ACTION_NOT_UNIQUE = 'action_not_unique'
+    AUTHENTICATION_EXCEPTION = 'authentication_exception'
+    BANK_MISMATCH = 'bank_mismatch'
+    COLLECT_ORIGIN_OR_DIALOG = 'collect_origin_or_dialog'
+    DIALOG_BLOCKED = 'dialog_blocked'
+    DIALOG_DISMISS_EXCEPTION = 'dialog_dismiss_exception'
+    ORIGIN_INSPECTION_EXCEPTION = 'origin_inspection_exception'
+    DUPLICATE_RULE_NAMES = 'duplicate_rule_names'
+    FORM_CONTROLS_PRESENT = 'form_controls_present'
+    FRAME_INSPECTION_EXCEPTION = 'frame_inspection_exception'
+    INSPECTION_EXCEPTION = 'inspection_exception'
+    INVALID_OUTCOME = 'invalid_outcome'
+    INVALID_TRANSITION = 'invalid_transition'
+    MATCHED_BLOCKER = 'matched_blocker'
+    NATIVE_FORM_SUBMISSION = 'native_form_submission'
+    NAVIGATION_ORIGIN = 'navigation_origin'
+    NO_MATCHING_CHECKPOINT = 'no_matching_checkpoint'
+    NO_PROGRESS = 'no_progress'
+    ORIGIN_AFTER_EVALUATION = 'origin_after_evaluation'
+    ORIGIN_AFTER_PREPARE = 'origin_after_prepare'
+    ORIGIN_BEFORE_EVALUATION = 'origin_before_evaluation'
+    ORIGIN_BEFORE_PREPARE = 'origin_before_prepare'
+    ORIGIN_BEFORE_SUBMIT = 'origin_before_submit'
+    PROGRESS_INSPECTION_EXCEPTION = 'progress_inspection_exception'
+    PROGRESS_WAIT_EXCEPTION = 'progress_wait_exception'
+    RULE_BUDGET_EXHAUSTED = 'rule_budget_exhausted'
+    RULE_INSPECTION_EXCEPTION = 'rule_inspection_exception'
+    STEP_LIMIT = 'step_limit'
 
 
 class CheckpointKind(StrEnum):
@@ -188,6 +223,7 @@ class CheckpointOutcome:
     rule_name: str | None = None
     action_label: str | None = None
     interaction: str | None = None
+    reason: CheckpointReason = field(default=CheckpointReason.UNSPECIFIED, compare=False)
 
 
 def validate_login_checkpoint_outcome(
@@ -205,7 +241,7 @@ def validate_login_checkpoint_outcome(
     else:
         rule = rules_by_name.get(outcome.rule_name or "")
         valid = rule is not None and rule.kind is outcome.kind
-    return outcome if valid else CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    return outcome if valid else CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.INVALID_OUTCOME)
 
 
 def _action_selected(action: Any) -> bool:
@@ -265,6 +301,7 @@ def _evaluate_rule(
             rule.kind,
             rule_name=rule.name,
             interaction=_interaction(rule.kind),
+            reason=CheckpointReason.MATCHED_BLOCKER if rule.kind is CheckpointKind.UNKNOWN_BLOCKER else CheckpointReason.UNSPECIFIED,
         )
     if rule.kind in {CheckpointKind.DISMISSIBLE_NOTICE, CheckpointKind.DUPLICATE_SESSION}:
         for container, _ in matched:
@@ -278,7 +315,7 @@ def _evaluate_rule(
                 for item in bounded_locator_matches(form_controls)
             ):
                 return CheckpointOutcome(
-                    CheckpointKind.UNKNOWN_BLOCKER,
+                    CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.FORM_CONTROLS_PRESENT,
                     rule_name=rule.name,
                 )
 
@@ -303,7 +340,7 @@ def _evaluate_rule(
                 label = None
             eligible.append((container, fingerprint, action, label))
     if len(eligible) != 1:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.ACTION_NOT_UNIQUE, rule_name=rule.name)
 
     container, fingerprint, action, label = eligible[0]
     # Native form ownership includes ancestors and external form= targets.
@@ -312,18 +349,18 @@ def _evaluate_rule(
         "el => (el instanceof HTMLButtonElement || el instanceof HTMLInputElement)"
         " && el.form !== null && ['submit', 'image'].includes(el.type)"
     ):
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.NATIVE_FORM_SUBMISSION, rule_name=rule.name)
     was_enabled = action.is_enabled()
     was_selected = _action_selected(action)
     try:
         if can_act is not None and not can_act():
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.ACTION_GUARD_DENIED, rule_name=rule.name)
     except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.ACTION_GUARD_EXCEPTION, rule_name=rule.name)
     try:
         action.click()
     except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.ACTION_CLICK_EXCEPTION, rule_name=rule.name)
     try:
         container.wait_for(state="hidden", timeout=500)
         progressed = True
@@ -337,11 +374,12 @@ def _evaluate_rule(
                 or _matching_body_fingerprint(container, None) != fingerprint
             )
         except Exception:
-            progressed = False
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name,
+                                     reason=CheckpointReason.PROGRESS_INSPECTION_EXCEPTION)
     except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.PROGRESS_WAIT_EXCEPTION, rule_name=rule.name)
     if not progressed:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.NO_PROGRESS, rule_name=rule.name)
     return CheckpointOutcome(
         rule.kind,
         rule_name=rule.name,
@@ -360,14 +398,16 @@ def _evaluate_login_checkpoint(
     is_scope_owned: Callable[[Any], bool] | None = None,
     can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome:
+    inspection_reason = CheckpointReason.AUTHENTICATION_EXCEPTION
     try:
         if any(rule.bank != bank for rule in rules):
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.BANK_MISMATCH)
         if (
             phase is not CheckpointPhase.POST_SUBMIT_SETTLE
             and is_authenticated(page)
         ):
             return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
+        inspection_reason = CheckpointReason.FRAME_INSPECTION_EXCEPTION
         scopes = [page]
         if is_scope_owned is not None:
             scopes.extend(
@@ -376,7 +416,7 @@ def _evaluate_login_checkpoint(
                 if frame is not page.main_frame and is_scope_owned(frame)
             )
     except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=inspection_reason)
 
     for rule in rules:
         if phase not in rule.phases:
@@ -384,7 +424,7 @@ def _evaluate_login_checkpoint(
         try:
             outcome = _evaluate_rule(scopes, rule, can_act)
         except Exception:
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.RULE_INSPECTION_EXCEPTION, rule_name=rule.name)
         if outcome:
             return outcome
 
@@ -393,13 +433,14 @@ def _evaluate_login_checkpoint(
             if is_authenticated(page):
                 return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
         except Exception:
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.AUTHENTICATION_EXCEPTION)
     fallback = (
         CheckpointKind.READY_FOR_CREDENTIALS
         if phase is CheckpointPhase.PRE_SUBMIT
         else CheckpointKind.UNKNOWN_BLOCKER
     )
-    return CheckpointOutcome(fallback)
+    return CheckpointOutcome(fallback, reason=CheckpointReason.NO_MATCHING_CHECKPOINT
+                             if fallback is CheckpointKind.UNKNOWN_BLOCKER else CheckpointReason.UNSPECIFIED)
 
 
 def evaluate_login_checkpoint(
@@ -413,7 +454,7 @@ def evaluate_login_checkpoint(
     can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome:
     if any(rule.bank != bank for rule in rules):
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.BANK_MISMATCH)
     try:
         with bounded_login_inspection(page):
             return _evaluate_login_checkpoint(
@@ -426,7 +467,7 @@ def evaluate_login_checkpoint(
                 can_act=can_act,
             )
     except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.INSPECTION_EXCEPTION)
 
 
 class LoginCheckpointTerminal(RuntimeError):
@@ -440,14 +481,8 @@ class LoginCheckpointTerminal(RuntimeError):
         self.budget = budget
         self.outcome = outcome
         self.phase = phase
-        rule = f", rule_name={outcome.rule_name}" if outcome.rule_name else ""
-        phase_text = f", phase={phase}" if phase else ""
-        super().__init__(
-            f"terminal login checkpoint: kind={outcome.kind}{rule}{phase_text}, "
-            f"credential_submissions={budget.credential_submissions}, "
-            f"protocol_resubmits={budget.protocol_resubmits}, "
-            f"captcha_resubmits={budget.captcha_resubmits}, reloads={budget.reloads}"
-        )
+        # Only the bank-aware run sink may render diagnostic evidence.
+        super().__init__("terminal login checkpoint; details withheld")
 
 
 class LoginCheckpointBlocked(LoginCheckpointTerminal):
@@ -483,7 +518,7 @@ def reduce_login_checkpoint(
         return phase, budget
     if outcome.kind is CheckpointKind.READY_FOR_CREDENTIALS:
         if phase is not CheckpointPhase.PRE_SUBMIT or budget.credential_submissions != 0:
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+            raise LoginCheckpointBlocked(budget, replace(outcome, reason=CheckpointReason.INVALID_TRANSITION), phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(budget, credential_submissions=1)
     if outcome.kind is CheckpointKind.PROTOCOL_RESUBMIT:
         if (
@@ -492,7 +527,7 @@ def reduce_login_checkpoint(
             or budget.protocol_resubmits >= 1
             or not outcome.rule_name
         ):
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+            raise LoginCheckpointBlocked(budget, replace(outcome, reason=CheckpointReason.INVALID_TRANSITION), phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
@@ -505,7 +540,7 @@ def reduce_login_checkpoint(
             or budget.captcha_resubmits >= 1
             or not outcome.rule_name
         ):
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+            raise LoginCheckpointBlocked(budget, replace(outcome, reason=CheckpointReason.INVALID_TRANSITION), phase=phase)
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
@@ -513,6 +548,6 @@ def reduce_login_checkpoint(
         )
     if outcome.kind is CheckpointKind.STARTUP_RECOVERY:
         if budget.reloads >= 1:
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+            raise LoginCheckpointBlocked(budget, replace(outcome, reason=CheckpointReason.INVALID_TRANSITION), phase=phase)
         return CheckpointPhase.PRE_SUBMIT, replace(budget, reloads=1)
-    raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+    raise LoginCheckpointBlocked(budget, replace(outcome, reason=CheckpointReason.INVALID_TRANSITION), phase=phase)

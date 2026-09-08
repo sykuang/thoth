@@ -29,6 +29,7 @@ from scrapling.fetchers import StealthyFetcher
 
 from backend.core.login_checkpoints import (
     CheckpointKind,
+    CheckpointReason,
     CheckpointOutcome,
     CheckpointPhase,
     DEFAULT_ACTION_SELECTOR,
@@ -274,6 +275,75 @@ def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
     ):
         return frozenset()
     return allowlist
+
+
+
+
+# Diagnostic labels only: never used to select or authorize browser actions.
+_SAFE_LOGIN_RULES = (
+    ('cathay', ('cathay-login-announcement', 'cathay-unknown-dialog', 'cathay-unknown-modal')),
+    ('ctbc', ('ctbc-duplicate-session', 'ctbc-entry-announcement', 'ctbc-otp-required', 'ctbc-unknown-dialog', 'ctbc-unknown-modal')),
+    ('dbs', ('dbs-explicit-login-error-alert', 'dbs-explicit-login-error-error', 'dbs-explicit-login-error-role-alert', 'dbs-login-form-still-visible', 'dbs-otp-required-dialog', 'dbs-otp-required-modal', 'dbs-password-change-required-dialog', 'dbs-password-change-required-modal', 'dbs-unknown-dialog', 'dbs-unknown-modal')),
+    ('esun', ('esun-login-form-still-visible', 'esun-otp-required-dialog', 'esun-otp-required-modal', 'esun-password-change-required-dialog', 'esun-password-change-required-modal', 'esun-unknown-dialog', 'esun-unknown-modal')),
+    ('fubon', ('fubon-explicit-login-error-alert', 'fubon-explicit-login-error-error', 'fubon-explicit-login-error-role-alert', 'fubon-login-form-still-visible', 'fubon-otp-required-dialog', 'fubon-otp-required-modal', 'fubon-password-change-required-dialog', 'fubon-password-change-required-modal', 'fubon-unknown-dialog', 'fubon-unknown-modal')),
+    ('hsbc', ('hsbc-explicit-login-error-alert', 'hsbc-explicit-login-error-error', 'hsbc-explicit-login-error-role-alert', 'hsbc-login-form-still-visible-password', 'hsbc-login-form-still-visible-userId', 'hsbc-login-form-still-visible-captchaInput', 'hsbc-otp-required-dialog', 'hsbc-otp-required-modal', 'hsbc-password-change-required-dialog', 'hsbc-password-change-required-modal', 'hsbc-security-notice', 'hsbc-unknown-dialog', 'hsbc-unknown-modal')),
+    ('linebank', ('linebank-login-form-still-visible', 'linebank-login-success-notice', 'linebank-otp-required', 'linebank-unknown-modal')),
+    ('rakuten', ('rakuten-duplicate-session', 'rakuten-otp-required', 'rakuten-referral-promo', 'rakuten-ricb-promo', 'rakuten-startup-connect-error', 'rakuten-time-deposit-promo', 'rakuten-unknown-modal')),
+    ('scb', ('scb-captcha-retry-alert', 'scb-captcha-retry-error', 'scb-captcha-retry-role-alert', 'scb-duplicate-session-dialog', 'scb-duplicate-session-modal', 'scb-explicit-login-error-alert', 'scb-explicit-login-error-error', 'scb-explicit-login-error-role-alert', 'scb-login-form-still-visible', 'scb-otp-required-dialog', 'scb-otp-required-modal', 'scb-password-change-required-dialog', 'scb-password-change-required-modal', 'scb-unknown-dialog', 'scb-unknown-modal')),
+    ('scsb', ('scsb-explicit-login-error-alert', 'scsb-explicit-login-error-error', 'scsb-explicit-login-error-role-alert', 'scsb-fraud-notice', 'scsb-intro-notice', 'scsb-login-form-still-visible', 'scsb-otp-required-dialog', 'scsb-otp-required-intro', 'scsb-otp-required-modal', 'scsb-password-change-required-dialog', 'scsb-password-change-required-intro', 'scsb-password-change-required-modal', 'scsb-unknown-custom-modal', 'scsb-unknown-dialog', 'scsb-unknown-modal')),
+    ('sinopac', ('sinopac-captcha-retry-alert', 'sinopac-captcha-retry-error', 'sinopac-captcha-retry-role-alert', 'sinopac-explicit-login-error-alert', 'sinopac-explicit-login-error-error', 'sinopac-explicit-login-error-role-alert', 'sinopac-login-form-still-visible', 'sinopac-otp-required-dialog', 'sinopac-otp-required-modal', 'sinopac-password-change-required-dialog', 'sinopac-password-change-required-modal', 'sinopac-unknown-dialog', 'sinopac-unknown-modal')),
+    ('taishin', ('taishin-login-form-still-visible', 'taishin-mandatory-password-dialog', 'taishin-mandatory-password-modal', 'taishin-otp-required-dialog', 'taishin-otp-required-modal', 'taishin-post-notice-dialog', 'taishin-post-notice-modal', 'taishin-post-protocol-dialog', 'taishin-post-protocol-modal', 'taishin-pre-duplicate-dialog', 'taishin-pre-duplicate-modal', 'taishin-unknown-dialog', 'taishin-unknown-modal')),
+    ('ubot', ('ubot-login-form-still-visible', 'ubot-otp-required', 'ubot-password-change-optional', 'ubot-password-change-required', 'ubot-unknown-modal')),
+)
+
+
+_SAFE_LOGIN_PHASES = ((CheckpointPhase.PRE_SUBMIT, "pre_submit"), (CheckpointPhase.POST_SUBMIT, "post_submit"), (CheckpointPhase.POST_SUBMIT_SETTLE, "post_submit_settle"))
+_SAFE_LOGIN_REASONS = (
+    (CheckpointReason.UNSPECIFIED, 'unspecified'),
+    (CheckpointReason.ACTION_CLICK_EXCEPTION, 'action_click_exception'),
+    (CheckpointReason.ACTION_GUARD_DENIED, 'action_guard_denied'),
+    (CheckpointReason.ACTION_GUARD_EXCEPTION, 'action_guard_exception'),
+    (CheckpointReason.ACTION_NOT_UNIQUE, 'action_not_unique'),
+    (CheckpointReason.AUTHENTICATION_EXCEPTION, 'authentication_exception'),
+    (CheckpointReason.BANK_MISMATCH, 'bank_mismatch'),
+    (CheckpointReason.COLLECT_ORIGIN_OR_DIALOG, 'collect_origin_or_dialog'),
+    (CheckpointReason.DIALOG_BLOCKED, 'dialog_blocked'),
+    (CheckpointReason.DIALOG_DISMISS_EXCEPTION, 'dialog_dismiss_exception'),
+    (CheckpointReason.ORIGIN_INSPECTION_EXCEPTION, 'origin_inspection_exception'),
+    (CheckpointReason.DUPLICATE_RULE_NAMES, 'duplicate_rule_names'),
+    (CheckpointReason.FORM_CONTROLS_PRESENT, 'form_controls_present'),
+    (CheckpointReason.FRAME_INSPECTION_EXCEPTION, 'frame_inspection_exception'),
+    (CheckpointReason.INSPECTION_EXCEPTION, 'inspection_exception'),
+    (CheckpointReason.INVALID_OUTCOME, 'invalid_outcome'),
+    (CheckpointReason.INVALID_TRANSITION, 'invalid_transition'),
+    (CheckpointReason.MATCHED_BLOCKER, 'matched_blocker'),
+    (CheckpointReason.NATIVE_FORM_SUBMISSION, 'native_form_submission'),
+    (CheckpointReason.NAVIGATION_ORIGIN, 'navigation_origin'),
+    (CheckpointReason.NO_MATCHING_CHECKPOINT, 'no_matching_checkpoint'),
+    (CheckpointReason.NO_PROGRESS, 'no_progress'),
+    (CheckpointReason.ORIGIN_AFTER_EVALUATION, 'origin_after_evaluation'),
+    (CheckpointReason.ORIGIN_AFTER_PREPARE, 'origin_after_prepare'),
+    (CheckpointReason.ORIGIN_BEFORE_EVALUATION, 'origin_before_evaluation'),
+    (CheckpointReason.ORIGIN_BEFORE_PREPARE, 'origin_before_prepare'),
+    (CheckpointReason.ORIGIN_BEFORE_SUBMIT, 'origin_before_submit'),
+    (CheckpointReason.PROGRESS_INSPECTION_EXCEPTION, 'progress_inspection_exception'),
+    (CheckpointReason.PROGRESS_WAIT_EXCEPTION, 'progress_wait_exception'),
+    (CheckpointReason.RULE_BUDGET_EXHAUSTED, 'rule_budget_exhausted'),
+    (CheckpointReason.RULE_INSPECTION_EXCEPTION, 'rule_inspection_exception'),
+    (CheckpointReason.STEP_LIMIT, 'step_limit'),
+)
+
+def _safe_login_diagnostics(bank, exception_state, outcome_state):
+    phase = _safe_state_value(exception_state, "phase")
+    phase_label = next((label for item, label in _SAFE_LOGIN_PHASES if phase is item), "unknown")
+    reason = _safe_state_value(outcome_state, "reason")
+    reason_label = next((label for item, label in _SAFE_LOGIN_REASONS
+                         if reason is item or (type(reason) is str and reason == label)), "unspecified")
+    rule = _safe_state_value(outcome_state, "rule_name")
+    rule_label = next((name for owner, names in _SAFE_LOGIN_RULES
+                       if type(bank) is str and bank == owner
+                       for name in names if type(rule) is str and rule == name), "unknown")
+    return f"phase={phase_label}, reason={reason_label}, rule={rule_label}"
 
 
 def write_private_json(path: Path, payload: dict) -> None:
@@ -1553,6 +1623,8 @@ class BankCrawler(ABC):
     CREDENTIAL_HOSTS: ClassVar[frozenset[str]] = frozenset()
     SAFE_COLLECT_GUARDS: ClassVar[frozenset[str]] = frozenset()
     _shared_dialog_blocked: bool = False
+    _dialog_dismiss_failed: bool = False
+    _origin_inspection_failed: bool = False
 
     def __post_init__(self):
         self.session_dir = DATA_ROOT / f"{self.name}_session"
@@ -1643,27 +1715,27 @@ class BankCrawler(ABC):
             reduce_login_checkpoint(
                 CheckpointPhase.PRE_SUBMIT,
                 LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_BEFORE_PREPARE)),
             )
         self.prepare_login_page(page)
         if not self._credential_origin_allowed(page):
             reduce_login_checkpoint(
                 CheckpointPhase.PRE_SUBMIT,
                 LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_AFTER_PREPARE)),
             )
         rules = self.login_checkpoint_rules()
         if len({rule.name for rule in rules}) != len(rules):
             reduce_login_checkpoint(
                 CheckpointPhase.PRE_SUBMIT,
                 LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.DUPLICATE_RULE_NAMES),
             )
         if any(rule.bank != self.name for rule in rules):
             reduce_login_checkpoint(
                 CheckpointPhase.PRE_SUBMIT,
                 LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.BANK_MISMATCH),
             )
 
         action_counts = {rule.name: 0 for rule in rules}
@@ -1678,13 +1750,13 @@ class BankCrawler(ABC):
                 reduce_login_checkpoint(
                     phase,
                     budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._dialog_failure_reason()),
                 )
             if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(
                     phase,
                     budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_BEFORE_EVALUATION)),
                 )
             active_rules = tuple(
                 rule
@@ -1738,7 +1810,7 @@ class BankCrawler(ABC):
                 reduce_login_checkpoint(
                     phase,
                     budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_AFTER_EVALUATION)),
                 )
             active_rules_by_name = {rule.name: rule for rule in active_rules}
             outcome = validate_login_checkpoint_outcome(outcome, active_rules)
@@ -1746,8 +1818,13 @@ class BankCrawler(ABC):
                 reduce_login_checkpoint(
                     phase,
                     budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._dialog_failure_reason()),
                 )
+            if (outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+                    and any(rule.name == outcome.rule_name and rule.kind is not CheckpointKind.UNKNOWN_BLOCKER
+                            for rule in rules)
+                    and outcome.reason is CheckpointReason.MATCHED_BLOCKER):
+                outcome = replace(outcome, reason=CheckpointReason.RULE_BUDGET_EXHAUSTED)
             next_phase, next_budget = reduce_login_checkpoint(phase, budget, outcome)
 
             if (
@@ -1762,7 +1839,7 @@ class BankCrawler(ABC):
                     reduce_login_checkpoint(
                         phase,
                         budget,
-                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_BEFORE_SUBMIT)),
                     )
                 self.submit_credentials_once(page)
             if next_budget.reloads == budget.reloads + 1:
@@ -1778,18 +1855,33 @@ class BankCrawler(ABC):
         reduce_login_checkpoint(
             phase,
             budget,
-            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=CheckpointReason.STEP_LIMIT),
         )
         return False  # pragma: no cover - reducer always raises
 
     def _credential_origin_allowed(self, page) -> bool:
+        self._origin_inspection_failed = False
         try:
-            return self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS)
+            return self._exact_https_origin_allowed(
+                page.url, self.CREDENTIAL_HOSTS, _raise_on_error=True
+            )
         except Exception:
+            self._origin_inspection_failed = True
             return False
 
+    def _origin_failure_reason(self, fallback):
+        return (CheckpointReason.ORIGIN_INSPECTION_EXCEPTION
+                if getattr(self, "_origin_inspection_failed", False) is True else fallback)
+
+    def _dialog_failure_reason(self):
+        return (CheckpointReason.DIALOG_DISMISS_EXCEPTION
+                if getattr(self, "_dialog_dismiss_failed", False) is True
+                else CheckpointReason.DIALOG_BLOCKED)
+
     @staticmethod
-    def _exact_https_origin_allowed(url: str, hosts: frozenset[str]) -> bool:
+    def _exact_https_origin_allowed(
+        url: str, hosts: frozenset[str], *, _raise_on_error: bool = False
+    ) -> bool:
         try:
             current = urlparse(url or "")
             return (
@@ -1800,6 +1892,8 @@ class BankCrawler(ABC):
                 and current.password is None
             )
         except Exception:
+            if _raise_on_error:
+                raise
             return False
 
     def _frame_origin_allowed(self, page, frame) -> bool:
@@ -1923,6 +2017,7 @@ class BankCrawler(ABC):
                 collector.attach(page)
                 self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
                 self._shared_dialog_blocked = False
+                self._dialog_dismiss_failed = False
                 self.attach_shared_dialog_handler(page)
                 try:
                     ok = self._shared_login(page)
@@ -1984,7 +2079,8 @@ class BankCrawler(ABC):
                                 f"credential_submissions={budget.credential_submissions}, "
                                 f"protocol_resubmits={budget.protocol_resubmits}, "
                                 f"captcha_resubmits={budget.captcha_resubmits}, "
-                                f"reloads={budget.reloads}"
+                                f"reloads={budget.reloads}, "
+                                f"{_safe_login_diagnostics(self.name, exception_state, outcome_state)}"
                             )
                         elif type(safe_code) is str and safe_code == "captcha_ocr_failed":
                             msg = f"{exception_type}: code=captcha_ocr_failed"
@@ -2010,7 +2106,9 @@ class BankCrawler(ABC):
                             reduce_login_checkpoint(
                                 CheckpointPhase.POST_SUBMIT_SETTLE,
                                 LoginBudget(credential_submissions=1),
-                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=(
+                                    self._dialog_failure_reason() if self._shared_dialog_blocked
+                                    else self._origin_failure_reason(CheckpointReason.COLLECT_ORIGIN_OR_DIALOG))),
                             )
 
                     ensure_collect_origin()
@@ -2037,6 +2135,15 @@ class BankCrawler(ABC):
                         f"collect_failed: {_safe_exception_type(e)}: "
                         f"code={_safe_collect_failure_code(e)}"
                     )
+                    if _exception_inherits(e, LoginCheckpointBlocked, LoginInteractionRequired):
+                        exception_state = _base_exception_state(e)
+                        outcome = _safe_state_value(exception_state, "outcome")
+                        try:
+                            outcome_state = (object.__getattribute__(outcome, "__dict__")
+                                             if type(outcome) is CheckpointOutcome else {})
+                        except BaseException:
+                            outcome_state = {}
+                        msg += f", {_safe_login_diagnostics(self.name, exception_state, outcome_state)}"
                     guard = _safe_collect_guard(
                         e, _class_collect_guard_allowlist(self)
                     )
@@ -2086,8 +2193,10 @@ class BankCrawler(ABC):
         """Dismiss opaque JS dialogs and let the typed lifecycle fail closed."""
         def _on_dialog(dialog):
             self._shared_dialog_blocked = True
-            with contextlib.suppress(Exception):
+            try:
                 dialog.dismiss()
+            except Exception:
+                self._dialog_dismiss_failed = True
 
         page.on("dialog", _on_dialog)
 
