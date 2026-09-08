@@ -73,13 +73,18 @@ def _safe_login_message(value, creds):
         return None
 
     def normalize(text):
-        for _ in range(3):
-            text = unicodedata.normalize("NFKC", html.unescape(unquote(text)))
-        return "".join(c for c in text if unicodedata.category(c) not in {"Cf", "Cc", "Zl", "Zp"})
+        for _ in range(4):
+            decoded = unicodedata.normalize("NFKC", html.unescape(unquote(text)))
+            decoded = "".join(c for c in decoded if unicodedata.category(c) not in {"Cf", "Cc", "Zl", "Zp"})
+            if decoded == text:
+                return decoded
+            text = decoded
+        # Do not emit a still-reversible credential when the decode budget expires.
+        return ""
 
     text = normalize(value)
     secrets = [normalize(secret) for secret in secrets]
-    if any(not secret for secret in secrets):
+    if not text or any(not secret for secret in secrets):
         return None
     for secret in sorted(secrets, key=len, reverse=True):
         text = re.sub(re.escape(secret), "[REDACTED]", text, flags=re.IGNORECASE)

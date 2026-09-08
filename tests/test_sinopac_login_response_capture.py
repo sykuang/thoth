@@ -152,3 +152,18 @@ def test_missing_cdp_never_falls_back(url):
     response.json.assert_not_called()
     assert len(collector.hits) == 1
     assert collector.hits[0].req_body is None and collector.hits[0].resp_json is None
+
+
+@pytest.mark.parametrize('depth', [4, 8])
+def test_nonconvergent_encoding_suppresses_entire_message(depth):
+    from urllib.parse import quote
+    value = 'Fake&Password'
+    creds = SinopacCreds(national_id='B123456789', user_code='SyntheticUser', password=value)
+    for _ in range(depth):
+        value = quote(value, safe='')
+    assert _safe_login_message('失敗 ' + value, creds) is None
+
+
+def test_controls_cannot_hide_encoded_known_credentials():
+    creds = SinopacCreds(national_id='B123456789', user_code='SyntheticUser', password='Fake&Password')
+    assert _safe_login_message('失敗 Fake%\u200b26Password', creds) == '失敗 [REDACTED]'
