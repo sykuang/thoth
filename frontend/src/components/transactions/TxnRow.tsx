@@ -42,7 +42,7 @@ export const TxnRow = React.memo(
     selected = false,
     selectionMode = false,
   }: TxnRowProps) {
-    if (t.read_only) { selectionMode = false; onLongPress = undefined; }
+    if (t.kind === 'loan_repayment') { selectionMode = false; onLongPress = undefined; }
     const render = renderAmount(t, fxMode);
     // Backend already returns t.date according to cardDateBasis; keep this fallback
     // for older API payloads that may not yet have migrated.

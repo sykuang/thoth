@@ -1432,7 +1432,18 @@ def update_transaction(
 ) -> dict[str, Any]:
     """改單筆交易的 category / subcategory (其他欄位禁改保護 raw data)."""
     if kind == "loan_repayment":
-        raise HTTPException(400, "銀行貸款還款明細僅供讀取，無法修改")
+        _assert_bank_ownership(user["id"], bank)
+        try:
+            fact = db_api.update_loan_transaction(
+                bank=bank, user_id=user["id"], txn_id=txn_id, changes=body)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        except (TxnNotFound, BankNotAvailable):
+            raise HTTPException(404, "找不到此筆交易") from None
+        clear_dashboard_cache(user["id"])
+        from backend.server.routers.portfolio import get_excluded_account_nos
+        excluded = fact.account_no in get_excluded_account_nos(user["id"]).get(bank, set())
+        return next(item for item in loan_transactions(fact, excluded) if item['id'] == txn_id)
     txn_id = _legacy_transaction_id(txn_id)
     if bank not in KNOWN_BANKS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"不支援的銀行: {bank}")

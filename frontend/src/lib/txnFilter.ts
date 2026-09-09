@@ -152,13 +152,13 @@ export function transactionSectionTitle(direction: TxnFilters['direction']): str
  * 回傳 dict (跟 backend by_category response shape 一致), 按 count desc sort 由 caller 用 Object.entries 排序.
  */
 export function aggregateByCategory(items: Transaction[]): Record<string, number> {
-  const out: Record<string, number> = {};
+  const out: Record<string, number> = Object.create(null);
   for (const t of items) {
     if (t.excluded === true || t.auto_excluded === true) continue;
     const key = t.category || '__null__';
     out[key] = (out[key] ?? 0) + 1;
   }
-  return out;
+  return { ...out };
 }
 
 /**
@@ -177,7 +177,7 @@ export function aggregateBySubcategory(
   currentCategory: string,
 ): Record<string, number> {
   if (!currentCategory || currentCategory === '__null__') return {};
-  const out: Record<string, number> = {};
+  const out: Record<string, number> = Object.create(null);
   for (const t of items) {
     if (t.excluded === true || t.auto_excluded === true) continue;
     if (t.category !== currentCategory) continue;
@@ -185,7 +185,7 @@ export function aggregateBySubcategory(
     if (!sub) continue;
     out[sub] = (out[sub] ?? 0) + 1;
   }
-  return out;
+  return { ...out };
 }
 
 // ============================================================

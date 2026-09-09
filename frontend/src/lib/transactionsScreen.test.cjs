@@ -97,13 +97,16 @@ const press = (id) => (tree) => {
   node.props.onPress();
 };
 const has = (html, id) => html.includes(`data-testid="${id}"`);
-test('loan facts render neutral positive principal and a visible unreconciled notice, never selectable', () => {
+test('loan facts render neutral positive principal and a loan expense summary without reconciliation warnings, never selectable', () => {
   const {projectReplicaDataset} = require('./replica');
   const facts = {id:'loan:v1:test', bank:'cathay', source_account_id:1, account_no:'123456789', sub_account:'', currency:'TWD', due_date:transaction.date, paid_on:transaction.date, status:'paid', query_start:null, query_end:null, principal:'100.001', interest:'0.1', penalty:'0.2', paid_total:'100.301', principal_balance:'900'};
   const dataset = projectReplicaDataset({partitions:{'bank:cathay':{transactions:[],loan_repayments:[facts]}},generations:{},syncedAt:transaction.date});
   client.setQueryData(datasetKey,{...dataset,preferences});
   const html = render();
-  assert.ok(has(html, 'loan-reconciliation-warning'));
+  assert.ok(has(html, 'loan-expense-summary'));
+  assert.ok(!html.includes('未核對'));
+  assert.ok(!has(html, 'loan-reconciliation-warning'));
+  assert.ok(dataset.transactions.every(t => t.reconciliation_status === 'unverified'));
   assert.match(html, /data-testid="expense-card-toggle"[^]*?NT\$ 0\.3/);
   assert.ok(!html.includes('未併入上方統計'));
   assert.ok(html.includes('+NT$ 100.001'));
@@ -128,27 +131,152 @@ test('loan facts render neutral positive principal and a visible unreconciled no
   assert.ok(selected.includes('已選 0 筆'));
 });
 
-test('loan detail renders safe facts and warning without editing, splitting or API queries', () => {
+test('loan detail edits category and inclusion through real React hooks and Query mutation, invalidates canonical replica on success and error', async () => {
   const filename = require.resolve('../components/transactions/TxnDetailModal');
   delete require.cache[filename];
-  for (const name of ['CategoryPicker', 'Dropdown', 'TagPicker']) {
-    stubModule(`../components/${name}`, {[name]: () => assert.fail('loan editor must not render')});
-  }
-  stubModule('../components/transactions/SplitEditor', {SplitEditor: () => assert.fail('loan split editor must not render')});
-  const {TxnDetailModal} = require('../components/transactions/TxnDetailModal');
+  for (const name of ['CategoryPicker', 'Dropdown']) stubModule(`../components/${name}`, {[name]: native});
+  stubModule('../components/TagPicker', {TagPicker: () => assert.fail('loan tags unsupported')});
+  stubModule('../components/transactions/SplitEditor', {SplitEditor: () => assert.fail('loan splits unsupported')});
+  let fail = false;
+  const calls = [];
+  const replica = require('./replica');
+  let auth = {token:'test-token',email:'loan@example.test',serverUrl:'https://example.test'};
+  stubModule('../stores/auth', {useAuthStore: selector => selector(auth)});
+  const editOwner = replica.makeReplicaOwnerKey(auth.serverUrl, auth.email);
+  replica.activateReplicaOwner(editOwner);
+  const editEpoch = replica.getReplicaOwnerEpoch(editOwner);
+  let complete;
+  let delayed = false;
+  stubModule('../lib/api', {api: async (path, options) => {
+    assert.equal(options?.authRetryKey, `${editOwner}:${editEpoch}`, 'unscoped API request');
+    assert.equal(typeof options.authRetryGuard, 'function');
+    calls.push({path,method:options.method,body:options.body});
+    if(fail) throw Error('save denied');
+    if(delayed) await new Promise(resolve => {complete = resolve;});
+    return txn;
+  }, formatApiError:e=>e.message});
+  delete require.cache[require.resolve('../hooks/useOwnerBoundApi')];
+  const {LoanTxnDetail, TxnDetailModal} = require('../components/transactions/TxnDetailModal');
   const {projectLoanRepayment} = require('./loanRepayments');
   const txn = projectLoanRepayment({id:'loan:v1:detail',bank:'cathay',source_account_id:1,account_no:'123456789',sub_account:'A',currency:'USD',paid_on:transaction.date,due_date:transaction.date,status:'paid',query_start:null,query_end:null,principal:'1.001',interest:'0.1',penalty:'0',paid_total:'1.101',principal_balance:'99.999'})[0];
-  const html = renderToStaticMarkup(React.createElement(TxnDetailModal,{txn,fxMode:'auto',onClose:()=>{}}));
-  assert.ok(!html.includes('唯讀'));
-  assert.ok(html.includes('尚未核對'));
-  assert.ok(html.includes('99.999'));
-  assert.ok(html.includes('本金餘額'));
-  assert.ok(has(html, 'loan-detail'));
-  assert.ok(html.includes('bg-white dark:bg-ink-900'));
-  assert.ok(!html.includes('來源帳戶識別碼'));
-  assert.ok(!html.includes('principal_balance:'));
-  assert.ok(!html.includes('儲存'));
-  assert.ok(!html.includes('拆帳'));
+  assert.equal(TxnDetailModal({txn}).type, LoanTxnDetail);
+  let close = 0;
+  let save;
+  let dismiss;
+  let editingTxn = txn;
+  function Driver() {
+    const step = React.useRef(0);
+    const [,rerender] = React.useState(0);
+    const tree = LoanTxnDetail({txn:editingTxn,fxMode:'auto',onClose:()=>close++});
+    const all = nodes(tree);
+    dismiss = all.find(n => n.props.accessibilityLabel === '關閉貸款明細').props.onPress;
+    const control = id => all.find(n=>n.props.testID===id);
+    if(step.current===0) {assert.equal(control('txn-detail-save').props.disabled,true); control('txn-detail-category-dropdown').props.onChange('住房');}
+    if(step.current===1) {assert.equal(control('txn-detail-subcategory-dropdown').props.value,'');control('txn-detail-subcategory-dropdown').props.onChange('房貸');control('txn-detail-ignore-toggle').props.onPress();}
+    if(step.current===2) {assert.equal(control('txn-detail-subcategory-dropdown').props.value,'房貸');assert.ok(control('txn-detail-category-dropdown').props.options.some(o => o.value === '住房'), 'custom category remains visible');assert.ok(control('txn-detail-subcategory-dropdown').props.options.some(o => o.value === '房貸'), 'custom subcategory remains visible');assert.equal(control('txn-detail-ignore-toggle').props.accessibilityState.checked,true);save=control('txn-detail-save').props.onPress;}
+    if(step.current++<2) rerender(step.current);
+    return tree;
+  }
+  const renderEditor = () => renderToStaticMarkup(React.createElement(QueryClientProvider,{client},React.createElement(Driver)));
+  for (const error of [false,true]) {
+    fail=error;
+    client.setQueryData(datasetKey,{transactions:[txn]});
+    client.setQueryData(['portfolio','summary'],{});
+    const html=renderEditor();
+    assert.ok(html.includes('儲存') && html.includes('99.999'));
+    assert.ok(!/唯讀|未核對|拆帳|標籤/.test(html));
+    save();
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert.deepEqual(calls.at(-1),{path:'/transactions/cathay/loan_repayment/loan%3Av1%3Adetail%3Aprincipal',method:'PATCH',body:{category:'住房',subcategory:'房貸',auto_excluded:true}});
+    assert.equal(client.getQueryState(datasetKey).isInvalidated,true);
+    assert.equal(client.getQueryState(['portfolio','summary']).isInvalidated,true);
+    assert.equal(close,1,'failed save must not close');
+    const mutation=client.getMutationCache().getAll().at(-1);
+    assert.equal(mutation.state.status,error?'error':'success');
+    if(error) {
+      assert.equal(mutation.state.error.message,'save denied');
+      assert.deepEqual(mutation.state.variables,{category:'住房',subcategory:'房貸',auto_excluded:true},'failed edit remains available without reset');
+    }
+    assert.deepEqual(client.getQueryData(datasetKey).transactions[0],txn,'no optimistic loan arithmetic');
+  }
+  fail = false;
+  delayed = true;
+  renderEditor();
+  save();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  dismiss();
+  const afterDismiss = close;
+  editingTxn = {...txn,id:'loan:v1:other:principal'};
+  renderEditor(); // Another real React edit instance with unsaved edits.
+  const newerSave = save;
+  complete();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(close, afterDismiss, 'dismissed A success must not close B');
+  assert.equal(client.getQueryState(datasetKey).isInvalidated, true);
+  // B's retained production save callback still carries its edits.
+  delayed = false;
+  fail = true;
+  newerSave();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(calls.at(-1).body, {category:'住房',subcategory:'房貸',auto_excluded:true});
+  assert.equal(calls.at(-1).path, '/transactions/cathay/loan_repayment/loan%3Av1%3Aother%3Aprincipal');
+  assert.equal(close, afterDismiss, 'failed B save must not close');
+  editingTxn = txn;
+  close = 1;
+  // SSR rerenders retain the actual hook state, but do not run mount effects.
+  const originalAuth = auth;
+  function SwitchDriver() {
+    const [switched, setSwitched] = React.useState(false);
+    const tree = LoanTxnDetail({txn,fxMode:'auto',onClose:()=>close++});
+    if (!switched) {
+      assert.ok(nodes(tree).some(n => n.props.testID === 'loan-detail'));
+      auth = {...auth,email:'direct-switch@example.test'};
+      setSwitched(true);
+    } else {
+      assert.equal(tree, null, 'retained old owner financial modal must disappear immediately');
+    }
+    return tree;
+  }
+  renderToStaticMarkup(React.createElement(QueryClientProvider,{client},React.createElement(SwitchDriver)));
+  auth = originalAuth;
+  fail = false;
+  for (const suffix of [['categories'],['subcategories','住房']]) {
+    const query = client.getQueryCache().find({queryKey:['rules',...suffix,editOwner,editEpoch],exact:true});
+    assert.ok(query, 'category queries must be scoped to the edit owner');
+    await query.options.queryFn();
+  }
+  delayed = true;
+  renderEditor();
+  save();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(typeof complete, 'function');
+  auth = {...auth,token:null,email:null};
+  await replica.clearReplicaOwner({clear:async()=>{}}, 'https://example.test', 'loan@example.test');
+  client.setQueryData(datasetKey,{transactions:[txn]});
+  client.setQueryData(['portfolio','summary'],{});
+  complete();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(close,1,'late completion must not close');
+  assert.equal(client.getQueryState(datasetKey).isInvalidated,false,'late completion must not invalidate');
+  const count = calls.length;
+  save();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(calls.length,count,'stale save must never reach API');
+  assert.equal(close,1);
+  assert.equal(client.getQueryState(['portfolio','summary']).isInvalidated,false);
+  // Switch to another active account, then replay the actual old callbacks.
+  auth = {token:'other-token',email:'other@example.test',serverUrl:'https://example.test'};
+  replica.activateReplicaOwner(replica.makeReplicaOwnerKey(auth.serverUrl,auth.email));
+  save();
+  const oldMutation = client.getMutationCache().getAll().at(-1);
+  await assert.rejects(oldMutation.options.mutationFn(oldMutation.state.variables), /owner transition/);
+  oldMutation.options.onSuccess(txn);
+  oldMutation.options.onSettled();
+  const categoryQuery = client.getQueryCache().find({queryKey:['rules','categories',editOwner,editEpoch],exact:true});
+  await assert.rejects(categoryQuery.options.queryFn(), /owner transition/);
+  assert.equal(calls.length,count);
+  assert.equal(close,1,'stale production success callback cannot close another account');
+  assert.equal(client.getQueryState(datasetKey).isInvalidated,false);
 });
 
 const cachedPortfolio = () => ({

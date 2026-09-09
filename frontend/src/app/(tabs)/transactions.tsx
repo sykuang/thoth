@@ -34,7 +34,6 @@ import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { BrokerageTxnRow } from '@/components/transactions/BrokerageTxnRow';
 import { TxnRow } from '@/components/transactions/TxnRow';
 import { addMoney, absMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
-import { LOAN_RECONCILIATION_WARNING } from '@/lib/loanRepayments';
 import { formatDecimal } from '@/lib/decimal';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
 import {
@@ -184,7 +183,7 @@ export default function TransactionsScreen() {
   // 統一 row identity：txnKey 與 row key 共用 t.id (Transaction type 已標 required)
   const txnKey = (t: Transaction) => `${t.bank}|${t.kind}|${t.id}`;
   function toggleSelect(t: Transaction) {
-    if (t.read_only) return;
+    if (t.kind === 'loan_repayment') return;
     const k = txnKey(t);
     setSelectedKeys((prev) => {
       const next = new Set(prev);
@@ -422,10 +421,9 @@ export default function TransactionsScreen() {
     >
       <View className="px-4 py-4 max-w-[800px] w-full mx-auto">
         {rawItems.some(t => t.kind === 'loan_repayment') && (
-          <View testID="loan-reconciliation-warning" accessibilityRole="alert" className="p-3 mb-3 bg-amber-50 dark:bg-ink-800">
-            <Text className="text-ink-700 dark:text-ink-200">{LOAN_RECONCILIATION_WARNING}</Text>
+          <View testID="loan-expense-summary" className="p-3 mb-3 bg-ink-50 dark:bg-ink-800">
             {Object.entries(monthStats.loan_by_currency ?? {}).map(([currency, stats]) => (
-              <Text key={currency} className="text-red-600 dark:text-red-400">貸款支出（未核對）-{currency} {formatDecimal(stats.expense)}</Text>
+              <Text key={currency} className="text-red-600 dark:text-red-400">貸款支出 -{currency} {formatDecimal(stats.expense)}</Text>
             ))}
           </View>
         )}
@@ -751,13 +749,13 @@ export default function TransactionsScreen() {
                       }
                     }}
                     onLongPress={() => {
-                      if (!selectionMode && !item.transaction.read_only) {
+                      if (!selectionMode && item.transaction.kind !== 'loan_repayment') {
                         setSelectionMode(true);
                         setSelectedKeys(new Set([txnKey(item.transaction)]));
                       }
                     }}
                     selected={selectionMode && selectedKeys.has(txnKey(item.transaction))}
-                    selectionMode={selectionMode && !item.transaction.read_only}
+                    selectionMode={selectionMode && item.transaction.kind !== 'loan_repayment'}
                   />
                 ))
               ) : (

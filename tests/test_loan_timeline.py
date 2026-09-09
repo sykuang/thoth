@@ -34,7 +34,7 @@ def test_writer_to_route_detail_stats_replica(client, monkeypatch, tmp_path):
     assert by_component['interest']['amount'] == '-0.125'
     assert by_component['penalty']['amount'] == '-0.025'
     for item in items:
-        assert item['read_only'] is True
+        assert item['read_only'] is False
         assert item['reconciliation_status'] == 'unverified'
         detail = client.get('/transactions/sinopac/loan_repayment/' + item['id'], headers=headers)
         assert detail.status_code == 200, detail.text
@@ -55,13 +55,13 @@ def test_writer_to_route_detail_stats_replica(client, monkeypatch, tmp_path):
     assert response.status_code == 200, response.text
 
 
-@pytest.mark.parametrize('body', [{}, {'category': 'x'}, {'splits': []}, {'auto_excluded': True}])
-def test_read_only_patch(client, monkeypatch, tmp_path, body):
+@pytest.mark.parametrize('body', [{}, {'amount': 'x'}, {'splits': []}, {'description': 'x'}])
+def test_unsupported_patch(client, monkeypatch, tmp_path, body):
     headers, account, rows = seed(client, monkeypatch, tmp_path)
     item = client.get('/transactions?kind=loan_repayment', headers=headers).json()['items'][0]
     result = client.patch('/transactions/sinopac/loan_repayment/' + item['id'], json=body, headers=headers)
     assert result.status_code == 400
-    assert '僅供讀取' in result.json()['detail']
+    assert result.json()['detail']
 
 
 def test_bulk_guard_precedes_writes(client, monkeypatch, tmp_path):

@@ -72,7 +72,7 @@ export function categoryColor(category: string | null | undefined): { bg: string
     };
   }
   // 已知 taxonomy → fixed slot (絕無撞色)
-  const fixed = CATEGORY_COLORS[category];
+  const fixed = Object.hasOwn(CATEGORY_COLORS, category) ? CATEGORY_COLORS[category] : undefined;
   if (fixed !== undefined) return PALETTE[fixed];
   // 未知 category → djb2 hash fallback (使用者自訂類別有 stable 色)
   const slot = djb2(category) % PALETTE.length;
@@ -115,7 +115,7 @@ const CATEGORY_EMOJI: Record<string, string> = {
 /** category → emoji. 未知 / null → 📦 (其他). */
 export function categoryEmoji(category: string | null | undefined): string {
   if (!category) return '📦';
-  return CATEGORY_EMOJI[category] ?? '📦';
+  return Object.hasOwn(CATEGORY_EMOJI, category) ? CATEGORY_EMOJI[category] : '📦';
 }
 
 /**

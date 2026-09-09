@@ -128,11 +128,12 @@ export type LoanRepaymentFact = {
   query_start: string | null; query_end: string | null;
   principal: string; interest: string; penalty: string;
   paid_total: string; principal_balance: string; excluded?: boolean;
+  component_overrides?: Partial<Record<'principal' | 'interest' | 'penalty', {category?: string | null; subcategory?: string | null; auto_excluded?: boolean}>>;
 };
 export type LoanTransaction = Omit<BankTransaction, 'kind' | 'amount' | 'cashflow_amount' | 'display_amount' | 'read_only' | 'reconciliation_status'> & {
   kind: 'loan_repayment'; source_account_id: number | null; amount: string; cashflow_amount: string; display_amount: string;
   component: 'principal' | 'interest' | 'penalty'; display_sign: '+' | '-';
-  read_only: true; reconciliation_status: 'unverified'; loan_repayment: LoanRepaymentFact;
+  read_only: false; reconciliation_status: 'unverified'; loan_repayment: LoanRepaymentFact;
 };
 export type Transaction = BankTransaction | LoanTransaction;
 export type BankTransaction = {

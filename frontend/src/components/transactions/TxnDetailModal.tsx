@@ -9,7 +9,7 @@
  *   不再 inline chip 多選, 用 @/components/Dropdown 統一 affordance.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -25,6 +25,8 @@ import { CategoryPicker } from '@/components/CategoryPicker';
 import { Dropdown } from '@/components/Dropdown';
 import { TagPicker } from '@/components/TagPicker';
 import { ApiError, api, formatApiError } from '@/lib/api';
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
+import { assertReplicaOwnerEpoch } from '@/lib/replica';
 import { sortCategoryKeys } from '@/lib/category-color';
 import {
   formatSignedCurrency,
@@ -32,7 +34,6 @@ import {
   fxRateSourceLabel,
   renderAmount,
 } from '@/lib/currency';
-import { LOAN_RECONCILIATION_WARNING } from '@/lib/loanRepayments';
 import { maskCardNo } from '@/lib/mask';
 import { SCOPE_LABEL, formatTransactionSource, getDisplayDescription } from '@/lib/txnDisplay';
 import {
@@ -60,21 +61,73 @@ export type TxnDetailModalProps = {
 };
 
 export function TxnDetailModal(props: TxnDetailModalProps) {
-  if (props.txn?.kind === 'loan_repayment') {
-    const txn = props.txn;
+  if (props.txn?.kind === 'loan_repayment') return <LoanTxnDetail key={`${props.txn.bank}:${props.txn.id}`} {...props} txn={props.txn} />;
+  return <EditableTxnDetailModal {...props} txn={props.txn} />;
+}
+
+export function LoanTxnDetail(props: Omit<TxnDetailModalProps, 'txn'> & {txn: import('@/types/api').LoanTransaction}) {
+    const {txn} = props;
+    const qc = useQueryClient();
+    const owner = useOwnerBoundApi();
+    const [session] = useState(owner);
+    const {ownerKey, ownerEpoch, request: ownerApi} = session;
+    const isCurrent = () => {
+      if (!ownerKey || owner.ownerKey !== ownerKey || owner.ownerEpoch !== ownerEpoch) return false;
+      try { assertReplicaOwnerEpoch(ownerKey, ownerEpoch); return true; } catch { return false; }
+    };
+    const live = useRef(true);
+    useEffect(() => {
+      live.current = true;
+      return () => { live.current = false; };
+    }, []);
+    const close = () => {
+      if (!live.current) return;
+      live.current = false;
+      props.onClose();
+    };
+    const [editCat, setEditCat] = useState(txn.category ?? '');
+    const [editSub, setEditSub] = useState(txn.subcategory ?? '');
+    const [editIgnored, setEditIgnored] = useState(txn.auto_excluded ?? false);
+    const categoriesQ = useQuery({queryKey:['rules','categories',ownerKey,ownerEpoch], queryFn:() => ownerApi<{categories:string[]}>('/rules/categories'), enabled:isCurrent(), staleTime:60_000});
+    const subcategoriesQ = useQuery({queryKey:['rules','subcategories',editCat,ownerKey,ownerEpoch], queryFn:() => ownerApi<{subcategories:string[]}>(`/rules/subcategories?category=${encodeURIComponent(editCat)}`), enabled:isCurrent() && !!editCat, staleTime:60_000});
+    const patchMut = useMutation({
+      mutationFn: (body: {category:string|null; subcategory:string|null; auto_excluded:boolean}) => ownerApi<import('@/types/api').LoanTransaction>(`/transactions/${txn.bank}/loan_repayment/${encodeURIComponent(txn.id)}`, {method:'PATCH',body}),
+      onSuccess: () => { if (isCurrent()) close(); },
+      onSettled: () => {
+        if (!isCurrent()) return;
+        qc.invalidateQueries({queryKey:['transactions']});
+        qc.invalidateQueries({queryKey:['frontend-dataset']});
+        qc.invalidateQueries({queryKey:['portfolio','summary']});
+      },
+    });
+    const current = isCurrent();
+    useEffect(() => {
+      if (!current && live.current) {
+        live.current = false;
+        props.onClose();
+      }
+    }, [current, props.onClose]);
+    const hasChange = editCat !== (txn.category ?? '') || editSub !== (txn.subcategory ?? '') || editIgnored !== (txn.auto_excluded ?? false);
+    if (!current) return null;
     const amount = renderAmount(txn, props.fxMode);
-    return <Modal visible onRequestClose={props.onClose} animationType="slide" presentationStyle="pageSheet">
+    return <Modal visible onRequestClose={close} animationType="slide" presentationStyle="pageSheet">
       <ScrollView testID="loan-detail" className="bg-white dark:bg-ink-900" contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{padding:24}}>
         <Text className="text-h2 text-ink-900 dark:text-ink-50">{txn.description}</Text>
         <Text className={amount.direction === 'zero' ? 'text-ink-500 dark:text-ink-400' : 'text-red-600 dark:text-red-400'}>{amount.primary}</Text>
         <Text className="text-ink-700 dark:text-ink-300">{formatTransactionSource(BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank, {kind:txn.kind, accountNo:txn.account_no, accountOrCard:txn.account_or_card})}</Text>
-        <Text accessibilityRole="alert" className="text-ink-700 dark:text-ink-300 my-4">{LOAN_RECONCILIATION_WARNING}</Text>
         {Object.entries({sub_account:'子帳號',currency:'幣別',due_date:'應繳日期',paid_on:'繳款日期',status:'繳款狀態',principal:'本金',interest:'利息',penalty:'違約金',paid_total:'繳款總額',principal_balance:'本金餘額',query_start:'查詢起日',query_end:'查詢迄日'}).map(([key,label]) => <DetailRow key={key} label={label} value={String(txn.loan_repayment[key as keyof typeof txn.loan_repayment] ?? '—')} />)}
-        <Pressable accessibilityRole="button" accessibilityLabel="關閉貸款明細" className="py-4" onPress={props.onClose}><Text className="text-brand-600 dark:text-brand-400">關閉</Text></Pressable>
+        <CategoryPicker label="主分類" value={editCat} onChange={next => {setEditCat(next); if (next !== editCat) setEditSub('');}} options={sortCategoryKeys([...new Set([...(categoriesQ.data?.categories ?? []), ...editCat ? [editCat] : []])]).map(value => ({label:value,value}))} disabled={categoriesQ.isLoading || patchMut.isPending} testID="txn-detail-category-dropdown" />
+        {editCat ? <Dropdown label="子分類" value={editSub} onChange={setEditSub} options={[...new Set([...(subcategoriesQ.data?.subcategories ?? []), ...editSub ? [editSub] : []])].map(value => ({label:value,value}))} clearLabel="(無子分類)" disabled={subcategoriesQ.isLoading || patchMut.isPending} testID="txn-detail-subcategory-dropdown" /> : null}
+        <Pressable accessibilityRole="switch" accessibilityLabel="忽略這筆" accessibilityState={{checked:editIgnored}} disabled={patchMut.isPending} testID="txn-detail-ignore-toggle" onPress={() => setEditIgnored(value => !value)} className="flex-row items-center justify-between rounded-xl border border-ink-200 dark:border-ink-700 p-3 my-3">
+          <View><Text className="text-ink-900 dark:text-ink-50">忽略這筆</Text><Text className="text-ink-500">勾起來 → 不納入本月消費 / 收支統計</Text></View>
+          <View className={`w-12 h-7 rounded-full justify-center px-0.5 ${editIgnored ? 'bg-brand-600' : 'bg-ink-300 dark:bg-ink-600'}`}><View className={`w-6 h-6 rounded-full bg-white ${editIgnored ? 'self-end' : 'self-start'}`} /></View>
+        </Pressable>
+        {txn.excluded && <Text className="text-ink-500">此帳戶已排除，不納入統計。</Text>}
+        {patchMut.isError && <Text accessibilityRole="alert" className="text-red-600">{formatApiError(patchMut.error)}</Text>}
+        <Pressable accessibilityRole="button" testID="txn-detail-save" disabled={!isCurrent() || !hasChange || patchMut.isPending} onPress={() => {if (live.current && isCurrent() && hasChange && !patchMut.isPending) patchMut.mutate({category:editCat || null,subcategory:editSub || null,auto_excluded:editIgnored});}} className="py-3 rounded-xl bg-brand-600 items-center"><Text className="text-white">{patchMut.isPending ? '儲存中…' : '儲存'}</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="關閉貸款明細" className="py-4" onPress={close}><Text className="text-brand-600 dark:text-brand-400">關閉</Text></Pressable>
       </ScrollView>
     </Modal>;
-  }
-  return <EditableTxnDetailModal {...props} txn={props.txn} />;
 }
 
 function EditableTxnDetailModal({

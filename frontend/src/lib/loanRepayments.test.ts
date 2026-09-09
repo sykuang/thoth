@@ -16,7 +16,7 @@ assert.deepEqual(renderAmount(rows[1]), {primary:'-USD 0.1', sub:null, direction
 assert.equal(rows[0].amount, '100.001');
 assert.equal(rows[0].cashflow_amount, '0');
 assert.equal(rows[1].amount, '-0.1');
-assert.equal(rows[0].read_only, true);
+assert.equal(rows[0].read_only, false);
 assert.equal(rows[0].reconciliation_status, 'unverified');
 assert.equal(computePeriodStats(rows).income, 0);
 assert.equal(computePeriodStats(rows).expense, 0, 'USD is never added to legacy TWD aggregates');
@@ -87,4 +87,24 @@ const currencyChanged = envelope([{...fact, currency:'TWD'}]);
 (currencyChanged.partitions['bank:cathay'] as Record<string,unknown>).accounts = [{account_no:fact.account_no,currency:'USD',excluded:true}];
 assert.equal(projectReplicaDataset(currencyChanged).transactions.every(t=>t.excluded), true);
 assert.equal(computeLocalDashboardStats(twdRows, 'consume').amount_by_month['2026-09'].count, twdRows.length);
-console.log('loanRepayments: projection, decimal, availability, validation, hydration and exclusion checks passed');
+const edited = (ignored: boolean) => projectReplicaDataset(envelope([{...fact, currency:'TWD', component_overrides:{principal:{category:'收入', subcategory:null},interest:{category:'住房',subcategory:'房貸',auto_excluded:ignored}}}])).transactions;
+assert.equal(edited(true)[0].category, '收入');
+assert.equal(edited(true)[0].subcategory, null);
+assert.equal(edited(true)[0].cashflow_direction, 'neutral');
+assert.equal(edited(true)[1].auto_excluded, true);
+for (const ignored of [true,false]) {
+  const stats = computeLocalDashboardStats(edited(ignored), 'consume');
+  assert.equal(stats.total_income, 0);
+  assert.equal(stats.total_expense, ignored ? '0.2' : '0.3');
+  assert.equal(stats.amount_by_month['2026-09'].expense, ignored ? '0.2' : '0.3');
+  assert.equal(stats.amount_by_category['住房'] ?? 0, ignored ? 0 : '0.1');
+}
+for (const component_overrides of [null, [], {other:{}}, {interest:null}, {interest:[]}, {interest:{auto_excluded:1}}, {interest:{category:7}}, {interest:{category:'x'.repeat(101)}}, {interest:{tags:[]}}, JSON.parse('{"__proto__":{}}'), {interest:JSON.parse('{"__proto__":{}}')}]) assert.throws(() => projectReplicaDataset(envelope([{...fact,component_overrides}])));
+assert.equal(projectReplicaDataset(envelope([{...fact,excluded:true,component_overrides:{interest:{auto_excluded:false}}}])).transactions[1].excluded,true);
+for (const key of ['category', 'subcategory']) {
+  const category = '😀'.repeat(100);
+  const projected = projectReplicaDataset(envelope([{...fact, component_overrides:{interest:{[key]:category}}}])).transactions;
+  assert.equal(projected[1][key as 'category' | 'subcategory'], category);
+  assert.throws(() => projectReplicaDataset(envelope([{...fact,component_overrides:{interest:{[key]:'😀'.repeat(101)}}}])));
+}
+console.log('loanRepayments: projection, overrides, decimal, hydration and exclusion checks passed');

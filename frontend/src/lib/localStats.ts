@@ -29,20 +29,20 @@ export function computeLocalDashboardStats(
   transactions: Transaction[],
   cardDateBasis: CardDateBasis,
 ): DashboardStats {
-  const amountByMonth: DashboardStats['amount_by_month'] = {};
-  const amountByCategory: Record<string, Money> = {};
-  const byKind: Record<string, number> = {};
+  const amountByMonth: DashboardStats['amount_by_month'] = Object.create(null);
+  const amountByCategory: Record<string, Money> = Object.create(null);
+  const byKind: Record<string, number> = Object.create(null);
   const amountByFlowType: Record<string, Money> = {
     expense: 0,
     income: 0,
     transfer: 0,
     investment: 0,
   };
-  const subscriptionByMonth: Record<string, Money> = {};
+  const subscriptionByMonth: Record<string, Money> = Object.create(null);
   const amountByIncomeCategory: Record<string, Money> = Object.fromEntries(
     INCOME_CATEGORIES.map((category) => [category, 0]),
   );
-  const passiveIncomeByMonth: Record<string, Money> = {};
+  const passiveIncomeByMonth: Record<string, Money> = Object.create(null);
   let totalIncome: Money = 0;
   let totalExpense: Money = 0;
   let subscriptionTotal: Money = 0;
@@ -78,7 +78,7 @@ export function computeLocalDashboardStats(
     if (typeof signed !== 'number') throw new Error('Unexpected non-loan decimal cashflow');
     const amount = Math.abs(signed);
     const flowType = transaction.flow_type;
-    if (flowType && flowType in amountByFlowType) {
+    if (flowType && Object.hasOwn(amountByFlowType, flowType)) {
       amountByFlowType[flowType] = addMoney(amountByFlowType[flowType], amount);
     }
     if (transaction.is_subscription && direction === 'expense') {
@@ -87,7 +87,7 @@ export function computeLocalDashboardStats(
     }
     if (flowType === 'income' && direction === 'income') {
       const incomeCategory = transaction.income_category;
-      if (incomeCategory && incomeCategory in amountByIncomeCategory) {
+      if (incomeCategory && Object.hasOwn(amountByIncomeCategory, incomeCategory)) {
         amountByIncomeCategory[incomeCategory] = addMoney(amountByIncomeCategory[incomeCategory], amount);
         if (PASSIVE_INCOME.has(incomeCategory)) {
           passiveIncomeTotal = addMoney(passiveIncomeTotal, amount);
@@ -126,7 +126,7 @@ export function computeLocalDashboardStats(
     amount_by_category: Object.fromEntries(
       Object.entries(amountByCategory).sort(([, left], [, right]) => moneySign(addMoney(right, negateMoney(left)))),
     ),
-    by_kind: byKind,
+    by_kind: { ...byKind },
     amount_by_flow_type: amountByFlowType,
     subscription_total: subscriptionTotal,
     subscription_by_month: sortedDescending(subscriptionByMonth),

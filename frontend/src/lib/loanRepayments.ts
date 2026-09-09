@@ -1,7 +1,13 @@
 import type { LoanRepaymentFact, LoanTransaction, Transaction } from '@/types/api';
 import { addDecimal } from './decimal';
 
-export const LOAN_RECONCILIATION_WARNING = '貸款還款尚未核對：利息／違約金可能與存款扣款重複，請核對既有排除設定；不會自動排除扣款。台幣利息／違約金已納入收支統計；外幣依原幣另列，未換算為台幣。';
+function validOverrides(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Object.entries(value).every(([component, fields]) =>
+    ['principal', 'interest', 'penalty'].includes(component) && fields !== null && typeof fields === 'object' && !Array.isArray(fields) && Object.getPrototypeOf(fields) === Object.prototype &&
+    Object.entries(fields).every(([key, field]) => key === 'auto_excluded' ? typeof field === 'boolean' :
+      ['category', 'subcategory'].includes(key) && (field === null || typeof field === 'string' && Array.from(field).length <= 100)));
+}
 export function validLoanRepaymentFact(value: unknown): value is LoanRepaymentFact {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
@@ -10,7 +16,8 @@ export function validLoanRepaymentFact(value: unknown): value is LoanRepaymentFa
     && typeof row.source_account_id === 'number' && Number.isSafeInteger(row.source_account_id) && row.source_account_id > 0
     && ['due_date', 'paid_on', 'status', 'query_start', 'query_end'].every(k => row[k] === null || typeof row[k] === 'string')
     && ['principal', 'interest', 'penalty', 'paid_total', 'principal_balance'].every(k => typeof row[k] === 'string' && /^\d+(?:\.\d+)?$/.test(row[k] as string))
-    && (row.excluded === undefined || typeof row.excluded === 'boolean');
+    && (row.excluded === undefined || typeof row.excluded === 'boolean')
+    && (!Object.hasOwn(row, 'component_overrides') || validOverrides(row.component_overrides));
 }
 export function projectLoanRepayment(fact: LoanRepaymentFact, excluded = false): LoanTransaction[] {
   if (!validLoanRepaymentFact(fact)) throw new Error('Invalid loan repayment fact');
@@ -18,6 +25,7 @@ export function projectLoanRepayment(fact: LoanRepaymentFact, excluded = false):
     const magnitude = addDecimal(fact[component], '0')!;
     if (magnitude === '0') return [];
     const principal = component === 'principal';
+    const overrides = fact.component_overrides?.[component] ?? {};
     const description = principal ? '貸款還本金' : component === 'interest' ? '貸款利息' : '貸款違約金';
     return [{id: `${fact.id}:${component}`, kind:'loan_repayment', component,
       bank:fact.bank, source_account_id:fact.source_account_id, account_no:fact.account_no, account_or_card:fact.account_no,
@@ -25,8 +33,8 @@ export function projectLoanRepayment(fact: LoanRepaymentFact, excluded = false):
       category:principal ? '還款' : '金融', subcategory:principal ? '本金' : component === 'interest' ? '貸款利息' : '違約金',
       amount:principal ? magnitude : `-${magnitude}`, display_amount:magnitude, display_sign:principal ? '+' : '-',
       cashflow_amount:principal ? '0' : magnitude, cashflow_direction:principal ? 'neutral' : 'expense',
-      flow_type:principal ? 'transfer' : 'expense', read_only:true, reconciliation_status:'unverified',
-      loan_repayment:fact, excluded:excluded || fact.excluded === true, auto_excluded:false }];
+      flow_type:principal ? 'transfer' : 'expense', read_only:false, reconciliation_status:'unverified',
+      loan_repayment:fact, excluded:excluded || fact.excluded === true, auto_excluded:false, ...overrides }];
   });
 }
 export type LoanCurrencyStats = Record<string, { income:string; expense:string; net:string; count:number }>;

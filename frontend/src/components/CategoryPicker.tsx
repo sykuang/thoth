@@ -105,11 +105,11 @@ const CATEGORY_ICONS: Record<string, LucideIcon> = {
 };
 
 function categoryIconFor(category: string): LucideIcon {
-  return CATEGORY_ICONS[category] ?? PackageIcon;
+  return Object.hasOwn(CATEGORY_ICONS, category) ? CATEGORY_ICONS[category] : PackageIcon;
 }
 
 function accentFor(category: string): string {
-  return CATEGORY_ACCENTS[category] ?? '#64748b';
+  return Object.hasOwn(CATEGORY_ACCENTS, category) ? CATEGORY_ACCENTS[category] : '#64748b';
 }
 
 function isSpecialOption(opt: CategoryPickerOption): boolean {
