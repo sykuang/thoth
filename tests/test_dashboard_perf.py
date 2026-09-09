@@ -166,7 +166,10 @@ def test_transactions_stats_uses_ttl_cache(client, monkeypatch):
     token = _register(client, "tx-cache@palace.example")
     calls = {"n": 0}
 
-    def fake_compute(*, banks, kinds, since, until, q, category, card_date_basis, user_id):
+    def fake_compute(*, banks, kinds, since, until, q, category, card_date_basis, user_id,
+                     currency=None, source_account_id=None):
+        assert currency is None
+        assert source_account_id is None
         assert card_date_basis == "consume"
         calls["n"] += 1
         return {
@@ -209,3 +212,47 @@ def test_transactions_stats_uses_ttl_cache(client, monkeypatch):
     clear_dashboard_cache()
     r3 = client.get("/transactions/stats", headers=_auth(token))
     assert r3.json()["total"] == 2
+
+
+def test_transactions_stats_cache_separates_loan_options(client, monkeypatch):
+    import backend.server.routers.transactions as tx
+    from backend.server.dashboard_cache import clear_dashboard_cache
+
+    headers = _auth(_register(client, "loan-cache@palace.example"))
+    accounts = [client.post('/accounts', headers=headers,
+                            json={'bank': 'sinopac', 'label': label}).json()['id']
+                for label in ('first', 'second')]
+    calls = []
+
+    def fake_compute(*, banks, kinds, since, until, q, category, card_date_basis,
+                     user_id, currency=None, source_account_id=None):
+        calls.append((tuple(kinds), currency, source_account_id))
+        return {'generation': len(calls), 'kinds': kinds, 'currency': currency,
+                'source_account_id': source_account_id}
+
+    monkeypatch.setattr(tx, '_compute_transactions_stats', fake_compute)
+    monkeypatch.delenv('PYTEST_CURRENT_TEST', raising=False)
+    clear_dashboard_cache()
+    variants = [({}, None, None, False),
+                ({'include_loan_repayments': 'true'}, None, None, True),
+                ({'include_loan_repayments': 'true', 'currency': 'TWD'}, 'TWD', None, True),
+                ({'include_loan_repayments': 'true', 'currency': 'USD'}, 'USD', None, True),
+                *[({'include_loan_repayments': 'true', 'currency': 'TWD', 'account_id': account},
+                   'TWD', account, True) for account in accounts]]
+    try:
+        for generation, (query, currency, account, loans) in enumerate(variants, 1):
+            for _ in range(2):
+                response = client.get('/transactions/stats', headers=headers,
+                                      params={'bank': 'sinopac', **query})
+                assert response.status_code == 200
+                value = response.json()
+                assert value['generation'] == generation
+                assert value['currency'] == currency
+                assert value['source_account_id'] == account
+                assert ('loan_repayment' in value['kinds']) is loans
+        assert len(calls) == len(variants)
+        assert client.get('/transactions/stats?bank=sinopac', headers=headers).json()['generation'] == 1
+        clear_dashboard_cache()
+        assert client.get('/transactions/stats?bank=sinopac', headers=headers).json()['generation'] == len(variants) + 1
+    finally:
+        clear_dashboard_cache()
