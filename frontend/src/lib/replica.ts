@@ -655,6 +655,7 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
       ? fxDisplayMode
       : 'auto',
     card_date_basis: preferences.card_date_basis === 'post' ? 'post' : 'consume',
+    show_snaptrade_transactions: preferences.show_snaptrade_transactions === true,
   };
   return {
     cursor,

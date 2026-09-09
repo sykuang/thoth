@@ -724,6 +724,8 @@ export type UserPreferences = {
   fx_display_mode: FxDisplayMode;
   /** 信用卡交易日期認列 (消費日 / 入帳日). */
   card_date_basis?: CardDateBasis;
+  /** 僅在交易明細列顯示 SnapTrade 交易，預設不顯示。 */
+  show_snaptrade_transactions?: boolean;
   /** Future-proof: backend payload_json 可加任何欄位, frontend 容忍。 */
   [key: string]: unknown;
 };

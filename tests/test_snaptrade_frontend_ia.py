@@ -127,15 +127,8 @@ def test_portal_repair_refreshes_health_before_sync_and_keeps_target_scoped():
     assert "if (result.type === 'success')" not in settings
 
 
-def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
-    transactions = TRANSACTIONS.read_text()
-
-    assert "const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;" in transactions
-    assert "brokerageScopeActive && brokerageQ.isError" in transactions
-    assert "brokerageScopeActive && brokerageQ.isLoading" in transactions
-    assert "enabled: brokerageScopeActive" in transactions
-    assert "const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;" in transactions
-    assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions
+# Bank/account scope and independent source states are rendered behaviorally in
+# frontend/src/lib/transactionsScreen.test.cjs (tsx --test), not source substrings.
 
 
 def test_brokerage_amounts_use_shared_currency_formatter():

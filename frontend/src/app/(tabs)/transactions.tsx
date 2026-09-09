@@ -40,7 +40,7 @@ import {
   periodRange,
   periodDisplayLabel,
 } from '@/lib/period';
-import { api, formatApiError } from '@/lib/api';
+import { formatApiError } from '@/lib/api';
 import { categorySortRank, sortCategoryKeys } from '@/lib/category-color';
 import { formatCurrency, formatSignedCurrency } from '@/lib/currency';
 import { mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
@@ -105,12 +105,14 @@ export default function TransactionsScreen() {
   const cardNo = typeof params.card_no === 'string' ? params.card_no : '';
   const bp = useBreakpoint();
   const datasetQ = useFrontendDatasetCache();
+  const { ownerKey, ownerEpoch, ownerApi } = datasetQ;
   const preferencesQ = usePreferences();
   const prefs = preferencesQ.hasServerData
     ? preferencesQ.data
     : (datasetQ.data?.preferences ?? preferencesQ.data);
   const fxMode = prefs.fx_display_mode;
   const cardDateBasis = prefs.card_date_basis ?? 'consume';
+  const showSnaptradeTransactions = prefs.show_snaptrade_transactions === true;
   const [selectedBanks, setSelectedBanks] = useState<string[]>(initialBank ? [initialBank] : []);
   const [activeAccountNo, setActiveAccountNo] = useState(accountNo);
   const [activeCardNo, setActiveCardNo] = useState(cardNo);
@@ -193,8 +195,9 @@ export default function TransactionsScreen() {
   }
 
   const bankAccountsQ = useQuery<BankAccount[]>({
-    queryKey: ['accounts'],
-    queryFn: () => api<BankAccount[]>('/accounts'),
+    queryKey: ['accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<BankAccount[]>('/accounts'),
+    enabled: Boolean(ownerKey),
   });
 
   // Transactions come from the local replica; account/card read models remain on
@@ -214,11 +217,13 @@ export default function TransactionsScreen() {
   );
   const effectiveAccountNo = drilldownScopeActive ? activeAccountNo : '';
   const effectiveCardNo = drilldownScopeActive ? activeCardNo : '';
-  const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
+  const brokerageScopeActive = showSnaptradeTransactions && selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
+  const brokerageRelevant = brokerageScopeActive && viewMode === 'list'
+    && !category && !subcategory && direction === 'all' && !selectionMode;
   const brokerageQ = useQuery({
-    queryKey: ['snaptrade', 'portfolio'],
-    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
-    enabled: brokerageScopeActive,
+    queryKey: ['snaptrade', 'portfolio', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradePortfolio>('/snaptrade/portfolio'),
+    enabled: brokerageRelevant && Boolean(ownerKey),
   });
   const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;
 
@@ -238,7 +243,7 @@ export default function TransactionsScreen() {
   const transactionRefreshing = (
     (datasetQ.isRefetching && !datasetQ.isLoading)
     || datasetQ.isRefreshingChanges
-    || (brokerageScopeActive && brokerageQ.isRefetching)
+    || (brokerageRelevant && brokerageQ.isRefetching)
   );
 
   // chip 來源 (主類 chip) — 不被 category/subcategory/direction/search filter 影響,
@@ -276,7 +281,7 @@ export default function TransactionsScreen() {
   }, [activeBrokeragePortfolio, brokerageScopeActive, granularity, selectedPeriod]);
 
   const visibleBrokerageActivities = useMemo(() => {
-    if (viewMode !== 'list' || category || subcategory || direction !== 'all' || selectionMode) return [];
+    if (!brokerageRelevant) return [];
     const needle = search.trim().toLowerCase();
     if (!needle) return brokeragePeriodActivities;
     const accounts = new Map((activeBrokeragePortfolio?.accounts ?? []).map((account) => [account.id, account]));
@@ -290,7 +295,7 @@ export default function TransactionsScreen() {
         account?.name,
       ].some((value) => value?.toLowerCase().includes(needle));
     });
-  }, [brokeragePeriodActivities, activeBrokeragePortfolio, viewMode, category, subcategory, direction, search, selectionMode]);
+  }, [brokeragePeriodActivities, activeBrokeragePortfolio, brokerageRelevant, search]);
 
   const timelineItems = useMemo(
     () => mergeTransactionTimeline(
@@ -375,6 +380,11 @@ export default function TransactionsScreen() {
     + Number(subcategory !== '')
     + Number(search.trim().length > 0);
   const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;
+  const noKnownSources = availableBanks.length === 0 && brokerageAccountCount === 0;
+  const sourceInventoryUnknown = noKnownSources && (bankAccountsQ.data === undefined
+    || (showSnaptradeTransactions && brokerageQ.data === undefined));
+  const sourcesPending = datasetQ.isPending || (brokerageRelevant && brokerageQ.isPending);
+  const brokerageUnavailable = brokerageRelevant && brokerageQ.isError && !brokerageQ.data;
   const isUnsupportedAccountDrilldown = Boolean(
     effectiveAccountNo && selectedBanks.length === 1 && TWD_TXN_UNSUPPORTED_BANKS.has(selectedBanks[0]),
   );
@@ -399,7 +409,8 @@ export default function TransactionsScreen() {
           refreshing={transactionRefreshing}
           onRefresh={() => {
             void datasetQ.refreshSnapshot();
-            if (brokerageScopeActive) void brokerageQ.refetch();
+            if (showSnaptradeTransactions && (brokerageRelevant || (sourceInventoryUnknown && brokerageQ.data === undefined))) void brokerageQ.refetch();
+            if (sourceInventoryUnknown) void bankAccountsQ.refetch();
           }}
           tintColor="#7c3aed"
         />
@@ -601,16 +612,31 @@ export default function TransactionsScreen() {
         {/* Full filter controls live in the button-triggered sheet below; keep the list compact. */}
 
         {/* ===== 主表 / 載入 / 錯誤 ===== */}
-        {viewMode === 'list' && brokerageScopeActive && brokerageQ.isError && (
-          <Text className="text-red-600 dark:text-red-400 text-small mb-3">
+        {datasetQ.isError && (datasetQ.data || filteredCount > 0) && (
+          <Text testID="txn-dataset-error" accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mb-3">
+            銀行交易讀取失敗，保留已載入的交易：{formatApiError(datasetQ.error)}
+          </Text>
+        )}
+        {datasetQ.isPending && filteredCount > 0 && (
+          <Text testID="txn-dataset-loading" accessibilityLiveRegion="polite" className="text-ink-500 dark:text-ink-400 text-small mb-3">
+            銀行交易載入中，先顯示已載入的交易
+          </Text>
+        )}
+        {brokerageRelevant && brokerageQ.isError && (
+          <Text testID="txn-brokerage-error" accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mb-3">
             券商交易讀取失敗：{formatApiError(brokerageQ.error)}
           </Text>
         )}
-        {datasetQ.isLoading || (brokerageScopeActive && brokerageQ.isLoading) ? (
+        {brokerageRelevant && brokerageQ.isPending && (
+          <Text testID="txn-brokerage-loading" accessibilityLiveRegion="polite" className="text-ink-500 dark:text-ink-400 text-small mb-3">
+            券商交易載入中，先顯示已載入的交易
+          </Text>
+        )}
+        {filteredCount === 0 && sourcesPending ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
             <ActivityIndicator />
           </View>
-        ) : datasetQ.isError ? (
+        ) : filteredCount === 0 && !datasetQ.data && datasetQ.isError ? (
           <View className="bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 rounded-2xl p-5">
             <Text className="text-red-700 dark:text-red-300 text-h3 mb-2">查詢失敗</Text>
             <Text className="text-red-700 dark:text-red-400 text-small">
@@ -618,21 +644,28 @@ export default function TransactionsScreen() {
             </Text>
           </View>
         ) : filteredCount === 0 ? (
-          <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
-            <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">
-              {brokerageScopeActive && brokerageQ.isError
+          <View testID="txn-empty" className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
+            <Text
+              testID={brokerageUnavailable ? undefined : sourceInventoryUnknown ? 'txn-sources-unknown' : noKnownSources ? 'txn-no-sources' : undefined}
+              className="text-ink-400 dark:text-ink-500 text-h3 mb-1"
+            >
+              {brokerageUnavailable
                 ? '券商交易目前無法載入'
-                : availableBanks.length === 0 && brokerageAccountCount === 0
-                  ? '還沒有任何交易來源'
+                : sourceInventoryUnknown
+                  ? '此篩選沒有任何交易，交易來源尚未確認'
+                : noKnownSources
+                  ? showSnaptradeTransactions ? '還沒有任何交易來源' : '目前顯示範圍沒有交易來源'
                 : isUnsupportedAccountDrilldown
                   ? '此銀行尚未支援存款交易明細同步'
                   : '此篩選沒有任何交易'}
             </Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
-              {brokerageScopeActive && brokerageQ.isError
+              {brokerageUnavailable || sourceInventoryUnknown
                 ? '請下拉重新整理'
-                : availableBanks.length === 0 && brokerageAccountCount === 0
-                  ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                : noKnownSources
+                  ? showSnaptradeTransactions
+                    ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                    : '可到「帳戶」新增銀行帳戶，或在「設定」開啟「顯示 SnapTrade 交易明細」'
                 : isUnsupportedAccountDrilldown
                   ? '目前這家銀行只同步到帳戶餘額，尚未同步存款交易明細；清除篩選也不會出現此帳戶的明細。'
                   : '試試清除篩選或執行同步'}
