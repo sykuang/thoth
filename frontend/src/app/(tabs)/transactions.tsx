@@ -34,7 +34,6 @@ import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { BrokerageTxnRow } from '@/components/transactions/BrokerageTxnRow';
 import { TxnRow } from '@/components/transactions/TxnRow';
 import { addMoney, absMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
-import { formatDecimal } from '@/lib/decimal';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
 import {
   type Granularity,
@@ -420,13 +419,6 @@ export default function TransactionsScreen() {
       }
     >
       <View className="px-4 py-4 max-w-[800px] w-full mx-auto">
-        {rawItems.some(t => t.kind === 'loan_repayment') && (
-          <View testID="loan-expense-summary" className="p-3 mb-3 bg-ink-50 dark:bg-ink-800">
-            {Object.entries(monthStats.loan_by_currency ?? {}).map(([currency, stats]) => (
-              <Text key={currency} className="text-red-600 dark:text-red-400">貸款支出 -{currency} {formatDecimal(stats.expense)}</Text>
-            ))}
-          </View>
-        )}
         {datasetQ.data?.loanRepaymentsAvailable === false && <Text className="text-ink-500">伺服器未提供完整貸款還款資料，不能視為零筆。</Text>}
         {/* Header: 收支表 標題 + Phase 9.2 選取模式按鈕 */}
         <View className="flex-row items-center justify-between mb-3">

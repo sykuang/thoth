@@ -97,13 +97,14 @@ const press = (id) => (tree) => {
   node.props.onPress();
 };
 const has = (html, id) => html.includes(`data-testid="${id}"`);
-test('loan facts render neutral positive principal and a loan expense summary without reconciliation warnings, never selectable', () => {
+test('loan facts retain rows and expense totals without a redundant loan summary, never selectable', () => {
   const {projectReplicaDataset} = require('./replica');
   const facts = {id:'loan:v1:test', bank:'cathay', source_account_id:1, account_no:'123456789', sub_account:'', currency:'TWD', due_date:transaction.date, paid_on:transaction.date, status:'paid', query_start:null, query_end:null, principal:'100.001', interest:'0.1', penalty:'0.2', paid_total:'100.301', principal_balance:'900'};
   const dataset = projectReplicaDataset({partitions:{'bank:cathay':{transactions:[],loan_repayments:[facts]}},generations:{},syncedAt:transaction.date});
   client.setQueryData(datasetKey,{...dataset,preferences});
   const html = render();
-  assert.ok(has(html, 'loan-expense-summary'));
+  assert.ok(!has(html, 'loan-expense-summary'));
+  assert.ok(!html.includes('貸款支出'));
   assert.ok(!html.includes('未核對'));
   assert.ok(!has(html, 'loan-reconciliation-warning'));
   assert.ok(dataset.transactions.every(t => t.reconciliation_status === 'unverified'));
