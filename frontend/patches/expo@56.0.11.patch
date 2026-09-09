@@ -1,0 +1,29 @@
+diff --git a/ios/Fetch/ExpoFetchModule.swift b/ios/Fetch/ExpoFetchModule.swift
+index efdd744e1d0d0c6f493e201822187be2cde32b4b..5ae00e2205ba8dbb33b6871db6326556f9ef8240 100644
+--- a/ios/Fetch/ExpoFetchModule.swift
++++ b/ios/Fetch/ExpoFetchModule.swift
+@@ -59,14 +59,22 @@ public final class ExpoFetchModule: Module {
+       Property("redirected", \.redirected)
+ 
+       AsyncFunction("arrayBuffer") { (response: NativeResponse, promise: Promise) in
+-        response.waitFor(states: [.bodyCompleted]) { _ in
++        response.waitFor(states: [.bodyCompleted, .errorReceived]) { state in
++          if state == .errorReceived {
++            promise.reject(response.error ?? FetchUnknownException())
++            return
++          }
+           let data = response.sink.finalize()
+           promise.resolve(NativeArrayBuffer.wrap(dataWithoutCopy: data))
+         }
+       }.runOnQueue(fetchRequestQueue)
+ 
+       AsyncFunction("text") { (response: NativeResponse, promise: Promise) in
+-        response.waitFor(states: [.bodyCompleted]) { _ in
++        response.waitFor(states: [.bodyCompleted, .errorReceived]) { state in
++          if state == .errorReceived {
++            promise.reject(response.error ?? FetchUnknownException())
++            return
++          }
+           let data = response.sink.finalize()
+           let text = String(decoding: data, as: UTF8.self)
+           promise.resolve(text)
