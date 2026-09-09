@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import math
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 # ddddocr singleton 與 thread-safety lock。
@@ -59,6 +61,11 @@ def _finite_confidence(value: object) -> float | None:
     return confidence if math.isfinite(confidence) else None
 
 
+def _next_diagnostic_count(value):
+    # Corrupted history is unknown, not an invented zero or an auth exception.
+    return min(value + 1, 10000) if type(value) is int and 0 <= value <= 10000 else None
+
+
 def solve_captcha(
     page,
     img_selector: str,
@@ -68,6 +75,8 @@ def solve_captcha(
     tmp_path: Path | None = None,
     min_confidence: float = 0.0,
     digits_only: bool = False,
+    diagnostics: dict | None = None,
+    on_failure=None,
 ) -> str | None:
     """對 img_selector 指向的驗證碼圖 OCR，回傳辨識字串（清理後）。失敗回 None。
 
@@ -81,14 +90,23 @@ def solve_captcha(
             "solve_captcha() 需要 tmp_path 參數 (per-bank session_dir/captcha.png)。"
             " /tmp 共用 race condition 已禁用——詳見 C-3 修法註解。",
         )
+    if type(diagnostics) is dict:
+        diagnostics["ocr_status"] = "image_unavailable"
+    operation = "ocr_image_lookup"
+    inference_started = None
     try:
         el = page.query_selector(img_selector)
         if not el or not el.is_visible():
             _log(f"[captcha] selector {img_selector!r} 不可見")
             return None
+        operation = "ocr_screenshot"
         data = el.screenshot(timeout=5000)
         if not isinstance(data, bytes):
             return None
+        if type(diagnostics) is dict:
+            diagnostics["ocr_image_captured_at"] = time.monotonic()
+        operation = "ocr_inference"
+        inference_started = time.monotonic() if type(diagnostics) is dict else None
         conf = None
         if min_confidence > 0:
             try:
@@ -98,30 +116,59 @@ def solve_captcha(
                     conf = rp.get("confidence")
                 else:
                     raw = rp
-            except Exception:
+            except Exception as exc:
+                if type(diagnostics) is dict:
+                    diagnostics["ocr_status"] = "exception"
+                    diagnostics["ocr_inference_ms"] = round((time.monotonic() - inference_started) * 1000)
+                if on_failure is not None:
+                    with contextlib.suppress(Exception):
+                        on_failure("ocr_inference", exc)
                 _log("[captcha] probability inference 失敗，confidence gate fail closed")
                 return None
         else:
             raw = _ocr_classification(data)
+        operation = "ocr_validation"
+        if type(diagnostics) is dict:
+            diagnostics["ocr_inference_ms"] = round((time.monotonic() - inference_started) * 1000)
         conf = _finite_confidence(conf)
+        if type(diagnostics) is dict:
+            diagnostics["confidence"] = conf
+            diagnostics["ocr_result_type"] = next((label for cls, label in ((str, "str"), (dict, "dict"), (list, "list"), (int, "int"), (float, "float"), (type(None), "NoneType")) if type(raw) is cls), "other")
         text = str(raw).strip()
         if alnum_only:
             text = re.sub(r"[^0-9a-zA-Z]", "", text)
         if digits_only and not text.isdigit():
+            if type(diagnostics) is dict:
+                diagnostics["ocr_status"] = "digits_rejected"
             _log("[captcha] OCR 非純數字，判失敗重試")
             return None
         if expected_len and len(text) != expected_len:
+            if type(diagnostics) is dict:
+                diagnostics["ocr_status"] = "length_rejected"
             _log(f"[captcha] 長度 {len(text)} != 預期 {expected_len}，可能誤判")
             return None
         if min_confidence > 0:
             if conf is None:
+                if type(diagnostics) is dict:
+                    diagnostics["ocr_status"] = "confidence_unavailable"
                 _log("[captcha] 缺少 confidence，捨棄換圖")
                 return None
             if conf < min_confidence:
+                if type(diagnostics) is dict:
+                    diagnostics["ocr_status"] = "confidence_rejected"
                 _log(f"[captcha] 信心 {conf:.3f} < {min_confidence}，捨棄換圖")
                 return None
+        if type(diagnostics) is dict:
+            diagnostics["ocr_status"] = "accepted"
         return text or None
-    except Exception:
+    except Exception as exc:
+        if type(diagnostics) is dict:
+            diagnostics["ocr_status"] = "exception"
+            if operation == "ocr_inference" and inference_started is not None:
+                diagnostics["ocr_inference_ms"] = round((time.monotonic() - inference_started) * 1000)
+        if on_failure is not None:
+            with contextlib.suppress(Exception):
+                on_failure(operation, exc)
         _log("[captcha] OCR 失敗")
         return None
 
@@ -176,6 +223,8 @@ def wait_captcha_stable(
     tries: int = 6,
     gap_ms: int = 500,
     tmp_path: Path | None = None,
+    diagnostics: dict | None = None,
+    on_failure=None,
 ) -> bool:
     """等驗證碼圖渲染穩定（連續兩次 screenshot 位元組相同），避免抓到換圖中途的舊/空圖。
 
@@ -187,18 +236,26 @@ def wait_captcha_stable(
             " /tmp 共用 race condition 已禁用——詳見 C-3 修法註解。",
         )
     last = None
+    if type(diagnostics) is dict:
+        diagnostics["stability_matched"] = False
     for _ in range(tries):
         el = page.query_selector(img_selector)
         if el and el.is_visible():
             try:
+                if type(diagnostics) is dict:
+                    diagnostics["stability_samples"] = _next_diagnostic_count(diagnostics.get("stability_samples", 0))
                 raw = el.screenshot(timeout=5000)
                 if not isinstance(raw, bytes):
                     raise TypeError
                 h = hashlib.sha256(raw).digest()
                 if h == last:
+                    if type(diagnostics) is dict:
+                        diagnostics["stability_matched"] = True
                     return True
                 last = h
-            except Exception:
-                pass
+            except Exception as exc:
+                if on_failure is not None:
+                    with contextlib.suppress(Exception):
+                        on_failure("captcha_stability_screenshot", exc)
         page.wait_for_timeout(gap_ms)
     return last is not None

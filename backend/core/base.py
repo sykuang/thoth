@@ -26,6 +26,10 @@ from typing import Any, ClassVar, NotRequired, Required, TypedDict
 from urllib.parse import urlparse
 
 from scrapling.fetchers import StealthyFetcher
+from patchright._impl._errors import TargetClosedError as PatchrightTargetClosedError
+from patchright.sync_api import Error as PatchrightError, TimeoutError as PatchrightTimeoutError
+from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
+from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -45,6 +49,12 @@ from backend.core.login_checkpoints import (
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[1]
 _SAFE_EXCEPTION_TYPES = (
+    (PatchrightTargetClosedError, "PatchrightTargetClosedError"),
+    (PatchrightTimeoutError, "PatchrightTimeoutError"),
+    (PatchrightError, "PatchrightError"),
+    (PlaywrightTargetClosedError, "PlaywrightTargetClosedError"),
+    (PlaywrightTimeoutError, "PlaywrightTimeoutError"),
+    (PlaywrightError, "PlaywrightError"),
     (LoginCheckpointBlocked, "LoginCheckpointBlocked"),
     (LoginInteractionRequired, "LoginInteractionRequired"),
     (NotImplementedError, "NotImplementedError"),
@@ -57,6 +67,7 @@ _SAFE_EXCEPTION_TYPES = (
     (RuntimeError, "RuntimeError"),
     (TypeError, "TypeError"),
     (ValueError, "ValueError"),
+    (Exception, "Exception"),
 )
 
 
@@ -945,15 +956,25 @@ class ResponseCollector:
             if is_sinopac_login:
                 # Never use Response.json/body: Patchright may replay a bank POST.
                 req_body = None
+                capture = self._sinopac_capture_diagnostics = {
+                    "request_sequence": request_sequence, "status": "request_binding_rejected",
+                    "exception_type": None,
+                }
+                if (url == _SINOPAC_LOGIN_RESPONSE_URL
+                        and main_frame_request and request_sequence > 0
+                        and request_frame_url == "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"):
+                    capture["status"] = "observer_unavailable"
                 if (url == _SINOPAC_LOGIN_RESPONSE_URL
                         and main_frame_request and request_sequence > 0
                         and request_frame_url == "https://mma.sinopac.com/MemberPortal/Member/MMALogin.aspx"
                         and self._history_observer is not None):
-                    with contextlib.suppress(Exception):
+                    capture["status"] = "cdp_read_rejected"
+                    try:
                         raw_body = self._history_observer.read(
                             resp, request_frame, request_frame_url, 16_384, 1,
                         )
                         if raw_body is not None:
+                            capture["status"] = "projection_rejected"
                             body_size = len(raw_body)
                             payload = json.loads(raw_body)
                             row = payload[0] if type(payload) is list and len(payload) == 1 else None
@@ -962,6 +983,9 @@ class ResponseCollector:
                             if (type(header) is str and 0 < len(header) <= 64
                                     and type(message) is str and len(message) <= 4096):
                                 resp_json = [{"Header": header, "Message": message}]
+                                capture["status"] = "captured"
+                    except Exception as exc:
+                        capture["exception_type"] = _safe_exception_type(exc)
             elif "json" in ct and not metadata_only:
                 if is_bounded_json:
                     minimum_size = 64 if is_ubot_history else 0
@@ -1762,6 +1786,11 @@ class BankCrawler(ABC):
         return False
 
     def _shared_login(self, page) -> bool:
+        if self.name == "sinopac":
+            self._sinopac_diagnostics = {}
+            self._login_diagnostic_floor = None
+            self._login_terminal_exception_type = None
+            self._login_underlying_exception_type = None
         if not self._credential_origin_allowed(page):
             reduce_login_checkpoint(
                 CheckpointPhase.PRE_SUBMIT,
@@ -2089,6 +2118,13 @@ class BankCrawler(ABC):
                         import sys as _sys
                         exception_type = _safe_exception_type(e)
                         exception_state = _base_exception_state(e)
+                        self._login_terminal_exception_type = exception_type
+                        context = BaseException.__dict__["__cause__"].__get__(e, BaseException)
+                        if context is None:
+                            context = _base_exception_context(e)
+                        self._login_underlying_exception_type = (
+                            _safe_exception_type(context) if context is not None else None
+                        )
                         safe_code = _safe_state_value(exception_state, "safe_code")
                         if _exception_inherits(
                             e, LoginCheckpointBlocked, LoginInteractionRequired

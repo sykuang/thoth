@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -37,6 +38,9 @@ from backend.core.base import (
     _HistoryBodyObserver,
     _OriginGuardProxy,
     _safe_state_value,
+    _safe_exception_type,
+    _base_exception_state,
+    _SAFE_EXCEPTION_TYPES,
     _SINOPAC_LOGIN_RESPONSE_URL,
     BankCollectResult,
     BankCrawler,
@@ -50,7 +54,7 @@ from backend.core.card_bills import (
     make_card_bill_fact,
     publish_card_bill_facts,
 )
-from backend.core.captcha import solve_captcha, wait_captcha_stable
+from backend.core.captcha import _next_diagnostic_count, solve_captcha, wait_captcha_stable
 from backend.core.creds import SinopacCreds
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -93,6 +97,34 @@ def _safe_login_message(value, creds):
     if any(secret.casefold() in text.casefold() for secret in secrets):
         return None
     return text.strip()[:512] or None
+
+
+def _diagnostic_number(value, *, fraction=False):
+    return value if (type(value) is int or (fraction and type(value) is float)) and 0 <= value <= 86_400_000 and math.isfinite(value) else None
+
+
+def _diagnostic_exception(value):
+    return value if type(value) is str and value in {label for _, label in _SAFE_EXCEPTION_TYPES} else None
+
+
+def _diagnostic_failure(value):
+    if type(value) is not dict:
+        return None
+    operation = _safe_state_value(value, "operation")
+    allowed = {
+        "prepare_page", "input_length", "captcha_refresh", "captcha_image_wait",
+        "input_inventory", "input_geometry", "input_order", "input_enabled",
+        "credential_fill", "captcha_ocr", "captcha_fill", "login_button",
+        "credential_submit", "post_submit_wait", "logged_in", "response_visible",
+        "logged_in_url", "logged_in_scopes", "logged_in_captcha_inspection",
+        "logged_in_input_inspection", "logged_in_body", "captcha_image_lookup",
+        "captcha_stability", "captcha_stability_screenshot", "ocr_image_lookup",
+        "ocr_screenshot", "ocr_inference", "ocr_validation", "captcha_refresh_click",
+        "captcha_refresh_wait",
+    }
+    return {"operation": operation if type(operation) is str and operation in allowed else "unknown",
+            "exception_type": _diagnostic_exception(_safe_state_value(value, "exception_type")),
+            **{key: _diagnostic_number(_safe_state_value(value, key)) for key in ("submission_attempt", "ocr_attempt")}}
 
 
 def _taipei_today() -> date:
@@ -262,11 +294,25 @@ class SinopacCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "sinopac.com"
 
+    def _record_login_failure(self, operation, exc):
+        state = getattr(self, "_sinopac_diagnostics", None)
+        if type(state) is not dict:
+            state = self._sinopac_diagnostics = {}
+        event = {"operation": operation, "exception_type": _safe_exception_type(exc),
+                 "submission_attempt": state.get("submission_attempt"),
+                 "ocr_attempt": state.get("ocr_attempt")}
+        state.setdefault("first", event)
+        state["last"] = event
+        state["failure_count"] = _next_diagnostic_count(state.get("failure_count", 0))
+
     def log_login_failure_diagnostics(self, page) -> None:
         message, source = None, "unknown"
+        reason = "no_bound_login_response"
+        response_status, label_status = "submission_boundary_unavailable", "not_inspected"
         try:
             floor = getattr(self, "_login_diagnostic_floor", None)
-            hits = self.collector.hits if self.collector is not None else []
+            collector = getattr(self, "collector", None)
+            hits = collector.hits if collector is not None else []
             candidates = [hit for hit in hits if (
                 type(hit.raw_url) is str and hit.raw_url == LOGIN_RESPONSE_URL
                 and type(hit.method) is str and hit.method == "POST"
@@ -276,30 +322,80 @@ class SinopacCrawler(BankCrawler):
                 and type(floor) is int and type(hit.request_sequence) is int
                 and hit.request_sequence > floor
             )]
+            response_status = ("no_bound_login_response" if type(floor) is int else "submission_boundary_unavailable")
+            if len(candidates) > 1:
+                response_status = "ambiguous_login_responses"
             if len(candidates) == 1:
+                response_status = "capture_or_projection_unavailable"
                 payload = candidates[0].resp_json
                 row = payload[0] if type(payload) is list and len(payload) == 1 else None
                 header = _safe_state_value(row, "Header")
                 if type(header) is str and 0 < len(header) <= 64 and header != "SUCCESS":
+                    response_status = "message_rejected_by_sanitizer"
                     message = _safe_login_message(_safe_state_value(row, "Message"), self.creds)
                     if message is not None:
                         source = "login_response.Message"
+                        response_status = "sanitized"
+                elif type(header) is str and header == "SUCCESS":
+                    response_status = "bank_success_header"
+            label_status = "not_login_document" if message is None else "not_needed"
             if message is None and type(page.url) is str and page.url == BASE:
+                label_status = "label_inspection_exception"
                 label = page.locator("#ctl00_ctl00_ContentPlaceHolder1__errorLabel")
-                if label.count() == 1 and label.is_visible():
-                    text = label.inner_text(timeout=250)
-                    if page.url == BASE:
-                        message = _safe_login_message(text, self.creds)
-                        if message is not None:
-                            source = "login_page.errorLabel"
-        except Exception:
+                count = label.count()
+                label_status = "label_not_unique"
+                if count == 1:
+                    label_status = "label_inspection_exception"
+                    visible = label.is_visible()
+                    label_status = "label_not_visible"
+                    if visible:
+                        label_status = "label_inspection_exception"
+                        text = label.inner_text(timeout=250)
+                        label_status = "document_changed"
+                        if page.url == BASE:
+                            label_status = "message_rejected_by_sanitizer"
+                            message = _safe_login_message(text, self.creds)
+                            if message is not None:
+                                source = "login_page.errorLabel"
+                                label_status = "sanitized"
+        except Exception as exc:
             message, source = None, "unknown"
+            reason = "diagnostic_inspection_exception"
+            inspection_exception = _safe_exception_type(exc)
+        else:
+            inspection_exception = None
+            reason = "response_and_label_unavailable"
+        capture = getattr(getattr(self, "collector", None), "_sinopac_capture_diagnostics", None)
+        capture_sequence = _safe_state_value(capture, "request_sequence")
+        floor = getattr(self, "_login_diagnostic_floor", None)
+        capture_status, capture_exception = None, None
+        if type(floor) is int and type(capture_sequence) is int and capture_sequence > floor:
+            status = _safe_state_value(capture, "status")
+            if type(status) is str and status in {"request_binding_rejected", "observer_unavailable", "cdp_read_rejected", "projection_rejected", "captured"}:
+                capture_status = status
+                capture_exception = _diagnostic_exception(_safe_state_value(capture, "exception_type"))
         # Observed context only: does not classify an error or authorize a retry.
         _log("[sinopac][login][WARNING] " + json.dumps({
             "event": "bank_login_diagnostic", "bank": "sinopac",
             "source": source, "message": message,
             "message_status": "sanitized" if message is not None else "unavailable",
             "bank_error_code": None, "bank_error_code_status": "not_verified",
+            "message_unavailable_reason": reason if message is None else None,
+            "response_status": response_status, "label_status": label_status,
+            "capture_status": capture_status, "capture_exception_type": capture_exception,
+            "inspection_exception_type": inspection_exception,
+            "terminal_exception_type": _diagnostic_exception(getattr(self, "_login_terminal_exception_type", None)),
+            "underlying_exception_type": _diagnostic_exception(getattr(self, "_login_underlying_exception_type", None)),
+            "failures": {**{key: _diagnostic_failure(_safe_state_value(getattr(self, "_sinopac_diagnostics", None), key))
+                         for key in ("first", "last")},
+                         "failure_count": _diagnostic_number(_safe_state_value(getattr(self, "_sinopac_diagnostics", None), "failure_count"))},
+            "captcha": {**{key: _diagnostic_number(_safe_state_value(getattr(self, "_sinopac_diagnostics", None), key), fraction=key == "confidence")
+                         for key in ("submission_attempt", "ocr_attempt", "ocr_duration_ms", "ocr_inference_ms", "confidence", "stability_samples", "refresh_count", "ocr_to_submit_ms", "image_to_submit_ms")},
+                        **{key: next((value for value in choices if type(_safe_state_value(getattr(self, "_sinopac_diagnostics", None), key)) is type(value) and _safe_state_value(getattr(self, "_sinopac_diagnostics", None), key) == value), None)
+                           for key, choices in (("ocr_status", ("image_unavailable", "digits_rejected", "length_rejected", "confidence_unavailable", "confidence_rejected", "accepted", "exception")),
+                                                ("ocr_result_type", ("str", "dict", "list", "int", "float", "NoneType", "other")),
+                                                ("stability_matched", (True, False)))},
+                        "accuracy_status": "not_verified", "bank_expiry_status": "not_verified"},
         }, ensure_ascii=False))
 
     @staticmethod
@@ -310,6 +406,7 @@ class SinopacCrawler(BankCrawler):
         ]
 
     def _logged_in(self, page) -> bool:
+        operation = "logged_in_url"
         try:
             current = urlparse(page.url or "")
             path = (current.path or "").lower()
@@ -323,13 +420,16 @@ class SinopacCrawler(BankCrawler):
                 )
             ):
                 return False
+            operation = "logged_in_scopes"
             for scope in self._page_scopes(page):
+                operation = "logged_in_captcha_inspection"
                 captcha_images = scope.locator(SEL_CAP_IMG)
                 if any(
                     captcha_images.nth(index).is_visible()
                     for index in range(captcha_images.count())
                 ):
                     return False
+                operation = "logged_in_input_inspection"
                 inputs = scope.locator("input")
                 for index in range(inputs.count()):
                     field = inputs.nth(index)
@@ -338,8 +438,10 @@ class SinopacCrawler(BankCrawler):
                         and field.get_attribute("maxlength") in {"6", "11", "20"}
                     ):
                         return False
+            operation = "logged_in_body"
             body = page.locator("body").inner_text()
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure(operation, exc)
             return False
         return (
             len(body) >= 500
@@ -351,10 +453,14 @@ class SinopacCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._sinopac_diagnostics = {}
+        self._login_terminal_exception_type = None
+        self._login_underlying_exception_type = None
         self._login_diagnostic_floor = None
         try:
             page.wait_for_timeout(8000)
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure("prepare_page", exc)
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入頁面無法安全準備；未送出登入",
@@ -484,6 +590,7 @@ class SinopacCrawler(BankCrawler):
             )
 
     def prepare_captcha_resubmit(self, page) -> None:
+        operation = "captcha_refresh"
         try:
             image = self._captcha_image(page, enabled=True)
             if image is None:
@@ -492,11 +599,15 @@ class SinopacCrawler(BankCrawler):
                     "無法安全更新永豐驗證碼；未送出登入",
                     login_stage="captcha_refresh",
                 )
+            operation = "captcha_refresh_click"
             image.click()
+            operation = "captcha_refresh_wait"
             page.wait_for_timeout(1500)
-        except SinopacLoginError:
+        except SinopacLoginError as exc:
+            self._record_login_failure(operation, exc)
             raise
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure(operation, exc)
             raise SinopacLoginError(
                 self.CAPTCHA_INVALID,
                 "無法安全更新永豐驗證碼；未送出登入",
@@ -505,11 +616,24 @@ class SinopacCrawler(BankCrawler):
 
     def _ocr_captcha(self, page, max_attempts=5):
         attempts = min(max(max_attempts, 1), 5)
+        state = getattr(self, "_sinopac_diagnostics", None)
+        if type(state) is not dict:
+            state = self._sinopac_diagnostics = {}
+        state["refresh_count"] = 0
         for attempt in range(attempts):
+            state["ocr_attempt"] = attempt + 1
+            for key in ("confidence", "ocr_status", "ocr_result_type", "stability_matched", "ocr_completed_at", "ocr_image_captured_at", "ocr_inference_ms"):
+                state[key] = None
+            state["stability_samples"] = 0
+            started = time.monotonic()
+            operation = "captcha_image_lookup"
             try:
                 if self._captcha_image(page) is None:
                     return None
-                wait_captcha_stable(page, SEL_CAP_IMG, tmp_path=self.captcha_tmp)
+                operation = "captcha_stability"
+                wait_captcha_stable(page, SEL_CAP_IMG, tmp_path=self.captcha_tmp,
+                                    diagnostics=state, on_failure=self._record_login_failure)
+                operation = "captcha_ocr"
                 text = solve_captcha(
                     page,
                     SEL_CAP_IMG,
@@ -518,19 +642,28 @@ class SinopacCrawler(BankCrawler):
                     digits_only=True,
                     min_confidence=0.98,
                     tmp_path=self.captcha_tmp,
+                    diagnostics=state, on_failure=self._record_login_failure,
                 )
                 if isinstance(text, str) and len(text) == 6 and text.isdigit():
+                    state["ocr_completed_at"] = time.monotonic()
                     return text
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_login_failure(operation, exc)
+            finally:
+                state["ocr_duration_ms"] = round((time.monotonic() - started) * 1000)
             if attempt + 1 < attempts:
+                operation = "captcha_image_lookup"
                 try:
                     image = self._captcha_image(page, enabled=True)
                     if image is None:
                         return None
+                    operation = "captcha_refresh_click"
                     image.click()
+                    state["refresh_count"] = _next_diagnostic_count(state.get("refresh_count", 0))
+                    operation = "captcha_refresh_wait"
                     page.wait_for_timeout(1500)
-                except Exception:
+                except Exception as exc:
+                    self._record_login_failure(operation, exc)
                     return None
         return None
 
@@ -553,6 +686,14 @@ class SinopacCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
+        state = getattr(self, "_sinopac_diagnostics", None)
+        if type(state) is not dict:
+            state = self._sinopac_diagnostics = {}
+        state["submission_attempt"] = _next_diagnostic_count(state.get("submission_attempt", 0))
+        for key in ("ocr_attempt", "confidence", "stability_samples", "ocr_duration_ms",
+                    "ocr_completed_at", "ocr_to_submit_ms", "refresh_count",
+                    "ocr_status", "ocr_result_type", "stability_matched", "ocr_image_captured_at", "ocr_inference_ms", "image_to_submit_ms"):
+            state[key] = None
         collector = getattr(self, "collector", None)
         self._login_diagnostic_floor = collector.request_sequence if type(collector) is ResponseCollector else None
         stage = "captcha_image_wait"
@@ -643,9 +784,15 @@ class SinopacCrawler(BankCrawler):
                     login_stage=stage,
                 )
             button = eligible[0]
-        except SinopacLoginError:
+        except SinopacLoginError as exc:
+            last = _safe_state_value(state, "last")
+            last_attempt = _diagnostic_number(_safe_state_value(last, "submission_attempt"))
+            if (stage != "captcha_ocr" or type(last) is not dict or last_attempt is None
+                    or last_attempt != state["submission_attempt"]):
+                self._record_login_failure(_safe_state_value(_base_exception_state(exc), "login_stage"), exc)
             raise
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure(stage, exc)
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入欄位無法安全填寫；未送出登入",
@@ -653,9 +800,16 @@ class SinopacCrawler(BankCrawler):
             ) from None
 
         stage = "credential_submit"
+        completed = _diagnostic_number(state.get("ocr_completed_at"), fraction=True)
+        if completed is not None:
+            state["ocr_to_submit_ms"] = round((time.monotonic() - completed) * 1000)
+        captured = _diagnostic_number(state.get("ocr_image_captured_at"), fraction=True)
+        if captured is not None:
+            state["image_to_submit_ms"] = round((time.monotonic() - captured) * 1000)
         try:
             button.click(timeout=8000)
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure(stage, exc)
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入送出狀態不明；禁止自動重試",
@@ -663,12 +817,18 @@ class SinopacCrawler(BankCrawler):
             ) from None
 
         stage = "post_submit_check"
+        operation = "post_submit_wait"
         try:
             for _ in range(8):
+                operation = "post_submit_wait"
                 page.wait_for_timeout(1000)
-                if self._logged_in(page) or self._response_visible(page):
+                operation = "logged_in"
+                authenticated = self._logged_in(page)
+                operation = "response_visible"
+                if authenticated or self._response_visible(page):
                     return
-        except Exception:
+        except Exception as exc:
+            self._record_login_failure(operation, exc)
             raise SinopacLoginError(
                 self.LOGIN_FAILED,
                 "永豐登入送出後狀態無法安全確認；禁止自動重試",

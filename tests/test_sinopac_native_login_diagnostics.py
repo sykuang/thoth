@@ -12,6 +12,11 @@ from tests.test_bank_login_lifecycle import _StagedCrawler, _run
     ('captcha_invalid', 'captcha_ocr'),
     ('login_failed', 'input_inventory'),
     ('login_failed', 'credential_submit'),
+    *[('login_failed', stage) for stage in (
+        'prepare_page', 'input_length', 'captcha_refresh', 'captcha_image_wait',
+        'input_geometry', 'input_order', 'input_enabled', 'credential_fill',
+        'captcha_fill', 'login_button', 'post_submit_check',
+    )],
 ])
 def test_native_code_and_stage_reach_warning_sink(monkeypatch, tmp_path, capsys, code, stage):
     monkeypatch.setattr(base, 'DATA_ROOT', tmp_path / 'initial')
@@ -100,6 +105,7 @@ def test_every_submit_stage_producer(stage):
     with pytest.raises(SinopacLoginError) as raised:
         crawler.submit_credentials_once(page)
     assert raised.value.login_stage == stage
+    assert crawler._sinopac_diagnostics['last']['operation'] == ('logged_in' if stage == 'post_submit_check' else stage)
     assert 'PRIVATE' not in str(raised.value)
     assert button.click.call_count == (1 if stage in {'credential_submit', 'post_submit_check'} else 0)
 
@@ -113,6 +119,7 @@ def test_refresh_stage_both_native_raise_sites(missing):
     with pytest.raises(SinopacLoginError) as raised:
         crawler.prepare_captcha_resubmit(page)
     assert raised.value.login_stage == 'captcha_refresh'
+    assert crawler._sinopac_diagnostics['last']['operation'] == ('captcha_refresh' if missing else 'captcha_refresh_click')
     button.click.assert_not_called()
 
 

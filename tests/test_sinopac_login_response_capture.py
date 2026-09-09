@@ -34,6 +34,12 @@ def test_login_capture_requires_its_own_document_and_payload(fault):
     response.body.assert_not_called()
     response.json.assert_not_called()
     assert len(collector.hits) == 1 and collector.hits[0].req_body is None
+    report = collector._sinopac_capture_diagnostics
+    expected = {'missing': 'observer_unavailable', 'rejected': 'cdp_read_rejected',
+                'untracked': 'request_binding_rejected', 'wrong_document': 'request_binding_rejected',
+                'wrong_shape': 'projection_rejected', 'valid': 'captured'}
+    assert report['status'] == expected[fault]
+    assert report['request_sequence'] == collector.hits[0].request_sequence
     assert (collector.hits[0].resp_json is not None) == (fault == 'valid')
     assert observer.read.call_count == (1 if fault in {'rejected', 'wrong_shape', 'valid'} else 0)
 

@@ -36,7 +36,7 @@ def _captcha_page() -> tuple[Mock, Mock]:
 def test_sinopac_captcha_uses_confidence_gate(monkeypatch):
     calls = []
 
-    def fake_wait(page, selector, *, tmp_path):
+    def fake_wait(page, selector, *, tmp_path, **kwargs):
         calls.append(("wait", selector, tmp_path))
 
     def fake_solve(page, selector, **kwargs):
@@ -50,6 +50,8 @@ def test_sinopac_captcha_uses_confidence_gate(monkeypatch):
     assert _crawler()._ocr_captcha(page, max_attempts=1) == "123456"
 
     solve_call = next(call for call in calls if call[0] == "solve")
+    assert callable(solve_call[2].pop("on_failure"))
+    assert type(solve_call[2].pop("diagnostics")) is dict
     assert solve_call[2] == {
         "expected_len": 6,
         "alnum_only": True,
