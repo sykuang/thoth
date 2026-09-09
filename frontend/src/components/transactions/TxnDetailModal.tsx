@@ -65,7 +65,7 @@ export function TxnDetailModal(props: TxnDetailModalProps) {
     const amount = renderAmount(txn, props.fxMode);
     return <Modal visible onRequestClose={props.onClose} animationType="slide" presentationStyle="pageSheet">
       <ScrollView testID="loan-detail" className="bg-white dark:bg-ink-900" contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{padding:24}}>
-        <Text className="text-h2 text-ink-900 dark:text-ink-50">{txn.description} · 唯讀</Text>
+        <Text className="text-h2 text-ink-900 dark:text-ink-50">{txn.description}</Text>
         <Text className={amount.direction === 'zero' ? 'text-ink-500 dark:text-ink-400' : 'text-red-600 dark:text-red-400'}>{amount.primary}</Text>
         <Text className="text-ink-700 dark:text-ink-300">{formatTransactionSource(BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank, {kind:txn.kind, accountNo:txn.account_no, accountOrCard:txn.account_or_card})}</Text>
         <Text accessibilityRole="alert" className="text-ink-700 dark:text-ink-300 my-4">{LOAN_RECONCILIATION_WARNING}</Text>

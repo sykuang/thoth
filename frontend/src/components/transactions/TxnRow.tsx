@@ -154,7 +154,7 @@ export const TxnRow = React.memo(
             <View className="flex-row items-center justify-between mt-1">
               <View className="flex-row items-center gap-2 flex-wrap flex-1 mr-2">
                 <BankBadge bank={t.bank as SupportedBank} size="xs" rectangular />
-                {t.kind === 'loan_repayment' && <Text className="text-ink-500 text-micro">{t.account_no} · 貸款 · 唯讀</Text>}
+                {t.kind === 'loan_repayment' && <Text className="text-ink-500 text-micro">{t.account_no} · 貸款</Text>}
                 {(t.tags ?? []).slice(0, 3).map((tag) => (
                   <Text
                     key={tag}

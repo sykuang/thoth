@@ -109,6 +109,15 @@ test('loan facts render neutral positive principal and a visible unreconciled no
   assert.ok(html.includes('+NT$ 100.001'));
   assert.ok(html.includes('-NT$ 0.1'));
   assert.ok(html.includes('123456789'));
+  const {TxnRow} = require('../components/transactions/TxnRow');
+  for (const wide of [false, true]) {
+    const row = TxnRow.type({t:dataset.transactions[0], wide, fxMode:'original',
+      selectionMode:true, onLongPress:()=>assert.fail('loan must remain read-only')});
+    assert.equal(row.props.onLongPress, undefined);
+    const markup = renderToStaticMarkup(row);
+    assert.ok(!markup.includes('唯讀'));
+    if (!wide) assert.ok(markup.includes(' · 貸款'));
+  }
   const categoryHtml = render([press('txn-view-category')]);
   assert.ok(categoryHtml.includes('-NT$ 0.3'));
   assert.ok(!categoryHtml.includes('+NT$ 100.001'));
@@ -130,7 +139,7 @@ test('loan detail renders safe facts and warning without editing, splitting or A
   const {projectLoanRepayment} = require('./loanRepayments');
   const txn = projectLoanRepayment({id:'loan:v1:detail',bank:'cathay',source_account_id:1,account_no:'123456789',sub_account:'A',currency:'USD',paid_on:transaction.date,due_date:transaction.date,status:'paid',query_start:null,query_end:null,principal:'1.001',interest:'0.1',penalty:'0',paid_total:'1.101',principal_balance:'99.999'})[0];
   const html = renderToStaticMarkup(React.createElement(TxnDetailModal,{txn,fxMode:'auto',onClose:()=>{}}));
-  assert.ok(html.includes('唯讀'));
+  assert.ok(!html.includes('唯讀'));
   assert.ok(html.includes('尚未核對'));
   assert.ok(html.includes('99.999'));
   assert.ok(html.includes('本金餘額'));
