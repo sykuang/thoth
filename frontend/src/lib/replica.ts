@@ -11,6 +11,7 @@ import type {
 } from '@/types/api';
 
 import { projectReplicaDashboard } from './dashboardCache';
+import { projectLoanRepayment, validLoanRepaymentFact } from './loanRepayments';
 
 export const REPLICA_SCHEMA_VERSION = 2;
 
@@ -55,6 +56,7 @@ export type ReplicaEnvelope = {
 
 export type ReplicaTransactionDataset = {
   cursor: string;
+  loanRepaymentsAvailable?: boolean;
   transactions: Transaction[];
   preferences: UserPreferences;
   dashboardCache?: ReplicaDashboardCache;
@@ -487,7 +489,7 @@ function normalizedSplits(row: Record<string, unknown>): TransactionSplit[] | un
   return total === parentAmount ? splits : undefined;
 }
 
-function projectParent(row: Record<string, unknown>): Transaction {
+function projectParent(row: Record<string, unknown>): import('@/types/api').BankTransaction {
   const amount = numberOrNull(row.amount) ?? 0;
   const cashflowAmount = Math.abs(numberOrNull(row.cashflow_amount) ?? amount);
   const displayAmount = Math.abs(numberOrNull(row.display_amount) ?? amount);
@@ -623,6 +625,18 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
         datetime: parent.datetime ?? '',
       });
     }
+    if (partition.loan_repayments !== undefined) {
+      if (!Array.isArray(partition.loan_repayments) || !partition.loan_repayments.every(validLoanRepaymentFact)) {
+        throw new Error('Invalid loan repayment facts');
+      }
+      for (const fact of partition.loan_repayments) {
+        if (fact.bank !== bank) throw new Error('Loan repayment bank mismatch');
+        const excluded = asRows(partition.accounts).some(account => account.account_no === fact.account_no
+          && account.excluded === true);
+        const rows = projectLoanRepayment(fact, excluded);
+        if (rows.length) groups.push({rows, bankOrder, kindOrder:3, id:fact.id, date:fact.paid_on ?? '', datetime:''});
+      }
+    }
     bankOrder += 1;
   }
   groups.sort((left, right) => {
@@ -659,6 +673,8 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
   };
   return {
     cursor,
+    loanRepaymentsAvailable: Object.entries(envelope.partitions).filter(([name]) => name.startsWith('bank:'))
+      .every(([, value]) => Array.isArray((value as Record<string, unknown>).loan_repayments)),
     transactions,
     preferences: projectedPreferences,
     dashboardCache: projectReplicaDashboard(

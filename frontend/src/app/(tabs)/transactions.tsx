@@ -33,6 +33,9 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { BrokerageTxnRow } from '@/components/transactions/BrokerageTxnRow';
 import { TxnRow } from '@/components/transactions/TxnRow';
+import { addMoney, absMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
+import { LOAN_RECONCILIATION_WARNING } from '@/lib/loanRepayments';
+import { formatDecimal } from '@/lib/decimal';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
 import {
   type Granularity,
@@ -181,6 +184,7 @@ export default function TransactionsScreen() {
   // 統一 row identity：txnKey 與 row key 共用 t.id (Transaction type 已標 required)
   const txnKey = (t: Transaction) => `${t.bank}|${t.kind}|${t.id}`;
   function toggleSelect(t: Transaction) {
+    if (t.read_only) return;
     const k = txnKey(t);
     setSelectedKeys((prev) => {
       const next = new Set(prev);
@@ -332,20 +336,20 @@ export default function TransactionsScreen() {
   //   - 2026-07-05 A 方案: 排序改固定生活記帳順序，不按 pct；否則「飲食」仍可能
   //     在分類 view 跑到底，跟上方 category chips 修法不一致。
   const groupedByCategory = useMemo(() => {
-    type Group = { key: string; label: string; subtotal: number; count: number; pct: number };
+    type Group = { key: string; label: string; subtotal: Money; count: number; pct: number };
     const map = new Map<string, Omit<Group, 'pct'>>();
     for (const t of filteredItems) {
       if (t.excluded === true || t.auto_excluded === true) continue;
       const key = t.category || '__null__';
       const g = map.get(key) ?? { key, label: key === '__null__' ? '未分類' : key, subtotal: 0, count: 0 };
-      g.subtotal += txnCashflowAmount(t);
+      g.subtotal = addMoney(g.subtotal, txnCashflowAmount(t));
       g.count += 1;
       map.set(key, g);
     }
     const groups = Array.from(map.values());
-    const total = groups.reduce((s, g) => s + Math.abs(g.subtotal), 0);
+    const total = groups.reduce<Money>((s, g) => addMoney(s, absMoney(g.subtotal)), 0);
     return groups
-      .map<Group>((g) => ({ ...g, pct: total > 0 ? (Math.abs(g.subtotal) / total) * 100 : 0 }))
+      .map<Group>((g) => ({ ...g, pct: moneyPercentage(g.subtotal, total) }))
       .sort((a, b) => {
         const rankDiff = categorySortRank(a.key) - categorySortRank(b.key);
         if (rankDiff !== 0) return rankDiff;
@@ -393,7 +397,7 @@ export default function TransactionsScreen() {
   // computePeriodStats(rawItems) 取代. 砍掉 day/year/month 三分支邏輯,
   // 因為全 snapshot 已在 frontend，monthStats 永遠從 rawItems 算就準.
   const incomeAmt = monthStats?.income ?? 0;
-  const expenseAmt = Math.abs(monthStats?.expense ?? 0);
+  const expenseAmt = absMoney(monthStats?.expense ?? 0);
 
   // Period label 給 section header / CategorySummary 用
   const periodLabel = periodDisplayLabel(granularity, selectedPeriod);
@@ -417,6 +421,15 @@ export default function TransactionsScreen() {
       }
     >
       <View className="px-4 py-4 max-w-[800px] w-full mx-auto">
+        {rawItems.some(t => t.kind === 'loan_repayment') && (
+          <View testID="loan-reconciliation-warning" accessibilityRole="alert" className="p-3 mb-3 bg-amber-50 dark:bg-ink-800">
+            <Text className="text-ink-700 dark:text-ink-200">{LOAN_RECONCILIATION_WARNING}</Text>
+            {Object.entries(monthStats.loan_by_currency ?? {}).map(([currency, stats]) => (
+              <Text key={currency} className="text-red-600 dark:text-red-400">貸款支出（未核對）-{currency} {formatDecimal(stats.expense)}</Text>
+            ))}
+          </View>
+        )}
+        {datasetQ.data?.loanRepaymentsAvailable === false && <Text className="text-ink-500">伺服器未提供完整貸款還款資料，不能視為零筆。</Text>}
         {/* Header: 收支表 標題 + Phase 9.2 選取模式按鈕 */}
         <View className="flex-row items-center justify-between mb-3">
           <View className="w-16" />{/* spacer 對稱 */}
@@ -738,13 +751,13 @@ export default function TransactionsScreen() {
                       }
                     }}
                     onLongPress={() => {
-                      if (!selectionMode) {
+                      if (!selectionMode && !item.transaction.read_only) {
                         setSelectionMode(true);
                         setSelectedKeys(new Set([txnKey(item.transaction)]));
                       }
                     }}
                     selected={selectionMode && selectedKeys.has(txnKey(item.transaction))}
-                    selectionMode={selectionMode}
+                    selectionMode={selectionMode && !item.transaction.read_only}
                   />
                 ))
               ) : (
@@ -753,15 +766,15 @@ export default function TransactionsScreen() {
                 // 按 pct 降序, 大宗在頂
                 groupedByCategory.map((g) => {
                   const barColor =
-                    g.subtotal > 0
+                    moneySign(g.subtotal) > 0
                       ? 'bg-accent-500 dark:bg-accent-500'
-                      : g.subtotal < 0
+                      : moneySign(g.subtotal) < 0
                         ? 'bg-red-500 dark:bg-red-500'
                         : 'bg-ink-400 dark:bg-ink-500';
                   const amountColor =
-                    g.subtotal > 0
+                    moneySign(g.subtotal) > 0
                       ? 'text-accent-600 dark:text-accent-500'
-                      : g.subtotal < 0
+                      : moneySign(g.subtotal) < 0
                         ? 'text-red-600 dark:text-red-400'
                         : 'text-ink-500 dark:text-ink-400';
                   return (

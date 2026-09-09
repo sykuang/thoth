@@ -22,7 +22,9 @@
  *   - dashboard.tsx 用的 amount_by_month / subscription / passive_income / flow_type
  *     enum 邏輯 (太複雜, 且 dashboard 無 filter 重打成本=0, 維持 server stats)
  */
+import { addMoney, absMoney, negateMoney, moneySign, type Money } from './money';
 import type { Transaction } from '@/types/api';
+import { loanStatsByCurrency, type LoanCurrencyStats } from './loanRepayments';
 
 // ============================================================
 // Filter — 套 category/subcategory/direction/search
@@ -55,7 +57,7 @@ export function txnCashflowDirection(t: Transaction): TxnCashflowDirection {
   }
   if (t.cashflow_direction === 'neutral') return 'zero';
   if (t.txn_type === 'cashback' || t.txn_type === 'refund' || t.txn_type === 'fee_waiver') return 'income';
-  if (t.txn_type === 'payment') return 'zero';
+  if (t.txn_type === 'payment' || t.kind === 'loan_repayment') return 'zero';
   const amt = t.amount ?? 0;
   if (amt > 0) return 'income';
   if (amt < 0) return 'expense';
@@ -63,7 +65,9 @@ export function txnCashflowDirection(t: Transaction): TxnCashflowDirection {
 }
 
 /** Signed amount from the user's cash-flow perspective. */
-export function txnCashflowAmount(t: Transaction): number {
+export function txnCashflowAmount(t: Transaction): Money {
+  // Unconverted foreign loans stay in explicit original-currency buckets.
+  if (t.kind === 'loan_repayment') return t.currency === 'TWD' && t.component !== 'principal' ? negateMoney(t.cashflow_amount) : 0;
   if (typeof t.cashflow_amount === 'number') {
     const dir = txnCashflowDirection(t);
     if (dir === 'income') return Math.abs(t.cashflow_amount);
@@ -104,7 +108,7 @@ export function applyTxnFilters(items: Transaction[], f: TxnFilters): Transactio
     // 對齊 backend `q` filter 行為: server 端只 match desc, 此處是 client 補強 (期間內 row
     // 已全載到 rawItems, 多 match tag 不會增加 API call).
     if (searchLower) {
-      const desc = (t.description ?? '').toLowerCase();
+      const desc = (t.kind === 'loan_repayment' ? [t.description, t.bank, t.account_no, t.currency, t.loan_repayment.sub_account].join(' ') : t.description ?? '').toLowerCase();
       const hitDesc = desc.includes(searchLower);
       const hitTag = (t.tags ?? []).some((tag) =>
         tag.toLowerCase().includes(searchLower),
@@ -189,9 +193,10 @@ export function aggregateBySubcategory(
 // ============================================================
 
 export type PeriodStats = {
-  income: number;   // 正數
-  expense: number;  // 正數 (絕對值)
-  net: number;      // income - expense
+  loan_by_currency?: LoanCurrencyStats;
+  income: Money;   // 正數
+  expense: Money;  // 正數 (絕對值)
+  net: Money;      // income - expense
   count: number;    // 入算的筆數
 };
 
@@ -215,18 +220,19 @@ export type PeriodStats = {
  *   就算什麼方向.
  */
 export function computePeriodStats(items: Transaction[]): PeriodStats {
-  let income = 0;
-  let expense = 0;
+  let income: Money = 0;
+  let expense: Money = 0;
   let count = 0;
   for (const t of items) {
     if (t.excluded === true || t.auto_excluded === true) continue;
     const signed = txnCashflowAmount(t);
-    if (signed !== 0) count += 1;
-    if (signed > 0) {
-      income += signed;
-    } else if (signed < 0) {
-      expense += -signed;
+    const sign = moneySign(signed);
+    if (sign !== 0) count += 1;
+    if (typeof signed === 'number' && sign > 0) {
+      income = addMoney(income, signed);
+    } else if (sign < 0) {
+      expense = addMoney(expense, absMoney(signed));
     }
   }
-  return { income, expense, net: income - expense, count };
+  return { income, expense, net: addMoney(income, negateMoney(expense)), count, ...(items.some(t => t.kind === 'loan_repayment') ? {loan_by_currency:loanStatsByCurrency(items)} : {}) };
 }

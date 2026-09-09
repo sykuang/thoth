@@ -100,7 +100,7 @@ export type TriggerSyncResponse = {
 // Phase 5 — /transactions API (跨銀行聚合)
 // ---------------------------------------------------------------------------
 
-export type TransactionKind = 'twd' | 'billed' | 'pending';
+export type TransactionKind = 'twd' | 'billed' | 'pending' | 'loan_repayment';
 
 /**
  * Phase 10 (2026-07-29) — 分類拆帳的單一子項。
@@ -121,7 +121,24 @@ export type TransactionSplit = {
   auto_excluded?: boolean;
 };
 
-export type Transaction = {
+export type LoanRepaymentFact = {
+  id: string; bank: string; source_account_id: number | null;
+  account_no: string; sub_account: string; currency: string;
+  due_date: string | null; paid_on: string | null; status: string | null;
+  query_start: string | null; query_end: string | null;
+  principal: string; interest: string; penalty: string;
+  paid_total: string; principal_balance: string; excluded?: boolean;
+};
+export type LoanTransaction = Omit<BankTransaction, 'kind' | 'amount' | 'cashflow_amount' | 'display_amount' | 'read_only' | 'reconciliation_status'> & {
+  kind: 'loan_repayment'; source_account_id: number | null; amount: string; cashflow_amount: string; display_amount: string;
+  component: 'principal' | 'interest' | 'penalty'; display_sign: '+' | '-';
+  read_only: true; reconciliation_status: 'unverified'; loan_repayment: LoanRepaymentFact;
+};
+export type Transaction = BankTransaction | LoanTransaction;
+export type BankTransaction = {
+  read_only?: false;
+  reconciliation_status?: never;
+
   /**
    * SQLite rowid in the bank's DB. Required for detail / PATCH endpoints.
    *
@@ -131,7 +148,7 @@ export type Transaction = {
    */
   id: number | string;
   bank: string;
-  kind: TransactionKind;
+  kind: Exclude<TransactionKind, 'loan_repayment'>;
   date: string | null;
   datetime: string | null;
   description: string | null;
@@ -465,19 +482,21 @@ export const BANK_LABELS: Record<SupportedBank, string> = {
 // =====================================================================
 
 export type DashboardStats = {
+  /** Unreconciled loan detail; TWD expenses are also included in unified aggregates. */
+  loan_by_currency?: Record<string, {income:string; expense:string; net:string; count:number}>;
   total: number;
-  total_income: number;
-  total_expense: number;
-  total_net: number;
-  amount_by_month: Record<string, { income: number; expense: number; net: number; count: number }>;
-  amount_by_category: Record<string, number>;
+  total_income: number | string;
+  total_expense: number | string;
+  total_net: number | string;
+  amount_by_month: Record<string, { income: number | string; expense: number | string; net: number | string; count: number }>;
+  amount_by_category: Record<string, number | string>;
   by_kind: Record<string, number>;
-  amount_by_flow_type?: Record<string, number>;
-  subscription_total?: number;
-  subscription_by_month?: Record<string, number>;
-  amount_by_income_category?: Record<string, number>;
-  passive_income_total?: number;
-  passive_income_by_month?: Record<string, number>;
+  amount_by_flow_type?: Record<string, number | string>;
+  subscription_total?: number | string;
+  subscription_by_month?: Record<string, number | string>;
+  amount_by_income_category?: Record<string, number | string>;
+  passive_income_total?: number | string;
+  passive_income_by_month?: Record<string, number | string>;
   passive_income_pct?: number;
   income_unclassified_count?: number;
 };

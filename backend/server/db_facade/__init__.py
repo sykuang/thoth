@@ -76,7 +76,11 @@ class _TransactionScope(
     """All per-domain write mixins layered on top of the base scope."""
 
 
+from .loans import LoansReadMixin
+
+
 class Database(
+    LoansReadMixin,
     AccountsReadMixin,
     CardsReadMixin,
     PortfolioReadMixin,

@@ -42,6 +42,7 @@ export const TxnRow = React.memo(
     selected = false,
     selectionMode = false,
   }: TxnRowProps) {
+    if (t.read_only) { selectionMode = false; onLongPress = undefined; }
     const render = renderAmount(t, fxMode);
     // Backend already returns t.date according to cardDateBasis; keep this fallback
     // for older API payloads that may not yet have migrated.
@@ -153,6 +154,7 @@ export const TxnRow = React.memo(
             <View className="flex-row items-center justify-between mt-1">
               <View className="flex-row items-center gap-2 flex-wrap flex-1 mr-2">
                 <BankBadge bank={t.bank as SupportedBank} size="xs" rectangular />
+                {t.kind === 'loan_repayment' && <Text className="text-ink-500 text-micro">{t.account_no} · 貸款 · 唯讀</Text>}
                 {(t.tags ?? []).slice(0, 3).map((tag) => (
                   <Text
                     key={tag}
@@ -213,7 +215,7 @@ export const TxnRow = React.memo(
           {BANK_LABELS[t.bank as SupportedBank] ?? t.bank}
         </Text>
         <Text className="w-32 px-3 py-2 text-small text-ink-700 dark:text-ink-300 font-mono">
-          {maskCardNo(t.account_or_card)}
+          {t.kind === 'loan_repayment' ? t.account_no : maskCardNo(t.account_or_card)}
         </Text>
         <View className="flex-1 px-3 py-2">
           <Text className="text-small text-ink-700 dark:text-ink-300" numberOfLines={2}>

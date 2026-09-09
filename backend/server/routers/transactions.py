@@ -57,11 +57,13 @@ import json
 import logging
 import re
 import time
+from decimal import Decimal, localcontext
+from backend.server.db_facade.loans import loan_transactions, decimal_string
 from backend.server import db
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from backend.core import bank_data
 from backend.core.store import canonical_display_description
@@ -765,6 +767,8 @@ def _collect_transaction_stat_rows(
     card_date_basis: Literal["consume", "post"] = "consume",
 ) -> list[Any]:
     """Stats fast path: lightweight rows only, no SELECT * / raw transform."""
+    if "loan_repayment" in kinds:
+        return []  # Opt-in uses the canonical projection; legacy fast path stays untouched.
     if q:
         # q searches description/counterparty/memo; lightweight rows do not carry
         # those fields. Preserve behavior by falling back to full rows.
@@ -809,6 +813,7 @@ def _collect_transactions(
     account_no: str | None = None,
     card_no: str | None = None,
     card_date_basis: Literal["consume", "post"] = "consume",
+    source_account_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """跨銀行收集 transactions, in-memory 過濾, 後續排序+分頁.
 
@@ -825,6 +830,9 @@ def _collect_transactions(
     for bank in banks:
         bank_excluded_accounts = excluded_accounts_map.get(bank, set())
         bank_excluded_cards = excluded_cards_map.get(bank, set())
+        if "loan_repayment" in kinds:
+            for fact in db_api.list_loan_repayments(bank=bank, user_id=user_id, source_account_id=source_account_id):
+                items.extend(loan_transactions(fact, fact.account_no in bank_excluded_accounts))
         for txn_row in db_api.list_txns_for_bank(
             bank=bank, user_id=user_id, kinds=kinds,
         ):
@@ -879,7 +887,9 @@ def _collect_transactions(
 @router.get("")
 def list_transactions(
     bank: str | None = Query(None, description="銀行 code 或 comma 分隔列表 (e.g. 'hsbc,sinopac')"),
-    kind: Literal["twd", "billed", "pending", "all"] = Query("all"),
+    kind: Literal["twd", "billed", "pending", "loan_repayment", "all"] = Query("all"),
+    include_loan_repayments: bool = False,
+    currency: str | None = None,
     since: str | None = Query(None, description="起始日 YYYY-MM-DD (含)"),
     until: str | None = Query(None, description="結束日 YYYY-MM-DD (含)"),
     account_id: int | None = Query(None, description="指定 BankAccount id, 蓋過 bank"),
@@ -901,11 +911,17 @@ def list_transactions(
 ) -> dict[str, Any]:
     banks = _resolve_banks(bank, account_id, user["id"])
     kinds = ["twd", "billed", "pending"] if kind == "all" else [kind]
+    if include_loan_repayments and kind == "all":
+        kinds.append("loan_repayment")
     items = _collect_transactions(
         banks, kinds, since, until, q, category, user_id=user["id"],
         subcategory=subcategory, account_no=account_no, card_no=card_no,
+        source_account_id=account_id,
         card_date_basis=card_date_basis,
     )
+
+    if currency:
+        items = [item for item in items if item.get("currency") == currency]
 
     # Phase 6 (2026-06-14 PM): direction filter — 收入 / 支出 / 全部
     # 依 normalized cashflow_direction 判斷，不看 raw amount 符號。
@@ -937,7 +953,9 @@ def transactions_stats(
     bank: str | None = Query(None),
     account_id: int | None = Query(None),
     # Phase 8.2 A 路線 (2026-06-14): chip 來源跟隨當前 filter 範圍
-    kind: Literal["twd", "billed", "pending", "all"] = Query("all"),
+    kind: Literal["twd", "billed", "pending", "loan_repayment", "all"] = Query("all"),
+    include_loan_repayments: bool = False,
+    currency: str | None = None,
     since: str | None = Query(None, description="起始日 YYYY-MM-DD (含)"),
     until: str | None = Query(None, description="結束日 YYYY-MM-DD (含)"),
     q: str | None = Query(None, description="描述子字串 (case-insensitive)"),
@@ -948,7 +966,9 @@ def transactions_stats(
 ) -> dict[str, Any]:
     banks = _resolve_banks(bank, account_id, user["id"])
     kinds = ["twd", "billed", "pending"] if kind == "all" else [kind]
-    params = (tuple(banks), tuple(kinds), since, until, q, category, card_date_basis)
+    if include_loan_repayments and kind == "all":
+        kinds.append("loan_repayment")
+    params = (tuple(banks), tuple(kinds), since, until, q, category, card_date_basis, currency, account_id)
     return get_or_set_dashboard_cache(
         "transactions.stats",
         user_id=user["id"],
@@ -963,6 +983,8 @@ def transactions_stats(
             category=category,
             card_date_basis=card_date_basis,
             user_id=user["id"],
+            currency=currency,
+            source_account_id=account_id,
         ),
     )
 
@@ -977,11 +999,13 @@ def _compute_transactions_stats(
     category: str | None,
     card_date_basis: Literal["consume", "post"],
     user_id: int,
+    currency: str | None = None,
+    source_account_id: int | None = None,
 ) -> dict[str, Any]:
     # Phase 8.2 鐵則: 主聚合不帶 category 才有「全部主類 chip」可選；
     # category 只用在 by_subcategory 限縮 (見下方 if t["category"] == category 判斷)
     collect_started = time.perf_counter()
-    items = _collect_transaction_stat_rows(
+    items = [] if currency else _collect_transaction_stat_rows(
         banks, kinds, since, until, q, user_id=user_id, card_date_basis=card_date_basis,
     )
     collect_ms = (time.perf_counter() - collect_started) * 1000
@@ -991,6 +1015,7 @@ def _compute_transactions_stats(
         fallback_started = time.perf_counter()
         items = _collect_transactions(
             banks, kinds, since, until, q, None, user_id=user_id, subcategory=None,
+            source_account_id=source_account_id,
             card_date_basis=card_date_basis,
         )
         collect_ms += (time.perf_counter() - fallback_started) * 1000
@@ -998,173 +1023,192 @@ def _compute_transactions_stats(
         "event=transactions.stats section=collect user_id=%s duration_ms=%.1f banks=%s kinds=%s rows=%s fallback=%s",
         user_id, collect_ms, len(banks), ",".join(kinds), len(items), fallback_used,
     )
-    aggregate_started = time.perf_counter()
+    if currency:
+        items = [item for item in items if _item_get(item, 'currency', 'TWD') == currency]
+    if "loan_repayment" in kinds and len({_item_get(item, 'currency', 'TWD') for item in items}) > 1:
+        raise HTTPException(400, "貸款統計包含不同幣別，請先選擇幣別")
+    with localcontext() as context:
+        if "loan_repayment" in kinds:
+            context.prec = max(28, sum(len(str(_item_get(item, 'cashflow_amount', 0))) for item in items) + 10)
+        aggregate_started = time.perf_counter()
 
-    by_bank: dict[str, int] = {}
-    by_kind: dict[str, int] = {}
-    by_month: dict[str, int] = {}
-    by_category: dict[str, int] = {}
-    by_subcategory: dict[str, int] = {}  # Phase 8.2: 子分類 chip 來源 (含當前 filter)
+        by_bank: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        by_month: dict[str, int] = {}
+        by_category: dict[str, int] = {}
+        by_subcategory: dict[str, int] = {}  # Phase 8.2: 子分類 chip 來源 (含當前 filter)
 
-    # L8.5 — amount sum buckets (income = positive, expense = negative)
-    amount_by_month: dict[str, dict[str, int]] = {}  # {"2026-06": {income, expense, net, count}}
-    amount_by_category: dict[str, int] = {}  # 純支出金額 (取絕對值)
-    total_income = 0
-    total_expense = 0  # 累計支出 (絕對值，正數)
+        # L8.5 — amount sum buckets (income = positive, expense = negative)
+        amount_by_month: dict[str, dict[str, int]] = {}  # {"2026-06": {income, expense, net, count}}
+        amount_by_category: dict[str, int] = {}  # 純支出金額 (取絕對值)
+        total_income = 0
+        total_expense = 0  # 累計支出 (絕對值，正數)
 
-    # Phase 6 (category taxonomy 2026-06-15) — 新統計:
-    #   amount_by_flow_type: 看 flow_type 4 桶分佈 (expense/income/transfer/investment)
-    #                        驗證 transfer/investment 是否乾淨脫離 expense KPI
-    #   subscription_total : 本月訂閱合計 (Netflix/Spotify/iCloud/...)
-    #   subscription_by_month: 各月訂閱金額 (用於趨勢)
-    # 詳見 wiki [[personal-finance-transaction-category-taxonomy]]
-    amount_by_flow_type: dict[str, int] = {
-        "expense": 0, "income": 0, "transfer": 0, "investment": 0,
-    }
-    subscription_total = 0  # 全期訂閱金額 (絕對值)
-    subscription_by_month: dict[str, int] = {}
-    # Phase 7 (Income 5 類 2026-06-15) — FIRE 被動收入指標
-    #   amount_by_income_category: 收入 5 enum 分桶 (salary/bonus/interest_dividend/investment_gain/other)
-    #   passive_income_total:      被動收入合計 (interest_dividend + investment_gain)
-    #                              FIRE 公式分子
-    #   passive_income_by_month:   各月被動收入 (用於趨勢圖)
-    # 詳見 wiki [[income-classifier-and-fire-passive-income-spec]]
-    amount_by_income_category: dict[str, int] = {
-        "salary": 0, "bonus": 0, "interest_dividend": 0,
-        "investment_gain": 0, "other": 0,
-    }
-    income_unclassified_count = 0  # 未分類 income row 數 (UI 提示用)
-    passive_income_total = 0
-    passive_income_by_month: dict[str, int] = {}
+        # Phase 6 (category taxonomy 2026-06-15) — 新統計:
+        #   amount_by_flow_type: 看 flow_type 4 桶分佈 (expense/income/transfer/investment)
+        #                        驗證 transfer/investment 是否乾淨脫離 expense KPI
+        #   subscription_total : 本月訂閱合計 (Netflix/Spotify/iCloud/...)
+        #   subscription_by_month: 各月訂閱金額 (用於趨勢)
+        # 詳見 wiki [[personal-finance-transaction-category-taxonomy]]
+        amount_by_flow_type: dict[str, int] = {
+            "expense": 0, "income": 0, "transfer": 0, "investment": 0,
+        }
+        subscription_total = 0  # 全期訂閱金額 (絕對值)
+        subscription_by_month: dict[str, int] = {}
+        # Phase 7 (Income 5 類 2026-06-15) — FIRE 被動收入指標
+        #   amount_by_income_category: 收入 5 enum 分桶 (salary/bonus/interest_dividend/investment_gain/other)
+        #   passive_income_total:      被動收入合計 (interest_dividend + investment_gain)
+        #                              FIRE 公式分子
+        #   passive_income_by_month:   各月被動收入 (用於趨勢圖)
+        # 詳見 wiki [[income-classifier-and-fire-passive-income-spec]]
+        amount_by_income_category: dict[str, int] = {
+            "salary": 0, "bonus": 0, "interest_dividend": 0,
+            "investment_gain": 0, "other": 0,
+        }
+        income_unclassified_count = 0  # 未分類 income row 數 (UI 提示用)
+        passive_income_total = 0
+        passive_income_by_month: dict[str, int] = {}
 
-    for t in items:
-        # Phase 6 (excluded): 該 txn 的帳戶被標「不納入淨資產統計」→ 不算 stats
-        # by_bank / by_kind / by_month 等 raw count 仍算 (frontend 可看到), 但
-        # 金額類 bucket (amount_by_month / amount_by_category / total_*) 全跳過
-        #
-        # Phase 8.3 (2026-06-15): 加 auto_excluded — categorizer 命中標
-        # auto_excluded=1 的 rule (信用卡還款/轉帳/退款/回饋) 的 row 也納入 skip。
-        # 跟既有 per-account/per-card excluded 等效併用 (OR 邏輯)。
-        # 注意: by_category / by_subcategory raw count 也跟著 skip (auto_excluded row
-        # 不該污染 chip 列), 跟既有 excluded 不同 —— 後者只 skip 金額不 skip count,
-        # 因為 per-account excluded 是「整個帳戶不看」, 而 auto_excluded 是「這筆 by
-        # definition 不算收支」, 但這筆 row 還是要在 list 看得到 (反灰), 統計類
-        # bucket 全 skip。
-        is_excluded = bool(_item_get(t, "excluded")) or bool(_item_get(t, "auto_excluded"))
-        bank_key = _item_get(t, "bank")
-        kind_key = _item_get(t, "kind")
-        by_bank[bank_key] = by_bank.get(bank_key, 0) + 1
-        by_kind[kind_key] = by_kind.get(kind_key, 0) + 1
-        m = (_normalize_date(_item_get(t, "date")) or "")[:7]
-        if m:
-            by_month[m] = by_month.get(m, 0) + 1
-        # by_category / by_subcategory chip count: auto_excluded row 不計入
-        # (避免「還款 9 筆」chip 仍出現)
-        if not is_excluded:
-            category_value = _item_get(t, "category")
-            if category_value:
-                by_category[category_value] = by_category.get(category_value, 0) + 1
-            else:
-                # Phase 8.2 B: 未分類 (NULL/"") 用 __null__ sentinel key 暴露給 frontend chip
-                by_category["__null__"] = by_category.get("__null__", 0) + 1
-            # Phase 8.2: subcategory 統計 (chip 來源用)
-            # 鐵則: 只 aggregate 屬於當前 category filter 的 row, 否則子類 chip 會跨主類混雜
-            sub = _item_get(t, "subcategory")
-            if sub and (category is None or category_value == category):
-                by_subcategory[sub] = by_subcategory.get(sub, 0) + 1
-
-        if is_excluded:
-            continue
-
-        cashflow_direction = _item_get(t, "cashflow_direction") or _stat_cashflow_direction(t)
-        cashflow_amount = _item_get(t, "cashflow_amount")
-        if not isinstance(cashflow_amount, (int, float)):
-            cashflow_amount = _stat_cashflow_amount(t)
-        cashflow_amount = int(cashflow_amount)
-        abs_cashflow = abs(cashflow_amount)
-        flow_type = _item_get(t, "flow_type")
-        if flow_type in amount_by_flow_type:
-            amount_by_flow_type[flow_type] += abs_cashflow
-        # Phase 6 (taxonomy) subscription aggregate
-        if _item_get(t, "is_subscription") and cashflow_direction == "expense":
-            v = abs_cashflow
-            subscription_total += v
+        for t in items:
+            # Phase 6 (excluded): 該 txn 的帳戶被標「不納入淨資產統計」→ 不算 stats
+            # by_bank / by_kind / by_month 等 raw count 仍算 (frontend 可看到), 但
+            # 金額類 bucket (amount_by_month / amount_by_category / total_*) 全跳過
+            #
+            # Phase 8.3 (2026-06-15): 加 auto_excluded — categorizer 命中標
+            # auto_excluded=1 的 rule (信用卡還款/轉帳/退款/回饋) 的 row 也納入 skip。
+            # 跟既有 per-account/per-card excluded 等效併用 (OR 邏輯)。
+            # 注意: by_category / by_subcategory raw count 也跟著 skip (auto_excluded row
+            # 不該污染 chip 列), 跟既有 excluded 不同 —— 後者只 skip 金額不 skip count,
+            # 因為 per-account excluded 是「整個帳戶不看」, 而 auto_excluded 是「這筆 by
+            # definition 不算收支」, 但這筆 row 還是要在 list 看得到 (反灰), 統計類
+            # bucket 全 skip。
+            is_excluded = bool(_item_get(t, "excluded")) or bool(_item_get(t, "auto_excluded"))
+            bank_key = _item_get(t, "bank")
+            kind_key = _item_get(t, "kind")
+            by_bank[bank_key] = by_bank.get(bank_key, 0) + 1
+            by_kind[kind_key] = by_kind.get(kind_key, 0) + 1
+            m = (_normalize_date(_item_get(t, "date")) or "")[:7]
             if m:
-                subscription_by_month[m] = subscription_by_month.get(m, 0) + v
-        # Phase 7 (Income 5 類) income_category aggregate (FIRE 指標基礎)
-        # 鐵則: persisted taxonomy 與使用者視角方向都必須是 income。任一 writer
-        # 誤標（例如「放款利息」支出）都 fail closed，不得進收入或 FIRE 分子。
-        if flow_type == "income" and cashflow_direction == "income":
-            ic = _item_get(t, "income_category")
-            if ic in amount_by_income_category:
-                v = abs_cashflow
-                amount_by_income_category[ic] += v
-                # 被動收入兩類 (interest_dividend + investment_gain)
-                if ic in ("interest_dividend", "investment_gain"):
-                    passive_income_total += v
-                    if m:
-                        passive_income_by_month[m] = (
-                            passive_income_by_month.get(m, 0) + v
-                        )
-            else:
-                # ic is None / 未分類 / 信用卡 refund row → 不算進 5 類但記 unclassified count
-                income_unclassified_count += 1
-        if m:
-            bucket = amount_by_month.setdefault(
-                m, {"income": 0, "expense": 0, "net": 0, "count": 0},
-            )
-            bucket["count"] += 1
-            if cashflow_direction == "income":
-                v = abs_cashflow
-                bucket["income"] += v
-                bucket["net"] += v
-                total_income += v
-            elif cashflow_direction == "expense":
-                v = abs_cashflow
-                bucket["expense"] += v
-                bucket["net"] -= v
-                total_expense += v
-        # 分類統計只看「真正的支出」(expense 性質), 排掉 income/payment
-        category_value = _item_get(t, "category")
-        if category_value and cashflow_direction == "expense":
-            amount_by_category[category_value] = (
-                amount_by_category.get(category_value, 0) + abs_cashflow
-            )
+                by_month[m] = by_month.get(m, 0) + 1
+            # by_category / by_subcategory chip count: auto_excluded row 不計入
+            # (避免「還款 9 筆」chip 仍出現)
+            if not is_excluded:
+                category_value = _item_get(t, "category")
+                if category_value:
+                    by_category[category_value] = by_category.get(category_value, 0) + 1
+                else:
+                    # Phase 8.2 B: 未分類 (NULL/"") 用 __null__ sentinel key 暴露給 frontend chip
+                    by_category["__null__"] = by_category.get("__null__", 0) + 1
+                # Phase 8.2: subcategory 統計 (chip 來源用)
+                # 鐵則: 只 aggregate 屬於當前 category filter 的 row, 否則子類 chip 會跨主類混雜
+                sub = _item_get(t, "subcategory")
+                if sub and (category is None or category_value == category):
+                    by_subcategory[sub] = by_subcategory.get(sub, 0) + 1
 
-    aggregate_ms = (time.perf_counter() - aggregate_started) * 1000
-    perf_log.info(
-        "event=transactions.stats section=aggregate user_id=%s duration_ms=%.1f rows=%s months=%s categories=%s income=%s expense=%s",
-        user_id, aggregate_ms, len(items), len(amount_by_month), len(amount_by_category), total_income, total_expense,
-    )
-    return {
-        "total": len(items),
-        "by_bank": by_bank,
-        "by_kind": by_kind,
-        "by_month": dict(sorted(by_month.items(), reverse=True)),
-        "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
-        # Phase 8.2 A: 子分類 chip 來源 — 按筆數降冪
-        "by_subcategory": dict(sorted(by_subcategory.items(), key=lambda kv: -kv[1])),
-        "banks_queried": banks,
-        # L8.5 新增 — 金額統計
-        "amount_by_month": dict(sorted(amount_by_month.items(), reverse=True)),
-        "amount_by_category": dict(sorted(amount_by_category.items(), key=lambda kv: -kv[1])),
-        "total_income": total_income,
-        "total_expense": total_expense,
-        "total_net": total_income - total_expense,
-        # Phase 6 (category taxonomy) 新增 — flow_type 分桶 + 訂閱統計
-        "amount_by_flow_type": amount_by_flow_type,
-        "subscription_total": subscription_total,
-        "subscription_by_month": dict(sorted(subscription_by_month.items(), reverse=True)),
-        # Phase 7 (Income 5 類) 新增 — FIRE 被動收入指標
-        "amount_by_income_category": amount_by_income_category,
-        "passive_income_total": passive_income_total,
-        "passive_income_by_month": dict(sorted(passive_income_by_month.items(), reverse=True)),
-        "passive_income_pct": (
-            round(passive_income_total / total_income * 100, 1)
-            if total_income > 0 else 0.0
-        ),
-        "income_unclassified_count": income_unclassified_count,
-    }
+            if is_excluded:
+                continue
+
+            cashflow_direction = _item_get(t, "cashflow_direction") or _stat_cashflow_direction(t)
+            cashflow_amount = _item_get(t, "cashflow_amount")
+            if "loan_repayment" in kinds:
+                cashflow_amount = Decimal(str(cashflow_amount if cashflow_amount is not None else _stat_cashflow_amount(t)))
+            else:
+                if not isinstance(cashflow_amount, (int, float)):
+                    cashflow_amount = _stat_cashflow_amount(t)
+                cashflow_amount = int(cashflow_amount)
+            abs_cashflow = abs(cashflow_amount)
+            flow_type = _item_get(t, "flow_type")
+            if flow_type in amount_by_flow_type:
+                amount_by_flow_type[flow_type] += abs_cashflow
+            # Phase 6 (taxonomy) subscription aggregate
+            if _item_get(t, "is_subscription") and cashflow_direction == "expense":
+                v = abs_cashflow
+                subscription_total += v
+                if m:
+                    subscription_by_month[m] = subscription_by_month.get(m, 0) + v
+            # Phase 7 (Income 5 類) income_category aggregate (FIRE 指標基礎)
+            # 鐵則: persisted taxonomy 與使用者視角方向都必須是 income。任一 writer
+            # 誤標（例如「放款利息」支出）都 fail closed，不得進收入或 FIRE 分子。
+            if flow_type == "income" and cashflow_direction == "income":
+                ic = _item_get(t, "income_category")
+                if ic in amount_by_income_category:
+                    v = abs_cashflow
+                    amount_by_income_category[ic] += v
+                    # 被動收入兩類 (interest_dividend + investment_gain)
+                    if ic in ("interest_dividend", "investment_gain"):
+                        passive_income_total += v
+                        if m:
+                            passive_income_by_month[m] = (
+                                passive_income_by_month.get(m, 0) + v
+                            )
+                else:
+                    # ic is None / 未分類 / 信用卡 refund row → 不算進 5 類但記 unclassified count
+                    income_unclassified_count += 1
+            if m:
+                bucket = amount_by_month.setdefault(
+                    m, {"income": 0, "expense": 0, "net": 0, "count": 0},
+                )
+                bucket["count"] += 1
+                if cashflow_direction == "income":
+                    v = abs_cashflow
+                    bucket["income"] += v
+                    bucket["net"] += v
+                    total_income += v
+                elif cashflow_direction == "expense":
+                    v = abs_cashflow
+                    bucket["expense"] += v
+                    bucket["net"] -= v
+                    total_expense += v
+            # 分類統計只看「真正的支出」(expense 性質), 排掉 income/payment
+            category_value = _item_get(t, "category")
+            if category_value and cashflow_direction == "expense":
+                amount_by_category[category_value] = (
+                    amount_by_category.get(category_value, 0) + abs_cashflow
+                )
+
+        aggregate_ms = (time.perf_counter() - aggregate_started) * 1000
+        perf_log.info(
+            "event=transactions.stats section=aggregate user_id=%s duration_ms=%.1f rows=%s months=%s categories=%s",
+            user_id, aggregate_ms, len(items), len(amount_by_month), len(amount_by_category),
+        )
+        result = {
+            "total": len(items),
+            "by_bank": by_bank,
+            "by_kind": by_kind,
+            "by_month": dict(sorted(by_month.items(), reverse=True)),
+            "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
+            # Phase 8.2 A: 子分類 chip 來源 — 按筆數降冪
+            "by_subcategory": dict(sorted(by_subcategory.items(), key=lambda kv: -kv[1])),
+            "banks_queried": banks,
+            # L8.5 新增 — 金額統計
+            "amount_by_month": dict(sorted(amount_by_month.items(), reverse=True)),
+            "amount_by_category": dict(sorted(amount_by_category.items(), key=lambda kv: -kv[1])),
+            "total_income": total_income,
+            "total_expense": total_expense,
+            "total_net": total_income - total_expense,
+            # Phase 6 (category taxonomy) 新增 — flow_type 分桶 + 訂閱統計
+            "amount_by_flow_type": amount_by_flow_type,
+            "subscription_total": subscription_total,
+            "subscription_by_month": dict(sorted(subscription_by_month.items(), reverse=True)),
+            # Phase 7 (Income 5 類) 新增 — FIRE 被動收入指標
+            "amount_by_income_category": amount_by_income_category,
+            "passive_income_total": passive_income_total,
+            "passive_income_by_month": dict(sorted(passive_income_by_month.items(), reverse=True)),
+            "passive_income_pct": (
+                round(passive_income_total / total_income * 100, 1)
+                if total_income > 0 else 0.0
+            ),
+            "income_unclassified_count": income_unclassified_count,
+        }
+        if "loan_repayment" in kinds:
+            def money(value):
+                if isinstance(value, dict):
+                    return {key: (item if key == "count" else money(item)) for key, item in value.items()}
+                return decimal_string(value)
+            for key in result:
+                if key.startswith("amount_by_") or key in {"total_income", "total_expense", "total_net", "subscription_total", "subscription_by_month", "passive_income_total", "passive_income_by_month"}:
+                    result[key] = money(result[key])
+        return result
 
 
 # ============================================================
@@ -1194,14 +1238,29 @@ def _assert_bank_ownership(user_id: int, bank: str) -> None:
         )
 
 
+def _legacy_transaction_id(value: int | str) -> int:
+    try:
+        return TypeAdapter(int).validate_python(value)
+    except ValidationError:
+        raise HTTPException(422, "交易編號格式錯誤") from None
+
+
 @router.get("/{bank}/{kind}/{txn_id}")
 def get_transaction_detail(
     bank: str,
-    kind: Literal["twd", "billed", "pending"],
-    txn_id: int,
+    kind: Literal["twd", "billed", "pending", "loan_repayment"],
+    txn_id: int | str,
     user: dict = Depends(current_user),
 ) -> dict[str, Any]:
     """單筆交易完整 detail (含 raw row, 給 frontend modal 編輯用)."""
+    if kind == "loan_repayment":
+        _assert_bank_ownership(user["id"], bank)
+        items = _collect_transactions([bank], [kind], None, None, None, None, user_id=user["id"])
+        item = next((item for item in items if item["id"] == txn_id), None)
+        if item is None:
+            raise HTTPException(404, "找不到此筆交易")
+        return item
+    txn_id = _legacy_transaction_id(txn_id)
     if bank not in KNOWN_BANKS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"不支援的銀行: {bank}")
     if kind not in _KIND_TO_TABLE:
@@ -1366,12 +1425,15 @@ def delete_hashtag(
 @router.patch("/{bank}/{kind}/{txn_id}")
 def update_transaction(
     bank: str,
-    kind: Literal["twd", "billed", "pending"],
-    txn_id: int,
+    kind: Literal["twd", "billed", "pending", "loan_repayment"],
+    txn_id: int | str,
     body: dict[str, Any],
     user: dict = Depends(current_user),
 ) -> dict[str, Any]:
     """改單筆交易的 category / subcategory (其他欄位禁改保護 raw data)."""
+    if kind == "loan_repayment":
+        raise HTTPException(400, "銀行貸款還款明細僅供讀取，無法修改")
+    txn_id = _legacy_transaction_id(txn_id)
     if bank not in KNOWN_BANKS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"不支援的銀行: {bank}")
     if kind not in _KIND_TO_TABLE:

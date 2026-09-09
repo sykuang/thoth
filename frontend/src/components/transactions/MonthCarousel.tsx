@@ -16,7 +16,7 @@ export interface MonthCarouselProps {
   onGranularityChange: (g: Granularity) => void;
   onPeriodChange: (p: string) => void;
   /** stats for current period — 含 count 顯示在副字; 上游負責跨 granularity 計算 */
-  monthStat: { income: number; expense: number; net: number; count: number } | null;
+  monthStat: { count: number } | null;
 }
 
 export function MonthCarousel({

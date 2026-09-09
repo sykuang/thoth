@@ -32,6 +32,7 @@ import {
   fxRateSourceLabel,
   renderAmount,
 } from '@/lib/currency';
+import { LOAN_RECONCILIATION_WARNING } from '@/lib/loanRepayments';
 import { maskCardNo } from '@/lib/mask';
 import { SCOPE_LABEL, formatTransactionSource, getDisplayDescription } from '@/lib/txnDisplay';
 import {
@@ -58,12 +59,30 @@ export type TxnDetailModalProps = {
   onClose: () => void;
 };
 
-export function TxnDetailModal({
+export function TxnDetailModal(props: TxnDetailModalProps) {
+  if (props.txn?.kind === 'loan_repayment') {
+    const txn = props.txn;
+    const amount = renderAmount(txn, props.fxMode);
+    return <Modal visible onRequestClose={props.onClose} animationType="slide" presentationStyle="pageSheet">
+      <ScrollView testID="loan-detail" className="bg-white dark:bg-ink-900" contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{padding:24}}>
+        <Text className="text-h2 text-ink-900 dark:text-ink-50">{txn.description} · 唯讀</Text>
+        <Text className={amount.direction === 'zero' ? 'text-ink-500 dark:text-ink-400' : 'text-red-600 dark:text-red-400'}>{amount.primary}</Text>
+        <Text className="text-ink-700 dark:text-ink-300">{formatTransactionSource(BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank, {kind:txn.kind, accountNo:txn.account_no, accountOrCard:txn.account_or_card})}</Text>
+        <Text accessibilityRole="alert" className="text-ink-700 dark:text-ink-300 my-4">{LOAN_RECONCILIATION_WARNING}</Text>
+        {Object.entries({sub_account:'子帳號',currency:'幣別',due_date:'應繳日期',paid_on:'繳款日期',status:'繳款狀態',principal:'本金',interest:'利息',penalty:'違約金',paid_total:'繳款總額',principal_balance:'本金餘額',query_start:'查詢起日',query_end:'查詢迄日'}).map(([key,label]) => <DetailRow key={key} label={label} value={String(txn.loan_repayment[key as keyof typeof txn.loan_repayment] ?? '—')} />)}
+        <Pressable accessibilityRole="button" accessibilityLabel="關閉貸款明細" className="py-4" onPress={props.onClose}><Text className="text-brand-600 dark:text-brand-400">關閉</Text></Pressable>
+      </ScrollView>
+    </Modal>;
+  }
+  return <EditableTxnDetailModal {...props} txn={props.txn} />;
+}
+
+function EditableTxnDetailModal({
   txn,
   fxMode,
   cardDateBasis = 'consume',
   onClose,
-}: TxnDetailModalProps) {
+}: Omit<TxnDetailModalProps, 'txn'> & {txn: import('@/types/api').BankTransaction | null}) {
   const qc = useQueryClient();
   const [editCat, setEditCat] = useState('');
   const [editSub, setEditSub] = useState('');
@@ -106,10 +125,10 @@ export function TxnDetailModal({
   //   母筆 → 直接用
   const isSplitChild = txn?.split_of != null;
   const editTargetId = isSplitChild ? txn?.split_of : txn?.id;
-  const parentQ = useQuery<Transaction, ApiError>({
+  const parentQ = useQuery<import('@/types/api').BankTransaction, ApiError>({
     queryKey: ['transactions', 'detail', txn?.bank, txn?.kind, editTargetId],
     queryFn: () =>
-      api<Transaction>(`/transactions/${txn!.bank}/${txn!.kind}/${editTargetId}`),
+      api<import('@/types/api').BankTransaction>(`/transactions/${txn!.bank}/${txn!.kind}/${editTargetId}`),
     enabled: txn !== null && isSplitChild,
     staleTime: 10_000,
   });

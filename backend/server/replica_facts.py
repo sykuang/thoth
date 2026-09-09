@@ -227,6 +227,7 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
         "accounts": accounts,
         "cards": cards,
         "transactions": transactions,
+        "loan_repayments": [fact.model_dump() for fact in db_api.list_loan_repayments(bank=bank, user_id=user_id)],
         "portfolio_facts": {
             "latest_twd_balance": balance.model_dump() if balance else None,
             "latest_account_transaction_balances": txn_balances,

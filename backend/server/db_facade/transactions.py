@@ -1022,6 +1022,8 @@ class TransactionsWriteMixin(_BaseHelpers):
         track changed count; this method just executes all UPDATEs blindly
         and counts how many rows the DB reports as changed.
         """
+        if any(u.get("table") == "loan_repayments" or u.get("kind") == "loan_repayment" for u in updates):
+            raise ValueError("loan repayment is read-only")
         changed = 0
         for u in updates:
             tbl = u["table"]

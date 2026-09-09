@@ -22,6 +22,7 @@ import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import { api } from '@/lib/api';
 import { formatSignedCurrency } from '@/lib/currency';
+import { addMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
 import { useAuthStore } from '@/stores/auth';
 import {
   type DashboardStats,
@@ -300,7 +301,7 @@ function KpiBar({
     : currentMonth;
 
   const net = monthData.net;
-  const netColor = net >= 0
+  const netColor = !String(net).startsWith('-')
     ? 'text-accent-600 dark:text-accent-500'
     : 'text-red-600 dark:text-red-400';
 
@@ -443,21 +444,17 @@ function PassiveIncomeCard({
   const byMonth = stats?.passive_income_by_month ?? {};
   const amountByMonth = stats?.amount_by_month ?? {};
   const passive = byMonth[currentMonthKey] ?? 0;
-  if (!passive) return null;  // 本月 0 或 undefined 不顯示
+  if (moneySign(passive) === 0) return null;  // 本月 0 或 undefined 不顯示
 
   const monthIncome = amountByMonth[currentMonthKey]?.income ?? 0;
-  const passivePct = monthIncome > 0
-    ? Math.round((passive / monthIncome) * 1000) / 10
-    : 0;
+  const passivePct = moneyPercentage(passive, monthIncome, 1);
   const ytdPassive = Object.entries(byMonth)
     .filter(([month]) => month.startsWith(`${currentYear}-`))
-    .reduce((sum, [, amount]) => sum + amount, 0);
+    .reduce<Money>((sum, [, amount]) => addMoney(sum, amount), 0);
   const ytdIncome = Object.entries(amountByMonth)
     .filter(([month]) => month.startsWith(`${currentYear}-`))
-    .reduce((sum, [, bucket]) => sum + bucket.income, 0);
-  const ytdPct = ytdIncome > 0
-    ? Math.round((ytdPassive / ytdIncome) * 1000) / 10
-    : 0;
+    .reduce<Money>((sum, [, bucket]) => addMoney(sum, bucket.income), 0);
+  const ytdPct = moneyPercentage(ytdPassive, ytdIncome, 1);
 
   return (
     <View

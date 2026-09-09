@@ -519,6 +519,10 @@ def test_replica_transaction_exclusion_uses_all_cards_not_only_active_inventory(
         def list_loan_accounts(**_kwargs):
             return []
 
+        @staticmethod
+        def list_loan_repayments(**_kwargs):
+            return []
+
     monkeypatch.setattr(replica_facts, "db_api", FakeApi())
 
     facts = replica_facts.collect_bank_replica_facts("cathay", 1)

@@ -10,8 +10,8 @@ function stubModule(id, exports) {
   const filename = require.resolve(id);
   require.cache[filename] = { id: filename, filename, loaded: true, exports };
 }
-const native = ({ children, testID, visible }) => visible === false ? null
-  : React.createElement('div', { 'data-testid': testID }, children);
+const native = ({ children, testID, visible, className }) => visible === false ? null
+  : React.createElement('div', { 'data-testid': testID, className }, children);
 stubModule('react-native', {
   ...Object.fromEntries(['View', 'Text', 'Pressable', 'ScrollView', 'Modal', 'TextInput', 'RefreshControl'].map((name) => [name, native])),
   ActivityIndicator: () => React.createElement('i', { 'data-testid': 'spinner' }),
@@ -97,6 +97,50 @@ const press = (id) => (tree) => {
   node.props.onPress();
 };
 const has = (html, id) => html.includes(`data-testid="${id}"`);
+test('loan facts render neutral positive principal and a visible unreconciled notice, never selectable', () => {
+  const {projectReplicaDataset} = require('./replica');
+  const facts = {id:'loan:v1:test', bank:'cathay', source_account_id:1, account_no:'123456789', sub_account:'', currency:'TWD', due_date:transaction.date, paid_on:transaction.date, status:'paid', query_start:null, query_end:null, principal:'100.001', interest:'0.1', penalty:'0.2', paid_total:'100.301', principal_balance:'900'};
+  const dataset = projectReplicaDataset({partitions:{'bank:cathay':{transactions:[],loan_repayments:[facts]}},generations:{},syncedAt:transaction.date});
+  client.setQueryData(datasetKey,{...dataset,preferences});
+  const html = render();
+  assert.ok(has(html, 'loan-reconciliation-warning'));
+  assert.match(html, /data-testid="expense-card-toggle"[^]*?NT\$ 0\.3/);
+  assert.ok(!html.includes('未併入上方統計'));
+  assert.ok(html.includes('+NT$ 100.001'));
+  assert.ok(html.includes('-NT$ 0.1'));
+  assert.ok(html.includes('123456789'));
+  const categoryHtml = render([press('txn-view-category')]);
+  assert.ok(categoryHtml.includes('-NT$ 0.3'));
+  assert.ok(!categoryHtml.includes('+NT$ 100.001'));
+  const selected = render([press('txn-selection-enter'), tree => {
+    const row = tree.find(node => node.props.t?.kind === 'loan_repayment');
+    assert.ok(row); row.props.onLongPress(); row.props.onPress();
+  }]);
+  assert.ok(selected.includes('已選 0 筆'));
+});
+
+test('loan detail renders safe facts and warning without editing, splitting or API queries', () => {
+  const filename = require.resolve('../components/transactions/TxnDetailModal');
+  delete require.cache[filename];
+  for (const name of ['CategoryPicker', 'Dropdown', 'TagPicker']) {
+    stubModule(`../components/${name}`, {[name]: () => assert.fail('loan editor must not render')});
+  }
+  stubModule('../components/transactions/SplitEditor', {SplitEditor: () => assert.fail('loan split editor must not render')});
+  const {TxnDetailModal} = require('../components/transactions/TxnDetailModal');
+  const {projectLoanRepayment} = require('./loanRepayments');
+  const txn = projectLoanRepayment({id:'loan:v1:detail',bank:'cathay',source_account_id:1,account_no:'123456789',sub_account:'A',currency:'USD',paid_on:transaction.date,due_date:transaction.date,status:'paid',query_start:null,query_end:null,principal:'1.001',interest:'0.1',penalty:'0',paid_total:'1.101',principal_balance:'99.999'})[0];
+  const html = renderToStaticMarkup(React.createElement(TxnDetailModal,{txn,fxMode:'auto',onClose:()=>{}}));
+  assert.ok(html.includes('唯讀'));
+  assert.ok(html.includes('尚未核對'));
+  assert.ok(html.includes('99.999'));
+  assert.ok(html.includes('本金餘額'));
+  assert.ok(has(html, 'loan-detail'));
+  assert.ok(html.includes('bg-white dark:bg-ink-900'));
+  assert.ok(!html.includes('來源帳戶識別碼'));
+  assert.ok(!html.includes('principal_balance:'));
+  assert.ok(!html.includes('儲存'));
+  assert.ok(!html.includes('拆帳'));
+});
 
 const cachedPortfolio = () => ({
   ...emptyPortfolio,
