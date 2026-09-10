@@ -46,7 +46,7 @@ def az(args, timeout):
                                 capture_output=True, text=True, timeout=timeout, env=env)
         if result.returncode:
             missing = re.search(r'\bMANIFEST_UNKNOWN\b', result.stderr, re.IGNORECASE) or (
-                result.returncode == 3 and re.search(r'^ERROR: The specified tag does not exist\.', result.stderr, re.MULTILINE))
+                result.returncode == 3 and re.search(r'\bthe specified tag does not exist\.', result.stderr, re.IGNORECASE))
             if args[:3] == ['acr', 'repository', 'show'] and missing:
                 raise ReleaseError('manifest_missing')
             raise ReleaseError('az_failed')

@@ -209,7 +209,7 @@ class ApplyTests(unittest.TestCase):
     def test_missing_prior_cli_tag_not_exist_is_tolerated(self):
         def cli_hook(cmd):
             if '--image' in cmd and cmd[cmd.index('--image') + 1] == self.old.split('/', 1)[1]:
-                return subprocess.CompletedProcess(cmd, 3, '', 'ERROR: The specified tag does not exist.\n')
+                return subprocess.CompletedProcess(cmd, 3, '', 'ERROR: Error response from registry: the specified tag does not exist. private-sentinel\n')
         self.cli_hook = cli_hook
         self.assertEqual(self.release(), 0, self.output)
         self.assertIn('previous_reference_missing', self.output)

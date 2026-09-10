@@ -49,7 +49,7 @@ Aliases such as `latest` are rejected. A tag is resolved, locked and rechecked;
   digest plus both attributes and `readEnabled=true`. No delete, unlock or purge commands exist here.
 - A missing *replaced prior reference* is a warning (reference hash + affected
   Job names), not a repair blocker. Only the registry's `MANIFEST_UNKNOWN` error
-  or CLI exit 3 with `ERROR: The specified tag does not exist.` qualifies;
+  or CLI exit 3 with the fixed `the specified tag does not exist.` sentence (case-insensitive, allowing CLI prefixes) qualifies;
   authentication, timeout and ambiguous errors fail closed.
   This permits repair of the retired `0.3.122-7c2d0ec` reference. Missing candidate,
   digest mismatch or unverified locks are fatal. Lock-stage errors are never
