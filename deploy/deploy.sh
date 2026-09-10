@@ -21,6 +21,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Canonical worker-only release: use a previously built/tested immutable image.
+# Dispatch before bootstrap config, secrets, builds, resource groups or Bicep.
+if [[ "${1:-}" == "worker" ]]; then
+  shift
+  exec python3 deploy/release_worker.py "$@"
+fi
+
 # -------- config (override via env) --------
 RG="${RG:-thoth-rg}"
 LOCATION="${LOCATION:-eastasia}"
