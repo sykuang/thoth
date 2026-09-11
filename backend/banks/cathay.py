@@ -107,7 +107,7 @@ class CathayLoginError(RuntimeError):
     """Cathay 登入失敗（絕對失敗，重打也沒用，會鎖帳號）。"""
 
 
-def _click_login_once(page) -> None:
+def _click_login_once(page, *, before_dispatch=None) -> None:
     try:
         candidates = page.locator(SEL_LOGIN_BTN)
         if candidates.count() != 1:
@@ -120,6 +120,11 @@ def _click_login_once(page) -> None:
         raise
     except Exception:
         raise CathayLoginError("無法安全確認登入按鈕；未送出登入") from None
+    if before_dispatch is not None:
+        try:
+            before_dispatch()
+        except Exception:
+            pass  # Diagnostics must never prevent the existing click.
     try:
         button.click(timeout=8000)
     except Exception:
@@ -248,6 +253,7 @@ class CathayCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(2500)
 
     def is_authenticated(self, page) -> bool:
@@ -280,7 +286,11 @@ class CathayCrawler(BankCrawler):
             ),
         )
 
+    def _mark_login_dispatch(self) -> None:
+        self._diagnostic_stage = "login_submit"
+
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         try:
             page.wait_for_selector(SEL_CUSTID, state="visible", timeout=12000)
             for selector, value in (
@@ -303,12 +313,15 @@ class CathayCrawler(BankCrawler):
                     raise CathayLoginError("登入欄位輸入長度不符；未送出登入")
         except Exception:
             raise CathayLoginError("登入欄位無法安全填寫；未送出登入") from None
-        _click_login_once(page)
+        self._diagnostic_stage = "login_button"
+        _click_login_once(page, before_dispatch=self._mark_login_dispatch)
+        self._diagnostic_stage = "login_postconfirm"
         page.wait_for_timeout(9000)
 
     # ---------- 互動觸發：台幣交易明細 ----------
     def _seed_twd_query_templates(self, page, collector: ResponseCollector):
         """Use one native query per dropdown entry to obtain safe request templates."""
+        self._diagnostic_stage = "collect_transactions"
         page.wait_for_timeout(3000)
 
         def pick(label, downs=1):
@@ -631,6 +644,7 @@ class CathayCrawler(BankCrawler):
         as_of: date | None = None,
         expected_identities: set[str] | None = None,
     ) -> dict:
+        self._diagnostic_stage = "collect_transactions"
         end = as_of or date.today()
         floor = self._history_floor(end)
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
@@ -739,6 +753,7 @@ class CathayCrawler(BankCrawler):
         即時消費(C_BILL_Q_CardCurrentConsume) / 未出帳(C_BILL_Q_CardUnbilledConsume)
         / 已出帳逐筆(C_BILL_Q_RecentBillDetail)。
         """
+        self._diagnostic_stage = "collect_cards"
         def click_link(text):
             return page.evaluate(
                 "((t) => { const els=[...document.querySelectorAll('a,button,[role=button]')]"
@@ -749,8 +764,10 @@ class CathayCrawler(BankCrawler):
 
         for label in ["即時消費明細", "未出帳明細", "帳單明細"]:
             try:
+                self._diagnostic_stage = "collect_navigation"
                 page.goto(f"{BASE}/OnlineBanking/CQuery/C0101_BillOverview",
                           wait_until="domcontentloaded", timeout=25000)
+                self._diagnostic_stage = "collect_cards"
                 page.wait_for_timeout(5000)
                 clicked = click_link(label)
                 _log(f"[card_detail] 點 {label!r}: {clicked}")
@@ -767,23 +784,30 @@ class CathayCrawler(BankCrawler):
     # ---------- 主抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         # 逐頁造訪，讓 React 自動打 API
+        self._diagnostic_stage = "collect"
         twd_history = None
         for key, path in FEATURE_PAGES.items():
             _log(f"\n[collect] {key}: {path}")
             try:
+                self._diagnostic_stage = "collect_navigation"
                 page.goto(f"{BASE}{path}", wait_until="domcontentloaded", timeout=25000)
+                self._diagnostic_stage = "collect"
             except Exception as e:
                 _log(f"  [warn] goto: {str(e)[:80]}")
+            self._diagnostic_stage = "collect"
             page.wait_for_timeout(6500)
             if key == "twd_txn":
+                self._diagnostic_stage = "collect_accounts"
                 twd_history = self._collect_twd_history(
                     page,
                     collector,
                     expected_identities=self._twd_account_inventory(collector),
                 )
         # 信用卡逐筆明細（三種）
+        self._diagnostic_stage = "collect_cards"
         self._collect_card_details(page)
 
+        self._diagnostic_stage = "collect_validation"
         out = self._parse(collector)
         if twd_history is None:
             raise RuntimeError("cathay-twd-history-missing")

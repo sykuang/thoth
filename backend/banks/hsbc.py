@@ -180,6 +180,7 @@ class HsbcCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(7000)
         self._logged_in(page)
 
@@ -429,14 +430,17 @@ class HsbcCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         try:
             user_id = self._visible_enabled(page, SEL_USERID, optional=True)
             if user_id is not None:
                 self._keyboard_fill(page, user_id, self.creds.user_id)
+                self._diagnostic_stage = "login_button"
                 first = self._exact_button(
                     page, "button[data-testid='continueButton']", "繼續"
                 )
                 try:
+                    self._diagnostic_stage = "login_username_continue"
                     first.click(timeout=8000)
                     page.wait_for_timeout(6000)
                 except Exception:
@@ -446,13 +450,17 @@ class HsbcCrawler(BankCrawler):
                 if self._response_visible(page):
                     raise HsbcLoginError("帳號階段出現未分類提示；未送出登入")
 
+            self._diagnostic_stage = "login_field"
             password = self._visible_enabled(page, SEL_PWD)
             self._keyboard_fill(page, password, self.creds.password)
+            self._diagnostic_stage = "login_ocr"
             captcha_text = self._solve_captcha(page)
             if captcha_text is None:
                 raise HsbcLoginError("無法安全辨識驗證碼；未送出登入")
+            self._diagnostic_stage = "login_field"
             captcha = self._visible_enabled(page, SEL_CAPTCHA)
             self._keyboard_fill(page, captcha, captcha_text)
+            self._diagnostic_stage = "login_button"
             final = self._exact_button(
                 page, "button[type='submit']", "繼續", candidate_only=True
             )
@@ -466,11 +474,13 @@ class HsbcCrawler(BankCrawler):
             raise HsbcLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             final.click(timeout=8000)
         except Exception:
             raise HsbcLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             for _ in range(22):
                 page.wait_for_timeout(1000)
                 if self._logged_in(page) or self._response_visible(page):
@@ -485,6 +495,7 @@ class HsbcCrawler(BankCrawler):
         Passive dashboard responses are not authoritative: their decoded size
         cannot be bounded from absent or compressed Content-Length headers.
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(7000)
 
@@ -493,18 +504,22 @@ class HsbcCrawler(BankCrawler):
         token = self._history_token(collector)
         collector.detach(page)
         byte_budget = [5_000_000]
+        self._diagnostic_stage = "collect_cards"
         cards = self._fetch_card_inventory(page, token, byte_budget)
         out["cards"] = cards
         _log(f"[collect] 卡片清單: {len(out['cards'])} 張")
 
+        self._diagnostic_stage = "collect_cards"
         out["card_detail"], out["history_coverage"] = self._collect_card_details(
             page,
             collector,
             out["cards"],
             byte_budget=byte_budget,
         )
+        self._diagnostic_stage = "collect_cards"
         if self._fetch_card_inventory(page, token, byte_budget) != cards:
             raise RuntimeError("hsbc-card-inventory-replay")
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, _hsbc_card_bill_facts(out))
         return BankCollectResult(**out)
 
@@ -660,6 +675,7 @@ class HsbcCrawler(BankCrawler):
         ⚠️ 裸 fetch 回 HTTP 500——必須帶前端的 `Authorization: Bearer <JWT>`（從 collector 攔到）。
         卡 id 從卡片清單 payload[].id 取（新 endpoint `cards`；legacy `cards/suspend`）。
         """
+        self._diagnostic_stage = "collect_cards"
         token = self._history_token(collector)
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
         if mode not in {"full", "incremental"}:
@@ -670,6 +686,7 @@ class HsbcCrawler(BankCrawler):
         windows = []
         byte_budget = byte_budget if byte_budget is not None else [5_000_000]
         for c in cards:
+            self._diagnostic_stage = "collect_cards"
             cid = c.get("id")
             masked = c.get("maskedCardNumber", "")
             start, account_end = self._card_history_range(masked, end=end)
@@ -680,6 +697,7 @@ class HsbcCrawler(BankCrawler):
             )
             if byte_budget[0] <= 0:
                 raise RuntimeError("hsbc-history-byte-budget")
+            self._diagnostic_stage = "collect_transactions"
             history = self._fetch_posted_history(
                 page,
                 card_id=cid,

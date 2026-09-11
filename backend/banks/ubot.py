@@ -932,6 +932,7 @@ class UbotCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         try:
             page.wait_for_timeout(8000)
         except Exception:
@@ -1029,6 +1030,7 @@ class UbotCrawler(BankCrawler):
 
     def submit_credentials_once(self, page) -> None:
         try:
+            self._diagnostic_stage = "login_field"
             page.wait_for_selector(SEL_SID, state="visible", timeout=10000)
             for selector, value, wait in (
                 (SEL_SID, self.creds.national_id, 150),
@@ -1051,6 +1053,7 @@ class UbotCrawler(BankCrawler):
         except Exception:
             raise UbotLoginError("登入欄位無法安全填寫；未送出登入") from None
 
+        self._diagnostic_stage = "login_ocr"
         captcha = self._ocr_with_regen(page, max_attempts=5)
         if not captcha:
             raise UbotLoginError(
@@ -1058,6 +1061,7 @@ class UbotCrawler(BankCrawler):
                 safe_code="captcha_ocr_failed",
             )
         try:
+            self._diagnostic_stage = "login_field"
             candidates = page.locator(SEL_CAPTCHA)
             if candidates.count() != 1:
                 raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入")
@@ -1074,6 +1078,7 @@ class UbotCrawler(BankCrawler):
         except Exception:
             raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
 
+        self._diagnostic_stage = "login_button"
         button = _unique_visible_enabled_exact(
             page,
             "button",
@@ -1092,11 +1097,13 @@ class UbotCrawler(BankCrawler):
 
         _log("[login] 送出 login attempt=1")
         try:
+            self._diagnostic_stage = "login_submit"
             button.click(timeout=8000)
         except Exception:
             raise UbotLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(6000)
             for _ in range(20):
                 page.wait_for_timeout(1000)
@@ -1152,35 +1159,45 @@ class UbotCrawler(BankCrawler):
         out: dict = {}
 
         # 1) 帳戶總覽（A0101001）：自動打 IBKA010001~4
+        self._diagnostic_stage = "collect_navigation"
         self._goto(page, "/A0101001", wait=6500)
+        self._diagnostic_stage = "collect_accounts"
         out["deposit_twd"] = self._latest_body(collector, "IBKA010001")   # 台幣存款 NTList + LoanList
         out["deposit_foreign"] = self._latest_body(collector, "IBKA010002")  # 外幣 FTList
         out["card_summary"] = self._latest_body(collector, "IBKA010003")  # 信用卡 CardList
         out["investment"] = self._latest_body(collector, "IBKA010004")    # 投資 TNRWD
 
         # 2) 台幣交易明細（B0101001）：逐帳戶查銀行原生三個月份
+        self._diagnostic_stage = "collect_transactions"
         twd_history = self._collect_twd_history(page, collector)
         out["twd_txns"] = twd_history["results"]
         out["debit_accounts"] = twd_history["inventory"]
         out["history_coverage"] = twd_history["coverage"]
 
         # 3) 信用卡：額度彙總(F0101001 → IBKF010001) + 已出帳逐筆(F0201001 → IBKF020102)
+        self._diagnostic_stage = "collect_navigation"
         self._goto(page, "/F0101001", wait=6000)
+        self._diagnostic_stage = "collect_cards"
         out["card_limit"] = self._latest_body(collector, "IBKF010001")
         out["card_billed"] = self._collect_card_billed(page, collector)
         # 未出帳（F0301001 → IBKF030001）
+        self._diagnostic_stage = "collect_navigation"
         self._goto(page, "/F0301001", wait=6000)
+        self._diagnostic_stage = "collect_cards"
         out["card_unbilled"] = self._latest_body(collector, "IBKF030001")
         # 2026-06-22 (使用者指示「ubot 有近期繳款紀錄查詢呀」F0801001):
         # 近期繳款紀錄 (F0801001 → IBKF080001), 真實「上次繳款日 + 金額」source.
         # 補在 card_limit lastPayAmt=0 + lastPayDate=00000000 sentinel 無法判定的場景.
         # 進頁 auto-fire (跟 F0101001 / F0301001 同 pattern), 不需點按.
+        self._diagnostic_stage = "collect_navigation"
         self._goto(page, "/F0801001", wait=6000)
+        self._diagnostic_stage = "collect_cards"
         out["card_pay_history"] = self._latest_body(collector, "IBKF080001")
 
         out["_final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
 
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [_ubot_card_bill_fact(out)])
         return BankCollectResult(**out)
 

@@ -119,6 +119,7 @@ class ScbCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         try:
             page.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000)
             page.wait_for_timeout(5000)
@@ -293,6 +294,7 @@ class ScbCrawler(BankCrawler):
             raise ScbLoginError("登入欄位輸入長度不符；未送出登入")
 
     def prepare_captcha_resubmit(self, page) -> None:
+        self._diagnostic_stage = "login_ocr"
         try:
             if not self._click_unique_refresh(page):
                 raise ScbLoginError("無法安全更新驗證碼；未送出登入")
@@ -348,6 +350,7 @@ class ScbCrawler(BankCrawler):
 
     def _ocr_captcha(self, page, max_attempts=5):
         """從 captcha img 抽 base64 → OCR 6 碼純數字（送出前安全重試）。"""
+        self._diagnostic_stage = "login_ocr"
         attempts = min(max(max_attempts, 1), 5)
         for n in range(1, attempts + 1):
             try:
@@ -380,6 +383,7 @@ class ScbCrawler(BankCrawler):
         return None
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         try:
             page.wait_for_selector(
                 "input[name='__reCaptcha']", state="visible", timeout=15000
@@ -420,11 +424,14 @@ class ScbCrawler(BankCrawler):
                 strict=True,
             ):
                 self._keyboard_fill(page, item[4], value)
+            self._diagnostic_stage = "login_ocr"
             captcha = self._ocr_captcha(page, max_attempts=5)
             if not captcha:
                 raise ScbLoginError("無法安全辨識驗證碼；未送出登入")
+            self._diagnostic_stage = "login_field"
             self._keyboard_fill(page, layout[3][4], captcha)
 
+            self._diagnostic_stage = "login_button"
             candidates = page.locator("button[type='submit']")
             eligible = []
             for index in range(candidates.count()):
@@ -439,6 +446,7 @@ class ScbCrawler(BankCrawler):
             if len(eligible) != 1:
                 raise ScbLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
             button = eligible[0]
+            self._diagnostic_stage = "login_checkpoint"
             stale_captcha, stale_explicit, stale_other = self._visible_alert_state(page)
             if stale_explicit or stale_other:
                 raise ScbLoginError("登入頁已有未解決提示；未送出登入")
@@ -448,11 +456,13 @@ class ScbCrawler(BankCrawler):
             raise ScbLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             button.click(timeout=8000)
         except Exception:
             raise ScbLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             for _ in range(30):
                 page.wait_for_timeout(1000)
                 if self._logged_in(page):
@@ -493,6 +503,7 @@ class ScbCrawler(BankCrawler):
           3. 依序點每張卡「消費明細」→ dump cards_detail[]
           4. 點「帳單查詢」→ dump bill_text
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(8000)
 
@@ -507,6 +518,7 @@ class ScbCrawler(BankCrawler):
             out["title"] = ""
 
         try:
+            self._diagnostic_stage = "collect_accounts"
             txt = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
         except Exception:
             txt = ""
@@ -514,6 +526,7 @@ class ScbCrawler(BankCrawler):
         _log(f"[scb][collect] home text_len={len(txt)}")
 
         # === A. 點「信用卡綜覽」進信用卡頁 ===
+        self._diagnostic_stage = "collect_navigation"
         cc_click = page.evaluate("""() => {
             for (const el of document.querySelectorAll('a, button, span, div, li')) {
                 if (el.offsetParent === null) continue;
@@ -527,6 +540,7 @@ class ScbCrawler(BankCrawler):
         page.wait_for_timeout(8000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "01_credit_overview.png"), full_page=True)
+        self._diagnostic_stage = "collect_cards"
         out["card_url"] = page.url
         try:
             out["card_text"] = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
@@ -564,6 +578,7 @@ class ScbCrawler(BankCrawler):
         for i, btn in enumerate(consumption_btns):
             _log(f"[scb][collect] === 卡 {i+1} 消費明細 click ({btn['x']:.0f},{btn['y']:.0f}) ===")
             try:
+                self._diagnostic_stage = "collect_navigation"
                 page.mouse.click(btn["x"] + btn["w"] / 2, btn["y"] + btn["h"] / 2)
                 page.wait_for_timeout(8000)
                 cur_url = page.url
@@ -573,6 +588,7 @@ class ScbCrawler(BankCrawler):
 
                 # 找「查詢」BUTTON 的 bbox（限定 button tag，避開 wrapper）
                 # 用 mouse.click 觸發真實 form submit
+                self._diagnostic_stage = "collect_transactions"
                 query_btn = page.evaluate("""() => {
                     for (const el of document.querySelectorAll('button')) {
                         if (el.offsetParent === null) continue;
@@ -614,6 +630,7 @@ class ScbCrawler(BankCrawler):
                     }""")
                     page.wait_for_timeout(6000)
                     # 重新抓 dedup btns
+                    self._diagnostic_stage = "collect_cards"
                     new_raw = page.evaluate("""() => {
                         const out = [];
                         for (const el of document.querySelectorAll('a, button, span, div')) {
@@ -651,6 +668,7 @@ class ScbCrawler(BankCrawler):
         except Exception:
             pass
 
+        self._diagnostic_stage = "collect_navigation"
         bill_click = page.evaluate("""() => {
             for (const el of document.querySelectorAll('a, button, span, div')) {
                 if (el.offsetParent === null) continue;
@@ -665,6 +683,7 @@ class ScbCrawler(BankCrawler):
         page.wait_for_timeout(8000)
         with contextlib.suppress(Exception):
             page.screenshot(path=str(debug_dir / "03_bill_query.png"), full_page=True)
+        self._diagnostic_stage = "collect_cards"
         out["bill_url"] = page.url
         try:
             out["bill_text"] = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
@@ -672,6 +691,7 @@ class ScbCrawler(BankCrawler):
             out["bill_text"] = ""
         _log(f"[scb][collect] bill 頁 url={out['bill_url']} text_len={len(out['bill_text'])}")
 
+        self._diagnostic_stage = "collect"
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
 

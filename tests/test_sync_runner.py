@@ -209,7 +209,7 @@ def test_sync_runner_records_error_on_failure(isolated, monkeypatch):
     job_id = sr.run_sync_job(user_id=1, bank="sinopac", headless=True)
     row = _wait_for_status(job_id, {"done", "failed"})
     assert row["status"] == "failed", f"unexpected: {row}"
-    assert row["error_msg"] == "sync_failed:RuntimeError"
+    assert row["error_msg"] == "sync_failed:RuntimeError;stage=unknown;code=crawler_failed"
 
 
 def test_unknown_bank_raises(isolated):

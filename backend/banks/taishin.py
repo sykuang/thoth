@@ -1290,6 +1290,7 @@ class TaishinCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(10000)
 
     def is_authenticated(self, page) -> bool:
@@ -1797,6 +1798,7 @@ class TaishinCrawler(BankCrawler):
 
     def submit_credentials_once(self, page) -> None:
         try:
+            self._diagnostic_stage = "login_prepare"
             frame = self._find_login_frame(page)
         except Exception:
             raise TaishinLoginError("無法安全確認登入頁面；未送出登入") from None
@@ -1804,6 +1806,7 @@ class TaishinCrawler(BankCrawler):
             raise TaishinLoginError("找不到登入頁面；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_field"
             for label in ("national_id", "user_code", "password"):
                 value = getattr(self.creds, label)
                 candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS[label]))
@@ -1824,10 +1827,12 @@ class TaishinCrawler(BankCrawler):
         except Exception:
             raise TaishinLoginError("登入欄位無法安全填寫；未送出登入") from None
 
+        self._diagnostic_stage = "login_ocr"
         captcha = self._ocr_captcha(frame, max_attempts=5)
         if not captcha or len(captcha) != 6 or not captcha.isdigit():
             raise TaishinLoginError("圖形驗證碼 OCR 失敗；未送出登入")
         try:
+            self._diagnostic_stage = "login_field"
             candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS["captcha"]))
             if candidates.count() != 1:
                 raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
@@ -1847,6 +1852,7 @@ class TaishinCrawler(BankCrawler):
             raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_button"
             candidates = frame.locator(f"#{LOGIN_BTN_ID}")
             if candidates.count() != 1:
                 raise TaishinLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
@@ -1858,11 +1864,13 @@ class TaishinCrawler(BankCrawler):
         except Exception:
             raise TaishinLoginError("無法安全確認登入按鈕；未送出登入") from None
         try:
+            self._diagnostic_stage = "login_submit"
             button.click(timeout=8000)
         except Exception:
             raise TaishinLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(10000)
             for _ in range(30):
                 page.wait_for_timeout(1000)
@@ -1890,6 +1898,7 @@ class TaishinCrawler(BankCrawler):
         「信用卡」是第 5 個，約 x:1390/2160 寬。直接從 DOM 找元素點，不依賴座標猜測。
         """
         out: dict = {}
+        self._diagnostic_stage = "collect_cards"
         page.wait_for_timeout(8000)
 
         # ── Step 2: 從所有 frames（含主 page）找 top nav「信用卡」DOM 元素並點 ──
@@ -1955,6 +1964,7 @@ class TaishinCrawler(BankCrawler):
             if target_info and target_frame:
                 # 2026-06-11 (C 路徑教訓): 直接 click SPAN 文字無效 (toggle 'on' class 但無 routing)
                 # 需逐層 click ancestors，找到真正能展開 dropdown / 跳頁的層級
+                self._diagnostic_stage = "collect_navigation"
                 clicked_credit_card = self._try_ancestor_clicks(target_frame, page)
             else:
                 _log("[taishin][collect] 全 frames 都找不到「信用卡」元素")
@@ -1966,6 +1976,7 @@ class TaishinCrawler(BankCrawler):
 
         # ── Step 4: dump 信用卡頁 frame text + 攔 API ──
         # 已經點過「查詢信用卡明細」（在 _try_ancestor_clicks 內），現在直接 dump
+        self._diagnostic_stage = "collect_cards"
         credit_card_frame = None
         page_text = ""
         if clicked_credit_card:
@@ -2060,12 +2071,14 @@ class TaishinCrawler(BankCrawler):
                 out["credit_card_parsed"] = {"error": "parse_failed"}
 
         # ── Step 5: attested TWD transaction history ──
+        self._diagnostic_stage = "collect_transactions"
         out.update(self._collect_attested_twd_history(page, collector))
 
         # ── Step 6: retain only non-sensitive API responses needed by persistence ──
         hits_by_endpoint = self._non_sensitive_api_responses(collector.hits)
         out["api_responses"] = hits_by_endpoint
         parsed = out.get("credit_card_parsed") or {}
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])
         _log(f"[taishin][collect] 攔到 {len(hits_by_endpoint)} 個 endpoint")
         return BankCollectResult(**out)

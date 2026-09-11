@@ -152,6 +152,7 @@ class DbsCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(8000)
 
     def is_authenticated(self, page) -> bool:
@@ -202,6 +203,7 @@ class DbsCrawler(BankCrawler):
         return tuple(rules)
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         fields = (
             ("#username", self.creds.username, 300),
             ("#password", self.creds.password, 500),
@@ -209,8 +211,10 @@ class DbsCrawler(BankCrawler):
         try:
             page.wait_for_selector("#username", state="visible", timeout=15000)
             page.wait_for_selector("#password", state="visible", timeout=5000)
+            self._diagnostic_stage = "login_button"
             page.wait_for_selector("#loginbutton", state="visible", timeout=5000)
             for selector, value, final_wait in fields:
+                self._diagnostic_stage = "login_field"
                 candidates = page.locator(selector)
                 if candidates.count() != 1:
                     raise DbsLoginError("登入欄位無法安全填寫；未送出")
@@ -233,6 +237,7 @@ class DbsCrawler(BankCrawler):
             raise DbsLoginError("登入欄位無法安全填寫；未送出") from None
 
         try:
+            self._diagnostic_stage = "login_button"
             candidates = page.locator("#loginbutton")
             if candidates.count() != 1:
                 raise DbsLoginError("找不到唯一且可操作的登入按鈕；未送出")
@@ -249,11 +254,13 @@ class DbsCrawler(BankCrawler):
             raise DbsLoginError("無法安全確認登入按鈕；未送出") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             submit.click(timeout=8000)
         except Exception:
             raise DbsLoginError("送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(3000)
             for _ in range(20):
                 page.wait_for_timeout(1000)
@@ -281,6 +288,7 @@ class DbsCrawler(BankCrawler):
 
         TODO 第二輪（見檔案頂端 docstring）: 點信用卡 menu / 帳戶 → 抓 billed_txn / casa 交易明細
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(8000)
 
@@ -329,6 +337,7 @@ class DbsCrawler(BankCrawler):
         # DBS dashboard 沒有顯式「交易紀錄」menu；交易明細藏在帳戶 row drilldown。
         before_detail_hit_count = len(collector.hits)
         try:
+            self._diagnostic_stage = "collect_accounts"
             assets_hit = collector.latest("assets")
             twd_account = None
             if assets_hit and isinstance(assets_hit.resp_json, dict):
@@ -350,6 +359,7 @@ class DbsCrawler(BankCrawler):
                 "displayAccountNumber": acct_display,
                 "tail": acct_tail,
             }
+            self._diagnostic_stage = "collect_navigation"
             click_result = page.evaluate(r"""({acctName, acctTail}) => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
@@ -405,6 +415,7 @@ class DbsCrawler(BankCrawler):
             page.wait_for_timeout(9000)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "01_twd_account_detail.png"), full_page=True)
+            self._diagnostic_stage = "collect_accounts"
             detail_text = page.evaluate("() => (document.body.innerText || '').slice(0, 40000)") or ""
             out["twd_account_detail_url"] = page.url
             out["twd_account_detail_text"] = detail_text
@@ -431,6 +442,7 @@ class DbsCrawler(BankCrawler):
 
             # DBS API calls are made through frontend interceptors; raw fetch misses required
             # request decoration and returns 401. So collect via real UI clicks instead.
+            self._diagnostic_stage = "collect_transactions"
             before_month_click_hits = len(collector.hits)
             month_clicks = []
             for label in ("七月", "六月", "五月"):
@@ -577,6 +589,7 @@ class DbsCrawler(BankCrawler):
 
             # Return to overview before probing top-nav card-fee shortcut.
             with contextlib.suppress(Exception):
+                self._diagnostic_stage = "collect_navigation"
                 page.goto("https://internet-banking.dbs.com.tw/digitw/overview", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(5000)
         except Exception:
@@ -591,6 +604,7 @@ class DbsCrawler(BankCrawler):
         # 這頁是發起繳卡費流程，不是歷史繳款紀錄；只用來補 bill_due/payment_due。
         try:
             before_card_fee_hits = len(collector.hits)
+            self._diagnostic_stage = "collect_navigation"
             card_fee_click = page.evaluate(r"""() => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
@@ -618,6 +632,7 @@ class DbsCrawler(BankCrawler):
             }""") or {"clicked": False}
             out["dbs_card_fee_click"] = card_fee_click
             page.wait_for_timeout(8000)
+            self._diagnostic_stage = "collect_cards"
             card_fee_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
             out["dbs_card_fee_page_text"] = card_fee_text
             out["dbs_card_fee_page"] = self._parse_card_fee_page(card_fee_text)
@@ -637,6 +652,7 @@ class DbsCrawler(BankCrawler):
             out["dbs_card_fee_error"] = "probe_failed"
             _log("[dbs][card_fee] probe failed; details withheld")
 
+        self._diagnostic_stage = "collect"
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
 

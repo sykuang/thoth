@@ -501,6 +501,7 @@ class EsunCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(10000)
 
     def is_authenticated(self, page) -> bool:
@@ -577,6 +578,7 @@ class EsunCrawler(BankCrawler):
 
     def submit_credentials_once(self, page) -> None:
         try:
+            self._diagnostic_stage = "login_prepare"
             frame = self._find_login_frame(page)
         except Exception:
             raise EsunLoginError("無法安全確認登入頁面；未送出登入") from None
@@ -584,6 +586,7 @@ class EsunCrawler(BankCrawler):
             raise EsunLoginError("找不到唯一登入頁面；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_field"
             for selector, value, wait in (
                 (_sel(FIELD_NATIONAL_ID), self.creds.national_id, 200),
                 (_sel(FIELD_USER_CODE), self.creds.user_code, 200),
@@ -608,6 +611,7 @@ class EsunCrawler(BankCrawler):
             raise EsunLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_button"
             candidates = frame.locator(_sel(LOGIN_BTN_ID))
             if candidates.count() != 1:
                 raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
@@ -620,11 +624,13 @@ class EsunCrawler(BankCrawler):
             raise EsunLoginError("無法安全確認登入按鈕；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             button.click(timeout=8000)
         except Exception:
             raise EsunLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(10000)
             for _ in range(30):
                 page.wait_for_timeout(1000)
@@ -1188,6 +1194,7 @@ class EsunCrawler(BankCrawler):
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
         out: dict = {}
+        self._diagnostic_stage = "collect_accounts"
         page.wait_for_timeout(8000)
 
         from backend.core.store import _data_root
@@ -1225,6 +1232,7 @@ class EsunCrawler(BankCrawler):
         # 同名「存款交易明細查詢」，_navigate_menu 會避開我的最愛並優先點第一個
         # actionable 候選；目前首頁左側順序第一個就是「臺幣存匯 → 臺幣帳戶查詢」。
         try:
+            self._diagnostic_stage = "collect_navigation"
             twd_nav = self._navigate_menu(page, "存款交易明細查詢", debug_dir, "twd_txn_form.png")
             out["twd_txn_nav_probe"] = twd_nav
             twd_clicked = any(
@@ -1241,6 +1249,7 @@ class EsunCrawler(BankCrawler):
                 coverage_expected = []
                 expected_twd_identities: set[str] = set()
                 submitted_accounts: set[str] = set()
+                self._diagnostic_stage = "collect_transactions"
                 query_frame = self._wait_for_twd_query_frame(page)
                 form_url = urlparse(query_frame.url or "")
                 if (
@@ -1502,11 +1511,13 @@ class EsunCrawler(BankCrawler):
         # 第 2 階段：navigate 信用卡帳單資訊（hover mega menu，禁用我的最愛）
         # 玉山是 widget 切換（_leftMenuLoadWidget），不是新分頁——點完後 iframe 內 widget 替換
         try:
+            self._diagnostic_stage = "collect_navigation"
             nav_info = self._navigate_credit_card_bill(page, debug_dir)
             out["card_nav_probe"] = nav_info
             # 玉山 widget 載入慢且可能掛新 iframe — 等 10 秒讓 Playwright 註冊新 frame
             page.wait_for_timeout(10000)
 
+            self._diagnostic_stage = "collect_cards"
             card_frames = []
             for f in page.frames:
                 if f == page.main_frame:
@@ -1607,6 +1618,7 @@ class EsunCrawler(BankCrawler):
 
         # 第 3 階段：navigate 信用卡消費明細查詢（設計規範：每家銀行都要抓信用卡明細）
         try:
+            self._diagnostic_stage = "collect_navigation"
             txn_nav = self._navigate_menu(page, "信用卡消費明細查詢", debug_dir, "card_txn_form.png")
             out["card_txn_nav_probe"] = txn_nav
             txn_clicked = any(
@@ -1715,6 +1727,7 @@ class EsunCrawler(BankCrawler):
         # 必須 include main_frame, 且 widget 是替換 main DOM (frame URL 不變)，要靠
         # textContent 內含「已用額度」「可用餘額」label 來辨識。
         try:
+            self._diagnostic_stage = "collect_navigation"
             quota_nav = self._navigate_menu(page, "信用卡額度查詢", debug_dir, "card_quota_form.png")
             out["card_quota_nav_probe"] = quota_nav
             quota_clicked = any(
@@ -1774,6 +1787,7 @@ class EsunCrawler(BankCrawler):
         # 跟 quota / txn step 同 pattern: navigate → 等 widget load → dump frames text.
         # 用 raw dump 留底, 不在此 hard-code parser; persist 端用 defensive regex.
         try:
+            self._diagnostic_stage = "collect_navigation"
             pay_nav = self._navigate_menu(
                 page, "信用卡繳款明細查詢", debug_dir, "card_pay_form.png",
             )
@@ -1833,6 +1847,7 @@ class EsunCrawler(BankCrawler):
             out.get("card_transactions") or [],
             out["card_statement_transactions"],
         )
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [_esun_card_bill_fact(out)])
         _log(f"[esun][collect] 攔到 {endpoint_count} 個 API endpoint")
         for result in out.get("twd_txn_results") or []:

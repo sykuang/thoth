@@ -248,23 +248,28 @@ class BankCreds:
         - 兩者皆未設 → **CLI/MCP-mode**：走 env (含 .env)；
           缺欄位由 from_env() raise。
         """
-        account_id_raw = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
-        if account_id_raw:
-            # Defense-in-depth (Phase C-Suggestion 2026-06-17):
-            # sync_runner 同 thread 一定設 BANK_CRAWLER_USER_ID, 拿來餵 from_account
-            # owner check; account 不屬此 user → PermissionError.
-            user_id_for_check = os.environ.get("BANK_CRAWLER_USER_ID")
-            expected_owner = int(user_id_for_check) if user_id_for_check else None
-            return cls.from_account(
-                int(account_id_raw),
-                expected_owner_user_id=expected_owner,
-            )
-        user_id_raw = os.environ.get("BANK_CRAWLER_USER_ID")
-        if user_id_raw:
-            # Legacy: 老 caller 還沒升; v1 表 row 在 L5-1 migration 後也存活
-            return cls.from_db(int(user_id_raw))
-        # CLI / MCP / probe / unit test：走環境變數
-        return cls.from_env()
+        try:
+            account_id_raw = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
+            if account_id_raw:
+                # Defense-in-depth (Phase C-Suggestion 2026-06-17):
+                # sync_runner 同 thread 一定設 BANK_CRAWLER_USER_ID, 拿來餵 from_account
+                # owner check; account 不屬此 user → PermissionError.
+                user_id_for_check = os.environ.get("BANK_CRAWLER_USER_ID")
+                expected_owner = int(user_id_for_check) if user_id_for_check else None
+                return cls.from_account(
+                    int(account_id_raw),
+                    expected_owner_user_id=expected_owner,
+                )
+            user_id_raw = os.environ.get("BANK_CRAWLER_USER_ID")
+            if user_id_raw:
+                # Legacy: 老 caller 還沒升; v1 表 row 在 L5-1 migration 後也存活
+                return cls.from_db(int(user_id_raw))
+            # CLI / MCP / probe / unit test：走環境變數
+            return cls.from_env()
+        except Exception as exc:
+            from backend.core.error_diagnostics import annotate_failure
+            annotate_failure(exc, "credentials")
+            raise
 
 
 # ============================================================

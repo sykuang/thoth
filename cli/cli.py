@@ -21,13 +21,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.core.base import validate_history_coverage, write_private_json
 from backend.core.store import BankStore
 
 BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank", "rakuten"}
 
 
 def _write_private_json(path: Path, payload: dict) -> None:
+    from backend.core.base import write_private_json
+
     write_private_json(path, payload)
 
 
@@ -79,26 +80,38 @@ def _get_crawler(bank: str):
 
 
 def cmd_sync(args):
-    raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
-    # DOM-normalized history remains customer-bearing; canonical DB only.
-    if args.bank in {"rakuten", "fubon", "esun", "hsbc"}:
-        _remove_private_json(raw)
-    crawler, login_url = _get_crawler(args.bank)
-    print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
-    store = BankStore(args.bank)
+    from backend.core.error_diagnostics import _class_collect_guard_allowlist
+    from backend.core.error_diagnostics import annotate_failure, format_failure, result_failure, _safe_state_value, instance_stage
+    stage = 'init'
+    store = None
+    crawler = None
+    guards = frozenset()
+    primary = None
     try:
+        raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
+        # DOM-normalized history remains customer-bearing; canonical DB only.
+        if args.bank in {"rakuten", "fubon", "esun", "hsbc"}:
+            _remove_private_json(raw)
+        crawler, login_url = _get_crawler(args.bank)
+        guards = _class_collect_guard_allowlist(crawler)
+        print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
+        store = BankStore(args.bank)
         crawler.configure_transaction_cursor(
             "twd_transactions", store.latest_twd_transaction_dates(),
         )
         crawler.configure_transaction_cursor(
             "card_billed_transactions", store.latest_card_transaction_dates(),
         )
+        stage = 'session'
         result = crawler.run(login_url=login_url, headless=args.headless)
-        if result.get("error"):
-            print("[sync] 失敗: crawler_failed")
-            return 1
-        data = result.get("data", {})
+        failure = result_failure(result, bank=args.bank, guards=guards)
+        if failure is not None:
+            raise failure
+        stage = 'coverage'
+        data = _safe_state_value(result, 'data') or {}
         if crawler.HISTORY_COVERAGE_REQUIRED:
+            from backend.core.base import validate_history_coverage
+
             validate_history_coverage(
                 data.get("history_coverage"),
                 expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
@@ -117,15 +130,30 @@ def cmd_sync(args):
         rules = rules_repo.list_rules(user_id=1, enabled_only=True)
         if not rules:
             rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
+        stage = 'persist'
         from backend.core.persist import persist_collected
 
         delta = persist_collected(args.bank, data, store, rules=rules)
         if args.bank not in {"rakuten", "fubon", "esun", "hsbc"}:
             _write_private_json(raw, result)
+        stage = 'persist_summary'
         stats = store.stats()
+    except Exception as exc:
+        primary = exc
+        annotate_failure(exc, instance_stage(crawler, stage) if stage == 'session' else stage, bank=args.bank, guards=guards)
+        print('[sync] 失敗: ' + format_failure(exc, bank=args.bank, guards=guards))
+        return 1
     finally:
-        store.close()
+        if store is not None:
+            try:
+                store.close()
+            except Exception as exc:
+                if primary is None:
+                    annotate_failure(exc, 'cleanup')
+                    print('[sync] 失敗: ' + format_failure(exc))
+                    return 1
 
+    assert store is not None  # Only the successful construction path reaches this point.
     print("\n===== 增量同步結果 =====")
     print(f"  台幣交易    本次新增 {delta.get('twd_txn_new', 0)} 筆")
     print(f"  信用卡已出帳 本次新增 {delta.get('card_billed_new', 0)} 筆")

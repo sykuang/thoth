@@ -392,6 +392,7 @@ class FubonCrawler(BankCrawler):
         fetch_kwargs: dict,
     ) -> None:
         _log("[fubon][phase] browser_start")
+        self._diagnostic_stage = "browser_launch"
         with StealthySession(
             headless=headless,
             user_data_dir=str(self.session_dir),
@@ -410,6 +411,7 @@ class FubonCrawler(BankCrawler):
                 page.set_extra_http_headers(headers)
             try:
                 _log("[fubon][phase] goto_start")
+                self._diagnostic_stage = "browser_navigation"
                 page.goto(login_url, referer="https://www.google.com/")
                 page.wait_for_load_state("load")
                 page.wait_for_load_state("domcontentloaded")
@@ -513,6 +515,7 @@ class FubonCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         _log("[fubon][phase] prepare_start")
         with bounded_login_inspection(page):
             self._prepare_login_page(page)
@@ -667,9 +670,11 @@ class FubonCrawler(BankCrawler):
 
     def _submit_credentials_once(self, page) -> None:
         try:
+            self._diagnostic_stage = "login_prepare"
             frame = self._find_login_frame(page)
             if frame is None:
                 raise FubonLoginError("找不到唯一的登入頁面；未送出登入")
+            self._diagnostic_stage = "login_field"
             candidates = frame.locator("input[type='password']")
             ordered = []
             for field in bounded_locator_matches(candidates, first_timeout_ms=5000):
@@ -718,9 +723,11 @@ class FubonCrawler(BankCrawler):
                 or captcha_field.get_attribute("maxlength") != "6"
             ):
                 raise FubonLoginError("驗證碼欄位無法安全填寫；未送出登入")
+            self._diagnostic_stage = "login_ocr"
             captcha = self._ocr_captcha(frame, max_attempts=5)
             if not captcha or len(captcha) != 6 or not captcha.isdigit():
                 raise FubonLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+            self._diagnostic_stage = "login_field"
             captcha_field.click()
             captcha_field.click(click_count=3)
             captcha_field.press("Backspace", timeout=5000)
@@ -728,6 +735,7 @@ class FubonCrawler(BankCrawler):
             if len(captcha_field.input_value()) != 6:
                 raise FubonLoginError("驗證碼欄位輸入長度不符；未送出登入")
 
+            self._diagnostic_stage = "login_button"
             submits = tuple(bounded_locator_matches(
                 frame.locator("#btnLogin2"), first_timeout_ms=5000
             ))
@@ -746,11 +754,13 @@ class FubonCrawler(BankCrawler):
             raise FubonLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             submit.click(timeout=8000)
         except Exception:
             raise FubonLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(3000)
             for _ in range(10):
                 page.wait_for_timeout(1000)
@@ -1311,10 +1321,13 @@ class FubonCrawler(BankCrawler):
         def finish() -> BankCollectResult:
             out["final_url"] = page.url
             out["_all_endpoints"] = sorted({hit.endpoint for hit in collector.hits if hit.resp_json})
+            self._diagnostic_stage = "collect_validation"
             publish_card_bill_facts(out, [_fubon_card_bill_fact(out.get("amount_page_text") or "")])
             return BankCollectResult(**out)
 
+        self._diagnostic_stage = "collect_transactions"
         out.update(self._collect_attested_twd_history(page))
+        self._diagnostic_stage = "collect_navigation"
         page.goto(
             "https://ebank.taipeifubon.com.tw/B2C/cgequ/cgequ001/CGEQU001_Home.faces",
             wait_until="domcontentloaded", timeout=15000,
@@ -1324,6 +1337,7 @@ class FubonCrawler(BankCrawler):
         out["initial_url"] = page.url
 
         # === Step 1: 找 txnFrame (內容區，含 carousel mega menu) ===
+        self._diagnostic_stage = "collect_cards"
         content_frame = None
         for f in page.frames:
             url = f.url or ""
@@ -1665,6 +1679,7 @@ class FubonCrawler(BankCrawler):
         # 修法: 重新 navigate 到 home (CGEQU001) → 點 CBOQU003 → dump deposit frame text.
         try:
             # 直接回已知 home URL；舊 collector hit 掃描結果未被使用。
+            self._diagnostic_stage = "collect_navigation"
             home_back = page.goto(
                 "https://ebank.taipeifubon.com.tw/B2C/cgequ/cgequ001/CGEQU001_Home.faces",
                 wait_until="domcontentloaded", timeout=15000,
@@ -1675,6 +1690,7 @@ class FubonCrawler(BankCrawler):
             _log(f"[fubon][collect] 回 home 失敗: {type(e).__name__}")
 
         # 重新抓 txnFrame
+        self._diagnostic_stage = "collect_accounts"
         deposit_frame = None
         page.wait_for_timeout(2000)
         for f in page.frames:

@@ -73,6 +73,38 @@ class ScsbLoginError(RuntimeError):
 
 class ScsbCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    # Only reviewed literal raise gates; never accept arbitrary period.error.
+    SAFE_COLLECT_GUARDS: ClassVar[frozenset[str]] = frozenset({
+        'account-control-reverted',
+        'account-control-unavailable',
+        'account-inventory-incomplete',
+        'card-leaf-identity-unverified',
+        'card-leaf-navigation-failed',
+        'card-leaf-page-error',
+        'card-leaf-read-failed',
+        'card-navigation-failed',
+        'card-query-date-unavailable',
+        'card-query-form-failed',
+        'card-query-submit-unavailable',
+        'card-transaction-scope-incomplete',
+        'empty-result-close-unavailable',
+        'lookback-period-control-unavailable',
+        'lookback-period-not-applied',
+        'overview-navigation-failed',
+        'overview-twd-inventory-unavailable',
+        'partial-transaction-table',
+        'query-result-incomplete',
+        'query-result-stale',
+        'query-result-unbound',
+        'query-submit-unavailable',
+        'statement-month-collection-failed',
+        'statement-month-query-failed',
+        'statement-month-tab-unavailable',
+        'statement-month-tabs-unavailable',
+        'transaction-outside-query-period',
+        'twd-inquiry-navigation-failed',
+        'twd-navigation-failed',
+    })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
         "twd_transactions",
@@ -151,6 +183,7 @@ class ScsbCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(9000)
 
     def is_authenticated(self, page) -> bool:
@@ -305,6 +338,7 @@ class ScsbCrawler(BankCrawler):
         return True
 
     def _ocr_captcha(self, page, max_attempts=5):
+        self._diagnostic_stage = "login_ocr"
         attempts = min(max(int(max_attempts), 0), 5)
         for attempt in range(attempts):
             try:
@@ -359,9 +393,12 @@ class ScsbCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         try:
             page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
+            self._diagnostic_stage = "login_ocr"
             page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
+            self._diagnostic_stage = "login_field"
             fields = []
             for selector in (SEL_SID, SEL_USER, SEL_PWD, SEL_CAP):
                 candidates = page.locator(selector)
@@ -382,11 +419,14 @@ class ScsbCrawler(BankCrawler):
                 strict=True,
             ):
                 self._keyboard_fill(page, field, value)
+            self._diagnostic_stage = "login_ocr"
             captcha = self._ocr_captcha(page, max_attempts=5)
             if not captcha:
                 raise ScsbLoginError("無法安全辨識驗證碼；未送出登入")
+            self._diagnostic_stage = "login_field"
             self._keyboard_fill(page, fields[3], captcha)
 
+            self._diagnostic_stage = "login_button"
             candidates = page.locator(
                 "button, input[type='submit'], input[type='button']"
             )
@@ -415,11 +455,13 @@ class ScsbCrawler(BankCrawler):
             raise ScsbLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_submit"
             button.click(timeout=8000)
         except Exception:
             raise ScsbLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             for wait_ms in (12000, 5000, 5000, 5000):
                 page.wait_for_timeout(wait_ms)
                 if self._logged_in(page) or self._visible_blocker(page):
@@ -436,6 +478,7 @@ class ScsbCrawler(BankCrawler):
         SCSB SPA 不接受 page.goto 跳 hash route（會回 ERR_HTTP_RESPONSE_CODE_FAILURE），
         必須改 location.hash 設值或 click 左側選單。
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(5000)
         page.wait_for_timeout(2000)
@@ -454,6 +497,7 @@ class ScsbCrawler(BankCrawler):
 
         def _navigate(label, wait_ms=8000):
             """Click one top-level SCSB accordion/navigation control."""
+            self._diagnostic_stage = "collect_navigation"
             spec = menu.get(label)
             if not spec:
                 _log(f"  [nav] ❌ unknown label: {label}")
@@ -479,6 +523,7 @@ class ScsbCrawler(BankCrawler):
         # 1. My Overview / 我的總覽 — accordion 點開 = navigate
         if not _navigate("My Overview", wait_ms=10000):
             raise RuntimeError("overview-navigation-failed")
+        self._diagnostic_stage = "collect_accounts"
         # SCSB My Overview 預設眼睛 icon 隱藏餘額，需點開
         try:
             page.evaluate(
@@ -515,6 +560,7 @@ class ScsbCrawler(BankCrawler):
                 out["twd_text"] = ""
 
             # 2b. TWD Deposit → Account Balance and Account Statement (深入點 leaf)
+            self._diagnostic_stage = "collect_transactions"
             out["twd_inquiry"] = self._collect_twd_inquiry(
                 page, expected_twd_accounts)
         else:
@@ -524,6 +570,7 @@ class ScsbCrawler(BankCrawler):
         # 3. Credit Card / 信用卡 — accordion 本身 = navigate
         if not _navigate("Credit Card", wait_ms=8000):
             raise RuntimeError("card-navigation-failed")
+        self._diagnostic_stage = "collect_cards"
         try:
             out["card_text"] = (page.evaluate("document.body.innerText") or "")
         except Exception:
@@ -533,6 +580,7 @@ class ScsbCrawler(BankCrawler):
         out["card_inquiry"] = self._collect_credit_card_inquiry(page)
 
         # 從各頁 innerText regex 抽帳號/餘額/卡號
+        self._diagnostic_stage = "collect_accounts"
         all_text = "\n".join([out.get("overview_text", ""), out.get("twd_text", ""), out.get("card_text", "")])
         out["accounts"] = self._extract_accounts(all_text)
         parsed_account_numbers = {account["account_no"] for account in out["accounts"]}
@@ -544,6 +592,7 @@ class ScsbCrawler(BankCrawler):
         for raw_text_key in ("overview_text", "twd_text", "card_text"):
             out.pop(raw_text_key, None)
 
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [])
         out["history_coverage"] = self._twd_history_coverage(
             out["twd_inquiry"],
@@ -1470,6 +1519,7 @@ class ScsbCrawler(BankCrawler):
         account_no: str, period: dict,
     ) -> list[dict]:
         """Submit and validate one bank-supported (at most six-month) window."""
+        self._diagnostic_stage = "collect_transactions"
         self._apply_twd_period_controls(page, period)
         page.wait_for_timeout(500)
         period_check = page.evaluate(
@@ -1565,6 +1615,7 @@ class ScsbCrawler(BankCrawler):
 
     def _collect_twd_account(self, page, selector: str, account_no: str) -> dict:
         """查一個 SCSB 台幣帳戶；長區間切成銀行允許的六個月窗口。"""
+        self._diagnostic_stage = "collect_accounts"
         page.select_option(selector, value=account_no)
         page.wait_for_timeout(1500)
         account_select = page.locator(selector)
@@ -1586,6 +1637,7 @@ class ScsbCrawler(BankCrawler):
                 floor=self._one_year_floor(as_of),
                 domain="twd_transactions",
             )
+        self._diagnostic_stage = "collect_transactions"
         period = page.evaluate(
             self._twd_inquiry_period_script(
                 full_history=full_history,
@@ -1629,6 +1681,7 @@ class ScsbCrawler(BankCrawler):
     ) -> dict:
         """進入 SCSB 台幣交易明細頁，逐一查完所有帳戶。"""
         try:
+            self._diagnostic_stage = "collect_navigation"
             ret = page.evaluate(self._twd_inquiry_nav_script())
             _log(f"[twd_inq] JS sequence ok={bool(ret and ret.get('ok'))}")
             if not isinstance(ret, dict) or ret.get("ok") is not True:
@@ -1648,6 +1701,7 @@ class ScsbCrawler(BankCrawler):
             }""", arg=sorted(expected_accounts), timeout=120000)
             _log("[twd_inq] owned route and expected account controls ready")
 
+            self._diagnostic_stage = "collect_accounts"
             selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
                 id: s.id, name: s.name,
                 options: [...s.options].map(o => ({value: o.value}))
@@ -1681,6 +1735,7 @@ class ScsbCrawler(BankCrawler):
             all_records = []
             for index, (selector, account_no) in enumerate(targets, start=1):
                 _log(f"[twd_inq] query account index={index}/{len(targets)}")
+                self._diagnostic_stage = "collect_transactions"
                 account_result = self._collect_twd_account(page, selector, account_no)
                 records = account_result.pop("records")
                 account_result["record_count"] = len(records)
@@ -1720,6 +1775,7 @@ class ScsbCrawler(BankCrawler):
         ]
 
         for leaf_text, key, route in leaves_to_visit:
+            self._diagnostic_stage = "collect_navigation"
             stage = "navigate"
             try:
                 for menu_label in ("信用卡", "信用卡帳務", leaf_text):
@@ -1747,6 +1803,7 @@ class ScsbCrawler(BankCrawler):
                 page.wait_for_timeout(8000)
                 page.wait_for_timeout(1500)
 
+                self._diagnostic_stage = "collect_cards"
                 stage = "read"
                 leaf_result: dict = {"nav": {"ok": True}}
                 try:
@@ -1760,6 +1817,7 @@ class ScsbCrawler(BankCrawler):
                     raise RuntimeError("card-leaf-identity-unverified")
 
                 # 若有 date input 就填表 + Confirm（同 twd_inq）
+                self._diagnostic_stage = "collect_transactions"
                 stage = "form"
                 if key in ("statement", "current"):
                     try:
@@ -1873,6 +1931,7 @@ class ScsbCrawler(BankCrawler):
 
                 # 2026-06-13 升級：Statement Inquiry 加月份 tab 迭代抓帳單
                 # SCSB 顯示「2026/05 / 2026/04 / 2026/03」3 個月份 tab，點切換每月帳單
+                self._diagnostic_stage = "collect_cards"
                 stage = "statement"
                 if key == "statement":
                     try:
@@ -1993,6 +2052,7 @@ class ScsbCrawler(BankCrawler):
                     except Exception:
                         raise RuntimeError("statement-month-collection-failed") from None
 
+                self._diagnostic_stage = "collect_validation"
                 stage = "parse"
                 source_text = leaf_result.get("text_final") or leaf_result.get("text") or ""
                 if _scsb_page_error(source_text):

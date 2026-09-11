@@ -163,7 +163,7 @@ def test_e2e_sync_failure_records_error_msg(client, monkeypatch):
     job = wait_for_job(client, token, job_id)
     assert job["status"] == "failed"
     assert job["error_msg"] is not None
-    assert job["error_msg"] == "sync_failed:RuntimeError"
+    assert job["error_msg"] == "sync_failed:RuntimeError;stage=unknown;code=crawler_failed"
     # result_summary 不該被填（因為 except 之後沒寫 summary）
     # （sync_runner 寫法是 error 設了就走 error 分支，不寫 result_summary）
 

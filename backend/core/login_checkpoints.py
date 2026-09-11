@@ -6,9 +6,6 @@ from hashlib import sha256
 import re
 from typing import Any
 
-from patchright.sync_api import TimeoutError as PatchrightTimeoutError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
 
 class CheckpointPhase(StrEnum):
     PRE_SUBMIT = "pre_submit"
@@ -115,6 +112,9 @@ def bounded_login_inspection(page: Any):
 def bounded_locator_matches(
     locator: Any, *, first_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
 ) -> Iterator[Any]:
+    from patchright.sync_api import TimeoutError as PatchrightTimeoutError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     seen_handles: list[Any] = []
     for index in range(_MAX_LOCATOR_MATCHES + 1):
         try:
@@ -278,6 +278,9 @@ def _evaluate_rule(
     rule: LoginCheckpointRule,
     can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome | None:
+    from patchright.sync_api import TimeoutError as PatchrightTimeoutError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     matched = []
     for scope in scopes:
         containers = scope.locator(rule.container_selector)

@@ -356,7 +356,7 @@ def test_page_action_attaches_collector_before_dialog_and_prepare(monkeypatch, t
 
 
 def test_base_run_has_no_legacy_login_or_dialog_path() -> None:
-    run_source = inspect.getsource(BankCrawler.run)
+    run_source = inspect.getsource(BankCrawler._run_with_diagnostics)
     assert "USES_SHARED_LOGIN_CHECKPOINTS" not in run_source
     assert "attach_dialog_handler" not in run_source
     assert "self.login(page)" not in run_source

@@ -47,6 +47,8 @@ from backend.core.login_checkpoints import (
 )
 
 
+from backend.core.error_diagnostics import _SAFE_EXCEPTION_TYPES as _BUILTIN_EXCEPTION_TYPES
+
 _BACKEND_ROOT = Path(__file__).resolve().parents[1]
 _SAFE_EXCEPTION_TYPES = (
     (PatchrightTargetClosedError, "PatchrightTargetClosedError"),
@@ -55,49 +57,18 @@ _SAFE_EXCEPTION_TYPES = (
     (PlaywrightTargetClosedError, "PlaywrightTargetClosedError"),
     (PlaywrightTimeoutError, "PlaywrightTimeoutError"),
     (PlaywrightError, "PlaywrightError"),
-    (LoginCheckpointBlocked, "LoginCheckpointBlocked"),
-    (LoginInteractionRequired, "LoginInteractionRequired"),
-    (NotImplementedError, "NotImplementedError"),
-    (TimeoutError, "TimeoutError"),
-    (AssertionError, "AssertionError"),
-    (AttributeError, "AttributeError"),
-    (IndexError, "IndexError"),
-    (KeyError, "KeyError"),
-    (OSError, "OSError"),
-    (RuntimeError, "RuntimeError"),
-    (TypeError, "TypeError"),
-    (ValueError, "ValueError"),
-    (Exception, "Exception"),
+    *_BUILTIN_EXCEPTION_TYPES,
 )
 
 
-_SAFE_CHECKPOINT_KIND_LABELS = (
-    (CheckpointKind.AUTHENTICATED, "authenticated"),
-    (CheckpointKind.READY_FOR_CREDENTIALS, "ready_for_credentials"),
-    (CheckpointKind.DISMISSIBLE_NOTICE, "dismissible_notice"),
-    (CheckpointKind.DUPLICATE_SESSION, "duplicate_session"),
-    (CheckpointKind.PROTOCOL_RESUBMIT, "protocol_resubmit"),
-    (CheckpointKind.CAPTCHA_RETRY, "captcha_retry"),
-    (CheckpointKind.STARTUP_RECOVERY, "startup_recovery"),
-    (CheckpointKind.OTP_REQUIRED, "otp_required"),
-    (CheckpointKind.PASSWORD_CHANGE_OPTIONAL, "password_change_optional"),
-    (CheckpointKind.PASSWORD_CHANGE_REQUIRED, "password_change_required"),
-    (CheckpointKind.EXPLICIT_LOGIN_ERROR, "explicit_login_error"),
-    (CheckpointKind.UNKNOWN_BLOCKER, "unknown_blocker"),
+from backend.core.error_diagnostics import (
+    _safe_exception_mro, _exception_inherits, _base_exception_state,
+    _base_exception_args as _base_exception_args, _base_exception_context, _safe_state_value,
+    _safe_state_int, _safe_login_diagnostics, _safe_native_login_diagnostics,
+    make_diagnostics, instance_stage, exception_diagnostics, annotate_failure,
+    _safe_collect_guard, _class_collect_guard_allowlist,
+    _SAFE_CHECKPOINT_KIND_LABELS, _SAFE_LOGIN_RULES as _SAFE_LOGIN_RULES,
 )
-
-
-def _safe_exception_mro(exc: BaseException) -> tuple[type, ...]:
-    try:
-        mro = type.__getattribute__(type(exc), "__mro__")
-    except BaseException:
-        return ()
-    return mro if type(mro) is tuple else ()
-
-
-def _exception_inherits(exc: BaseException, *targets: type[BaseException]) -> bool:
-    return any(base is target for base in _safe_exception_mro(exc) for target in targets)
-
 
 def _safe_exception_type(exc: BaseException) -> str:
     for base in _safe_exception_mro(exc):
@@ -116,51 +87,6 @@ def _safe_checkpoint_kind_label(kind: object) -> str:
         ),
         "unknown_blocker",
     )
-
-
-def _base_exception_state(exc: BaseException) -> dict:
-    try:
-        reduced = BaseException.__reduce__(exc)
-    except BaseException:
-        return {}
-    if type(reduced) is tuple and len(reduced) >= 3 and type(reduced[2]) is dict:
-        return reduced[2]
-    return {}
-
-
-def _base_exception_args(exc: BaseException) -> tuple:
-    try:
-        reduced = BaseException.__reduce__(exc)
-    except BaseException:
-        return ()
-    if type(reduced) is tuple and len(reduced) >= 2 and type(reduced[1]) is tuple:
-        return reduced[1]
-    return ()
-
-
-def _base_exception_context(exc: BaseException) -> BaseException | None:
-    try:
-        context = BaseException.__dict__["__context__"].__get__(exc, BaseException)
-    except BaseException:
-        return None
-    return context if isinstance(context, BaseException) else None
-
-
-def _safe_state_value(state: object, field: str) -> object | None:
-    if type(state) is not dict:
-        return None
-    try:
-        for key, value in dict.items(state):
-            if type(key) is str and key == field:
-                return value
-    except BaseException:
-        return None
-    return None
-
-
-def _safe_state_int(state: object, field: str) -> int:
-    value = _safe_state_value(state, field)
-    return value if type(value) is int else -1
 
 
 def _bank_collect_failure_code(function: str) -> str:
@@ -239,140 +165,9 @@ def _safe_collect_failure_code(exc: BaseException) -> str:
     return code
 
 
-def _safe_collect_guard(exc: BaseException, allowlist: object) -> str | None:
-    """Return only a code-owned static guard, including suppressed contexts."""
-    if type(allowlist) is not frozenset or len(allowlist) > 128 or any(
-        type(value) is not str or len(value) > 128 for value in allowlist
-    ):
-        return None
-    guard = None
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen and len(seen) < 16:
-        seen.add(id(current))
-        args = _base_exception_args(current)
-        if (
-            _exception_inherits(current, RuntimeError)
-            and len(args) == 1
-            and type(args[0]) is str
-            and len(args[0]) <= 128
-            and args[0] in allowlist
-        ):
-            guard = args[0]
-        current = _base_exception_context(current)
-    return guard
-
-
-def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
-    """Read the exact crawler class namespace without invoking descriptors."""
-    try:
-        namespace = type.__dict__["__dict__"].__get__(
-            type(crawler), type(type(crawler))
-        )
-        if type(namespace) is not type(type.__dict__) or len(namespace) > 128:
-            return frozenset()
-        allowlist = next(
-            (
-                value
-                for key, value in namespace.items()
-                if type(key) is str and key == "SAFE_COLLECT_GUARDS"
-            ),
-            None,
-        )
-    except BaseException:
-        return frozenset()
-    if type(allowlist) is not frozenset or len(allowlist) > 128 or any(
-        type(value) is not str or len(value) > 128 for value in allowlist
-    ):
-        return frozenset()
-    return allowlist
 
 
 
-
-# Diagnostic labels only: never used to select or authorize browser actions.
-_SAFE_LOGIN_RULES = (
-    ('cathay', ('cathay-login-announcement', 'cathay-unknown-dialog', 'cathay-unknown-modal')),
-    ('ctbc', ('ctbc-duplicate-session', 'ctbc-entry-announcement', 'ctbc-otp-required', 'ctbc-unknown-dialog', 'ctbc-unknown-modal')),
-    ('dbs', ('dbs-explicit-login-error-alert', 'dbs-explicit-login-error-error', 'dbs-explicit-login-error-role-alert', 'dbs-login-form-still-visible', 'dbs-otp-required-dialog', 'dbs-otp-required-modal', 'dbs-password-change-required-dialog', 'dbs-password-change-required-modal', 'dbs-unknown-dialog', 'dbs-unknown-modal')),
-    ('esun', ('esun-login-form-still-visible', 'esun-otp-required-dialog', 'esun-otp-required-modal', 'esun-password-change-required-dialog', 'esun-password-change-required-modal', 'esun-unknown-dialog', 'esun-unknown-modal')),
-    ('fubon', ('fubon-explicit-login-error-alert', 'fubon-explicit-login-error-error', 'fubon-explicit-login-error-role-alert', 'fubon-login-form-still-visible', 'fubon-otp-required-dialog', 'fubon-otp-required-modal', 'fubon-password-change-required-dialog', 'fubon-password-change-required-modal', 'fubon-unknown-dialog', 'fubon-unknown-modal')),
-    ('hsbc', ('hsbc-explicit-login-error-alert', 'hsbc-explicit-login-error-error', 'hsbc-explicit-login-error-role-alert', 'hsbc-login-form-still-visible-password', 'hsbc-login-form-still-visible-userId', 'hsbc-login-form-still-visible-captchaInput', 'hsbc-otp-required-dialog', 'hsbc-otp-required-modal', 'hsbc-password-change-required-dialog', 'hsbc-password-change-required-modal', 'hsbc-security-notice', 'hsbc-unknown-dialog', 'hsbc-unknown-modal')),
-    ('linebank', ('linebank-login-form-still-visible', 'linebank-login-success-notice', 'linebank-otp-required', 'linebank-unknown-modal')),
-    ('rakuten', ('rakuten-duplicate-session', 'rakuten-otp-required', 'rakuten-referral-promo', 'rakuten-ricb-promo', 'rakuten-startup-connect-error', 'rakuten-time-deposit-promo', 'rakuten-unknown-modal')),
-    ('scb', ('scb-captcha-retry-alert', 'scb-captcha-retry-error', 'scb-captcha-retry-role-alert', 'scb-duplicate-session-dialog', 'scb-duplicate-session-modal', 'scb-explicit-login-error-alert', 'scb-explicit-login-error-error', 'scb-explicit-login-error-role-alert', 'scb-login-form-still-visible', 'scb-otp-required-dialog', 'scb-otp-required-modal', 'scb-password-change-required-dialog', 'scb-password-change-required-modal', 'scb-unknown-dialog', 'scb-unknown-modal')),
-    ('scsb', ('scsb-explicit-login-error-alert', 'scsb-explicit-login-error-error', 'scsb-explicit-login-error-role-alert', 'scsb-fraud-notice', 'scsb-intro-notice', 'scsb-login-form-still-visible', 'scsb-otp-required-dialog', 'scsb-otp-required-intro', 'scsb-otp-required-modal', 'scsb-password-change-required-dialog', 'scsb-password-change-required-intro', 'scsb-password-change-required-modal', 'scsb-unknown-custom-modal', 'scsb-unknown-dialog', 'scsb-unknown-modal')),
-    ('sinopac', ('sinopac-captcha-retry-alert', 'sinopac-captcha-retry-error', 'sinopac-captcha-retry-role-alert', 'sinopac-explicit-login-error-alert', 'sinopac-explicit-login-error-error', 'sinopac-explicit-login-error-role-alert', 'sinopac-login-form-still-visible', 'sinopac-otp-required-dialog', 'sinopac-otp-required-modal', 'sinopac-password-change-required-dialog', 'sinopac-password-change-required-modal', 'sinopac-unknown-dialog', 'sinopac-unknown-modal')),
-    ('taishin', ('taishin-login-form-still-visible', 'taishin-mandatory-password-dialog', 'taishin-mandatory-password-modal', 'taishin-otp-required-dialog', 'taishin-otp-required-modal', 'taishin-post-notice-dialog', 'taishin-post-notice-modal', 'taishin-post-protocol-dialog', 'taishin-post-protocol-modal', 'taishin-pre-duplicate-dialog', 'taishin-pre-duplicate-modal', 'taishin-unknown-dialog', 'taishin-unknown-modal')),
-    ('ubot', ('ubot-login-form-still-visible', 'ubot-otp-required', 'ubot-password-change-optional', 'ubot-password-change-required', 'ubot-unknown-modal')),
-)
-
-
-_SAFE_LOGIN_PHASES = ((CheckpointPhase.PRE_SUBMIT, "pre_submit"), (CheckpointPhase.POST_SUBMIT, "post_submit"), (CheckpointPhase.POST_SUBMIT_SETTLE, "post_submit_settle"))
-_SAFE_LOGIN_REASONS = (
-    (CheckpointReason.UNSPECIFIED, 'unspecified'),
-    (CheckpointReason.ACTION_CLICK_EXCEPTION, 'action_click_exception'),
-    (CheckpointReason.ACTION_GUARD_DENIED, 'action_guard_denied'),
-    (CheckpointReason.ACTION_GUARD_EXCEPTION, 'action_guard_exception'),
-    (CheckpointReason.ACTION_NOT_UNIQUE, 'action_not_unique'),
-    (CheckpointReason.AUTHENTICATION_EXCEPTION, 'authentication_exception'),
-    (CheckpointReason.BANK_MISMATCH, 'bank_mismatch'),
-    (CheckpointReason.COLLECT_ORIGIN_OR_DIALOG, 'collect_origin_or_dialog'),
-    (CheckpointReason.DIALOG_BLOCKED, 'dialog_blocked'),
-    (CheckpointReason.DIALOG_DISMISS_EXCEPTION, 'dialog_dismiss_exception'),
-    (CheckpointReason.ORIGIN_INSPECTION_EXCEPTION, 'origin_inspection_exception'),
-    (CheckpointReason.DUPLICATE_RULE_NAMES, 'duplicate_rule_names'),
-    (CheckpointReason.FORM_CONTROLS_PRESENT, 'form_controls_present'),
-    (CheckpointReason.FRAME_INSPECTION_EXCEPTION, 'frame_inspection_exception'),
-    (CheckpointReason.INSPECTION_EXCEPTION, 'inspection_exception'),
-    (CheckpointReason.INVALID_OUTCOME, 'invalid_outcome'),
-    (CheckpointReason.INVALID_TRANSITION, 'invalid_transition'),
-    (CheckpointReason.MATCHED_BLOCKER, 'matched_blocker'),
-    (CheckpointReason.NATIVE_FORM_SUBMISSION, 'native_form_submission'),
-    (CheckpointReason.NAVIGATION_ORIGIN, 'navigation_origin'),
-    (CheckpointReason.NO_MATCHING_CHECKPOINT, 'no_matching_checkpoint'),
-    (CheckpointReason.NO_PROGRESS, 'no_progress'),
-    (CheckpointReason.ORIGIN_AFTER_EVALUATION, 'origin_after_evaluation'),
-    (CheckpointReason.ORIGIN_AFTER_PREPARE, 'origin_after_prepare'),
-    (CheckpointReason.ORIGIN_BEFORE_EVALUATION, 'origin_before_evaluation'),
-    (CheckpointReason.ORIGIN_BEFORE_PREPARE, 'origin_before_prepare'),
-    (CheckpointReason.ORIGIN_BEFORE_SUBMIT, 'origin_before_submit'),
-    (CheckpointReason.PROGRESS_INSPECTION_EXCEPTION, 'progress_inspection_exception'),
-    (CheckpointReason.PROGRESS_WAIT_EXCEPTION, 'progress_wait_exception'),
-    (CheckpointReason.RULE_BUDGET_EXHAUSTED, 'rule_budget_exhausted'),
-    (CheckpointReason.RULE_INSPECTION_EXCEPTION, 'rule_inspection_exception'),
-    (CheckpointReason.STEP_LIMIT, 'step_limit'),
-)
-
-def _safe_login_diagnostics(bank, exception_state, outcome_state):
-    phase = _safe_state_value(exception_state, "phase")
-    phase_label = next((label for item, label in _SAFE_LOGIN_PHASES if phase is item), "unknown")
-    reason = _safe_state_value(outcome_state, "reason")
-    reason_label = next((label for item, label in _SAFE_LOGIN_REASONS
-                         if reason is item or (type(reason) is str and reason == label)), "unspecified")
-    rule = _safe_state_value(outcome_state, "rule_name")
-    rule_label = next((name for owner, names in _SAFE_LOGIN_RULES
-                       if type(bank) is str and bank == owner
-                       for name in names if type(rule) is str and rule == name), "unknown")
-    return f"phase={phase_label}, reason={reason_label}, rule={rule_label}"
-
-
-def _safe_native_login_diagnostics(bank, exception_state):
-    # Adapter classifications are not bank response codes and never authorize actions.
-    if type(bank) is not str or bank != "sinopac":
-        return ""
-    code = _safe_state_value(exception_state, "code")
-    code_label = next((label for label in (
-        "captcha_invalid", "credentials_invalid", "login_failed",
-    ) if type(code) is str and code == label), "unknown")
-    stage = _safe_state_value(exception_state, "login_stage")
-    stage_label = next((label for label in (
-        "prepare_page", "input_length", "captcha_refresh", "captcha_image_wait",
-        "input_inventory", "input_geometry", "input_order", "input_enabled",
-        "credential_fill", "captcha_ocr", "captcha_fill", "login_button",
-        "credential_submit", "post_submit_check",
-    ) if type(stage) is str and stage == label), "unknown")
-    return f"internal_error_code={code_label}, stage={stage_label}"
 
 
 def write_private_json(path: Path, payload: dict) -> None:
@@ -1702,6 +1497,7 @@ class BankCrawler(ABC):
     _origin_inspection_failed: bool = False
 
     def __post_init__(self):
+        self._diagnostic_stage = 'init'
         self.session_dir = DATA_ROOT / f"{self.name}_session"
         self.session_dir.mkdir(parents=True, exist_ok=True)
         # C-3 修法 (2026-06-17): per-bank captcha 暫存檔路徑 (放 session_dir 內)。
@@ -1786,6 +1582,7 @@ class BankCrawler(ABC):
         return False
 
     def _shared_login(self, page) -> bool:
+        self._diagnostic_stage = 'login_prepare'
         if self.name == "sinopac":
             self._sinopac_diagnostics = {}
             self._login_diagnostic_floor = None
@@ -1804,6 +1601,7 @@ class BankCrawler(ABC):
                 LoginBudget(),
                 CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_AFTER_PREPARE)),
             )
+        self._diagnostic_stage = 'login_checkpoint'
         rules = self.login_checkpoint_rules()
         if len({rule.name for rule in rules}) != len(rules):
             reduce_login_checkpoint(
@@ -1826,6 +1624,7 @@ class BankCrawler(ABC):
         ) + 8
 
         for _ in range(max_steps):
+            self._diagnostic_stage = ('login_checkpoint' if phase is CheckpointPhase.PRE_SUBMIT else 'login_postconfirm')
             if getattr(self, "_shared_dialog_blocked", False):
                 reduce_login_checkpoint(
                     phase,
@@ -1914,6 +1713,7 @@ class BankCrawler(ABC):
                 action_counts[outcome.rule_name] += 1
             if next_budget.credential_submissions == budget.credential_submissions + 1:
                 if next_budget.captcha_resubmits == budget.captcha_resubmits + 1:
+                    self._diagnostic_stage = 'login_ocr'
                     self.prepare_captcha_resubmit(page)
                 if not self._credential_origin_allowed(page):
                     reduce_login_checkpoint(
@@ -1921,8 +1721,10 @@ class BankCrawler(ABC):
                         budget,
                         CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, reason=self._origin_failure_reason(CheckpointReason.ORIGIN_BEFORE_SUBMIT)),
                     )
+                self._diagnostic_stage = 'login_submit'
                 self.submit_credentials_once(page)
             if next_budget.reloads == budget.reloads + 1:
+                self._diagnostic_stage = 'login_prepare'
                 page.reload()
                 self.prepare_login_page(page)
             if (
@@ -2078,6 +1880,18 @@ class BankCrawler(ABC):
         """Optional adapter-owned stderr diagnostics; never affects login decisions."""
 
     def run(self, login_url: str, headless: bool = False) -> dict:
+        self._diagnostic_stage = 'session'
+        result: dict = {}
+        try:
+            return self._run_with_diagnostics(login_url, headless, result)
+        except Exception as exc:
+            if 'error' in result:
+                return result
+            annotate_failure(exc, instance_stage(self), bank=self.name,
+                             guards=_class_collect_guard_allowlist(self))
+            raise
+
+    def _run_with_diagnostics(self, login_url, headless, result) -> dict:
         """完整流程：開瀏覽器 → 登入 → 抓取 → **登出** → 回傳資料。
 
         logout 走 finally 保證執行（包含 collect raise 的 case），best-effort
@@ -2091,20 +1905,24 @@ class BankCrawler(ABC):
         # 詳見 SESSION_MAX_AGE_SECONDS docstring（SCSB 2026-06-16 案例）。
         self._enforce_session_freshness()
 
+        self._diagnostic_stage = 'init'
         collector = ResponseCollector(host_filter=self._host_filter())
-        result: dict = {}
 
         def page_action(page):
             logged_in = False
+            escaped_error = False
             try:
+                self._diagnostic_stage = 'browser_navigation'
                 collector.attach(page)
                 self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
                 self._shared_dialog_blocked = False
                 self._dialog_dismiss_failed = False
                 self.attach_shared_dialog_handler(page)
                 try:
+                    self._diagnostic_stage = 'login_prepare'
                     ok = self._shared_login(page)
                 except Exception as e:
+                    terminal_diagnostics = exception_diagnostics(e, self, exception_type=_safe_exception_type)
                     try:
                         recovered = self._recover_late_authentication(page, e)
                     except Exception:
@@ -2179,21 +1997,26 @@ class BankCrawler(ABC):
                         native_diagnostics = _safe_native_login_diagnostics(self.name, exception_state)
                         if native_diagnostics:
                             msg += f", {native_diagnostics}"
+                        stage_fields = make_diagnostics(terminal_diagnostics['stage'])
                         print(
-                            f"[{self.name}][login] raise → {msg}; details withheld",
+                            f"[{self.name}][login] raise → {msg}"
+                            f";stage={stage_fields['stage']};code={stage_fields['code']}; details withheld",
                             file=_sys.stderr,
                         )
                         with contextlib.suppress(Exception):
                             self.log_login_failure_diagnostics(page)
                         result["error"] = msg
+                        result["error_diagnostics"] = terminal_diagnostics
                         return page
 
                 if not ok:
                     with contextlib.suppress(Exception):
                         self.log_login_failure_diagnostics(page)
                     result["error"] = "login_failed"
+                    result["error_diagnostics"] = make_diagnostics(instance_stage(self))
                     return page
                 logged_in = True
+                self._diagnostic_stage = 'collect'
                 try:
                     def ensure_collect_origin() -> None:
                         if (
@@ -2246,11 +2069,23 @@ class BankCrawler(ABC):
                     )
                     if guard is not None:
                         msg += f": guard={guard}"
+                    stage_fields = make_diagnostics(instance_stage(self))
                     print(
-                        f"[{self.name}][collect] raise → {msg}; details withheld",
+                        f"[{self.name}][collect] raise → {msg}"
+                        f";stage={stage_fields['stage']};code={stage_fields['code']}; details withheld",
                         file=_sys.stderr,
                     )
                     result["error"] = msg
+                    result["error_diagnostics"] = make_diagnostics(instance_stage(self))
+                    result["error_diagnostics"].update(exception_diagnostics(e, self, exception_type=_safe_exception_type))
+                    result["error_diagnostics"]["collect_code"] = _safe_collect_failure_code(e)
+                    if guard is not None:
+                        result["error_diagnostics"]["guard"] = guard
+            except Exception as exc:
+                escaped_error = True
+                annotate_failure(exc, instance_stage(self), bank=self.name,
+                                 guards=_class_collect_guard_allowlist(self))
+                raise
             finally:
                 # 已登入且仍在owned origin才best-effort logout；foreign origin零互動。
                 if logged_in and self._credential_origin_allowed(page):
@@ -2263,11 +2098,17 @@ class BankCrawler(ABC):
                             "(details withheld; best-effort, swallow)",
                             file=_sys.stderr,
                         )
-                collector.detach(page)
+                self._diagnostic_stage = 'cleanup'
+                try:
+                    collector.detach(page)
+                except Exception:
+                    if not escaped_error:
+                        raise
             return page
 
         # 所有 crawler 從 base 繼承同一套 macOS fingerprint spoof。
         # 詳見 wiki/concepts/bank-crawler-platform-spoof-rule.md
+        self._diagnostic_stage = 'browser_launch'
         fetch_kwargs = self._build_fetch_kwargs()
         cleanups = fetch_kwargs.pop("__cleanups__", [])
 

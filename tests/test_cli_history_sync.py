@@ -52,7 +52,7 @@ def test_cli_private_json_failure_preserves_previous_file(tmp_path, monkeypatch)
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
-def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch):
+def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch, capsys):
     from cli import cli
 
     class FakeCrawler:
@@ -91,8 +91,12 @@ def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch):
     )
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
 
-    with pytest.raises(ValueError, match="history coverage"):
-        cli.cmd_sync(SimpleNamespace(bank="sinopac", headless=True))
+    from backend.core import persist
+    monkeypatch.setattr(persist, 'persist_collected', lambda *a, **kw: pytest.fail('invalid coverage must not persist'))
+    assert cli.cmd_sync(SimpleNamespace(bank="sinopac", headless=True)) == 1
+    output = capsys.readouterr().out
+    assert 'stage=coverage;code=coverage_failed' in output
+    assert '增量同步結果' not in output
 
     assert set(crawler.cursor_domains) == {
         "twd_transactions", "card_billed_transactions",

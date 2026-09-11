@@ -453,6 +453,7 @@ class SinopacCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         self._sinopac_diagnostics = {}
         self._login_terminal_exception_type = None
         self._login_underlying_exception_type = None
@@ -590,6 +591,7 @@ class SinopacCrawler(BankCrawler):
             )
 
     def prepare_captcha_resubmit(self, page) -> None:
+        self._diagnostic_stage = "login_ocr"
         operation = "captcha_refresh"
         try:
             image = self._captcha_image(page, enabled=True)
@@ -686,6 +688,7 @@ class SinopacCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         state = getattr(self, "_sinopac_diagnostics", None)
         if type(state) is not dict:
             state = self._sinopac_diagnostics = {}
@@ -754,6 +757,7 @@ class SinopacCrawler(BankCrawler):
                 strict=True,
             ):
                 self._keyboard_fill(page, field, value)
+            self._diagnostic_stage = "login_ocr"
             stage = "captcha_ocr"
             captcha = self._ocr_captcha(page, max_attempts=5)
             if captcha is None:
@@ -762,9 +766,11 @@ class SinopacCrawler(BankCrawler):
                     "永豐驗證碼辨識失敗；未送出登入",
                     login_stage=stage,
                 )
+            self._diagnostic_stage = "login_field"
             stage = "captcha_fill"
             self._keyboard_fill(page, fields[3], captcha)
 
+            self._diagnostic_stage = "login_button"
             stage = "login_button"
             candidates = page.locator("#MMA_Login")
             eligible = []
@@ -799,6 +805,7 @@ class SinopacCrawler(BankCrawler):
                 login_stage=stage,
             ) from None
 
+        self._diagnostic_stage = "login_submit"
         stage = "credential_submit"
         completed = _diagnostic_number(state.get("ocr_completed_at"), fraction=True)
         if completed is not None:
@@ -816,6 +823,7 @@ class SinopacCrawler(BankCrawler):
                 login_stage=stage,
             ) from None
 
+        self._diagnostic_stage = "login_postconfirm"
         stage = "post_submit_check"
         operation = "post_submit_wait"
         try:
@@ -1137,6 +1145,7 @@ class SinopacCrawler(BankCrawler):
         AllCards/ws_mychart，巡訪「資產分析 / 信用卡總覽」頁也會補打。
         台幣交易明細 dropdown 是 jQuery 客製化元件（#divDebitAccount），待下次破。
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(5000)
 
@@ -1146,31 +1155,40 @@ class SinopacCrawler(BankCrawler):
             "https://mma.sinopac.com/mma/mymma/myasset/cards_summary.aspx",
         ]:
             try:
+                self._diagnostic_stage = "collect_navigation"
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                self._diagnostic_stage = "collect"
                 page.wait_for_timeout(6000)
             except Exception:
                 _log("[collect] page_navigation_failed")
 
         # 從 collector 取已攔到的 API JSON
+        self._diagnostic_stage = "collect_accounts"
         out["bank_balance"] = self._latest_json(collector, "ws_bankbal.ashx")        # 銀行帳戶餘額 list
         out["debit_accounts"] = self._latest_json(collector, "ws_debitacct.ashx")    # 扣款帳戶清單
+        self._diagnostic_stage = "collect_cards"
         out["card_summary"] = self._latest_json(collector, "ws_cardsum.ashx")        # 信用卡彙總
         out["card_billing"] = self._latest_json(collector, "ws_cardbilling_sp.ashx") # 信用卡 3 個月帳單
         out["all_cards"] = self._latest_json(collector, "AllCards")                  # 全卡清單
+        self._diagnostic_stage = "collect_accounts"
         out["asset_chart"] = self._latest_json(collector, "ws_mychart.ashx")         # 資產分佈圓餅
         out["alert_info"] = self._latest_json(collector, "ws_alertinfo.ashx")        # 帳戶通知
 
         # === 貸款明細：每個貸款帳號查本金餘額 / 利率 / 到期日 ===
+        self._diagnostic_stage = "collect_loans"
         out["loan"] = self._collect_loans(page, collector)
 
         # === 台幣交易明細：權威帳戶 inventory + 月窗 coverage ===
+        self._diagnostic_stage = "collect_transactions"
         twd_history = self._collect_transactions(page, collector)
         out["twd_transactions"] = twd_history["results"]
         out["debit_accounts"] = twd_history["inventory"]
         out["history_coverage"] = twd_history["coverage"]
 
         # === 信用卡明細：帳單已請款（StatementInquiry HTML）+ 未請款（UnbilledTxInquiry API）===
+        self._diagnostic_stage = "collect_cards"
         out["card_statements"] = self._collect_card_statements(page)
+        self._diagnostic_stage = "collect_cards"
         out["card_unbilled"] = self._collect_card_unbilled(page, collector)
 
         # 偵測尚未抓到的（log 給 debug 用）
@@ -1178,6 +1196,7 @@ class SinopacCrawler(BankCrawler):
         if miss:
             _log(f"[collect] 未攔到: {miss}")
 
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [_sinopac_card_bill_fact(out)])
 
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
@@ -1185,7 +1204,10 @@ class SinopacCrawler(BankCrawler):
 
     def _collect_loans(self, page, collector: ResponseCollector) -> dict:
         """逐帳號觸發 ws_loaninfo，回傳銀行原生貸款明細。"""
+        self._diagnostic_stage = "collect_loans"
+        self._diagnostic_stage = "collect_navigation"
         page.goto(LOAN_DETAIL_URL, wait_until="domcontentloaded", timeout=30000)
+        self._diagnostic_stage = "collect_loans"
         page.wait_for_timeout(8000)
 
         account_raw = self._latest_json(collector, "ws_loanaccount.ashx")
@@ -1258,7 +1280,9 @@ class SinopacCrawler(BankCrawler):
                 repayments.append(self._collect_loan_repayments(page, collector, account, record))
                 # Return once only after verified success. Never replay a POST or
                 # retry a failed query if history/selection cannot be restored.
+                self._diagnostic_stage = "collect_navigation"
                 page.go_back(wait_until="domcontentloaded", timeout=15_000)
+                self._diagnostic_stage = "collect_loans"
                 if (page.url != "https://mma.sinopac.com/mma/bank/easy_index_loan/mma_loandetail.aspx"
                         or getattr(self, "_shared_dialog_blocked", False) or self._response_visible(page)):
                     raise RuntimeError("sinopac-loan-restore-page")
@@ -1275,6 +1299,7 @@ class SinopacCrawler(BankCrawler):
 
     def _collect_loan_repayments(self, page, collector, account: dict, record: dict) -> dict:
         """One native default period, not a retention/full-history assertion."""
+        self._diagnostic_stage = "collect_loans"
         from backend.core.persist.sinopac import _parse_sinopac_repayment
 
         # Fallback for unexpected failures; the safe sink retains deeper guards
@@ -1410,6 +1435,7 @@ class SinopacCrawler(BankCrawler):
 
     def _collect_transactions(self, page, collector: ResponseCollector) -> dict:
         """Collect every authoritative TWD account across complete month windows."""
+        self._diagnostic_stage = "collect_transactions"
         deadline = time.monotonic() + 600
 
         def ensure_deadline() -> None:
@@ -1423,11 +1449,13 @@ class SinopacCrawler(BankCrawler):
         inventory_response_before = len(collector.by_endpoint("ws_debitacct.ashx"))
         history_issued_before = collector.issued_count("ws_transdetailMerge.ashx")
         history_response_before = len(collector.by_endpoint("ws_transdetailMerge.ashx"))
+        self._diagnostic_stage = "collect_navigation"
         page.goto(
             "https://mma.sinopac.com/mma/bank/transdetail/mma_transdetail.aspx",
             wait_until="domcontentloaded",
             timeout=30_000,
         )
+        self._diagnostic_stage = "collect_transactions"
         for _ in range(40):
             ensure_deadline()
             candidate = collector.latest("ws_debitacct.ashx")
@@ -1819,10 +1847,13 @@ class SinopacCrawler(BankCrawler):
         此頁 SSR：整頁 HTML 含 12 個月切換按鈕 + 當月所有消費紀錄。每月一次 goto 即可。
         我們抓最近 3 個月。回傳 list[{month, html_text, records}]。
         """
+        self._diagnostic_stage = "collect_cards"
         results = []
         try:
+            self._diagnostic_stage = "collect_navigation"
             page.goto("https://mma.sinopac.com/SinoCard/Account/StatementInquiry",
                       wait_until="domcontentloaded", timeout=20000)
+            self._diagnostic_stage = "collect_cards"
             page.wait_for_timeout(5000)
         except Exception:
             _log("[card_stmt] page_navigation_failed")
@@ -1914,9 +1945,12 @@ class SinopacCrawler(BankCrawler):
         此頁靠 POST API：LatestTx（最新交易）+ OutstandingDetail（已請款合計）。
         collector 攔 sinopac.com 全域，已自動收下。
         """
+        self._diagnostic_stage = "collect_cards"
         try:
+            self._diagnostic_stage = "collect_navigation"
             page.goto("https://mma.sinopac.com/SinoCard/Account/UnbilledTxInquiry",
                       wait_until="domcontentloaded", timeout=20000)
+            self._diagnostic_stage = "collect_cards"
             page.wait_for_timeout(7000)
         except Exception:
             _log("[card_unbilled] page_navigation_failed")

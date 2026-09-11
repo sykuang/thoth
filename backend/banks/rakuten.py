@@ -145,7 +145,9 @@ def _any_visible(page, selector: str) -> bool:
     return any(locators.nth(index).is_visible() for index in range(locators.count()))
 
 
-def _click_visible_login(page, *, can_click: Callable[[], bool] | None = None) -> bool:
+def _click_visible_login(
+    page, *, can_click: Callable[[], bool] | None = None, before_dispatch=None,
+) -> bool:
     candidates = page.locator("a.btn.btn-primary:visible").filter(
         has_text=re.compile(r"^\s*登入\s*$"),
     )
@@ -157,6 +159,11 @@ def _click_visible_login(page, *, can_click: Callable[[], bool] | None = None) -
         return False
     if can_click is not None and not can_click():
         return False
+    if before_dispatch is not None:
+        try:
+            before_dispatch()
+        except Exception:
+            pass  # Diagnostics must never prevent the existing click.
     button.click()
     return True
 
@@ -466,6 +473,7 @@ class RakutenCrawler(BankCrawler):
         *,
         as_of: date | None = None,
     ) -> dict:
+        self._diagnostic_stage = "collect_transactions"
         as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
         if mode not in {"full", "incremental"}:
@@ -626,6 +634,7 @@ class RakutenCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         # browserStartup may take 3s for a token plus 15s for its handshake.
         page.wait_for_timeout(20000)
 
@@ -685,6 +694,7 @@ class RakutenCrawler(BankCrawler):
                         ):
                             authenticated_quiet_polls = 0
                             continue
+                        self._diagnostic_stage = "login_postconfirm"
                         return True
                 else:
                     authenticated_quiet_polls = 0
@@ -804,12 +814,17 @@ class RakutenCrawler(BankCrawler):
             ),
         )
 
+    def _mark_login_dispatch(self) -> None:
+        self._diagnostic_stage = "login_submit"
+
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
 
         for selector in ("#custNo", "#userNo", "#pcode"):
             page.wait_for_selector(selector, timeout=15000)
 
         captcha = ""
+        self._diagnostic_stage = "login_ocr"
         if page.locator(CAPTCHA_IMG).is_visible():
             wait_captcha_stable(page, CAPTCHA_IMG, tmp_path=self.captcha_tmp)
             captcha = solve_captcha(
@@ -842,6 +857,7 @@ class RakutenCrawler(BankCrawler):
             if not captcha:
                 raise RakutenLoginError("圖形驗證碼 OCR 失敗；未送出登入")
 
+        self._diagnostic_stage = "login_field"
         fields = (
             ("#custNo", self.creds.national_id),
             ("#userNo", self.creds.user_code),
@@ -874,8 +890,10 @@ class RakutenCrawler(BankCrawler):
             or not self._credential_origin_allowed(page)
         ):
             raise RakutenLoginError("登入安全狀態已變更；未送出登入")
+        self._diagnostic_stage = "login_button"
         if not _click_visible_login(
             page,
+            before_dispatch=self._mark_login_dispatch,
             can_click=lambda: (
                 not getattr(self, "_shared_dialog_blocked", False)
                 and self._credential_origin_allowed(page)
@@ -884,6 +902,7 @@ class RakutenCrawler(BankCrawler):
         ):
             raise RakutenLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
 
+        self._diagnostic_stage = "login_postconfirm"
         for _ in range(20):
             page.wait_for_timeout(1000)
             try:
@@ -1272,6 +1291,7 @@ class RakutenCrawler(BankCrawler):
         不會被 SPA 還原，結果被踢回登入頁（2026-07-28 real-account probe 實證，
         final_url 落在 /cgn/cgnot0001/010）。只能點側邊導覽。
         """
+        self._diagnostic_stage = "collect_navigation"
         budget = LoginBudget(credential_submissions=1)
 
         def ensure_navigation_safe() -> None:
@@ -1356,7 +1376,9 @@ class RakutenCrawler(BankCrawler):
         ensure_navigation_safe()
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
+        self._diagnostic_stage = "collect_navigation"
         self._goto_twd(page)
+        self._diagnostic_stage = "collect_accounts"
         page.wait_for_selector(
             "simple-dropdown2 a.txt_dropdown",
             state="visible",
@@ -1372,6 +1394,7 @@ class RakutenCrawler(BankCrawler):
             raise RakutenLoginError("進入臺幣存款頁後 session 無效")
         self._wait_for_twd_view(page, timeout_seconds=30)
 
+        self._diagnostic_stage = "collect_transactions"
         history = self._collect_attested_twd_history(page, collector)
 
         endpoints = sorted({
@@ -1379,6 +1402,7 @@ class RakutenCrawler(BankCrawler):
             for hit in collector.hits
             if "/channel-" in hit.url
         })
+        self._diagnostic_stage = "collect_validation"
         return BankCollectResult(
             bank="rakuten",
             final_url=page.url,

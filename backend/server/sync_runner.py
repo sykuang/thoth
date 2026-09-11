@@ -24,6 +24,7 @@ import threading
 
 from backend.server import sync_batches_repo, sync_jobs_repo
 from backend.server.dashboard_cache import clear_dashboard_cache
+from backend.core.error_diagnostics import format_failure
 
 # Push notification taps must target Expo Router file-system routes, not stale
 # pseudo routes like /sync or /cards. Query metadata stays as separate data keys.
@@ -261,7 +262,15 @@ def _exec_sync(job_id: int) -> bool:
                 else:
                     os.environ["BANK_CRAWLER_HISTORY_MODE"] = old_history_mode
     except Exception as e:
-        error = f"sync_failed:{type(e).__name__}"
+        guards = frozenset()
+        try:
+            from backend.core.error_diagnostics import _class_collect_guard_allowlist
+            if type(bank) is str and bank in _CRAWLER_MODULE_MAP:
+                _, cls = _load_crawler(bank)
+                guards = _class_collect_guard_allowlist(None, crawler_class=cls)
+        except Exception:
+            pass
+        error = format_failure(e, bank=bank, guards=guards)
 
     # 3. 寫回 DB
     if error is None:
@@ -649,41 +658,52 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
     Phase C (2026-06-17)：user_id 為必填——所有 INSERT 透過 BankStore(bank, user_id)
     stamp 給每一 row, 達成 multi-tenant row-level isolation。
     """
-    # 延遲 import：避免 server bootstrap 階段就拖 scrapling 進來
-    from backend.core.store import BankStore
-    from backend.server import rules_repo
-
-    # Phase 5.1：撈 user 的 enabled rules（rules_repo 已按 priority DESC 排序）
-    rules: list[dict] | None = None
+    from backend.core.error_diagnostics import _class_collect_guard_allowlist
+    from backend.core.error_diagnostics import annotate_failure, result_failure, _safe_state_value, instance_stage
+    stage = 'init'
+    store = None
+    crawler = None
+    guards = frozenset()
+    primary = None
     try:
-        rules = rules_repo.list_rules(user_id=user_id, enabled_only=True)
-    except Exception:
-        rules = None
+        # 延遲 import：避免 server bootstrap 階段就拖 scrapling 進來
+        from backend.core.store import BankStore
+        from backend.server import rules_repo
 
-    mod, crawler_cls = _load_crawler(bank)
-    base_url = mod.BASE
+        # Phase 5.1：撈 user 的 enabled rules（rules_repo 已按 priority DESC 排序）
+        rules: list[dict] | None = None
+        try:
+            rules = rules_repo.list_rules(user_id=user_id, enabled_only=True)
+        except Exception:
+            rules = None
 
-    crawler = crawler_cls()
-    # cathay 特例（cli 也是這樣寫）
-    login_url = f"{base_url}/mybank/" if bank == "cathay" else base_url
+        mod, crawler_cls = _load_crawler(bank)
+        base_url = mod.BASE
 
-    source_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
-    store = BankStore(
-        bank,
-        user_id=user_id,
-        source_account_id=int(source_account_id) if source_account_id else None,
-    )
-    try:
+        crawler = crawler_cls()
+        guards = _class_collect_guard_allowlist(crawler)
+        # cathay 特例（cli 也是這樣寫）
+        login_url = f"{base_url}/mybank/" if bank == "cathay" else base_url
+
+        source_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
+        store = BankStore(
+            bank,
+            user_id=user_id,
+            source_account_id=int(source_account_id) if source_account_id else None,
+        )
         crawler.configure_transaction_cursor(
             "twd_transactions", store.latest_twd_transaction_dates(),
         )
         crawler.configure_transaction_cursor(
             "card_billed_transactions", store.latest_card_transaction_dates(),
         )
+        stage = 'session'
         result = crawler.run(login_url=login_url, headless=headless)
-        if result.get("error"):
-            raise RuntimeError("crawler_failed")
-        data = result.get("data", {})
+        failure = result_failure(result, bank=bank, guards=guards)
+        if failure is not None:
+            raise failure
+        stage = 'coverage'
+        data = _safe_state_value(result, 'data') or {}
         coverage_summary = None
         if crawler.HISTORY_COVERAGE_REQUIRED:
             from backend.core.base import validate_history_coverage
@@ -694,16 +714,29 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
                 expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
             )
 
+        stage = 'persist'
         from backend.core.persist import persist_collected
 
         delta = persist_collected(bank, data, store, rules=rules)
+        stage = 'persist_summary'
         stats = store.stats()
-    finally:
-        store.close()
 
-    return {
-        "delta": delta,
-        "stats": stats,
-        "card_bill_cycle_coverage": _summarize_card_bill_cycle_coverage(data),
-        "history_coverage": coverage_summary,
-    }
+
+        return {
+            "delta": delta,
+            "stats": stats,
+            "card_bill_cycle_coverage": _summarize_card_bill_cycle_coverage(data),
+            "history_coverage": coverage_summary,
+        }
+    except Exception as exc:
+        primary = exc
+        annotate_failure(exc, instance_stage(crawler, stage) if stage == 'session' else stage, bank=bank, guards=guards)
+        raise
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception as exc:
+                if primary is None:
+                    annotate_failure(exc, 'cleanup')
+                    raise

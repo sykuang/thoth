@@ -58,7 +58,7 @@ SEL_PWD = 'input[formcontrolname="pxd"]'       # 網銀密碼
 SEL_SUBMIT = "a.btn_submit"
 
 
-def _submit_login_once(page) -> None:
+def _submit_login_once(page, *, before_dispatch=None) -> None:
     """Click the uniquely safe login action once, never retrying unknown dispatch."""
     try:
         candidates = page.locator(SEL_SUBMIT)
@@ -80,6 +80,11 @@ def _submit_login_once(page) -> None:
         raise
     except Exception:
         raise CtbcLoginError("無法安全確認登入按鈕；未送出登入") from None
+    if before_dispatch is not None:
+        try:
+            before_dispatch()
+        except Exception:
+            pass  # Diagnostics must never prevent the existing click.
     try:
         button.click(timeout=8000)
     except Exception:
@@ -379,6 +384,7 @@ class CtbcCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(8000)
 
     def is_authenticated(self, page) -> bool:
@@ -419,6 +425,7 @@ class CtbcCrawler(BankCrawler):
             ):
                 return False
             if outcome.kind is CheckpointKind.AUTHENTICATED:
+                self._diagnostic_stage = "login_postconfirm"
                 return True
             if outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER or outcome.rule_name is not None:
                 return False
@@ -480,7 +487,11 @@ class CtbcCrawler(BankCrawler):
             ),
         )
 
+    def _mark_login_dispatch(self) -> None:
+        self._diagnostic_stage = "login_submit"
+
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         try:
             page.wait_for_selector(SEL_ID, state="visible", timeout=15000)
             for selector, value in (
@@ -504,7 +515,9 @@ class CtbcCrawler(BankCrawler):
         except Exception:
             raise CtbcLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        _submit_login_once(page)
+        self._diagnostic_stage = "login_button"
+        _submit_login_once(page, before_dispatch=self._mark_login_dispatch)
+        self._diagnostic_stage = "login_postconfirm"
         try:
             page.wait_for_timeout(5000)
             for _ in range(20):
@@ -711,17 +724,21 @@ class CtbcCrawler(BankCrawler):
           /twrbc-deposit/qu002/011   台幣存款逐筆交易明細 (2026-06-20 補上)
                                      rqData={accountId, type:"m0"..."m5"}, m0=本月
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
 
         page.wait_for_timeout(5000)
 
         # 1) 首頁總覽彙總（登入後自動載入，攔即可）—— ebAcctSummaryInq 含台幣/信用卡/信貸彙總
+        self._diagnostic_stage = "collect_accounts"
         home = self._latest_rsdata(collector, "/twrbc-home/qu000/010")
         out["summary"] = (home or {}).get("ebAcctSummaryInq") if isinstance(home, dict) else None
 
         # 2) 台幣存款帳戶（點臺幣存款 link 觸發，或直接複用攔到的）
         inventory_sequence = collector.request_sequence
+        self._diagnostic_stage = "collect_navigation"
         self._goto_twd_deposit(page, collector)
+        self._diagnostic_stage = "collect_accounts"
         out["twd_deposit"], twd_identities = self._validated_twd_inventory(
             collector, page, after_sequence=inventory_sequence,
         )
@@ -730,6 +747,7 @@ class CtbcCrawler(BankCrawler):
         # SPA route: /twrbc/twrbc-deposit/qu002/010 (date range picker) → fires qu002/011
         # qu002/011 rqData = {accountId, type:"m0"|"m1"|...} (m0=本月, m1=上月, ...)
         # 設計：先 goto qu002/010 載 dateRanges，再 _post_ebmw 各 type
+        self._diagnostic_stage = "collect_transactions"
         twd_history = self._collect_twd_deposit_history(
             page, collector, out["twd_deposit"], expected_identities=twd_identities,
         )
@@ -745,6 +763,7 @@ class CtbcCrawler(BankCrawler):
         card_targets = ["即時消費明細", "帳單明細查詢", "未出帳單明細", "信用卡繳款記錄"]
         nav_logs: list[dict] = []
         for target_text in card_targets:
+            self._diagnostic_stage = "collect_navigation"
             nav_result = self._goto_credit_card(page, target_text=target_text)
             nav_logs.append({"target": target_text, **nav_result})
             _log(f"[collect][card-nav] {target_text} → clicked={bool(nav_result.get('clicked'))}")
@@ -789,6 +808,7 @@ class CtbcCrawler(BankCrawler):
             _log(f"[collect][card-mega-menu-dump] ERROR: {type(e).__name__}")
 
         # 抽所有 creditcard / creditCard / card 相關的 resource
+        self._diagnostic_stage = "collect_cards"
         card_resources = sorted({
             (h.req_body or {}).get("resource", "")
             for h in collector.hits
@@ -828,6 +848,7 @@ class CtbcCrawler(BankCrawler):
                     if isinstance(row, dict) and row.get("payDt") and row.get("amt") is not None:
                         payment_rows.append((str(row["payDt"]), row["amt"]))
         last_date, last_amount = max(payment_rows, default=(None, None), key=lambda item: item[0])
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [make_card_bill_fact(
             remaining_due=cc.get("unpaidStmt"),
             payment_due_date=cc.get("pmtExpDt"),
@@ -858,6 +879,7 @@ class CtbcCrawler(BankCrawler):
         expected_identities: set[str],
     ) -> dict:
         """Collect every bank-exposed month for every authoritative TWD account."""
+        self._diagnostic_stage = "collect_transactions"
         end = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
         capability = _ctbc_month_windows(end)
         floor = capability[0][1]
@@ -897,10 +919,12 @@ class CtbcCrawler(BankCrawler):
             }
 
         try:
+            self._diagnostic_stage = "collect_navigation"
             page.goto(
                 "https://www.ctbcbank.com/twrbc/twrbc-deposit/qu002/010",
                 wait_until="domcontentloaded", timeout=15000,
             )
+            self._diagnostic_stage = "collect_transactions"
         except Exception:
             raise RuntimeError("ctbc-twd-history-template") from None
         try:
@@ -1326,6 +1350,7 @@ class CtbcCrawler(BankCrawler):
 
     def _goto_twd_deposit(self, page, collector: ResponseCollector):
         """Wait for the owned native link and its fresh inventory response."""
+        self._diagnostic_stage = "collect_navigation"
         before = len(collector.hits)
         baseline = collector.request_sequence
         document = None
@@ -1376,6 +1401,7 @@ class CtbcCrawler(BankCrawler):
         2026-06-13 升級：target_text 參數化，支援多家子選單迭代抓
         （pending=即時消費明細 / billed=帳單明細查詢 / unbilled=未出帳單明細）
         """
+        self._diagnostic_stage = "collect_navigation"
         log: list[str] = []
         try:
             # Step 1: 找「信用卡/點數」<a>

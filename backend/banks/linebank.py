@@ -127,6 +127,7 @@ class LinebankCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
+        self._diagnostic_stage = "login_prepare"
         page.wait_for_timeout(6000)
 
     def is_authenticated(self, page) -> bool:
@@ -174,6 +175,7 @@ class LinebankCrawler(BankCrawler):
         )
 
     def submit_credentials_once(self, page) -> None:
+        self._diagnostic_stage = "login_field"
         fields = (
             ("#nationalId", self.creds.national_id, 15000),
             ("#userId", self.creds.user_code, 5000),
@@ -203,6 +205,7 @@ class LinebankCrawler(BankCrawler):
             raise LinebankLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
+            self._diagnostic_stage = "login_button"
             buttons = page.locator("button")
             matches = []
             for index in range(buttons.count()):
@@ -219,11 +222,13 @@ class LinebankCrawler(BankCrawler):
             raise LinebankLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
 
         try:
+            self._diagnostic_stage = "login_submit"
             matches[0].click(timeout=8000)
         except Exception:
             raise LinebankLoginError("登入送出狀態不明；禁止自動重試") from None
 
         try:
+            self._diagnostic_stage = "login_postconfirm"
             page.wait_for_timeout(10000)
             for _ in range(20):
                 page.wait_for_timeout(1000)
@@ -254,6 +259,7 @@ class LinebankCrawler(BankCrawler):
 
         LINE Bank 無信用卡產品，跳過 credit card。
         """
+        self._diagnostic_stage = "collect"
         out: dict = {}
         page.wait_for_timeout(4000)
         debug_dir = _debug_dir()
@@ -276,6 +282,7 @@ class LinebankCrawler(BankCrawler):
 
         # dump 主 page 內所有可見 nav 元素（找選單）
         try:
+            self._diagnostic_stage = "collect_navigation"
             nav_items = page.evaluate("""() => {
                 const out = [];
                 for (const el of document.querySelectorAll('a, button, [role=button], [role=link]')) {
@@ -299,6 +306,7 @@ class LinebankCrawler(BankCrawler):
         # 無障礙版本要點 menu link, SPA 內部 routing
         _log("[linebank][collect] → goto /transaction（帳戶交易明細查詢）")
         try:
+            self._diagnostic_stage = "collect_navigation"
             page.goto("https://accessibility.linebank.com.tw/transaction", wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(6000)  # 等 SPA fetch
         except Exception as e:
@@ -308,6 +316,7 @@ class LinebankCrawler(BankCrawler):
             page.screenshot(path=str(debug_dir / "10_transaction.png"), full_page=True)
 
         try:
+            self._diagnostic_stage = "collect_transactions"
             txn_url = page.url
             txn_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
         except Exception:
@@ -320,6 +329,7 @@ class LinebankCrawler(BankCrawler):
         # 無障礙版必須先在 dropdown 選一個帳戶, 點「查詢」才會 fetch 該帳戶餘額 + 交易
         accounts_queried: list[dict] = []
         try:
+            self._diagnostic_stage = "collect_accounts"
             select_info = page.evaluate("""() => {
                 const sel = document.querySelector('select');
                 if (!sel) return {error: 'no_select_found'};
@@ -348,6 +358,7 @@ class LinebankCrawler(BankCrawler):
             _log(f"[linebank][collect] → 查詢帳戶 [{i+1}/{len(opts)}]")
             try:
                 # 用 JS 直接 set <select>.value 並 dispatch change/input（React onChange 認得）
+                self._diagnostic_stage = "collect_accounts"
                 page.evaluate("""(value) => {
                     const sel = document.querySelector('select');
                     if (!sel) return false;
@@ -359,6 +370,7 @@ class LinebankCrawler(BankCrawler):
                 page.wait_for_timeout(500)
 
                 # 點「查詢」按鈕
+                self._diagnostic_stage = "collect_transactions"
                 clicked = page.evaluate("""() => {
                     for (const b of document.querySelectorAll('button')) {
                         if (b.offsetParent === null) continue;
@@ -391,6 +403,7 @@ class LinebankCrawler(BankCrawler):
         out["accounts_queried"] = accounts_queried
 
         # ─── Step 3: dump 全 API responses（為 dedicated parser 鋪路）───
+        self._diagnostic_stage = "collect"
         out["final_url"] = page.url
         out["_all_endpoints"] = sorted({h.endpoint for h in collector.hits if h.resp_json})
 
@@ -403,6 +416,7 @@ class LinebankCrawler(BankCrawler):
                 "resp": h.resp_json, "req_body": h.req_body,
             })
         out["api_responses"] = api_responses
+        self._diagnostic_stage = "collect_validation"
         publish_card_bill_facts(out, [])
         _log(f"[linebank][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
         _log(f"[linebank][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")

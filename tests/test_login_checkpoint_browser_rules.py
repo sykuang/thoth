@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from patchright.sync_api import TimeoutError as PatchrightTimeoutError
 
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -668,11 +667,15 @@ def test_click_requires_bounded_safe_progress(progress):
     assert action.clicks == 1
 
 
-def test_patchright_timeout_falls_back_to_hidden_action_progress():
+@pytest.mark.parametrize('browser_module', ['patchright.sync_api', 'playwright.sync_api'])
+def test_patchright_timeout_falls_back_to_hidden_action_progress(browser_module):
+    from importlib import import_module
+
+    timeout_class = import_module(browser_module).TimeoutError
     action = Node(text="Continue")
     container = Node(
         queries={"button, a, [role=button]": [action]},
-        wait_error=PatchrightTimeoutError("bounded wait elapsed"),
+        wait_error=timeout_class("bounded wait elapsed"),
     )
     action.on_click = lambda _: setattr(action, "visible", False)
     rule = LoginCheckpointRule(
