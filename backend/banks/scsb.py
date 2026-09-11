@@ -313,13 +313,20 @@ class ScsbCrawler(BankCrawler):
             ),
         )
 
-    @staticmethod
-    def _keyboard_fill(page, field, value: str) -> None:
+    def _keyboard_fill(self, page, field, value: str, role: str) -> None:
+        # role is a code-owned literal, never a selector or credential value.
+        self._diagnostic_stage = f"login_field_{role}_click"
         field.click()
+        self._diagnostic_stage = f"login_field_{role}_triple_click"
         field.click(click_count=3)
+        self._diagnostic_stage = f"login_field_{role}_clear"
         page.keyboard.press("Backspace")
+        self._diagnostic_stage = f"login_field_{role}_type"
         page.keyboard.type(value, delay=80)
-        if len(field.input_value()) != len(value):
+        self._diagnostic_stage = f"login_field_{role}_readback"
+        entered = field.input_value()
+        self._diagnostic_stage = f"login_field_{role}_length"
+        if len(entered) != len(value):
             raise ScsbLoginError("登入欄位輸入長度不符；未送出登入")
 
     @staticmethod
@@ -393,23 +400,32 @@ class ScsbCrawler(BankCrawler):
         return False
 
     def submit_credentials_once(self, page) -> None:
-        self._diagnostic_stage = "login_field"
+        self._diagnostic_stage = "login_field_national_id_wait"
         try:
             page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
             self._diagnostic_stage = "login_ocr"
             page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
             self._diagnostic_stage = "login_field"
             fields = []
-            for selector in (SEL_SID, SEL_USER, SEL_PWD, SEL_CAP):
+            for role, selector in (
+                ("national_id", SEL_SID), ("user_code", SEL_USER),
+                ("password", SEL_PWD), ("captcha", SEL_CAP),
+            ):
+                self._diagnostic_stage = f"login_field_{role}_count"
                 candidates = page.locator(selector)
                 if candidates.count() != 1:
                     raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
                 field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
+                self._diagnostic_stage = f"login_field_{role}_visible"
+                if not field.is_visible():
+                    raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
+                self._diagnostic_stage = f"login_field_{role}_enabled"
+                if not field.is_enabled():
                     raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
                 fields.append(field)
 
-            for field, value in zip(
+            for role, field, value in zip(
+                ("national_id", "user_code", "password"),
                 fields[:3],
                 (
                     self.creds.national_id,
@@ -418,13 +434,13 @@ class ScsbCrawler(BankCrawler):
                 ),
                 strict=True,
             ):
-                self._keyboard_fill(page, field, value)
+                self._keyboard_fill(page, field, value, role)
             self._diagnostic_stage = "login_ocr"
             captcha = self._ocr_captcha(page, max_attempts=5)
             if not captcha:
                 raise ScsbLoginError("無法安全辨識驗證碼；未送出登入")
             self._diagnostic_stage = "login_field"
-            self._keyboard_fill(page, fields[3], captcha)
+            self._keyboard_fill(page, fields[3], captcha, "captcha")
 
             self._diagnostic_stage = "login_button"
             candidates = page.locator(

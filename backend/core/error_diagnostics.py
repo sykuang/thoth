@@ -195,7 +195,11 @@ STAGES = frozenset(('init', 'credentials', 'session', 'browser_launch', 'browser
     'login_submit', 'login_postconfirm', 'login_username_continue', 'collect',
     'collect_navigation', 'collect_accounts', 'collect_transactions', 'collect_cards',
     'collect_loans', 'collect_validation', 'coverage', 'persist', 'persist_summary',
-    'cleanup', 'unknown'))
+    'cleanup', 'unknown', 'login_field_national_id_wait',
+    *(f'login_field_{role}_{operation}'
+      for role in ('national_id', 'user_code', 'password', 'captcha')
+      for operation in ('count', 'visible', 'enabled', 'click', 'triple_click',
+                        'clear', 'type', 'readback', 'length'))))
 
 
 def instance_stage(crawler, fallback='unknown'):

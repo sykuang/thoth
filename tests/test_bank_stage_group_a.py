@@ -70,7 +70,8 @@ def test_login_failure_boundary(cls, stage):
         obj.submit_credentials_once(page)
     except RuntimeError:
         pass
-    assert obj._diagnostic_stage == stage
+    expected = 'login_field_national_id_count' if cls is ScsbCrawler and stage == 'login_field' else stage
+    assert obj._diagnostic_stage == expected
     assert button.click.call_count == (1 if stage in {"login_submit", "login_postconfirm"} else 0)
 
 
