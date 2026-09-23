@@ -410,18 +410,24 @@ class ResponseCollector:
         self._response_handler = self._on_response
         self._request_handler = self._on_request
         self._request_failed_handler = self._on_request_failed
+        self._detached = False
 
     def attach(self, page):
+        self._detached = False
         page.on("request", self._request_handler)
         page.on("requestfailed", self._request_failed_handler)
         page.on("response", self._response_handler)
 
     def detach(self, page) -> None:
+        # HSBC detaches during collect; the shared finally must not remove twice.
+        if self._detached:
+            return
         remove = getattr(page, "remove_listener", None)
         if callable(remove):
             remove("request", self._request_handler)
             remove("requestfailed", self._request_failed_handler)
             remove("response", self._response_handler)
+        self._detached = True
 
     @property
     def request_sequence(self) -> int:
