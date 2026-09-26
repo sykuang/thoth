@@ -109,21 +109,14 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
         one(target)
         action_guard = target._guard if isinstance(target, _OriginGuardProxy) else None
         target = _OriginGuardProxy._unwrap(target)
-        try:
-            if action_guard is not None:
-                action_guard()
-            if before_action is not None:
-                before_action()
-            reserve_action()
-            target.click(timeout=TIMEOUT)
-            if action_guard is not None:
-                action_guard()
-        except BaseException as primary:
-            try:
-                checkpoint()
-            except BaseException as secondary:
-                raise primary from secondary
-            raise
+        if action_guard is not None:
+            action_guard()
+        if before_action is not None:
+            before_action()
+        reserve_action()
+        target.click(timeout=TIMEOUT)
+        if action_guard is not None:
+            action_guard()
         checkpoint()
         owner()
 
@@ -304,19 +297,12 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
     one(submit)
     submit_guard = submit._guard if isinstance(submit, _OriginGuardProxy) else None
     submit = _OriginGuardProxy._unwrap(submit)
-    try:
-        if submit_guard is not None:
-            submit_guard()
-        if before_submit is not None:
-            before_submit()
-        reserve_action()
-        submit.click(timeout=TIMEOUT)
-        if submit_guard is not None:
-            submit_guard()
-    except BaseException as primary:
-        try:
-            checkpoint()
-        except BaseException as secondary:
-            raise primary from secondary
-        raise
+    if submit_guard is not None:
+        submit_guard()
+    if before_submit is not None:
+        before_submit()
+    reserve_action()
+    submit.click(timeout=TIMEOUT)
+    if submit_guard is not None:
+        submit_guard()
     checkpoint()

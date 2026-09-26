@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 
 from backend.server import sync_batches_repo, sync_jobs_repo
@@ -73,6 +74,19 @@ def supports_attested_history(bank: str) -> bool:
 
 # Phase 1 全域 dispatch lock — 同一時刻只跑一個 job（Scrapling 並非真 thread-safe）
 _dispatch_lock = threading.Lock()
+
+
+class _PersistenceError(RuntimeError):
+    """Identify only the persist call boundary; retain the original cause."""
+
+
+class _CollectDiagnosticError(RuntimeError):
+    """Carry only validated collect metadata to the job failure boundary."""
+
+    def __init__(self, crawler: object, diagnostics: dict[str, str]):
+        super().__init__("crawler_failed")
+        self.crawler = crawler
+        self.diagnostics = diagnostics
 
 
 def _launch_job(job_id: int) -> None:
@@ -261,7 +275,32 @@ def _exec_sync(job_id: int) -> bool:
                 else:
                     os.environ["BANK_CRAWLER_HISTORY_MODE"] = old_history_mode
     except Exception as e:
-        error = f"sync_failed:{type(e).__name__}"
+        if type(e) is _CollectDiagnosticError:
+            error = "sync_failed:RuntimeError"
+            try:
+                from backend.core.base import (
+                    _format_collect_diagnostics, _validated_collect_diagnostics,
+                )
+                diagnostics = _validated_collect_diagnostics(e.crawler, e.diagnostics)
+                if diagnostics:
+                    error = _format_collect_diagnostics(diagnostics)
+            except Exception:
+                pass  # Invalid carrier/import must not expose arbitrary error text.
+        elif type(e) is _PersistenceError:
+            from backend.core.base import _safe_exception_type
+
+            cause = e.__cause__
+            family = _safe_exception_type(cause) if cause is not None else "Exception"
+            error = f"sync_failed:{family}: phase=persistence"
+            print(f"[sync] {error}; details withheld", file=sys.stderr)
+        else:
+            error = "sync_failed:Exception"
+            try:
+                from backend.core.base import _safe_exception_type
+
+                error = f"sync_failed:{_safe_exception_type(e)}"
+            except ImportError:
+                pass  # Even a crawler import failure must retain the safe sink.
 
     # 3. 寫回 DB
     if error is None:
@@ -682,6 +721,13 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
         )
         result = crawler.run(login_url=login_url, headless=headless)
         if result.get("error"):
+            diagnostics = result.get("collect_diagnostics")
+            if diagnostics is not None:
+                from backend.core.base import _validated_collect_diagnostics
+
+                validated = _validated_collect_diagnostics(crawler, diagnostics)
+                if validated:
+                    raise _CollectDiagnosticError(crawler, validated)
             raise RuntimeError("crawler_failed")
         data = result.get("data", {})
         coverage_summary = None
@@ -696,9 +742,18 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
 
         from backend.core.persist import persist_collected
 
-        delta = persist_collected(bank, data, store, rules=rules)
+        try:
+            delta = persist_collected(bank, data, store, rules=rules)
+        except Exception as exc:
+            raise _PersistenceError("persistence_failed") from exc
         stats = store.stats()
-    finally:
+    except BaseException:
+        try:
+            store.close()
+        except Exception:
+            pass  # Keep the primary failure, especially its validated diagnostic.
+        raise
+    else:
         store.close()
 
     return {

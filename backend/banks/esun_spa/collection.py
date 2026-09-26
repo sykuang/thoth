@@ -355,6 +355,9 @@ def continue_twd_once(
             attachment, evidence, prove_records = retain_capture_records(
                 collector, paths, _history, observed_error=observed_error is not None)
             def prove():
+                prior_phase = crawler._esun_spa_phase
+                crawler._esun_spa_phase = "capture_publication"
+                crawler._esun_spa_gate = None
                 owner()
                 require(require_current_success(collector, initial_baseline, PATHS[2]) == (response, envelope))
                 if accepted is not None:
@@ -382,6 +385,7 @@ def continue_twd_once(
                 counts(existing + (1 if (accepted is not None or observed_error is not None) and not preissued else 0))
                 for proof in _history if _history is not None else (prove_records,):
                     proof()  # In-memory sweep after every event-pumping call.
+                crawler._esun_spa_phase = prior_phase
 
             _publication.append(prove)
         return (values, reason)
@@ -473,6 +477,7 @@ def continue_twd_once(
         crawler._esun_spa_phase = "continuation_wait"
         deadline = monotonic() + TIMEOUT / 1000
         while True:
+            crawler._esun_spa_phase = "continuation_wait"
             current()
             require(collector.issued_count(PATHS[5]) <= baseline["counts"][PATHS[5]] + 1)
             require(collector.query_issued_count() <= collector.MAX_QUERY_REQUESTS)
@@ -603,12 +608,15 @@ def navigation_guard(crawler, page, querying=lambda: False, selecting=lambda: Fa
     original_guard = lambda: crawler._ensure_collect_origin(native)
 
     def guard():
+        gate = 'origin'
         try:
             original_guard()
+            gate = 'blocker_snapshot'
             selectors = {"dialog", '[role="dialog"]', '[aria-modal="true"]'}
             selectors.update((rule.container_selector for rule in crawler.login_checkpoint_rules()))
             dialogs = page.locator(", ".join((selector + ":visible" for selector in sorted(selectors))))
             snapshot = dialogs.evaluate_all(BLOCKER_SNAPSHOT, [querying(), MENU, selecting()])
+            gate = 'blocker_contract'
             require(
                 type(snapshot) is list
                 and len(snapshot) == 3
@@ -616,6 +624,7 @@ def navigation_guard(crawler, page, querying=lambda: False, selecting=lambda: Fa
                 and all((type(v) is str for v in snapshot[1:]))
             )
             allowed, kind, reason = snapshot
+            gate = 'blocker_kind'
             require(
                 allowed
                 and reason == "none"
@@ -642,7 +651,9 @@ def navigation_guard(crawler, page, querying=lambda: False, selecting=lambda: Fa
                     )
                 )
             )
+            gate = 'blocker_allowed'
             require(allowed)
+            gate = 'login_visible'
             require(
                 page.locator(
                     '#layout-content.not-login, .temp-index:visible, input[name="id"]:visible, input[name="pxssword"]:visible'
@@ -650,7 +661,9 @@ def navigation_guard(crawler, page, querying=lambda: False, selecting=lambda: Fa
                 == 0
             )
         except Exception:
-            raise ValueError("SPA probe rejected") from None
+            crawler._esun_spa_gate = gate
+            raise
+        crawler._esun_spa_gate = None
 
     return guard
 
@@ -661,11 +674,16 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
     history = [] if _history is None else _history
 
     def prove_history():
+        prior_phase = crawler._esun_spa_phase
+        crawler._esun_spa_phase = "capture_publication"
+        crawler._esun_spa_gate = None
         for prove in history:
             prove()
+        crawler._esun_spa_phase = prior_phase
 
-    def require(ok):
+    def require(ok, gate=None):
         if not ok:
+            crawler._esun_spa_gate = gate
             raise ValueError("SPA probe rejected")
 
     native = _OriginGuardProxy._unwrap(page)
@@ -676,22 +694,20 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
     guard = navigation_guard(crawler, page, lambda: querying, lambda: selecting)
 
     def current_plan():
-        try:
-            guard()
-        except Exception:
-            raise ValueError("SPA probe rejected") from None
+        guard()
         return read_plan()
 
     def read_plan():
-        try:
-            body, envelope = require_current_success(collector, login_baseline, PATHS[0])
-            request = envelope.get("requestBody")
-            require(type(request) is dict)
-            locale = request.get("locale")
-            require(type(locale) is str and locale in ("zh-TW", "en-US"))
-            return build_menu_plan(body.get("menuList"), locale)
-        except Exception:
-            raise ValueError("SPA probe rejected") from None
+        prior_phase = crawler._esun_spa_phase
+        crawler._esun_spa_phase = 'menu_plan'
+        body, envelope = require_current_success(collector, login_baseline, PATHS[0])
+        request = envelope.get("requestBody")
+        require(type(request) is dict)
+        locale = request.get("locale")
+        require(type(locale) is str and locale in ("zh-TW", "en-US"))
+        plan = build_menu_plan(body.get("menuList"), locale)
+        crawler._esun_spa_phase = prior_phase
+        return plan
 
     guard()
     require(page.locator("#layout-content").count() == 1)
@@ -704,7 +720,7 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
         return current
 
     baseline = collector.snapshot()
-    crawler._esun_spa_phase = "navigation"
+    crawler._esun_spa_phase = "destination_navigation"
     navigate_twd(page, plan, guard, revalidate)
     crawler._diagnostic_stage = "collect_accounts"
     crawler._esun_spa_phase = "prequery_response"
@@ -733,7 +749,7 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
 
     def validate_account(body, envelope):
         request = envelope.get("requestBody")
-        require(type(request) is dict and "account" in request)
+        require(type(request) is dict and "account" in request, 'account_request')
         account = request["account"]
         require(
             account is None
@@ -741,7 +757,7 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
                 type(account) is str
                 and re.fullmatch("[0-9]{13}", account) is not None
                 and (account == body.get("demandDeptAcc"))
-            )
+            ), 'account_owner',
         )
         inventory = body.get("twAccountList")
         detail = body.get("queryDeptTxDtlResult")
@@ -751,24 +767,24 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
             and len(inventory) <= 64
             and all((type(a) is dict for a in inventory))
             and (type(detail) is dict)
-            and (type(currency) is dict)
+            and (type(currency) is dict), 'inventory_shape',
         )
         groups = detail.get("detailListData")
-        require(type(groups) is list and len(groups) <= 128)
+        require(type(groups) is list and len(groups) <= 128, 'inventory_groups')
         row_count = 0
         for group in groups:
             require(
                 type(group) is dict
                 and type(group.get("detailInfo")) is list
-                and all((type(row) is dict for row in group["detailInfo"]))
+                and all((type(row) is dict for row in group["detailInfo"])), 'inventory_rows',
             )
             row_count += len(group["detailInfo"])
-            require(row_count <= 1000)
+            require(row_count <= 1000, 'inventory_budget')
         accounts = [a.get("accountNo") for a in inventory]
-        require(all((type(a) is str and re.fullmatch("[0-9]{13}", a) for a in accounts)))
-        require(len(set(accounts)) == len(accounts) and body.get("demandDeptAcc") in accounts)
-        require(currency.get("curr") == "TWD")
-        require(all(type(a.get("accountAlias")) is str for a in inventory))
+        require(all((type(a) is str and re.fullmatch("[0-9]{13}", a) for a in accounts)), 'inventory_accounts')
+        require(len(set(accounts)) == len(accounts) and body.get("demandDeptAcc") in accounts, 'inventory_selected')
+        require(currency.get("curr") == "TWD", 'currency')
+        require(all(type(a.get("accountAlias")) is str for a in inventory), 'inventory_alias')
 
     require(page.evaluate(DESTINATION) is True)
     validate_account(body, envelope)
@@ -819,6 +835,8 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
             return display
 
         while True:
+            crawler._esun_spa_phase = "transaction_preflight"
+            crawler._esun_spa_gate = None
             if collector.query_issued_count() >= collector.MAX_QUERY_REQUESTS:
                 return rows_all, False
             crawler._diagnostic_stage = "collect_transactions"
@@ -858,7 +876,7 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
                     break
                 except ValueError:
                     page.wait_for_timeout(20)
-            crawler._esun_spa_phase = "transaction_result"
+            crawler._esun_spa_phase = "transaction_request"
             request = envelope.get("requestBody")
             require(type(request) is dict)
             require(set(request) == {"account", "startDate", "endDate", "startIndex", "count", "customerInputHashtag"})
@@ -873,16 +891,17 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
             require(type(request["count"]) is int)
             require(request["count"] == 100)
             require(request["customerInputHashtag"] == [])
+            crawler._esun_spa_phase = "transaction_shape"
             empty_state = empty_window_state(response)
             if empty_state in ("empty_shape_unknown", "empty_contradiction"):
                 raise ValueError("ambiguous empty result")
             empty = empty_state == "explicit_empty_candidate"
             if not empty:
                 validate_query_response(response)
+            crawler._esun_spa_phase = "transaction_render"
             while True:
                 query_revalidate()
                 require_current_success(collector, query_baseline, PATHS[2])
-                crawler._esun_spa_phase = "transaction_result"
                 rendered = page.evaluate(TIMELINE)
                 if empty:
                     card = page.evaluate(EMPTY_CARD)
@@ -961,9 +980,16 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
             require(
                 all(collector.issued_count(path) == query_baseline["counts"][path] for path in PATHS if path != PATHS[2])
             )
+            prior_phase = crawler._esun_spa_phase
+            crawler._esun_spa_phase = "capture_publication"
+            crawler._esun_spa_gate = None
             _, _, prove_records = retain_capture_records(collector, PATHS[:3], history)
+            crawler._esun_spa_phase = prior_phase
 
             def prove_empty(snapshot=query_baseline, saved=response, dates=window, records=prove_records):
+                prior_phase = crawler._esun_spa_phase
+                crawler._esun_spa_phase = "capture_publication"
+                crawler._esun_spa_gate = None
                 query_revalidate()
                 require(require_current_success(collector, snapshot, PATHS[2])[0] == saved)
                 require(normalized(page.evaluate(EMPTY_CARD)) == "(2003)" + EMPTY_MESSAGE)
@@ -973,6 +999,7 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
                 require(all(collector.issued_count(p) == snapshot["counts"][p] + (p == PATHS[2]) for p in PATHS))
                 records()
                 prove_history()
+                crawler._esun_spa_phase = prior_phase
 
             _publication.append(prove_empty)
             prove_empty()

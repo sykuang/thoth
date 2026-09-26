@@ -769,10 +769,11 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         "cfee36ec91a4b13a62769e91dfa1a596e22a86f8280e26775c457e06a996fbb4"
     )
     # New hash deliberately includes the reviewed SPA dispatch + final proof;
+    # four added phase/gate assignments identify SPA entry and final publication.
     # legacy-only hash above keeps the original JSF parser frozen independently.
     full = "\n".join(
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     ).encode()
     assert hashlib.sha256(full).hexdigest() == (
-        "46699a5507b6ff6b1a49ca47ef253be322320ea18c4485c2b7828b26179b5b81"
+        "38e200e41a1a180d3e5fa28d165f13008aa1580c6178d87ea3c859f3641743fa"
     )

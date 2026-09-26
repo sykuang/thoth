@@ -26,6 +26,8 @@ from typing import Any, ClassVar, NotRequired, Required, TypedDict
 from urllib.parse import urlparse
 
 from scrapling.fetchers import StealthyFetcher
+from patchright.sync_api import TimeoutError as PatchrightTimeoutError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -48,6 +50,8 @@ _SAFE_EXCEPTION_TYPES = (
     (LoginInteractionRequired, "LoginInteractionRequired"),
     (NotImplementedError, "NotImplementedError"),
     (TimeoutError, "TimeoutError"),
+    (PatchrightTimeoutError, "TimeoutError"),
+    (PlaywrightTimeoutError, "TimeoutError"),
     (AssertionError, "AssertionError"),
     (AttributeError, "AttributeError"),
     (IndexError, "IndexError"),
@@ -77,7 +81,7 @@ _SAFE_CHECKPOINT_KIND_LABELS = (
 
 def _safe_exception_mro(exc: BaseException) -> tuple[type, ...]:
     try:
-        mro = type.__getattribute__(type(exc), "__mro__")
+        mro = type.__dict__["__mro__"].__get__(type(exc), type(type(exc)))
     except BaseException:
         return ()
     return mro if type(mro) is tuple else ()
@@ -251,7 +255,7 @@ def _safe_collect_guard(exc: BaseException, allowlist: object) -> str | None:
     return guard
 
 
-def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
+def _class_collect_guard_allowlist(crawler: object, field: str = "SAFE_COLLECT_GUARDS") -> frozenset[str]:
     """Read the exact crawler class namespace without invoking descriptors."""
     try:
         namespace = type.__dict__["__dict__"].__get__(
@@ -263,7 +267,7 @@ def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
             (
                 value
                 for key, value in namespace.items()
-                if type(key) is str and key == "SAFE_COLLECT_GUARDS"
+                if type(key) is str and key == field
             ),
             None,
         )
@@ -274,6 +278,74 @@ def _class_collect_guard_allowlist(crawler: object) -> frozenset[str]:
     ):
         return frozenset()
     return allowlist
+
+
+def _safe_collect_marker(crawler: object, allowlist: str, field: str) -> str | None:
+    """Export only a code-owned marker from the exact adapter class."""
+    markers = _class_collect_guard_allowlist(crawler, allowlist)
+    if not markers:
+        return None
+    try:
+        # Bypass adapter-defined __dict__ properties, not just __getattribute__.
+        state = BankCrawler.__dict__["__dict__"].__get__(crawler, BankCrawler)
+    except BaseException:
+        return None
+    value = _safe_state_value(state, field)
+    if type(value) is str:
+        return next((known for known in markers if known == value), None)
+    return None
+
+
+def _validated_collect_diagnostics(crawler: object, value: object) -> dict[str, str]:
+    """Reconstruct the closed collection metadata at each result/job boundary."""
+    if type(value) is not dict or len(value) > 5 or any(
+        type(key) is not str or key not in {'exception', 'code', 'phase', 'gate', 'guard'}
+        for key in value
+    ):
+        return {}
+    vocabularies = {
+        'exception': frozenset(label for _, label in _SAFE_EXCEPTION_TYPES) | {'Exception'},
+        'code': frozenset({
+            'collect_checkpoint', 'collect_timeout', 'collect_inventory', 'collect_range',
+            'collect_transport', 'collect_navigation', 'collect_validation', 'collect_history',
+            'collect_adapter', 'collect_persistence', 'collect_contract', 'collect_external',
+        }),
+        'phase': _class_collect_guard_allowlist(crawler, 'SAFE_COLLECT_PHASES'),
+        'gate': _class_collect_guard_allowlist(crawler, 'SAFE_COLLECT_GATES'),
+        'guard': _class_collect_guard_allowlist(crawler),
+    }
+    clean = {}
+    for key, allowed in vocabularies.items():
+        raw = value.get(key)
+        if type(raw) is str:
+            matched = next((known for known in allowed if raw == known), None)
+            if matched is not None:
+                clean[key] = matched
+    return clean if 'exception' in clean and 'code' in clean else {}
+
+
+def _format_collect_diagnostics(value: dict[str, str]) -> str:
+    """Format already-validated metadata; never parse exception text."""
+    message = f"collect_failed: {value['exception']}: code={value['code']}"
+    for key in ('guard', 'phase', 'gate'):
+        if key in value:
+            message += f": {key}={value[key]}"
+    return message
+
+
+def _collect_failure_diagnostics(crawler: object, exc: BaseException) -> dict[str, str]:
+    values = {'exception': _safe_exception_type(exc), 'code': _safe_collect_failure_code(exc)}
+    for key, allowed, state_field in (
+        ('phase', 'SAFE_COLLECT_PHASES', '_esun_spa_phase'),
+        ('gate', 'SAFE_COLLECT_GATES', '_esun_spa_gate'),
+    ):
+        marker = _safe_collect_marker(crawler, allowed, state_field)
+        if marker is not None:
+            values[key] = marker
+    guard = _safe_collect_guard(exc, _class_collect_guard_allowlist(crawler))
+    if guard is not None:
+        values['guard'] = guard
+    return _validated_collect_diagnostics(crawler, values)
 
 
 def write_private_json(path: Path, payload: dict) -> None:
@@ -1896,6 +1968,7 @@ class BankCrawler(ABC):
             nonlocal collector, callback_entered
             if callback_entered:
                 result.pop("data", None)
+                result.pop("collect_diagnostics", None)
                 result["error"] = "browser_callback_repeated"
                 return page
             callback_entered = True
@@ -2019,16 +2092,12 @@ class BankCrawler(ABC):
                 except Exception as e:
                     # collect 階段 raise（包含 SCSB/Taishin 等明細查詢 raise）
                     # 一樣寫進 error，但 logged_in 仍 True → finally 會跑 logout。
+                    if result.get("error") == "browser_callback_repeated":
+                        return page
                     import sys as _sys
-                    msg = (
-                        f"collect_failed: {_safe_exception_type(e)}: "
-                        f"code={_safe_collect_failure_code(e)}"
-                    )
-                    guard = _safe_collect_guard(
-                        e, _class_collect_guard_allowlist(self)
-                    )
-                    if guard is not None:
-                        msg += f": guard={guard}"
+                    diagnostics = _collect_failure_diagnostics(self, e)
+                    result['collect_diagnostics'] = diagnostics
+                    msg = _format_collect_diagnostics(diagnostics)
                     print(
                         f"[{self.name}][collect] raise → {msg}; details withheld",
                         file=_sys.stderr,
@@ -2052,9 +2121,15 @@ class BankCrawler(ABC):
                         # Validate before local teardown destroys the receipts.
                         self._validate_collect_publication(collector)
                 except Exception as e:
-                    result["error"] = (
-                        f"collect_failed: {_safe_exception_type(e)}: "
-                        f"code={_safe_collect_failure_code(e)}"
+                    if result.get("error") == "browser_callback_repeated":
+                        return page
+                    import sys as _sys
+                    diagnostics = _collect_failure_diagnostics(self, e)
+                    result['collect_diagnostics'] = diagnostics
+                    result['error'] = _format_collect_diagnostics(diagnostics)
+                    print(
+                        f"[{self.name}][collect] raise → {result['error']}; details withheld",
+                        file=_sys.stderr,
                     )
                 finally:
                     if collector is not None:

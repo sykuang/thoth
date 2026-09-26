@@ -197,6 +197,73 @@ def inventory_product(product, monkeypatch):
     return product, requests, inventory
 
 
+@pytest.mark.parametrize("empty,point", [(False, "proof"), (True, "proof"), (True, "retention")])
+def test_window_publication_failure_has_own_phase(inventory_product, monkeypatch, empty, point):
+    product, _, inventory = inventory_product
+    inventory[:] = inventory[:1]
+    crawler, _, origin, _, external, captured, state, _, _ = product
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+    if empty:
+        state["page_mode"] = "empty_initial"
+    retain = collection.retain_capture_records
+    checked = []
+
+    def retain_with_failure(owner, paths, history, **kwargs):
+        if point == "retention":
+            checked.append(True)
+            raise ValueError("synthetic private revoked receipt")
+        attachment, evidence, proof = retain(owner, paths, history, **kwargs)
+
+        def reject():
+            checked.append(True)
+            raise ValueError("synthetic private publication detail")
+
+        if history is not None:
+            assert history[-1] is proof
+            history[-1] = reject
+        return attachment, evidence, reject
+
+    monkeypatch.setattr(collection, "retain_capture_records", retain_with_failure)
+    result = crawler.run(origin + "/synthetic", headless=True)
+    assert checked and not captured and not external and "data" not in result
+    assert result["collect_diagnostics"]["phase"] == "capture_publication"
+    assert "private" not in repr(result)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_second_window_preflight_never_keeps_previous_phase(inventory_product, monkeypatch, empty):
+    product, requests, inventory = inventory_product
+    inventory[:] = inventory[:1]
+    crawler, page, origin, _, external, captured, state, _, _ = product
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+    if empty:
+        state["page_mode"] = "empty_initial"
+    next_window = collection.next_window
+    evaluate = page.evaluate
+    following_windows = []
+
+    def advance(end, today):
+        following = next_window(end, today)
+        following_windows.append(following)
+        return following
+
+    def fail_next_timeline(expression, arg=None):
+        if following_windows and expression == collection.TIMELINE:
+            raise ValueError("synthetic private next-window detail")
+        return evaluate(expression, arg)
+
+    monkeypatch.setattr(collection, "next_window", advance)
+    monkeypatch.setattr(page, "evaluate", fail_next_timeline)
+    result = crawler.run(origin + "/synthetic", headless=True)
+    assert len(following_windows) == 1 and following_windows[0] is not None
+    assert len([p for p, _ in requests if p == PATHS[2]]) == 1
+    assert not [p for p, _ in requests if p == PATHS[5]]
+    assert not captured and not external and "data" not in result
+    assert result["collect_diagnostics"]["phase"] == "transaction_preflight"
+    assert "gate" not in result["collect_diagnostics"]
+    assert "private" not in repr(result)
+
+
 @pytest.mark.parametrize("mode,expected_queries", [("incremental", 1), ("full", 6)])
 def test_native_empty_account_persists_coverage_and_cursor(inventory_product, store_esun_twd, monkeypatch, mode, expected_queries):
     from backend.core.persist import persist_collected
