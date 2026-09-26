@@ -236,14 +236,7 @@ def navigate_twd(page, plan, guard, revalidate, *, target="CTW01002-TW"):
         require(type(current) is dict and current == expected and (plan == expected))
 
     def click_once(target):
-        try:
-            target.click(timeout=TIMEOUT)
-        except BaseException as primary:
-            try:
-                checkpoint()
-            except BaseException as secondary:
-                raise primary from secondary
-            raise
+        target.click(timeout=TIMEOUT)
         checkpoint()
 
     checkpoint()

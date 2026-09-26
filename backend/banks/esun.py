@@ -107,6 +107,24 @@ def _esun_card_bill_fact(out: dict):
 
 class EsunCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
+    SAFE_COLLECT_PHASES = frozenset({
+        'spa_entry', 'navigation', 'menu_plan', 'destination_navigation',
+        'prequery_response', 'account_validation',
+        'transaction_preflight', 'transaction_form', 'transaction_response',
+        'transaction_request', 'transaction_shape',
+        'transaction_render', 'transaction_normalization', 'continuation',
+        'continuation_preflight', 'continuation_geometry', 'continuation_action',
+        'continuation_wait', 'continuation_response', 'continuation_render',
+        'continuation_finalize', 'capture_publication', 'incomplete_result',
+        'card_navigation', 'card_overview', 'native_bill',
+    })
+    SAFE_COLLECT_GATES = frozenset({
+        'origin', 'blocker_snapshot', 'blocker_contract', 'blocker_kind',
+        'blocker_allowed', 'login_visible',
+        'inventory_shape', 'inventory_groups', 'inventory_rows', 'inventory_budget',
+        'inventory_accounts', 'inventory_selected', 'inventory_alias', 'currency',
+        'account_request', 'account_owner',
+    })
     SAFE_COLLECT_GUARDS = frozenset({
         "esun-twd-history",
         "esun-twd-history-account",
@@ -140,6 +158,7 @@ class EsunCrawler(BankCrawler):
     def _make_collector(self, page) -> ResponseCollector:
         self._spa_login_baseline = None
         self._esun_spa_phase = None
+        self._esun_spa_gate = None
         # Collector must be attached before login. An empty startup DOM is not
         # evidence of the legacy site; it may be a still-mounting SPA.
         for attempt in range(41):
@@ -806,6 +825,8 @@ class EsunCrawler(BankCrawler):
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
         self._diagnostic_stage = "collect_validation"
         if page.evaluate("() => document.querySelector('#layout-content') !== null") is True:
+            self._esun_spa_phase = 'spa_entry'
+            self._esun_spa_gate = None
             from backend.banks.esun_spa.capture import SpaCollector
             from backend.banks.esun_spa.collection import collect_twd
             if not isinstance(collector, SpaCollector) or not getattr(self, "_spa_login_baseline", None):
@@ -825,6 +846,8 @@ class EsunCrawler(BankCrawler):
                 result.telemetry.update(card.telemetry)
             except Exception:
                 result.telemetry['esun_spa_products'] = {'status': 'unavailable'}
+            self._esun_spa_phase = 'capture_publication'
+            self._esun_spa_gate = None
             self._ensure_collect_origin(page)
             for prove in history:
                 prove()

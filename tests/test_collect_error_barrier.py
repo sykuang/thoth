@@ -73,7 +73,8 @@ def test_collect_error_is_sanitized_before_serialization(crawler, error, capsys)
     result = crawler.run('offline')
     assert result['error'] == 'collect_failed: ValueError: code=collect_contract'
     assert 'data' not in result
-    assert set(result) == {'error'}
+    assert set(result) == {'error', 'collect_diagnostics'}
+    assert result['collect_diagnostics'] == {'exception': 'ValueError', 'code': 'collect_contract'}
     crawler.payload.to_dict.assert_not_called()
     crawler.logout.assert_called_once()
     assert 'synthetic sentinel' not in repr(result) + capsys.readouterr().err

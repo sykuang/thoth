@@ -247,7 +247,51 @@ def test_spa_failure_reports_navigation_phase(product, monkeypatch):
     assert not captured
     assert 'data' not in result and result['error'].startswith('collect_failed: ValueError: code=')
     assert crawler._diagnostic_stage == 'collect_navigation'
+    assert 'phase=menu_plan' in result['error']
     assert 'synthetic navigation failure' not in repr(result)
+
+
+def test_spa_guard_failure_reaches_job_error_without_private_text(product, monkeypatch, capsys):
+    from backend.banks.esun_spa import collection
+    crawler, _, origin, _, _, captured, _, _, _ = product
+    original_guard = collection.navigation_guard
+
+    def fail_at_guard(*args, **kwargs):
+        guard = original_guard(*args, **kwargs)
+        def fail():
+            crawler._ensure_collect_origin = Mock(side_effect=TimeoutError('private page text\nFORGED_LOG'))
+            return guard()
+        return fail
+
+    monkeypatch.setattr(collection, 'navigation_guard', fail_at_guard)
+    result = crawler.run(origin + '/synthetic', headless=True)
+    assert not captured and 'data' not in result
+    assert 'phase=navigation: gate=origin' in result['error']
+    assert 'private page text' not in repr(result) + capsys.readouterr().err
+
+
+@pytest.mark.parametrize('change, gate', [
+    (lambda body: body.update(twAccountList={}), 'inventory_shape'),
+    (lambda body: body['twCurrInfo'].update(curr='USD'), 'currency'),
+    (lambda body: body['twAccountList'][0].update(accountAlias=None), 'inventory_alias'),
+])
+def test_account_validation_failure_identifies_predicate(product, monkeypatch, change, gate):
+    from backend.banks.esun_spa import collection
+    crawler, _, origin, _, _, captured, _, _, _ = product
+    original = collection.require_current_success
+
+    def altered(collector, baseline, path):
+        body, envelope = original(collector, baseline, path)
+        if path == collection.PATHS[1]:
+            body = json.loads(json.dumps(body))
+            change(body)
+        return body, envelope
+
+    monkeypatch.setattr(collection, 'require_current_success', altered)
+    result = crawler.run(origin + '/synthetic', headless=True)
+    assert not captured and 'data' not in result
+    assert result['collect_diagnostics']['phase'] == 'account_validation'
+    assert result['collect_diagnostics']['gate'] == gate
 
 
 def test_spa_transaction_form_failure_keeps_closed_phase(product, monkeypatch):
@@ -263,7 +307,77 @@ def test_spa_transaction_form_failure_keeps_closed_phase(product, monkeypatch):
     assert result['error'].startswith('collect_failed: ValueError: code=')
     assert crawler._diagnostic_stage == 'collect_transactions'
     assert crawler._esun_spa_phase == 'transaction_form'
+    assert 'phase=transaction_form' in result['error']
     assert 'private page text' not in repr(result)
+
+
+def test_spa_response_shape_failure_has_own_phase(product, monkeypatch):
+    from backend.banks.esun_spa import collection
+    crawler, _, origin, _, _, captured, _, _, _ = product
+    monkeypatch.setattr(collection, 'empty_window_state', lambda _: 'empty_shape_unknown')
+    result = crawler.run(origin + '/synthetic', headless=True)
+    assert not captured and 'data' not in result
+    assert 'phase=transaction_shape' in result['error']
+
+
+def test_spa_render_failure_has_own_phase(product, monkeypatch):
+    from backend.banks.esun_spa import collection
+    crawler, _, origin, _, _, captured, _, _, _ = product
+
+    def reject(*_args):
+        raise ValueError('private rendered row')
+
+    monkeypatch.setattr(collection, 'require_rendered_occurrences', reject)
+    result = crawler.run(origin + '/synthetic', headless=True)
+    assert not captured and 'data' not in result
+    assert 'phase=transaction_render' in result['error']
+    assert 'private rendered row' not in repr(result)
+
+
+def test_product_phase_does_not_mask_late_history_proof_failure(product, monkeypatch):
+    from backend.banks.esun_spa import products
+    crawler, _, origin, _, _, captured, _, _, _ = product
+
+    def card_probe(crawler, _page, collector, _baseline):
+        crawler._esun_spa_phase = 'native_bill'
+        crawler._esun_spa_gate = 'blocker_allowed'
+        def reject():
+            raise ValueError('private financial value')
+        collector.publication_checks.append(reject)
+        return BankCollectResult(bank='esun', card_bill_facts_ok=False)
+
+    monkeypatch.setattr(products, 'collect_products', card_probe)
+    result = crawler.run(origin + '/synthetic', headless=True)
+    assert not captured and 'data' not in result
+    assert 'phase=capture_publication' in result['error']
+    assert 'gate=' not in result['error']
+    assert 'private financial value' not in repr(result)
+
+
+def test_continuation_render_retry_returns_to_wait_phase(product, monkeypatch):
+    from backend.banks.esun_spa import collection
+
+    crawler, _, origin, _, _, captured, _, _, _ = product
+    render = collection.require_rendered_occurrences
+    current = collection.require_current_success
+    retried = []
+
+    def reject_first_merged(page, groups, *args, **kwargs):
+        if not retried and sum(len(group["detailInfo"]) for group in groups) > 100:
+            retried.append(True)
+            raise ValueError("synthetic render pending")
+        return render(page, groups, *args, **kwargs)
+
+    def fail_wait(owner, baseline, path):
+        if retried and path == collection.PATHS[2]:
+            raise ValueError("synthetic retry ownership failure")
+        return current(owner, baseline, path)
+
+    monkeypatch.setattr(collection, "require_rendered_occurrences", reject_first_merged)
+    monkeypatch.setattr(collection, "require_current_success", fail_wait)
+    result = crawler.run(origin + "/synthetic", headless=True)
+    assert retried and not captured and "data" not in result
+    assert result["collect_diagnostics"]["phase"] == "continuation_wait"
 
 
 def test_spa_continuation_action_failure_reports_subphase(product, monkeypatch):
@@ -278,6 +392,7 @@ def test_spa_continuation_action_failure_reports_subphase(product, monkeypatch):
     assert result['error'].startswith('collect_failed: ValueError: code=')
     assert crawler._diagnostic_stage == 'collect_transactions'
     assert crawler._esun_spa_phase == 'continuation_action'
+    assert 'phase=continuation_action' in result['error']
     assert 'private action detail' not in repr(result)
 
 
@@ -309,7 +424,7 @@ def test_spa_collection_updates_diagnostic_stage_per_owned_phase(product, monkey
     assert account_phases[0] == 'prequery_response'
     assert 'account_validation' in account_phases
     assert len(captured) == 1 and captured[0].error == 'spa_collection_incomplete'
-    assert 'data' not in result and result['error'] == 'collect_failed: ValueError: code=collect_contract'
+    assert 'data' not in result and result['error'] == 'collect_failed: ValueError: code=collect_contract: phase=incomplete_result'
     assert crawler._diagnostic_stage == 'collect_validation'
     assert crawler._esun_spa_phase == 'incomplete_result'
 
@@ -465,7 +580,7 @@ def test_run_collects_native_continuation_but_keeps_error_barrier(product):
     assert hits[-1][1]["requestBody"]["startIndex"] == 107
     assert hits[-1][1]["requestBody"]["count"] == 100
     assert crawler._spa_login_baseline["counts"][PATHS[0]] == 0
-    assert "data" not in result and result["error"] == "collect_failed: ValueError: code=collect_contract"
+    assert "data" not in result and result["error"] == "collect_failed: ValueError: code=collect_contract: phase=incomplete_result"
     assert crawler._diagnostic_stage == "collect_validation"
     assert not external
     assert not any(value in json.dumps(result) for value in ("TEST-", "SYNTHETIC-", "0000000000001"))

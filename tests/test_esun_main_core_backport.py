@@ -96,6 +96,65 @@ def test_prelogin_collector_final_proof_and_detach(monkeypatch, tmp_path):
     assert page.listeners["requestfailed"] == []
 
 
+@pytest.mark.parametrize('registered', [False, True])
+def test_diagnostic_state_never_executes_adapter_dict_descriptor(monkeypatch, tmp_path, capsys, registered):
+    accesses = []
+
+    class Hostile(Crawler):
+        SAFE_COLLECT_PHASES = frozenset({'capture_publication'}) if registered else frozenset()
+
+        @property
+        def __dict__(self):
+            accesses.append(True)
+            print('PRIVATE-DESCRIPTOR-PAYLOAD')
+            return {'_esun_spa_phase': 'capture_publication'}
+
+    crawler = Hostile(name='esun', reject_publication=True)
+    crawler._esun_spa_phase = 'capture_publication'
+    result, _ = run_offline(monkeypatch, tmp_path, crawler)
+    assert 'data' not in result
+    assert not accesses
+    assert 'PRIVATE' not in capsys.readouterr().out
+    if registered:
+        assert 'phase=capture_publication' in result['error']
+
+
+def test_late_publication_logs_same_structured_error_as_early_failure(monkeypatch, tmp_path, capsys):
+    class Late(Crawler):
+        SAFE_COLLECT_PHASES = frozenset({'capture_publication'})
+
+        def logout(self, page):
+            self.reject_publication = True
+            self._esun_spa_phase = 'capture_publication'
+            return super().logout(page)
+
+    crawler = Late(name='esun')
+    result, page = run_offline(monkeypatch, tmp_path, crawler)
+    assert 'data' not in result
+    assert result['collect_diagnostics'] == {
+        'exception': 'RuntimeError', 'code': 'collect_contract', 'phase': 'capture_publication',
+    }
+    stderr = capsys.readouterr().err
+    assert result['error'] in stderr
+    assert 'PRIVATE' not in repr(result) + stderr
+    assert page.listeners['response'] == []
+
+
+@pytest.mark.parametrize('family', ['patchright', 'playwright'])
+def test_native_browser_timeout_retains_safe_type_at_collect_sink(monkeypatch, tmp_path, capsys, family):
+    from importlib import import_module
+    native = import_module(f'{family}.sync_api').TimeoutError
+    crawler = Crawler(name='esun')
+
+    def fail(_page, _collector):
+        raise native('PRIVATE-BROWSER-LOCATOR')
+
+    monkeypatch.setattr(crawler, 'collect', fail)
+    result, _ = run_offline(monkeypatch, tmp_path, crawler)
+    assert result['collect_diagnostics']['exception'] == 'TimeoutError'
+    assert 'PRIVATE' not in repr(result) + capsys.readouterr().err
+
+
 def test_collector_selection_failure_is_sanitized_before_login(monkeypatch, tmp_path):
     class Broken(Crawler):
         def _make_collector(self, page):
@@ -130,15 +189,29 @@ def test_repeated_callback_cannot_publish_or_login_again(monkeypatch, tmp_path):
     assert page.listeners["response"] == []
 
 
-def test_reentrant_callback_during_collection_cannot_publish(monkeypatch, tmp_path):
+@pytest.mark.parametrize("timing", ["collect", "publication", "late_publication"])
+@pytest.mark.parametrize("reject", [False, True])
+def test_reentrant_callback_during_collection_cannot_publish(monkeypatch, tmp_path, timing, reject):
     callback = None
+
+    def repeat():
+        assert callback is not None
+        callback(page)
+        if reject:
+            raise ValueError("synthetic failure after repeated callback")
 
     class Reentrant(Crawler):
         def collect(self, page, collector):
             self.events.append("collect")
-            assert callback is not None
-            callback(page._target)
+            if timing == "collect":
+                repeat()
             return self.outcome
+
+        def _validate_collect_publication(self, collector):
+            super()._validate_collect_publication(collector)
+            expected = 1 if timing == "publication" else 2 if timing == "late_publication" else 0
+            if self.events.count("proof") == expected:
+                repeat()
 
     crawler = Reentrant(name="esun")
     crawler.session_dir = tmp_path / "session"
