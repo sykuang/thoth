@@ -52,15 +52,21 @@ def test_esun_shared_login_api_and_terminal_first_rules() -> None:
         "esun-otp-required-dialog",
         "esun-password-change-required-modal",
         "esun-password-change-required-dialog",
+        "esun-spa-duplicate-session",
+        "esun-six-month-password-reminder",
         "esun-unknown-modal",
         "esun-unknown-dialog",
         "esun-login-form-still-visible",
+        "esun-main-login-form-still-visible",
     ]
     assert [rule.kind for rule in rules] == [
         CheckpointKind.OTP_REQUIRED,
         CheckpointKind.OTP_REQUIRED,
         CheckpointKind.PASSWORD_CHANGE_REQUIRED,
         CheckpointKind.PASSWORD_CHANGE_REQUIRED,
+        CheckpointKind.DUPLICATE_SESSION,
+        CheckpointKind.DISMISSIBLE_NOTICE,
+        CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
         CheckpointKind.UNKNOWN_BLOCKER,
@@ -70,21 +76,32 @@ def test_esun_shared_login_api_and_terminal_first_rules() -> None:
         "[role='dialog']",
         ".modal.show",
         "[role='dialog']",
+        "dialog.mib-modal-container[role='dialog']",
+        "dialog.mib-modal-container[role='dialog']",
         ".modal.show",
         "[role='dialog']",
         _sel(FIELD_NATIONAL_ID),
+        'input[name="id"]',
     ]
     assert [rule.phases for rule in rules] == [
         tuple(CheckpointPhase),
         tuple(CheckpointPhase),
         tuple(CheckpointPhase),
         tuple(CheckpointPhase),
+        (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
+        (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
         tuple(CheckpointPhase),
         tuple(CheckpointPhase),
         (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
+        (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
     ]
     assert all(rule.bank == "esun" for rule in rules)
-    assert all(rule.action_texts == () and not rule.is_clickable for rule in rules)
+    assert rules[4].action_texts == ("確定登入",)
+    assert all(rule.action_texts == () for rule in rules if rule is not rules[4])
+    assert [rule.name for rule in rules if rule.is_clickable] == [
+        "esun-spa-duplicate-session", "esun-six-month-password-reminder"
+    ]
+    assert rules[5].action_selector == "div.modal-close-button[role='button'][aria-label='關閉']"
 
 
 @pytest.mark.parametrize(
@@ -137,14 +154,15 @@ def test_esun_legacy_login_debug_and_generic_actions_are_absent() -> None:
     login_source = inspect.getsource(EsunCrawler.login)
 
     assert login_source.strip().endswith("return self._shared_login(page)")
+    non_rules = source[: source.index("    # ---------- 抓取 ----------")].replace(
+        inspect.getsource(EsunCrawler.login_checkpoint_rules), "")
+    assert "確定登入" not in non_rules and "取消" not in non_rules
     for forbidden in (
         "_login_snapshot",
         "handle_dup_login_modal",
         "page.screenshot",
         "document.body.innerText\")[:2000]",
         "錯誤訊息/全文摘要",
-        "確定登入",
-        "取消",
     ):
         assert forbidden not in source[: source.index("    # ---------- 抓取 ----------")]
 
@@ -366,6 +384,8 @@ def test_auth_is_one_shot_fieldless_and_exception_safe(capsys) -> None:
 
 def _submit_fixture():
     page = Mock()
+    # Native Keyboard is an object, not a callable Mock.
+    page.keyboard = SimpleNamespace(press=Mock(), type=Mock())
     page.url = "https://ebank.esunbank.com.tw/fco/"
     frame = Mock(url=f"https://ebank.esunbank.com.tw/fco/{IFRAME_HINT}")
     page.frames = [frame]
@@ -430,9 +450,9 @@ def test_submit_requires_unique_frame_fields_lengths_and_action_then_clicks_once
         ]
     assert page.keyboard.press.call_args_list == [call("Backspace")] * 3
     assert page.keyboard.type.call_args_list == [
-        call("ID-PRIVATE", delay=80),
-        call("USER-PRIVATE", delay=80),
-        call("PASSWORD-PRIVATE", delay=80),
+        call(character, delay=80)
+        for value in ("ID-PRIVATE", "USER-PRIVATE", "PASSWORD-PRIVATE")
+        for character in value
     ]
     page.fill.assert_not_called()
     assert page.wait_for_timeout.call_args_list == [
@@ -736,10 +756,23 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         for index, node in enumerate(crawler.body)
         if isinstance(node, ast.FunctionDef) and node.name == "collect"
     )
-    payload = "\n".join(
+    collect = crawler.body[start]
+    assert isinstance(collect, ast.FunctionDef)
+    # Narrow reviewed exception to the former main AST: JSF accepts an absent
+    # totalCount, but rejects conflicting or present-but-unparsed displayed totals
+    # outside dated transaction rows; grid footer totals remain in scope.
+    # both producer marker lists recognize 查無符合資料！. Legacy quota drops its
+    # raw_text_sample and dictionary stderr log. Other nodes/helpers stay frozen.
+    legacy = collect.body[3:] + crawler.body[start + 1:]
+    payload = "\n".join(ast.dump(node, include_attributes=False) for node in legacy).encode()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "cfee36ec91a4b13a62769e91dfa1a596e22a86f8280e26775c457e06a996fbb4"
+    )
+    # New hash deliberately includes the reviewed SPA dispatch + final proof;
+    # legacy-only hash above keeps the original JSF parser frozen independently.
+    full = "\n".join(
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     ).encode()
-
-    assert hashlib.sha256(payload).hexdigest() == (
-        "e1603c148b587bfd392d1ac226bf5094fb2a81c687869e9b1a07ca965fdbdaad"
+    assert hashlib.sha256(full).hexdigest() == (
+        "46699a5507b6ff6b1a49ca47ef253be322320ea18c4485c2b7828b26179b5b81"
     )

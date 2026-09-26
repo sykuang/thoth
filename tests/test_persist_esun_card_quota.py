@@ -72,13 +72,10 @@ def test_parse_card_quota_zero_used_just_after_payment():
     assert out["credit_limit_twd"] == 400000
 
 
-def test_parse_card_quota_empty_text_keeps_sample_only():
-    """頁面沒抓到任何 keyword → 不命中, 但 raw_text_sample 還在好讓使用者 audit。"""
-    text = "Language\nENGLISH\n登出\n"
-    out = EsunCrawler._parse_card_quota(text)
-    assert "credit_limit_twd" not in out
-    assert "used_credit_twd" not in out
-    assert "raw_text_sample" in out
+def test_parse_card_quota_empty_text_returns_no_private_sample():
+    """No recognized quota means no data; never retain raw account-bearing page text."""
+    text = "Language\nENGLISH\n登出\nPRIVATE-CANARY-ID-987654321"
+    assert EsunCrawler._parse_card_quota(text) == {}
 
 
 def test_parse_card_quota_inline_tabs_no_newlines():

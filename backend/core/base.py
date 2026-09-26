@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import math
@@ -16,6 +17,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import date, datetime, timedelta
@@ -378,6 +380,188 @@ class ApiHit:
     @property
     def endpoint(self) -> str:
         return self.url.split("?")[0].rsplit("/", 1)[-1]
+
+
+class _HistoryBodyObserver:
+    """Read-only CDP size proof; bounds admitted decoded bytes, not browser RSS."""
+
+    LIMIT: int = 5_000_000
+    TOTAL_LIMIT: int | None = None  # None preserves the legacy cumulative LIMIT.
+    MAX_RECORDS: int = 64
+    WAIT_SECONDS: float = 10
+
+    def __init__(self, page, url):
+        self.page, self.url = page, url
+        self.records = {}
+        self.native_requests = []
+        self.total = 0
+        self.bad = False
+        self.session = page.context.new_cdp_session(page)
+        self._disconnect_attempted = False
+        self.handlers = {"Network.requestWillBeSent": self._request}
+        for name in ("responseReceived", "dataReceived", "loadingFinished", "loadingFailed"):
+            self.handlers["Network." + name] = lambda event, kind=name: self._event(kind, event)
+        try:
+            for name, handler in self.handlers.items():
+                self.session.on(name, handler)
+            self.session.send("Network.enable", {"maxPostDataSize": 16_384})
+        except Exception:
+            self.close()
+            raise
+
+    def disconnect(self):
+        """Finish event-pumping teardown without erasing publication evidence."""
+        if self._disconnect_attempted:
+            return
+        self._disconnect_attempted = True
+        try:
+            self.session.detach()
+        except Exception:
+            self.bad = True
+            raise
+
+    def close(self):
+        self.bad = True
+        for name, handler in self.handlers.items():
+            with contextlib.suppress(Exception):
+                self.session.remove_listener(name, handler)
+        with contextlib.suppress(Exception):
+            self.disconnect()
+        self.records.clear()
+        self.native_requests.clear()
+
+    def _request(self, event):
+        request_id = event.get("requestId")
+        if request_id in self.records:
+            self.records[request_id]["bad"] = True  # Redirect/reused ID.
+            return
+        request = event.get("request", {})
+        if request.get("url") != self.url:
+            return
+        if len(self.records) >= self.MAX_RECORDS:
+            self.bad = True
+            return
+        post = request.get("postData")
+        if (request.get("method") != "POST" or not isinstance(post, str)
+                or len(post.encode("utf-8")) > 16_384 or not event.get("frameId")):
+            self.bad = True
+            return
+        self.records[request_id] = {
+            "key": (request["url"], request["method"], post, event["frameId"]),
+            "loader": event.get("loaderId"), "document_url": event.get("documentURL", ""),
+            "bytes": 0, "done": False, "bad": "redirectResponse" in event,
+            "response": False, "used": False,
+        }
+
+    def _event(self, kind, event):
+        record = self.records.get(event.get("requestId"))
+        if record is None:
+            return
+        if kind == "dataReceived":
+            size = event.get("dataLength")
+            if type(size) is not int or size < 0 or record["done"] or "data" in event:
+                record["bad"] = True
+                return
+            record["bytes"] = min(self.LIMIT + 1, record["bytes"] + size)
+            total_limit = self.LIMIT if self.TOTAL_LIMIT is None else self.TOTAL_LIMIT
+            self.total = min(total_limit + 1, self.total + size)
+            self.bad |= self.total > total_limit
+        elif kind == "loadingFinished":
+            record["bad"] |= record["done"]
+            record["done"] = True
+        elif kind == "loadingFailed":
+            record["bad"] = True
+        else:
+            response = event.get("response", {})
+            record["response"] = (
+                response.get("status") == 200 and response.get("url") == self.url
+                and not response.get("fromServiceWorker")
+                and not response.get("fromDiskCache")
+                and not response.get("fromPrefetchCache")
+                and bool(record["loader"]) and event.get("loaderId") == record["loader"]
+                and event.get("frameId") == record["key"][3]
+            )
+            record["bad"] |= not record["response"]
+
+    def _document(self, frame, frame_url):
+        """Bind a native Frame to its current CDP document, never by URL alone."""
+        if frame is None:
+            return None
+        tree = self.session.send("Page.getFrameTree")["frameTree"]
+        # Read the native URL AFTER CDP dispatch: SPA routing may run during send.
+        current_url = frame.url
+        if (not any(native is frame for native in self.page.frames)
+                or urlparse(current_url)[:2] != urlparse(frame_url)[:2]):
+            return None
+        if frame is self.page.main_frame:
+            matches = [tree["frame"]]
+        else:
+            native = [f for f in self.page.frames if f.url == current_url]
+            if len(native) != 1 or native[0] is not frame:
+                return None
+            pending, matches = [tree], []
+            while pending:
+                node = pending.pop()
+                if node["frame"]["url"] + node["frame"].get("urlFragment", "") == current_url:
+                    matches.append(node["frame"])
+                pending.extend(node.get("childFrames", []))
+        if (len(matches) != 1
+                or matches[0]["url"] + matches[0].get("urlFragment", "") != current_url
+                or not matches[0].get("loaderId")):
+            return None
+        return matches[0]["id"], matches[0]["loaderId"]
+
+    def read(self, resp, frame, frame_url, remaining, minimum, admit=None):
+        req = resp.request
+        if (self.bad or resp.status != 200 or req.url != self.url or resp.url != self.url
+                or req.method != "POST" or req.frame is not frame
+                or getattr(req, "redirected_from", None) is not None
+                or getattr(req, "redirected_to", None) is not None):
+            return None
+        if (any(native is req for native in self.native_requests)
+                or len(self.native_requests) >= self.MAX_RECORDS):
+            return None
+        self.native_requests.append(req)
+        document = self._document(frame, frame_url)
+        if document is None:
+            return None
+        key = (req.url, req.method, req.post_data, document[0])
+        deadline = time.monotonic() + min(30, self.WAIT_SECONDS)
+        while not self.bad:
+            matches = [(rid, r) for rid, r in self.records.items() if r["key"] == key and not r["used"]]
+            if len(matches) > 1:
+                return None
+            if matches:
+                request_id, record = matches[0]
+                if (record["bad"] or record.get("native_request", req) is not req
+                        or record["loader"] != document[1]
+                        or urlparse(record["document_url"])[:2] != urlparse(frame_url)[:2]):
+                    return None
+                record["native_request"] = req
+                if record["done"]:
+                    available = remaining() if callable(remaining) else remaining
+                    if not record["response"] or not minimum <= record["bytes"] <= available:
+                        return None
+                    if admit is not None and not admit(record["bytes"]):
+                        return None
+                    if (self._document(frame, frame_url) != document or self.bad or record["bad"]
+                            or sum(r["key"] == key and not r["used"] for r in self.records.values()) != 1):
+                        return None
+                    # Direct observer buffer read cannot enter Patchright's
+                    # Network.loadNetworkResource replay fallback (even with CL).
+                    result = self.session.send("Network.getResponseBody", {"requestId": request_id})
+                    body = (base64.b64decode(result["body"], validate=True)
+                            if result.get("base64Encoded") else result["body"].encode("utf-8"))
+                    if (self._document(frame, frame_url) == document
+                            and not self.bad and not record["bad"] and len(body) == record["bytes"]
+                            and sum(r["key"] == key and not r["used"] for r in self.records.values()) == 1):
+                        record["used"] = True
+                        return body
+                    return None
+            if time.monotonic() >= deadline:
+                return None
+            self.page.wait_for_timeout(20)
+        return None
 
 
 class ResponseCollector:
@@ -1155,7 +1339,9 @@ class BankCollectResult:
             if value is None:
                 continue
             if value == []:
-                if name == "twd_txn_results" and self.history_coverage is not None:
+                if (name == "twd_txn_results" and self.history_coverage is not None
+                        or name == "twd_txns" and self.bank == "esun"
+                        and self.history_coverage is not None and self.twd_txn_results is None):
                     out[name] = []
                 continue
             if value == {}:
@@ -1489,6 +1675,11 @@ class BankCrawler(ABC):
                 rules=active_rules,
                 is_authenticated=self.is_authenticated,
                 is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                **({"can_act": lambda: (
+                    not getattr(self, "_shared_dialog_blocked", False)
+                    and self._credential_origin_allowed(page)
+                    and not getattr(self, "_shared_dialog_blocked", False)
+                )} if self.name == "esun" else {}),
             )
             if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(
@@ -1514,13 +1705,25 @@ class BankCrawler(ABC):
             if next_budget.credential_submissions == budget.credential_submissions + 1:
                 if next_budget.captcha_resubmits == budget.captcha_resubmits + 1:
                     self.prepare_captcha_resubmit(page)
-                if not self._credential_origin_allowed(page):
+                if (getattr(self, "_shared_dialog_blocked", False)
+                        or not self._credential_origin_allowed(page)):
                     reduce_login_checkpoint(
                         phase,
                         budget,
                         CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
                     )
-                self.submit_credentials_once(page)
+                submit_page = page
+                if self.name == "esun":
+                    def ensure_submission_origin() -> None:
+                        if (getattr(self, "_shared_dialog_blocked", False)
+                                or not self._credential_origin_allowed(page)
+                                or getattr(self, "_shared_dialog_blocked", False)):
+                            reduce_login_checkpoint(
+                                phase, budget,
+                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                            )
+                    submit_page = _OriginGuardProxy(page, ensure_submission_origin)
+                self.submit_credentials_once(submit_page)
             if next_budget.reloads == budget.reloads + 1:
                 page.reload()
                 self.prepare_login_page(page)
@@ -1656,6 +1859,21 @@ class BankCrawler(ABC):
             **fetch_kwargs,
         )
 
+    def _make_collector(self, page) -> ResponseCollector:
+        return ResponseCollector(host_filter=self._host_filter())
+
+    def _ensure_collect_origin(self, page) -> None:
+        if (getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)):
+            reduce_login_checkpoint(
+                CheckpointPhase.POST_SUBMIT_SETTLE,
+                LoginBudget(credential_submissions=1),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            )
+
+    def _validate_collect_publication(self, collector) -> None:
+        """Adapter-owned in-memory proof after final origin check, before publish."""
+
     def run(self, login_url: str, headless: bool = False) -> dict:
         """完整流程：開瀏覽器 → 登入 → 抓取 → **登出** → 回傳資料。
 
@@ -1670,15 +1888,31 @@ class BankCrawler(ABC):
         # 詳見 SESSION_MAX_AGE_SECONDS docstring（SCSB 2026-06-16 案例）。
         self._enforce_session_freshness()
 
-        collector = ResponseCollector(host_filter=self._host_filter())
+        collector = None
         result: dict = {}
+        callback_entered = False
 
         def page_action(page):
-            collector.attach(page)
-            self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
-            self._shared_dialog_blocked = False
-            self.attach_shared_dialog_handler(page)
+            nonlocal collector, callback_entered
+            if callback_entered:
+                result.pop("data", None)
+                result["error"] = "browser_callback_repeated"
+                return page
+            callback_entered = True
+            try:
+                collector = self._make_collector(page)
+                collector.attach(page)
+                self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
+                self._shared_dialog_blocked = False
+                self.attach_shared_dialog_handler(page)
+            except Exception as e:
+                if collector is not None:
+                    with contextlib.suppress(Exception):
+                        collector.detach(page)
+                result["error"] = f"{_safe_exception_type(e)}: browser setup failed"
+                return page
             logged_in = False
+            data = None
             try:
                 try:
                     ok = self._shared_login(page)
@@ -1759,12 +1993,7 @@ class BankCrawler(ABC):
                 logged_in = True
                 try:
                     def ensure_collect_origin() -> None:
-                        if not self._credential_origin_allowed(page):
-                            reduce_login_checkpoint(
-                                CheckpointPhase.POST_SUBMIT_SETTLE,
-                                LoginBudget(credential_submissions=1),
-                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-                            )
+                        self._ensure_collect_origin(page)
 
                     ensure_collect_origin()
                     collect_result = self.collect(
@@ -1776,12 +2005,17 @@ class BankCrawler(ABC):
                             f"{self.__class__.__name__}.collect() must return "
                             f"BankCollectResult, got {type(collect_result).__name__}"
                         )
+                    if collect_result.error is not None and not (
+                        type(collect_result.error) is str and collect_result.error == ""
+                    ):
+                        raise ValueError("collect result reported an error")
                     if collect_result.error is None and collect_result.card_bill_facts_ok is None:
                         raise ValueError(
                             f"{self.__class__.__name__}.collect() must publish "
                             "card_bill_facts_ok at the crawler boundary"
                         )
-                    result["data"] = collect_result.to_dict()
+                    data = collect_result.to_dict()
+                    self._validate_collect_publication(collector)
                 except Exception as e:
                     # collect 階段 raise（包含 SCSB/Taishin 等明細查詢 raise）
                     # 一樣寫進 error，但 logged_in 仍 True → finally 會跑 logout。
@@ -1812,6 +2046,24 @@ class BankCrawler(ABC):
                             "(details withheld; best-effort, swallow)",
                             file=_sys.stderr,
                         )
+                try:
+                    if data is not None and "error" not in result:
+                        # Logout may dispatch a late failure for accepted rows.
+                        # Validate before local teardown destroys the receipts.
+                        self._validate_collect_publication(collector)
+                except Exception as e:
+                    result["error"] = (
+                        f"collect_failed: {_safe_exception_type(e)}: "
+                        f"code={_safe_collect_failure_code(e)}"
+                    )
+                finally:
+                    if collector is not None:
+                        try:
+                            collector.detach(page)
+                        except Exception as e:
+                            result.setdefault("error", f"{_safe_exception_type(e)}: browser cleanup failed")
+            if data is not None and "error" not in result:
+                result["data"] = data
             return page
 
         # 所有 crawler 從 base 繼承同一套 macOS fingerprint spoof。

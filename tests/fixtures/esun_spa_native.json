@@ -1,0 +1,62 @@
+{
+  "menu": [
+    {
+      "itemName": {
+        "zh-TW": "PRIVATE-MENU",
+        "en-US": "PRIVATE-MENU"
+      },
+      "show": true,
+      "enable": true,
+      "taskId": null,
+      "childMenuList": [
+        {
+          "itemName": {
+            "zh-TW": "PRIVATE-LEAF",
+            "en-US": "PRIVATE-LEAF"
+          },
+          "show": true,
+          "enable": true,
+          "taskId": "CTW01002-TW",
+          "childMenuList": null
+        }
+      ]
+    }
+  ],
+  "prequery": {
+    "twAccountList": [
+      {
+        "accountNo": "0000000000001",
+        "accountAlias": "PRIVATE-NAME"
+      }
+    ],
+    "demandDeptAcc": "0000000000001",
+    "twCurrInfo": {
+      "curr": "TWD",
+      "realBalance": "100"
+    },
+    "queryDeptTxDtlResult": {
+      "startIndex": 1,
+      "count": 100,
+      "displayErrorCode": null,
+      "displayErrorMsg": null,
+      "detailListData": [
+        {
+          "year": "2026",
+          "month": "09",
+          "detailInfo": [
+            {
+              "date": "2026/09/01",
+              "txDate": "20260901",
+              "txTime": "12:34:56",
+              "amount": "123",
+              "balance": 100,
+              "debitCredit": "DB",
+              "detailTitle": "PRIVATE-SHOP"
+            }
+          ]
+        }
+      ]
+    },
+    "accountAlias": "PRIVATE-NAME"
+  }
+}

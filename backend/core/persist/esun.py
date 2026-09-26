@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 import re
 
 from backend.core import account_classify, classify
+from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
 from backend.core.persist._common import _num_real, _num_to_float, _roc_to_west
 
@@ -38,7 +39,7 @@ def _esun_twd_integer(raw, *, non_negative: bool) -> int | None:
     return int(value)
 
 
-def _validated_esun_twd_row(row: dict) -> dict:
+def _validated_esun_twd_row(row: dict, *, unknown_account_date: bool = False) -> dict:
     account_no = row.get("account_no")
     txn_datetime = row.get("datetime")
     account_date = row.get("account_date")
@@ -46,7 +47,7 @@ def _validated_esun_twd_row(row: dict) -> dict:
         not isinstance(account_no, str)
         or re.fullmatch(r"\d{13}", account_no) is None
         or not isinstance(txn_datetime, str)
-        or not isinstance(account_date, str)
+        or not (account_date is None if unknown_account_date else isinstance(account_date, str))
         or not isinstance(row.get("desc"), str)
         or not row["desc"].strip()
     ):
@@ -54,12 +55,16 @@ def _validated_esun_twd_row(row: dict) -> dict:
     txn_format = "%Y-%m-%d %H:%M:%S" if " " in txn_datetime else "%Y-%m-%d"
     try:
         parsed_txn = datetime.strptime(txn_datetime, txn_format)
-        parsed_account = datetime.strptime(account_date, "%Y-%m-%d")
+        if unknown_account_date:
+            parsed_account = None
+        else:
+            assert isinstance(account_date, str)
+            parsed_account = datetime.strptime(account_date, "%Y-%m-%d")
     except ValueError:
         raise ValueError("invalid E.SUN TWD transaction date") from None
     if (
         parsed_txn.strftime(txn_format) != txn_datetime
-        or parsed_account.strftime("%Y-%m-%d") != account_date
+        or parsed_account is not None and parsed_account.strftime("%Y-%m-%d") != account_date
     ):
         raise ValueError("noncanonical E.SUN TWD transaction date")
     money = (row.get("expend"), row.get("income"))
@@ -239,8 +244,8 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
             if (
                 type(row_count) is not int
                 or row_count <= 0
-                or type(total_count) is not int
-                or total_count != row_count
+                or total_count is not None
+                and (type(total_count) is not int or total_count != row_count)
                 or type(grid_candidate_count) is not int
                 or grid_candidate_count != 1
                 or snapshot.get("emptyMarker") is not None
@@ -263,16 +268,18 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
                 snapshot.get("hasGrid") is not False
                 or type(grid_candidate_count) is not int
                 or grid_candidate_count != 0
-                or snapshot.get("gridText") != ""
+                or snapshot.get("gridText", "") != ""
                 or snapshot.get("gridRows") != []
                 or type(snapshot.get("gridRowCount")) is not int
                 or snapshot["gridRowCount"] != 0
                 or type(snapshot.get("totalCount")) is not int
                 or snapshot["totalCount"] != 0
                 or snapshot.get("emptyMarker") not in {
-                    "查無交易資料", "查無資料", "無交易明細",
+                    "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
                 }
-                or _parse_esun_twd_txn_results([result]) != []
+                or _parse_esun_twd_txn_results([
+                    {**result, "snapshot": {**snapshot, "gridText": snapshot.get("gridText", "")}}
+                ]) != []
             ):
                 raise ValueError("invalid E.SUN TWD empty result coverage")
         else:
@@ -280,19 +287,69 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
     return parsed
 
 
-def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _validated_esun_spa_rows(data: dict) -> list[dict]:
+    """Accept normalized rows only under independently supplied window coverage."""
+    coverage = data.get("history_coverage")
+    rows = data.get("twd_txns")
+    if not isinstance(rows, list) or not isinstance(coverage, dict):
+        raise ValueError("unsupported E.SUN normalized TWD payload")
+    mode = coverage.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("invalid E.SUN SPA history mode")
+    validate_history_coverage(
+        coverage, expected_mode=mode,
+        expected_domains=frozenset({"twd_transactions"}),
+    )
+    domains = coverage["domains"]
+    if len(domains) != 1 or "twd_txn_results" in data:
+        raise ValueError("ambiguous E.SUN TWD history payload")
+    domain = domains[0]
+    expected = domain["expected"]
+    windows = domain["windows"]
+    identities = {item["identity"] for item in expected}
+    if any(re.fullmatch(r"\d{13}", identity) is None for identity in identities):
+        raise ValueError("invalid E.SUN SPA TWD identity")
+    validated = []
+    seen = [0] * len(windows)
+    for original in rows:
+        if not isinstance(original, dict) or "account_date" not in original:
+            raise ValueError("invalid E.SUN SPA TWD row")
+        row = _validated_esun_twd_row(dict(original), unknown_account_date=True)
+        if row["balance"] is None or row["account_no"] not in identities:
+            raise ValueError("invalid E.SUN SPA TWD row")
+        day = date.fromisoformat(row["datetime"][:10])
+        matching = [i for i, window in enumerate(windows) if
+                    window["identity"] == row["account_no"]
+                    and window["start"] <= day.isoformat() <= window["end"]
+                    and window["status"] == "complete"]
+        if len(matching) != 1:
+            raise ValueError("E.SUN SPA TWD row outside complete window")
+        seen[matching[0]] += 1
+        validated.append(row)
+    if any(window["status"] == "complete" and not seen[i] for i, window in enumerate(windows)):
+        raise ValueError("E.SUN SPA TWD complete window lacks rows")
+    return validated
+
+
+def persist_esun(
+    data: dict, store: BankStore, rules: list[dict] | None = None, *, commit: bool = True,
+) -> dict:
     """玉山 collect → store 入庫。
 
-    映射：
-      data.accounts[]    → accounts(UPSERT) + balance_history (TWD 累加)
-      data.card_frames[] → daily_metrics (debug dump)
-      data._all_endpoints → daily_metrics (endpoint map)
-      data.frames[]      → daily_metrics (frame text preview, debug)
+    Structured accounts, transactions, cards and safe metrics only; no raw debug dumps.
     """
+    error = data.get("error")
+    if error is not None and not (type(error) is str and error == ""):
+        raise ValueError("E.SUN collection result contains an error")
+    if "twd_txns" in data and data.get("history_coverage") is None:
+        raise ValueError("unsupported E.SUN normalized TWD payload")
+
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {"bank": "esun"}
     delta["scope"] = "structured"
-    if data.get("history_coverage") is not None:
+    if "twd_txns" in data:
+        twd_rows = _validated_esun_spa_rows(data)
+    elif data.get("history_coverage") is not None:
         twd_rows = _validated_esun_twd_results_for_coverage(data)
     else:
         twd_rows = _parse_esun_twd_txn_results(data.get("twd_txn_results") or [])
@@ -327,41 +384,42 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
         if currency == "TWD":
             twd_total += balance
     if accts:
-        store.upsert_accounts(accts)
+        store.upsert_accounts(accts, commit=commit)
         delta["accounts"] = len(accts)
     if accts:
         store.upsert_balance_history([{
             "snapshotDate": today,
             "twdBalance": twd_total if twd_total > 0 else None,
             "fxBalance": None,
-        }])
+        }], commit=commit)
         delta["balance_days"] = 1
         store.put_daily_metric("balance_latest", {
             "twd": twd_total,
             "n_accounts": len(accts),
             "by_currency": {a.get("currency"): a.get("balance") for a in raw_accounts},
-        }, today)
+        }, today, commit=commit)
 
     # --- TWD deposit transactions (FAO01002 存款交易明細查詢) ---
     if twd_rows:
-        delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules)
+        delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules, commit=commit)
 
     # --- card_summary（信用卡額度/點數/截止日）---
     # Step 2 (2026-06-14): card_summary 是整戶層, 套到 card_transactions 出現的所有卡 (ESun 通常 1 張卡).
     # 民國年 '115/06/29' → '2026-06-29' 用 _roc_to_west.
     card_summary = data.get("card_summary") or {}
     if card_summary:
-        store.put_daily_metric("esun_card_summary", card_summary, today)
+        store.put_daily_metric("esun_card_summary", card_summary, today, commit=commit)
         delta["card_summary"] = card_summary
 
     # --- card_quota（信用卡額度查詢頁，2026-06-18 新增 B 路線）---
     card_quota_raw = data.get("card_quota") or {}
     if card_quota_raw:
-        store.put_daily_metric("esun_card_quota", card_quota_raw, today)
-        delta["card_quota"] = {
+        safe_card_quota = {
             k: v for k, v in card_quota_raw.items()
-            if k != "raw_text_sample"  # debug 樣本不入 delta log
+            if k != "raw_text_sample"
         }
+        store.put_daily_metric("esun_card_quota", safe_card_quota, today, commit=commit)
+        delta["card_quota"] = safe_card_quota
 
     # ESun cards UPSERT (從 card_transactions 拿卡號, 套整戶層 limit/due)
     esun_limit = _num_to_float(card_summary.get("credit_limit_twd"))
@@ -369,12 +427,12 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
 
     # 2026-06-18 升級 (B 路線)：used_credit 改為直接抓「信用卡額度查詢」頁原生欄位
     # (data.card_quota.used_credit_twd)，因為原本 sum 已入帳會少算未入帳 + 上期未繳，
-    # 顯示 NT$2,085 而使用者實際 used=-807 (溢繳)。raw 欄位 vs sum 兩層 fallback:
+    # 可能顯示偏差，或實際為溢繳。raw 欄位 vs sum 兩層 fallback:
     #   1) card_quota.used_credit_twd  ← 玉山原生顯示，最誠實 (可能 0 或負數)
     #   2) sum(card_transactions 已入帳)  ← 舊路徑，最後 fallback (顯示不足但好過 None)
     #
     # ⚠️ used_credit 可能是 0 (剛繳完) 或負數 (溢繳)，所以判 "是否抓到 quota" 用
-    # `quota_used is not None` 而非 truthy check，否則 0 / -807 會誤走 fallback。
+    # `quota_used is not None` 而非 truthy check，否則 0 / 負值會誤走 fallback。
     card_quota = data.get("card_quota") or {}
     quota_used_raw = card_quota.get("used_credit_twd")
     quota_used: float | None = _num_to_float(quota_used_raw) if quota_used_raw is not None else None
@@ -439,7 +497,7 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
     esun_seen_cards: dict[str, dict] = {}
     for t in data.get("card_transactions") or []:
         last4 = t.get("card_last4")
-        full_masked = t.get("card_no") or ""  # '9064-XXXX-XXXX-7032'
+        full_masked = t.get("card_no") or ""  # bank-provided masked number
         if not last4 or last4 in esun_seen_cards:
             continue
         esun_seen_cards[last4] = {
@@ -460,23 +518,26 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
             "last_payment_date": esun_last_pay_date,
         }
     if esun_seen_cards:
-        store.upsert_cards(list(esun_seen_cards.values()))
+        store.upsert_cards(list(esun_seen_cards.values()), commit=commit)
 
     # --- card_bills（帳單月份列表）---
     card_bills = data.get("card_bills") or []
     if card_bills:
-        store.put_daily_metric("esun_card_bills", {"bills": card_bills, "count": len(card_bills)}, today)
+        store.put_daily_metric(
+            "esun_card_bills", {"bills": card_bills, "count": len(card_bills)}, today,
+            commit=commit,
+        )
         delta["card_bills"] = len(card_bills)
 
     # --- card_transactions（消費明細）— 入正規 schema ---
     card_txns = data.get("card_transactions") or []
 
-    # 2026-06-20 一次性 cleanup: 砍舊格式 card_no='5242-XXXX-XXXX-XXXX' row.
+    # 一次性 cleanup: 砍舊格式 card_no='0000-XXXX-XXXX-0001' row.
     # bug 期間 (2026-06-13 ~ 2026-06-20) 寫進去的 row 用 raw masked full
     # 對不上 cards.card_no='****XXXX', 砍掉讓本次 sync 寫的新 row 唯一 source of truth.
     # idempotent — 已修 fmt 的 DB 無舊格式 row, DELETE 0 row 無害.
     if card_txns:
-        store.purge_legacy_masked_card_no_rows()
+        store.purge_legacy_masked_card_no_rows(commit=commit)
 
     pending_txns = []
     billed_txns = []
@@ -489,7 +550,7 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
         desc = t.get("merchant")
         amt = int(t.get("billed_amount") or 0)
         # 2026-06-20 (root cause: 帳戶 tab 玉山卡顯示「使用額度 0」):
-        # cards.card_no 是 '****7032' (line 140), 但這裡若寫 raw '9064-XXXX-XXXX-7032'
+        # cards.card_no 是 '****0001', 但這裡若寫 raw '0000-XXXX-XXXX-0001'
         # → bill_summary SQL `WHERE card_no = ?` join 不到 → bill_due_amount=0 假象.
         # 統一寫 '****{last4}' 跟 cards 同格式 (跟 HSBC/CTBC/Taishin 同 norm 規則).
         # 沒 last4 退而求其次用 raw, 至少不會 KeyError.
@@ -525,89 +586,10 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # collector 必須明示兩個期間皆成功提交且看到結果 frame；只看到 [] 不足以證明零筆。
     n = store.refresh_card_pending(
         "unbilled", pending_txns, rules=rules,
-        fetch_ok=data.get("card_transactions_ok") is True)
+        fetch_ok=data.get("card_transactions_ok") is True, commit=commit)
     delta["card_unbilled"] = n
     if card_txns:
-        # 同時保留原始 JSON 在 daily_metrics 做 debug
-        store.put_daily_metric("esun_card_transactions",
-                                {"transactions": card_txns, "count": len(card_txns)}, today)
         delta["card_transactions"] = len(card_txns)
-
-    # cards 表 UPSERT 已在上面用 esun_seen_cards (從 card_transactions 抽 last4)
-    # 處理. 舊路徑 (用全 masked card_no='9064-XXXX-XXXX-7032' 當 number) 2026-06-14 拔除,
-    # 因為會跟新 path 的 number='****7032' 撞成 2 筆殘留.
-
-    # --- card_txn_frames + card_txn_nav_probe (debug) ---
-    card_txn_frames = data.get("card_txn_frames") or []
-    if card_txn_frames:
-        store.put_daily_metric("esun_card_txn_frames", {
-            "count": len(card_txn_frames),
-            "urls": [cf.get("url", "")[:200] for cf in card_txn_frames],
-            "text_preview": [cf.get("text_preview", "")[:1000] for cf in card_txn_frames],
-        }, today)
-    card_txn_nav_probe = data.get("card_txn_nav_probe")
-    if card_txn_nav_probe:
-        store.put_daily_metric("esun_card_txn_nav_probe", card_txn_nav_probe, today)
-
-    # --- card_frames (信用卡入口導航結果，debug) ---
-    card_frames = data.get("card_frames") or []
-    if card_frames:
-        store.put_daily_metric("esun_card_frames", {
-            "count": len(card_frames),
-            "urls": [cf.get("url", "")[:200] for cf in card_frames],
-            "text_preview": [cf.get("text_preview", "")[:500] for cf in card_frames],
-        }, today)
-
-    # --- card_nav_probe (信用卡 navigate 探勘結果，debug)---
-    card_nav_probe = data.get("card_nav_probe")
-    if card_nav_probe:
-        store.put_daily_metric("esun_card_nav_probe", card_nav_probe, today)
-
-    # --- card_quota_frames + card_quota_nav_probe (debug, 2026-06-18) ---
-    card_quota_frames = data.get("card_quota_frames") or []
-    if card_quota_frames:
-        store.put_daily_metric("esun_card_quota_frames", {
-            "count": len(card_quota_frames),
-            "urls": [cf.get("url", "")[:200] for cf in card_quota_frames],
-            "text_preview": [cf.get("text_preview", "")[:2000] for cf in card_quota_frames],
-        }, today)
-    card_quota_nav_probe = data.get("card_quota_nav_probe")
-    if card_quota_nav_probe:
-        store.put_daily_metric("esun_card_quota_nav_probe", card_quota_nav_probe, today)
-
-    # --- card_pay_frames + card_pay_nav_probe (2026-06-22 信用卡繳款明細查詢, raw dump) ---
-    # 等明早 sync 後從 PG 撈出來看真實 shape, 再決定 parser 邏輯.
-    card_pay_frames = data.get("card_pay_frames") or []
-    if card_pay_frames:
-        store.put_daily_metric("esun_card_pay_frames", {
-            "count": len(card_pay_frames),
-            "urls": [cf.get("url", "")[:200] for cf in card_pay_frames],
-            "text_preview": [cf.get("text_preview", "")[:2000] for cf in card_pay_frames],
-        }, today)
-    card_pay_nav_probe = data.get("card_pay_nav_probe")
-    if card_pay_nav_probe:
-        store.put_daily_metric("esun_card_pay_nav_probe", card_pay_nav_probe, today)
-    card_pay_history = data.get("card_pay_history") or {}
-    if card_pay_history:
-        store.put_daily_metric("esun_card_pay_history", card_pay_history, today)
-
-    # --- all_pages (debug: 是否有開新 tab) ---
-    all_pages = data.get("all_pages")
-    if all_pages:
-        store.put_daily_metric("esun_all_pages", {"pages": all_pages}, today)
-
-    # --- endpoint 地圖 ---
-    endpoints = data.get("_all_endpoints") or []
-    if endpoints:
-        store.put_daily_metric("esun_endpoints", {"endpoints": endpoints}, today)
-
-    # --- frames preview（debug，第一次入庫用，後續可移除）---
-    frames = data.get("frames") or []
-    if frames:
-        store.put_daily_metric("esun_frames_dump", {
-            "frame_urls": [f.get("url", "")[:200] for f in frames],
-            "main_text_preview": (data.get("main_text") or "")[:1000],
-        }, today)
 
     delta.setdefault("balance_days", 0)
     delta.setdefault("accounts", 0)
@@ -616,5 +598,5 @@ def persist_esun(data: dict, store: BankStore, rules: list[dict] | None = None) 
     delta.setdefault("card_unbilled", 0)
     delta.setdefault("card_current", 0)
 
-    store.log_sync(delta)
+    store.log_sync(delta, commit=commit)
     return delta

@@ -3,8 +3,8 @@
 
 玉山銀行 E.SUN ebank 個人網銀抓取器。
 
-登入入口：https://ebank.esunbank.com.tw（JSF 框架，iframe 內 form）
-流程：開頁 → 找 iframe1 (`/fco/fco08001/FCO08001_Home.faces`) → 填 3 欄 → 點登入鈕
+登入入口：https://ebank.esunbank.com.tw（主頁 name-based form；兼容既有 JSF iframe）
+流程：開頁 → 唯一同源登入表單 → 填 3 欄 → 點表單內唯一登入鈕
 
 ⚠️ 鐵律（見 wiki/concepts/taiwan-bank-login-retry-account-lockout-lesson.md）：
    login 失敗**絕不自動重打**——max_attempts=1 硬上限。
@@ -26,7 +26,7 @@ from typing import ClassVar
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import ApiHit, BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import ApiHit, BankCollectResult, BankCrawler, ResponseCollector, _OriginGuardProxy
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.core.creds import EsunCreds
 from backend.core.login_checkpoints import (
@@ -43,6 +43,9 @@ FIELD_NATIONAL_ID = "loginform:custid"   # text, maxlen=10
 FIELD_USER_CODE   = "loginform:name"     # password type, maxlen=15
 FIELD_PASSWORD    = "loginform:pxsswd"   # password type, maxlen=15 (注意是 pxsswd 不是 password)
 LOGIN_BTN_ID      = "loginform:linkCommand"  # <a class="login_btn">
+_MAIN_LOGIN_FIELDS = ('input[name="id"]', 'input[name="userName"]', 'input[name="pxssword"]')
+_MAIN_LOGIN_FORM = "form" + "".join(f":has({selector})" for selector in _MAIN_LOGIN_FIELDS)
+_MAIN_LOGIN_LABEL = re.compile(r"^\s*登\s*入\s*$")
 _ESUN_TWD_HISTORY_PATH = "/fco/fao01002/FAO01002.faces"
 _ESUN_TWD_FAILURE_RE = re.compile(
     r"(?:錯誤|失敗|異常|逾時|逾期|失效|中斷|請稍後再試|重新登入|"
@@ -132,7 +135,43 @@ class EsunCrawler(BankCrawler):
         self.creds = EsunCreds.load()
 
     def _host_filter(self) -> str:
-        return "esunbank.com"
+        return "esunbank.com.tw"
+
+    def _make_collector(self, page) -> ResponseCollector:
+        self._spa_login_baseline = None
+        self._esun_spa_phase = None
+        # Collector must be attached before login. An empty startup DOM is not
+        # evidence of the legacy site; it may be a still-mounting SPA.
+        for attempt in range(41):
+            if not self._credential_origin_allowed(page):
+                raise EsunLoginError("登入頁面來源不符；未送出登入")
+            if page.evaluate("() => !!document.querySelector('#layout-content, input[name=pxssword]')") is True:
+                if not self._credential_origin_allowed(page):
+                    raise EsunLoginError("登入頁面來源不符；未送出登入")
+                from backend.banks.esun_spa.capture import SpaCollector
+                return SpaCollector()
+            for frame in page.frames:
+                if (
+                    frame is not page.main_frame
+                    and self._frame_origin_allowed(page, frame)
+                    and (frame.name == "iframe1" or IFRAME_HINT in (urlparse(frame.url or "").path or ""))
+                    and all(frame.locator(_sel(field)).count() == 1 for field in (
+                        FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD
+                    ))
+                ):
+                    if not self._credential_origin_allowed(page):
+                        raise EsunLoginError("登入頁面來源不符；未送出登入")
+                    return super()._make_collector(page)
+            if attempt < 40:
+                page.wait_for_timeout(250)
+        raise EsunLoginError("無法確認登入頁面類型；未送出登入")
+
+    def _build_fetch_kwargs(self) -> dict:
+        kwargs = super()._build_fetch_kwargs()
+        # ponytail: native narrow desktop layout avoids the guide overlay;
+        # revisit only if bank layout changes.
+        kwargs.setdefault("additional_args", {})["viewport"] = {"width": 1200, "height": 1800}
+        return kwargs
 
     def _find_login_frame(self, page):
         matches = [
@@ -141,10 +180,40 @@ class EsunCrawler(BankCrawler):
         ]
         return matches[0] if len(matches) == 1 else None
 
+    @staticmethod
+    def _main_login_form(frame):
+        if frame.parent_frame is not None:
+            return None
+        forms = frame.locator(_MAIN_LOGIN_FORM)
+        if forms.count() != 1:
+            return None
+        form = forms.nth(0)
+        for selector in _MAIN_LOGIN_FIELDS:
+            fields = frame.locator(selector)
+            if fields.count() != 1 or not fields.nth(0).is_visible() or not fields.nth(0).is_enabled():
+                return None
+        if form.evaluate("""form => [
+            ['id', 'text', 10], ['userName', 'password', 15], ['pxssword', 'password', 15]
+        ].every(([name, type, max]) => {
+            const nodes = form.querySelectorAll('input[name="' + name + '"]');
+            return nodes.length === 1 && nodes[0].form === form && nodes[0].type === type && nodes[0].maxLength === max;
+        })""") is not True:
+            return None
+        buttons = form.locator('button[type="button"]').filter(has_text=_MAIN_LOGIN_LABEL)
+        if buttons.count() != 1:
+            return None
+        button = buttons.nth(0)
+        if not button.is_visible() or not button.is_enabled():
+            return None
+        if button.evaluate("el => el.form === el.closest('form')") is not True:
+            return None
+        return form
+
     def _is_login_frame(self, page, frame) -> bool:
         current = urlparse(frame.url or "")
         return self._frame_origin_allowed(page, frame) and (
             frame.name == "iframe1" or IFRAME_HINT in (current.path or "")
+            or self._main_login_form(frame) is not None
         )
 
     def _logged_in(self, page) -> bool:
@@ -174,10 +243,10 @@ class EsunCrawler(BankCrawler):
                 page,
                 *(frame for frame in page.frames if frame is not page.main_frame),
             ]
-            login_fields_selector = ", ".join(
-                _sel(field)
-                for field in (FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD)
-            )
+            login_fields_selector = ", ".join((
+                *(_sel(field) for field in (FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD)),
+                *_MAIN_LOGIN_FIELDS,
+            ))
             for scope in scopes:
                 fields = scope.locator(login_fields_selector)
                 if any(
@@ -185,9 +254,23 @@ class EsunCrawler(BankCrawler):
                     for index in range(fields.count())
                 ):
                     return False
+            layouts = page.locator("#layout-content")
+            if layouts.count():
+                if layouts.count() != 1 or not layouts.nth(0).is_visible():
+                    return False
+                layout = layouts.nth(0)
+                dashboard = layout.locator(".cpo08003 > .index")
+                return (
+                    page.locator("#layout-content.not-login").count() == 0
+                    and layout.locator(".temp-index:visible").count() == 0
+                    and layout.locator(".cpo08003").count() == 1
+                    and dashboard.count() == 1
+                    and dashboard.nth(0).is_visible()
+                )
             body = "\n".join(
                 scope.evaluate("() => document.body && document.body.innerText || ''") or ""
                 for scope in scopes
+                if scope is page or self._frame_origin_allowed(page, scope)
             )
         except Exception:
             return False
@@ -270,6 +353,33 @@ class EsunCrawler(BankCrawler):
                 )
             ),
             LoginCheckpointRule(
+                name="esun-spa-duplicate-session",
+                bank="esun",
+                phases=post_settle,
+                kind=CheckpointKind.DUPLICATE_SESSION,
+                container_selector="dialog.mib-modal-container[role='dialog']",
+                action_selector="button[type='button']",
+                action_texts=("確定登入",),
+                required_body_pattern=re.compile(
+                    r"^\s*重複登入提醒\s*"
+                    r"若要在此處登入，請按下「確定登入」，同時其它位置將會自動登出。\s*"
+                    r"(?:取消\s*確定登入|確定登入\s*取消)\s*$"
+                ),
+            ),
+            LoginCheckpointRule(
+                name="esun-six-month-password-reminder",
+                bank="esun",
+                phases=post_settle,
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector="dialog.mib-modal-container[role='dialog']",
+                action_selector="div.modal-close-button[role='button'][aria-label='關閉']",
+                required_body_pattern=re.compile(
+                    r"^\s*變更密碼提醒\s*"
+                    r"您已經有半年未變更使用者密碼了，為了網路銀行交易安全，請您立即變更。\s*"
+                    r"立即變更\s*$"
+                ),
+            ),
+            LoginCheckpointRule(
                 name="esun-unknown-modal",
                 bank="esun",
                 phases=all_phases,
@@ -290,23 +400,50 @@ class EsunCrawler(BankCrawler):
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
                 container_selector=_sel(FIELD_NATIONAL_ID),
             ),
+            LoginCheckpointRule(
+                name="esun-main-login-form-still-visible",
+                bank="esun",
+                phases=post_settle,
+                kind=CheckpointKind.UNKNOWN_BLOCKER,
+                container_selector=_MAIN_LOGIN_FIELDS[0],
+            ),
         )
 
     def submit_credentials_once(self, page) -> None:
+        from backend.banks.esun_spa.capture import SpaCollector
+        collector = getattr(self, "collector", None)
+        self._spa_login_baseline = collector.snapshot() if isinstance(collector, SpaCollector) else None
         try:
             frame = self._find_login_frame(page)
+            if frame is not None:
+                native_page = _OriginGuardProxy._unwrap(page)
+                native_frame = _OriginGuardProxy._unwrap(frame)
+
+                def guard_login_frame():
+                    if not self._credential_origin_allowed(native_page) or not self._frame_origin_allowed(native_page, native_frame):
+                        raise EsunLoginError("登入表單來源不符；未送出登入")
+
+                # Compose with the shared origin/dialog guard; keyboard actions
+                # must retain the selected frame guard as well as locators.
+                frame = _OriginGuardProxy(frame, guard_login_frame)
+                page = _OriginGuardProxy(page, guard_login_frame)
+            main_form = self._main_login_form(frame) if frame is not None else None
         except Exception:
             raise EsunLoginError("無法安全確認登入頁面；未送出登入") from None
         if frame is None:
             raise EsunLoginError("找不到唯一登入頁面；未送出登入") from None
+        scope = main_form if main_form is not None else frame
+        selectors = _MAIN_LOGIN_FIELDS if main_form is not None else tuple(
+            _sel(field) for field in (FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD)
+        )
 
         try:
-            for selector, value, wait in (
-                (_sel(FIELD_NATIONAL_ID), self.creds.national_id, 200),
-                (_sel(FIELD_USER_CODE), self.creds.user_code, 200),
-                (_sel(FIELD_PASSWORD), self.creds.password, 300),
+            for selector, value, wait in zip(
+                selectors,
+                (self.creds.national_id, self.creds.user_code, self.creds.password),
+                (200, 200, 300),
             ):
-                candidates = frame.locator(selector)
+                candidates = scope.locator(selector)
                 if candidates.count() != 1:
                     raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
                 field = candidates.nth(0)
@@ -315,7 +452,8 @@ class EsunCrawler(BankCrawler):
                 field.click()
                 field.click(click_count=3)
                 page.keyboard.press("Backspace")
-                page.keyboard.type(value, delay=80)
+                for character in value:
+                    page.keyboard.type(character, delay=80)
                 page.wait_for_timeout(wait)
                 if len(field.input_value()) != len(value):
                     raise EsunLoginError("登入欄位輸入長度不符；未送出登入")
@@ -325,7 +463,10 @@ class EsunCrawler(BankCrawler):
             raise EsunLoginError("登入欄位無法安全填寫；未送出登入") from None
 
         try:
-            candidates = frame.locator(_sel(LOGIN_BTN_ID))
+            candidates = (
+                main_form.locator('button[type="button"]').filter(has_text=_MAIN_LOGIN_LABEL)
+                if main_form is not None else frame.locator(_sel(LOGIN_BTN_ID))
+            )
             if candidates.count() != 1:
                 raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
             button = candidates.nth(0)
@@ -355,7 +496,7 @@ class EsunCrawler(BankCrawler):
                     for selector in (
                         ".modal.show",
                         "[role='dialog']",
-                        _sel(FIELD_NATIONAL_ID),
+                        selectors[0],
                     ):
                         checkpoints = scope.locator(selector)
                         if any(
@@ -566,7 +707,7 @@ class EsunCrawler(BankCrawler):
         ):
             raise RuntimeError("esun-twd-history-result")
         total_count = snapshot.get("totalCount")
-        if type(total_count) is not int or total_count < 0:
+        if total_count is not None and (type(total_count) is not int or total_count < 0):
             raise RuntimeError("esun-twd-history-result")
         has_grid = snapshot.get("hasGrid")
         grid_candidate_count = snapshot.get("gridCandidateCount")
@@ -595,7 +736,7 @@ class EsunCrawler(BankCrawler):
             if (
                 type(row_count) is not int
                 or row_count <= 0
-                or total_count != row_count
+                or total_count is not None and total_count != row_count
                 or not grid_text.strip()
                 or len(dates) != row_count
                 or snapshot.get("emptyMarker") is not None
@@ -641,7 +782,7 @@ class EsunCrawler(BankCrawler):
                 or snapshot.get("gridRowCount") != 0
                 or total_count != 0
                 or snapshot.get("emptyMarker") not in {
-                    "查無交易資料", "查無資料", "無交易明細",
+                    "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
                 }
             ):
                 raise RuntimeError("esun-twd-history-result")
@@ -655,8 +796,41 @@ class EsunCrawler(BankCrawler):
         }
 
     # ---------- 抓取 ----------
+    def _validate_collect_publication(self, collector) -> None:
+        from backend.banks.esun_spa.capture import SpaCollector
+        if isinstance(collector, SpaCollector):
+            for prove in collector.publication_checks:
+                prove()
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
+        self._diagnostic_stage = "collect_validation"
+        if page.evaluate("() => document.querySelector('#layout-content') !== null") is True:
+            from backend.banks.esun_spa.capture import SpaCollector
+            from backend.banks.esun_spa.collection import collect_twd
+            if not isinstance(collector, SpaCollector) or not getattr(self, "_spa_login_baseline", None):
+                raise ValueError("SPA collection requires pre-login capture")
+            publication, history = [], collector.publication_checks
+            result = collect_twd(self, page, collector, self._spa_login_baseline,
+                                 _publication=publication, _history=history)
+            self._diagnostic_stage = "collect_validation"
+            self._ensure_collect_origin(page)
+            for prove in publication:
+                prove()
+            # Card diagnostics may leave the TWD DOM: retain historical
+            # response proofs until all event-pumping operations finish.
+            try:
+                from backend.banks.esun_spa.products import collect_products
+                card = collect_products(self, page, collector, self._spa_login_baseline)
+                result.telemetry.update(card.telemetry)
+            except Exception:
+                result.telemetry['esun_spa_products'] = {'status': 'unavailable'}
+            self._ensure_collect_origin(page)
+            for prove in history:
+                prove()
+            self._esun_spa_phase = 'incomplete_result' if result.error else 'capture_publication'
+            self._diagnostic_stage = "collect_validation"
+            return result
         out: dict = {}
         page.wait_for_timeout(8000)
 
@@ -821,7 +995,7 @@ class EsunCrawler(BankCrawler):
                             stale_evidence = query_frame.evaluate(r"""() => {
                                 const selector = '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]';
                                 const evidence = [...document.querySelectorAll(selector)];
-                                const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
+                                const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細', '查無符合資料！']);
                                 for (const el of document.querySelectorAll('*')) {
                                     if (emptyLabels.has((el.textContent || '').trim()) && ![...el.children].some(
                                         (child) => emptyLabels.has((child.textContent || '').trim())
@@ -934,7 +1108,7 @@ class EsunCrawler(BankCrawler):
                                             return /(?:下一頁|下頁|next|page-next|pagenext|>)/i.test(marker);
                                         });
                                         const hasNextText = /(?:下一頁|下頁)/.test(bodyText);
-                                        const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細']);
+                                        const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細', '查無符合資料！']);
                                         const emptyMarkers = [resultScope, ...resultScope.querySelectorAll('*')].filter((el) => {
                                             if (!visible(el)) return false;
                                             const label = (el.textContent || '').trim();
@@ -942,7 +1116,20 @@ class EsunCrawler(BankCrawler):
                                                 (child) => emptyLabels.has((child.textContent || '').trim())
                                             );
                                         });
-                                        const totals = [...bodyText.matchAll(
+                                        // Memos are row data, not result totals. Remove only dated
+                                        // transaction rows from a detached copy; keep grid footers.
+                                        const totalScope = resultScope.cloneNode(true);
+                                        for (const row of totalScope.querySelectorAll(
+                                            '[id="fao01002:grid_DataGridBody"] tr, [id*="fao01002:grid"] tr'
+                                        )) {
+                                            if ([...row.querySelectorAll(':scope > th, :scope > td')].some(
+                                                (cell) => /(^|\D)20\d{2}\/\d{1,2}\/\d{1,2}(?!\d)/.test(cell.textContent || '')
+                                            )) row.remove();
+                                        }
+                                        const totalText = totalScope.textContent || '';
+                                        // An unparsed displayed total is not an absent total.
+                                        const totalLabels = totalText.match(/(?:共|總計|總筆數|資料筆數)/g) || [];
+                                        const totals = [...totalText.matchAll(
                                             /(?:共|總計|總筆數|資料筆數)\s*(\d+)\s*筆/g
                                         )].map((match) => Number(match[1]));
                                         const uniqueTotals = [...new Set(totals)];
@@ -969,7 +1156,8 @@ class EsunCrawler(BankCrawler):
                                             hasGrid: !!grid,
                                             gridCandidateCount: grids.length,
                                             gridRowCount: gridRows.length,
-                                            totalCount: uniqueTotals.length === 1 ? uniqueTotals[0] : null,
+                                            totalCount: totals.length !== totalLabels.length ? 'unparsed'
+                                                : uniqueTotals.length > 1 ? uniqueTotals : uniqueTotals[0] ?? null,
                                             pager: {
                                                 present: pagerRoots.length > 0 || hasNextText,
                                                 actionableNext: nextControls.length,
@@ -1361,7 +1549,7 @@ class EsunCrawler(BankCrawler):
                     best = max(quota_frames, key=lambda x: x.get("txt_len", 0))
                     full_text = best.get("text_preview", "")
                     out["card_quota"] = self._parse_card_quota(full_text)
-                    _log(f"[esun][collect] card_quota={out['card_quota']}")
+                    _log("[esun][collect] card_quota parsed")
                 else:
                     out["card_quota"] = {}
                     _log("[esun][collect] 信用卡額度查詢 frame 沒抓到 (已用額度+可用餘額+number)")
@@ -1525,7 +1713,6 @@ class EsunCrawler(BankCrawler):
             "used_credit_twd": -807,             # 可能為負 (溢繳)
             "available_credit_twd": 400807,
             "credit_limit_twd": 400000,          # = used + available (玉山這頁不顯示)
-            "raw_text_sample": "...",
           }
         """
         import re as _re
@@ -1550,8 +1737,6 @@ class EsunCrawler(BankCrawler):
             except ValueError:
                 pass
 
-        # debug：永遠留 sample，命中失敗時使用者才能 audit
-        out["raw_text_sample"] = text[:500]
         return out
 
     # ---------- 解析帳戶 ----------
@@ -1981,16 +2166,11 @@ class EsunCrawler(BankCrawler):
 
 
 if __name__ == "__main__":
-    import json
     crawler = EsunCrawler()
     try:
         result = crawler.run(login_url=BASE, headless=True)
     except EsunLoginError as e:
         result = {"error": "login_failed_stop", "detail": str(e)}
-
-    out_file = Path(__file__).resolve().parents[1] / "data" / "esun_collected.json"
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    _log(f"\n[esun][done] 已存: {out_file}")
 
     if result.get("error"):
         _log(f"  ❌ error: {result['error']}")

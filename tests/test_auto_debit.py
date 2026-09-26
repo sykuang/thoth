@@ -36,6 +36,9 @@ def client(monkeypatch, tmp_path) -> Iterator[TestClient]:
     import backend.server.app as app_mod
     import backend.server.db as db_mod
     import backend.server.routers.auto_debit as auto_debit_mod
+    from backend.server.security import login_limiter
+
+    login_limiter.reset()
     importlib.reload(db_mod)
     importlib.reload(app_mod)
     monkeypatch.setattr(auto_debit_mod, "_local_date", lambda _tz: TEST_TODAY)
