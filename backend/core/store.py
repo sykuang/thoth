@@ -1236,8 +1236,8 @@ class BankStore:
         self.conn.commit()
         return deleted
 
-    def purge_legacy_masked_card_no_rows(self) -> tuple[int, int]:
-        """一次性 cleanup：砍 card_no 仍為「raw masked full」(例 9064-XXXX-XXXX-7032) 的 row。
+    def purge_legacy_masked_card_no_rows(self, commit: bool = True) -> tuple[int, int]:
+        """一次性 cleanup：砍 card_no 仍為「raw masked full」(例 0000-XXXX-XXXX-0001) 的 row。
 
         Background: esun persist 在 2026-06-13 ~ 2026-06-20 期間 bug，把 raw masked
         full card_no 直接寫進 card_billed_txns / card_pending_txns，但 cards 表用
@@ -1254,7 +1254,8 @@ class BankStore:
             "DELETE FROM card_pending_txns WHERE user_id = ? AND card_no LIKE '%-XXXX-XXXX-%'",
             (self.user_id,),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return (cur_b.rowcount or 0, cur_p.rowcount or 0)
 
     # ---- 3. 未出帳/即時：refresh-by-scope ----
@@ -1415,6 +1416,10 @@ class BankStore:
             raise
         else:
             self.conn.execute(f"RELEASE SAVEPOINT {name}")
+
+    def begin_transaction(self) -> None:
+        """Keep nested savepoint releases inside the final commit/rollback."""
+        self.conn.execute("SAVEPOINT bank_store_transaction")
 
     def commit(self) -> None:
         self.conn.commit()

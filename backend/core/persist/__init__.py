@@ -78,9 +78,12 @@ def persist_collected(bank, data, store, rules=None):
     validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
-    atomic = bank in {"hsbc", "rakuten", "sinopac", "taishin", "ubot"}
+    atomic = bank in {"esun", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
     try:
         if atomic:
+            # Nest adapter savepoints even before the first DML; the existing
+            # final commit/rollback also closes this boundary.
+            store.begin_transaction()
             delta = persist(data, barrier, rules=rules, commit=False)
         else:
             delta = persist(data, barrier, rules=rules)
@@ -95,7 +98,7 @@ def persist_collected(bank, data, store, rules=None):
         store.record_history_coverage_cursors(
             data.get("history_coverage"),
             commit=not atomic,
-            replace=bank in {"rakuten", "taishin"} and coverage.get("mode") == "full",
+            replace=bank in {"esun", "rakuten", "taishin"} and coverage.get("mode") == "full",
         )
         if atomic:
             store.commit()

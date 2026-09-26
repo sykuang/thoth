@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.core.persist import persist_collected
 from backend.core.persist.esun import _parse_esun_twd_txn_results, persist_esun
 from backend.core.store import BankStore
 
@@ -18,7 +19,7 @@ from backend.core.store import BankStore
 @pytest.fixture
 def store_esun_twd(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
-    store = BankStore("esun_twd_test")
+    store = BankStore("esun_twd_test", user_id=7, source_account_id=91)
     try:
         yield store
     finally:
@@ -188,3 +189,73 @@ def test_persist_esun_empty_twd_query_does_not_create_rows(store_esun_twd) -> No
     assert delta["twd_txn_new"] == 0
     count = store_esun_twd.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0]
     assert count == 0
+
+
+def _spa_row(**changes):
+    return {
+        "account_no": "9999999999999", "datetime": "2026-08-20 01:02:03",
+        "account_date": None, "desc": "轉帳", "expend": 80, "income": None,
+        "balance": 4, **changes,
+    }
+
+
+def _spa_coverage(mode="full", status="complete"):
+    return {"mode": mode, "domains": [{
+        "domain": "twd_transactions",
+        "expected": [{"identity": "9999999999999", "start": "2026-08-01", "end": "2026-08-31"}],
+        "windows": [{"identity": "9999999999999", "start": "2026-08-01",
+                     "end": "2026-08-31", "status": status, "pages": 1}],
+    }]}
+
+
+@pytest.mark.parametrize("mode", ["full", "incremental"])
+def test_attested_spa_rows_preserve_null_posting_date_and_duplicate_occurrences(store_esun_twd, mode):
+    row = _spa_row()
+    data = {"twd_txns": [row, dict(row)], "history_coverage": _spa_coverage(mode)}
+    first = persist_collected("esun", data, store_esun_twd)
+    second = persist_collected("esun", data, store_esun_twd)
+    assert first["twd_txn_new"] == 2
+    assert second["twd_txn_new"] == 0
+    assert row["account_date"] is None
+    assert [tuple(r) for r in store_esun_twd.conn.execute(
+        "SELECT account_no, txn_datetime, account_date, raw_description, expend, income, balance "
+        "FROM twd_transactions ORDER BY id"
+    )] == [
+        ("9999999999999", "2026-08-20 01:02:03", None, "轉帳", 80, None, 4),
+    ] * 2
+    assert store_esun_twd.latest_twd_transaction_dates()["9999999999999"].isoformat() == "2026-08-31"
+
+
+@pytest.mark.parametrize("payload", [
+    {"twd_txns": [_spa_row()]},
+    {"twd_txns": [_spa_row()], "history_coverage": _spa_coverage(status="explicit_empty")},
+    {"twd_txns": [_spa_row(account_no="9999999999998")], "history_coverage": _spa_coverage()},
+    {"twd_txns": [_spa_row(datetime="2026-09-01 01:02:03")], "history_coverage": _spa_coverage()},
+    {"twd_txns": [_spa_row(account_date="2026-08-20")], "history_coverage": _spa_coverage()},
+    {"twd_txns": [_spa_row()], "twd_txn_results": [], "history_coverage": _spa_coverage()},
+])
+def test_spa_rows_refuse_missing_or_mismatched_authority_without_writes(store_esun_twd, payload):
+    with pytest.raises(ValueError):
+        persist_collected("esun", payload, store_esun_twd)
+    assert store_esun_twd.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == 0
+    assert store_esun_twd.latest_twd_transaction_dates() == {}
+
+
+def test_spa_cursor_failure_rolls_back_rows(store_esun_twd, monkeypatch):
+    monkeypatch.setattr(store_esun_twd, "record_history_coverage_cursors",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("cursor failed")))
+    with pytest.raises(RuntimeError, match="cursor failed"):
+        persist_collected("esun", {"twd_txns": [_spa_row()],
+                                   "history_coverage": _spa_coverage()}, store_esun_twd)
+    assert store_esun_twd.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == 0
+    assert store_esun_twd.latest_twd_transaction_dates() == {}
+
+
+def test_spa_missing_posting_date_field_is_not_an_explicit_unknown(store_esun_twd):
+    row = _spa_row()
+    del row["account_date"]
+    with pytest.raises(ValueError):
+        persist_collected("esun", {"twd_txns": [row],
+                                   "history_coverage": _spa_coverage()}, store_esun_twd)
+    assert store_esun_twd.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == 0
+    assert store_esun_twd.latest_twd_transaction_dates() == {}
