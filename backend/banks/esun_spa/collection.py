@@ -851,6 +851,16 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
             require_unchanged_query_issuance()
             querying = True
             crawler._esun_spa_phase = "transaction_form"
+            failure = None
+
+            def remember_failure(site):
+                nonlocal failure
+                if failure is None:
+                    phase, gate = crawler._esun_spa_phase, crawler._esun_spa_gate
+                    if gate is None and type(phase) is str and phase == "transaction_form":
+                        gate = site
+                    failure = (phase, gate)
+
             try:
                 action_budget = [0]
                 query_twd(
@@ -863,7 +873,12 @@ def _collect_rows(crawler, page, collector, login_baseline, _publication, _histo
                     action_budget=action_budget,
                     before_submit=require_unchanged_query_issuance,
                     before_action=require_unchanged_query_issuance,
+                    on_failure=remember_failure,
                 )
+            except BaseException:
+                if failure is not None:
+                    crawler._esun_spa_phase, crawler._esun_spa_gate = failure
+                raise
             finally:
                 querying = False
             crawler._esun_spa_phase = "transaction_response"
