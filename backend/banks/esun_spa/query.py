@@ -7,6 +7,7 @@ import calendar
 import json
 import re
 import time
+from contextlib import contextmanager
 from datetime import date
 from backend.core.base import _OriginGuardProxy
 
@@ -19,7 +20,7 @@ SAFE = r"""n => {
 }"""
 
 
-def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, action_budget=None, before_submit=None, before_action=None):
+def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, action_budget=None, before_submit=None, before_action=None, on_failure=None):
     """Select a legal explicit window with native calendar input, submit once.
 
     All inspected bank values remain in caller RAM; never printed or returned.
@@ -27,6 +28,17 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
     if action_budget is None:
         action_budget = [0]
 
+    @contextmanager
+    def site(label):
+        # Report only on unwinding: successful nested guards cannot erase a site.
+        try:
+            yield
+        except BaseException:
+            if on_failure is not None:
+                on_failure(label)
+            raise
+
+    @site("native_action_budget")
     def reserve_action():
         if (
             type(action_budget) is not list
@@ -60,23 +72,27 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
     root = page.locator(ROOT)
     form = root.locator(FORM)
 
+    @site("form_owner")
     def one(target):
-        require(target.count() == 1)
+        with site("form_cardinality"):
+            require(target.count() == 1)
         require(target.is_visible() and target.is_enabled() and target.evaluate(SAFE))
         return target
 
     active_base = None
 
-    def ready(predicate):
-        deadline = time.monotonic() + TIMEOUT / 1000
-        while True:
-            checkpoint()
-            owner()
-            if predicate():
-                return
-            require(time.monotonic() < deadline)
-            page.wait_for_timeout(20)
+    def ready(predicate, label="calendar_readiness"):
+        with site(label):
+            deadline = time.monotonic() + TIMEOUT / 1000
+            while True:
+                checkpoint()
+                owner()
+                if predicate():
+                    return
+                require(time.monotonic() < deadline)
+                page.wait_for_timeout(20)
 
+    @site("form_owner")
     def owner():
         dialogs = page.locator('dialog:visible,[role="dialog"]:visible')
         require(dialogs.count() <= 1)
@@ -103,6 +119,7 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
                 require(inputs.input_value() == "")
         require(form.locator('input[type="checkbox"]:checked').count() == 0)
 
+    @site("native_action")
     def click(target):
         checkpoint()
         owner()
@@ -112,7 +129,8 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
         if action_guard is not None:
             action_guard()
         if before_action is not None:
-            before_action()
+            with site("query_issuance_admission"):
+                before_action()
         reserve_action()
         target.click(timeout=TIMEOUT)
         if action_guard is not None:
@@ -167,6 +185,7 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
         )
         header = popup.locator('.calendar-header-block > .header-label[role="button"]')
 
+        @site("calendar_state")
         def title():
             text = one(header).inner_text().strip()
             require(header.get_attribute("aria-label") == text)
@@ -175,19 +194,20 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
         def day_title(year, month):
             return f"{year}年{month:02d}月" if locale == "zh-TW" else f"{months[month - 1][:3]}./{year}"
 
-        initial = title()
-        match = (
-            re.fullmatch("(\\d{4})年(\\d{2})月", initial)
-            if locale == "zh-TW"
-            else re.fullmatch("([A-Z][a-z]{2})\\./(\\d{4})", initial)
-        )
-        require(match is not None)
-        if locale == "zh-TW":
-            year, month = map(int, match.groups())
-        else:
-            require(match[1] in [m[:3] for m in months])
-            year, month = (int(match[2]), [m[:3] for m in months].index(match[1]) + 1)
-        require(shift(today, -36).year <= year <= today.year and 1 <= month <= 12)
+        with site("calendar_state"):
+            initial = title()
+            match = (
+                re.fullmatch("(\\d{4})年(\\d{2})月", initial)
+                if locale == "zh-TW"
+                else re.fullmatch("([A-Z][a-z]{2})\\./(\\d{4})", initial)
+            )
+            require(match is not None)
+            if locale == "zh-TW":
+                year, month = map(int, match.groups())
+            else:
+                require(match[1] in [m[:3] for m in months])
+                year, month = (int(match[2]), [m[:3] for m in months].index(match[1]) + 1)
+            require(shift(today, -36).year <= year <= today.year and 1 <= month <= 12)
         ready(lambda: popup.locator(".days-block").count() == 1)
         if (year, month) != (wanted.year, wanted.month):
             click(header)
@@ -239,7 +259,8 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
                             && ![...grids[0].classList].some(c=>/^slide-(left|right)-(enter|leave|move)/.test(c))
                             && p.getAnimations({subtree:true}).every(a=>a.playState==='finished');
                     }""")
-                    )
+                    ),
+                    "calendar_transition",
                 )
             except BaseException as error:
                 primary = error
@@ -247,11 +268,13 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
             finally:
                 cleanup_error = None
                 try:
-                    transition.evaluate("s => s.observer.disconnect()")
+                    with site("calendar_cleanup"):
+                        transition.evaluate("s => s.observer.disconnect()")
                 except BaseException as error:
                     cleanup_error = error
                 try:
-                    transition.dispose()
+                    with site("calendar_cleanup"):
+                        transition.dispose()
                 except BaseException as error:
                     if cleanup_error is None:
                         cleanup_error = error
@@ -300,9 +323,12 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
     if submit_guard is not None:
         submit_guard()
     if before_submit is not None:
-        before_submit()
+        with site("query_issuance_admission"):
+            before_submit()
     reserve_action()
-    submit.click(timeout=TIMEOUT)
-    if submit_guard is not None:
-        submit_guard()
-    checkpoint()
+    with site("query_submit"):
+        submit.click(timeout=TIMEOUT)
+    with site("post_submit_validation"):
+        if submit_guard is not None:
+            submit_guard()
+        checkpoint()

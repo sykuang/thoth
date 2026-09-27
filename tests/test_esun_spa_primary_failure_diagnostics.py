@@ -6,6 +6,7 @@ import pytest
 from patchright.sync_api import Locator, TimeoutError
 
 from tests.test_esun_spa_product import PATHS, browser as browser, product as product
+from tests.test_esun_spa_query_failure_sites import stored_job as stored_job
 
 
 @pytest.fixture(autouse=True)
@@ -15,7 +16,7 @@ def synthetic_credentials_only(monkeypatch):
 
 @pytest.mark.parametrize("action", ["header", "leaf", "calendar", "submit"])
 @pytest.mark.parametrize("secondary", ["menu_plan", "guard"])
-def test_primary_action_timeout_keeps_run_diagnostics(product, monkeypatch, capsys, action, secondary):
+def test_primary_action_timeout_keeps_run_diagnostics(product, stored_job, monkeypatch, capsys, action, secondary):
     crawler, page, origin, hits, external, captured, _, logout, submit = product
     selector = {
         "header": ".no-margin-right.header-option-button",
@@ -61,7 +62,7 @@ def test_primary_action_timeout_keeps_run_diagnostics(product, monkeypatch, caps
 
     monkeypatch.setattr(Locator, "click", obstructed_click)
     monkeypatch.setattr(crawler, "collect", observe_collect)
-    result = crawler.run(origin + "/synthetic", headless=True)
+    result, stored_error, _ = stored_job()
 
     assert len(failures) == 1
     error, cause, context, attempt_count = failures[0]
@@ -78,9 +79,12 @@ def test_primary_action_timeout_keeps_run_diagnostics(product, monkeypatch, caps
     diagnostics = result["collect_diagnostics"]
     assert diagnostics["exception"] == "TimeoutError"
     assert diagnostics["phase"] == phase
-    assert "gate" not in diagnostics and crawler._esun_spa_gate is None
+    gate = "native_action" if action == "calendar" else "query_submit" if action == "submit" else None
+    assert diagnostics.get("gate") == gate and crawler._esun_spa_gate == gate
     assert result["error"].startswith("collect_failed: TimeoutError: code=")
-    assert f"phase={phase}" in result["error"] and "gate=" not in result["error"]
+    assert f"phase={phase}" in result["error"]
+    assert result["error"] == stored_error
+    assert (f"gate={gate}" in stored_error) if gate else ("gate=" not in stored_error)
     assert error.__cause__ is cause and error.__context__ is context
     assert not any(text in repr(result) + capsys.readouterr().err for text in (
         "PRIVATE-", "SYNTHETIC-", "TEST-", "0000000000001", "Locator.click",

@@ -43,6 +43,7 @@ def browser():
 @pytest.fixture
 def product(browser, monkeypatch, tmp_path):
     # Use inherited BankCreds.from_env via the real local constructor, not cloud/DB.
+    monkeypatch.setattr("backend.core.creds._ENV_LOADED", True)
     for name in ("BANK_CRAWLER_ACCOUNT_ID", "BANK_CRAWLER_USER_ID", "PYTHON_DOTENV_DISABLED"):
         monkeypatch.delenv(name, raising=False)
     for name, value in dict(NATIONAL_ID="TEST-ID", USER_CODE="TEST-USER", PASSWORD="TEST-PASS").items():
@@ -472,6 +473,7 @@ def test_unexpected_continuation_stops_before_query_submission(product, monkeypa
 
 def test_calendar_admission_runs_after_proxy_guard():
     import ast
+    from contextlib import contextmanager
     from typing import Any
     from backend.banks.esun_spa.query import query_twd
     from backend.core.base import _OriginGuardProxy
@@ -480,6 +482,7 @@ def test_calendar_admission_runs_after_proxy_guard():
     function = source.body[0]
     assert isinstance(function, ast.FunctionDef)
     click = next(n for n in function.body if isinstance(n, ast.FunctionDef) and n.name == 'click')
+    site = next(n for n in function.body if isinstance(n, ast.FunctionDef) and n.name == 'site')
     issued, actions = [], []
     stop = ValueError('synthetic issuance drift')
 
@@ -493,8 +496,8 @@ def test_calendar_admission_runs_after_proxy_guard():
     native = Mock()
     scope: dict[str, Any] = dict(checkpoint=lambda: None, owner=lambda: None, one=lambda x: x,
                  reserve_action=lambda: actions.append(True), before_action=admission,
-                 _OriginGuardProxy=_OriginGuardProxy, TIMEOUT=1)
-    exec(compile(ast.Module(body=[click], type_ignores=[]), '<real-query-click>', 'exec'), scope)
+                 _OriginGuardProxy=_OriginGuardProxy, TIMEOUT=1, contextmanager=contextmanager, on_failure=None)
+    exec(compile(ast.Module(body=[site, click], type_ignores=[]), '<real-query-click>', 'exec'), scope)
     with pytest.raises(ValueError) as error:
         scope['click'](_OriginGuardProxy(native, guard))
     assert error.value is stop and issued and not actions

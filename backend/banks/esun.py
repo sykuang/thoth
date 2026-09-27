@@ -124,6 +124,10 @@ class EsunCrawler(BankCrawler):
         'inventory_shape', 'inventory_groups', 'inventory_rows', 'inventory_budget',
         'inventory_accounts', 'inventory_selected', 'inventory_alias', 'currency',
         'account_request', 'account_owner',
+        'form_cardinality', 'calendar_readiness', 'native_action_budget',
+        'post_submit_validation',
+        'form_owner', 'calendar_state', 'calendar_transition', 'calendar_cleanup',
+        'query_issuance_admission', 'native_action', 'query_submit',
     })
     SAFE_COLLECT_GUARDS = frozenset({
         "esun-twd-history",
