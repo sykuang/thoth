@@ -68,7 +68,7 @@ jobs:
         # Each test uses tmp_path + monkeypatch for full isolation (see conftest.py),
         # so no global env setup is needed.
         # pyproject 已設定自動排除 e2e；conftest 用 tmp_path 完全隔離 DB/secret。
-        run: uv run pytest -v --tb=short
+        run: uv run pytest -q --tb=short --durations=20
 
   # ============================================================
   # Job 2: Frontend (TypeScript / Expo) — typecheck + lint

@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    ApiHit,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -479,35 +480,56 @@ class HsbcCrawler(BankCrawler):
 
     # ---------- 抓取 ----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
-        """登入後抓信用卡：卡片清單(cards 或 legacy cards/suspend) + 逐卡明細。
-
-        注意：HSBC 2026-07-09 實測已把卡片清單 endpoint 從 `cards/suspend`
-        改成 `cards`。兩者 payload[] 都是各卡狀態；crawler 必須先認新端點再
-        fallback 舊端點，否則會登入成功但 cards=[]，逐卡 posted/unposted 全不跑。
-        明細用 cards/{id}/transactions/{posted,unposted} 直接 fetch。
-        """
+        """Stream current card inventory and details, then recheck inventory."""
         out: dict = {}
         page.wait_for_timeout(7000)
 
-        # 1) 卡片清單（dashboard 自動載入 cards；舊版曾用 cards/suspend）
-        cards = self._card_inventory(collector)
-        out["cards"] = cards
-        _log(f"[collect] 卡片清單: {len(out['cards'])} 張")
-
-        # 2) 直接 fetch 已自行限流；先卸載 collector，避免把同一 response 再無界解析/保留。
+        token = self._history_token(collector)
         detach = getattr(collector, "detach", None)
         if callable(detach):
             detach(page)
+        byte_budget = [5_000_000]
+        cards = self._fetch_card_inventory(page, token, byte_budget)
+        out["cards"] = cards
+        _log(f"[collect] 卡片清單: {len(out['cards'])} 張")
         out["card_detail"], out["history_coverage"] = self._collect_card_details(
             page,
             collector,
             out["cards"],
-            byte_budget=[5_000_000 - collector.hsbc_inventory_bytes],
+            byte_budget=byte_budget,
         )
-
-        out["_final_url"] = page.url
+        if self._fetch_card_inventory(page, token, byte_budget) != cards:
+            raise RuntimeError("hsbc-card-inventory-replay")
         publish_card_bill_facts(out, _hsbc_card_bill_facts(out))
         return BankCollectResult(**out)
+
+    @classmethod
+    def _fetch_card_inventory(cls, page, token: str, byte_budget: list[int]) -> list[dict]:
+        url = "https://card.hsbc.com.tw/ibk-bff/api/v1/cards"
+        if byte_budget[0] <= 0:
+            raise RuntimeError("hsbc-card-inventory-byte-budget")
+        response = cls._fetch_api_page(
+            page, url=url, token=token, timeout_ms=30_000, max_bytes=byte_budget[0],
+        )
+        if (
+            not isinstance(response, dict)
+            or type(response.get("bytes")) is not int
+            or not 0 <= response["bytes"] <= byte_budget[0]
+        ):
+            raise RuntimeError("hsbc-card-inventory-byte-budget")
+        byte_budget[0] -= response["bytes"]
+        if response.get("url") != url or response.get("redirected") is not False:
+            raise RuntimeError("hsbc-card-inventory-envelope")
+        snapshot = ResponseCollector("card.hsbc.com.tw")
+        snapshot.hits = [ApiHit(
+            url=url,
+            method="GET",
+            status=response.get("status"),
+            content_type=response.get("contentType"),
+            body_size=response["bytes"],
+            resp_json=response.get("body"),
+        )]
+        return cls._card_inventory(snapshot)
 
     @staticmethod
     def _card_inventory(collector: ResponseCollector) -> list[dict]:

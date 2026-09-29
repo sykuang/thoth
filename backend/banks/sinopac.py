@@ -572,6 +572,39 @@ class SinopacCrawler(BankCrawler):
         if len(candidates) != 1:
             raise RuntimeError("sinopac-twd-history-inventory-cardinality")
         hit = candidates[0]
+        if hit.req_body not in (None, ""):
+            error = "sinopac-twd-history-inventory-envelope"
+            try:
+                form = (
+                    parse_qs(
+                        hit.req_body,
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                        max_num_fields=len(cls._HISTORY_FORM_KEYS),
+                    )
+                    if isinstance(hit.req_body, str)
+                    else {}
+                )
+            except ValueError:
+                raise RuntimeError(error) from None
+            date_keys = {"BusinessDate", "StartDate", "EndDate"}
+            if (
+                set(form) != cls._HISTORY_FORM_KEYS
+                or any(
+                    form[key] != [""]
+                    for key in cls._HISTORY_FORM_KEYS - date_keys
+                )
+                or any(len(form[key]) != 1 for key in date_keys)
+            ):
+                raise RuntimeError(error)
+            dates = {key: cls._yyyymmdd(form[key][0], error) for key in date_keys}
+            if (
+                dates["BusinessDate"] != dates["EndDate"]
+                or dates["StartDate"].day != 1
+                or dates["StartDate"].replace(day=1)
+                != dates["EndDate"].replace(day=1)
+            ):
+                raise RuntimeError(error)
         payload = hit.resp_json if hit else None
         body = payload[0] if isinstance(payload, list) and len(payload) == 1 else None
         rows = body.get("SubInfo") if isinstance(body, dict) else None
@@ -581,7 +614,6 @@ class SinopacCrawler(BankCrawler):
             or hit.request_sequence <= after_sequence
             or hit.main_frame_request is not True
             or hit.method != "POST"
-            or hit.req_body not in (None, "")
             or hit.status != 200
             or hit.redirected
             or type(hit.body_size) is not int

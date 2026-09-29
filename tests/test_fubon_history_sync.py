@@ -518,3 +518,26 @@ def test_fubon_missing_or_mismatched_coverage_writes_nothing(tmp_path, monkeypat
             assert store.latest_twd_transaction_dates() == {}
         finally:
             store.close()
+
+
+def test_fubon_history_menu_route_requires_exact_owned_query():
+    crawler = object.__new__(FubonCrawler)
+    crawler._is_owned_frame = lambda page, frame: True
+    base = "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+    menu = SimpleNamespace(url=base + "?menuId=CDS0401")
+    page = SimpleNamespace(frames=[menu])
+
+    assert crawler._fubon_content_frame(
+        page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+    ) is menu
+
+    for suffix in (
+        "?account=PRIVATE", "?menuId=private", "?menuId=CDS0401&&",
+        "?menuId=CDS0401&menuId=CDS0401", "?menuId=", "?menuId=CDS0401&extra=1",
+        ";attacker",
+    ):
+        page.frames = [SimpleNamespace(url=base + suffix)]
+        with pytest.raises(RuntimeError, match="fubon-twd-history-frame"):
+            crawler._fubon_content_frame(
+                page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+            )

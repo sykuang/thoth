@@ -46,6 +46,7 @@ TWD_PATH_HINT = "/ctw/ctwqu0001/"
 LOGIN_PATH_HINT = "/cgn/cgnot0001/010"
 CAPTCHA_IMG = "captcha-image img"
 LOADER_SELECTOR = "modal-loader .modal_loading"
+SEMANTIC_MODAL_SELECTOR = ".modal.show:not(.modal_loading)"
 QUERY_PATH = "/ixtein/adapters/ebank/txns/channel-ctw/CTWQU0001/011"
 
 
@@ -207,6 +208,7 @@ class RakutenCrawler(BankCrawler):
     )
     REFERRAL_PROMO_PREFIX = "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~"
     INSURANCE_PROMO_PREFIX = "輸入專案代碼【RICB】投保即可抽大獎"
+    TIME_DEPOSIT_PROMO_PREFIX = "夏末優存限定，高利 2.0% 限額開搶!"
     LOGOUT_BODY = "登出網路銀行 確認登出本系統？"
 
     def __init__(self) -> None:
@@ -620,57 +622,96 @@ class RakutenCrawler(BankCrawler):
             not isinstance(error, LoginCheckpointBlocked)
             or error.budget != LoginBudget(credential_submissions=1)
             or error.outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER
-            or error.outcome.rule_name is not None
+            or error.outcome.rule_name not in {None, "rakuten-unknown-modal"}
             or getattr(self, "_shared_dialog_blocked", False)
         ):
             return False
-        page.wait_for_timeout(5000)
-        if (
-            getattr(self, "_shared_dialog_blocked", False)
-            or not self._credential_origin_allowed(page)
-            or _any_visible(page, "input[name='otpCode']")
-            or _any_visible(page, "#ib_init_connect_error_popup")
-        ):
-            return False
-        if not _any_visible(page, ".modal.show"):
-            return self._logged_in(page)
-
         rules = self.login_checkpoint_rules()
         active_rules = tuple(
             rule for rule in rules if CheckpointPhase.POST_SUBMIT_SETTLE in rule.phases
         )
-        outcome = validate_login_checkpoint_outcome(
-            evaluate_login_checkpoint(
-                page,
-                bank=self.name,
-                phase=CheckpointPhase.POST_SUBMIT_SETTLE,
-                rules=rules,
-                is_authenticated=self.is_authenticated,
-                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
-            ),
-            active_rules,
-        )
-        if outcome.kind not in {
-            CheckpointKind.DUPLICATE_SESSION,
-            CheckpointKind.DISMISSIBLE_NOTICE,
-        }:
-            return False
-        try:
-            reduce_login_checkpoint(
-                CheckpointPhase.POST_SUBMIT_SETTLE,
-                error.budget,
-                outcome,
+        active_rules_by_name = {rule.name: rule for rule in active_rules}
+        action_counts: dict[str, int] = {}
+        authenticated_quiet_polls = 0
+        deadline = time.monotonic() + 20.0
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            page.wait_for_timeout(min(1000, max(1, int(remaining * 1000))))
+            if (
+                time.monotonic() >= deadline
+                or getattr(self, "_shared_dialog_blocked", False)
+                or not self._credential_origin_allowed(page)
+                or _any_visible(page, "input[name='otpCode']")
+                or _any_visible(page, "#ib_init_connect_error_popup")
+            ):
+                return False
+            if _any_visible(page, LOADER_SELECTOR):
+                authenticated_quiet_polls = 0
+                continue
+            if not _any_visible(page, SEMANTIC_MODAL_SELECTOR):
+                if not self._logged_in(page):
+                    authenticated_quiet_polls = 0
+                    continue
+                authenticated_quiet_polls += 1
+                if authenticated_quiet_polls < 3:
+                    continue
+                return not (
+                    time.monotonic() >= deadline
+                    or getattr(self, "_shared_dialog_blocked", False)
+                    or not self._credential_origin_allowed(page)
+                    or _any_visible(page, "input[name='otpCode']")
+                    or _any_visible(page, "#ib_init_connect_error_popup")
+                    or _any_visible(page, LOADER_SELECTOR)
+                    or _any_visible(page, SEMANTIC_MODAL_SELECTOR)
+                    or not self._credential_origin_allowed(page)
+                    or getattr(self, "_shared_dialog_blocked", False)
+                    or time.monotonic() >= deadline
+                )
+
+            authenticated_quiet_polls = 0
+            if action_counts:
+                return False
+            outcome = validate_login_checkpoint_outcome(
+                evaluate_login_checkpoint(
+                    page,
+                    bank=self.name,
+                    phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+                    rules=rules,
+                    is_authenticated=self.is_authenticated,
+                    is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                    can_act=lambda: (
+                        time.monotonic() < deadline
+                        and not getattr(self, "_shared_dialog_blocked", False)
+                        and self._credential_origin_allowed(page)
+                        and not _any_visible(page, "input[name='otpCode']")
+                        and not _any_visible(page, "#ib_init_connect_error_popup")
+                        and self._credential_origin_allowed(page)
+                        and not getattr(self, "_shared_dialog_blocked", False)
+                        and time.monotonic() < deadline
+                    ),
+                ),
+                active_rules,
             )
-        except LoginCheckpointTerminal:
-            return False
-        return (
-            not getattr(self, "_shared_dialog_blocked", False)
-            and self._credential_origin_allowed(page)
-            and not _any_visible(page, "input[name='otpCode']")
-            and not _any_visible(page, ".modal.show")
-            and not _any_visible(page, "#ib_init_connect_error_popup")
-            and self._logged_in(page)
-        )
+            if time.monotonic() >= deadline or outcome.kind not in {
+                CheckpointKind.DUPLICATE_SESSION,
+                CheckpointKind.DISMISSIBLE_NOTICE,
+            }:
+                return False
+            rule = active_rules_by_name.get(outcome.rule_name or "")
+            if rule is None or action_counts.get(rule.name, 0) >= rule.max_actions:
+                return False
+            try:
+                reduce_login_checkpoint(
+                    CheckpointPhase.POST_SUBMIT_SETTLE,
+                    error.budget,
+                    outcome,
+                )
+            except LoginCheckpointTerminal:
+                return False
+            action_counts[rule.name] = action_counts.get(rule.name, 0) + 1
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -681,6 +722,19 @@ class RakutenCrawler(BankCrawler):
 
         def prefix(text: str) -> re.Pattern[str]:
             return re.compile(r"^\s*" + r"\s+".join(re.escape(part) for part in text.split()))
+
+        time_deposit_body = re.compile(
+            r"\A\s*免解任務\s*✕\s*可開多筆\s*✕\s*萬元起存\s*"
+            r"無需解任務！萬元即可開立：\s*"
+            r"🔒【限額\s*[0-9０-９]{1,4}\s*億】\s*"
+            r"[0-9０-９]{1,2}個月定期存款\s*"
+            r"[0-9０-９]{1,2}(?:[.．][0-9０-９]{1,2})?%\s*"
+            r"•鎖住收益，獻給追求穩健的你\s*"
+            r"•讓明年出行、旅行的預算更充裕\s*"
+            r"•期間：即日起～[0-9０-９]{2,4}/[0-9０-９]{1,2}/[0-9０-９]{1,2}（額滿即止）\s*"
+            r"🔥限額高利，額滿即止👇立即開立定存👇\s*"
+            r"(?:稍後再說|稍後)\s*立即開立定存\s*\Z"
+        )
 
         return (
             LoginCheckpointRule(
@@ -723,6 +777,15 @@ class RakutenCrawler(BankCrawler):
                 container_selector=".modal.show",
                 action_texts=("略過",),
                 required_body_pattern=prefix(self.INSURANCE_PROMO_PREFIX),
+            ),
+            LoginCheckpointRule(
+                name="rakuten-time-deposit-promo",
+                bank="rakuten",
+                phases=all_phases,
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector=".modal.show",
+                action_texts=("稍後再說", "稍後"),
+                required_body_pattern=time_deposit_body,
             ),
             LoginCheckpointRule(
                 name="rakuten-unknown-modal",

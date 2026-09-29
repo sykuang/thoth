@@ -303,13 +303,86 @@ def test_taishin_empty_account_inventory_emits_and_persists_explicit_coverage(
         store.close()
 
 
+def test_taishin_inventory_accepts_object_valued_native_options() -> None:
+    snapshot = _form_snapshot()
+    for select in snapshot["selects"][1:]:
+        for option in select["options"]:
+            if option["value"]:
+                option["value"] = "[object Object]"
+
+    form = TaishinCrawler._validate_history_form(snapshot)
+
+    assert [item["identity"] for item in form["accounts"]] == [ACCOUNT]
+    assert form["periods"][7]["identity"] == "12_months"
+    assert form["sorts"][0]["identity"] == "forward"
+
+
+def test_taishin_selects_object_valued_native_options_by_index() -> None:
+    from tests.test_taishin_login_checkpoints import _launch_browser
+
+    snapshot = _form_snapshot()
+    for select in snapshot["selects"][1:]:
+        for option in select["options"]:
+            if option["value"]:
+                option["value"] = "[object Object]"
+
+    manager, browser = _launch_browser()
+    try:
+        page = browser.new_page()
+        page.set_content("<main></main>")
+        page.evaluate("""snapshot => {
+          for (const source of snapshot.selects) {
+            const select = document.createElement('select');
+            for (const item of source.options) {
+              const option = document.createElement('option');
+              option.value = item.value;
+              option.textContent = item.text;
+              select.appendChild(option);
+            }
+            document.body.appendChild(select);
+          }
+          const query = document.createElement('input');
+          query.setAttribute('value', '查詢');
+          document.body.appendChild(query);
+        }""", snapshot)
+        form = TaishinCrawler._validate_history_form(
+            TaishinCrawler._history_form_snapshot(page.main_frame),
+        )
+
+        TaishinCrawler._select_history_options(
+            page.main_frame, form, identity=ACCOUNT, period="12_months",
+        )
+
+        selected = TaishinCrawler._history_selected_options(
+            TaishinCrawler._history_form_snapshot(page.main_frame), form,
+        )
+        assert selected == {
+            "selected_identity": ACCOUNT,
+            "selected_period": "12_months",
+            "selected_sort": "forward",
+        }
+    finally:
+        browser.close()
+        manager.__exit__(None, None, None)
+
+
+
 def test_taishin_inventory_finds_semantic_controls_and_canonical_account() -> None:
-    assert TaishinCrawler._validate_history_form(_form_snapshot()) == {
+    snapshot = _form_snapshot()
+    assert TaishinCrawler._validate_history_form(snapshot) == {
         "account_select": 1,
         "period_select": 2,
         "sort_select": 3,
         "query_button": 0,
-        "accounts": [{"index": 1, "identity": ACCOUNT, "value": ACCOUNT}],
+        "accounts": [{**snapshot["selects"][1]["options"][1], "identity": ACCOUNT}],
+        "periods": [
+            {**option, "identity": option["value"]}
+            for option in snapshot["selects"][2]["options"]
+        ],
+        "sorts": [
+            {**option, "identity": option["value"]}
+            for option in snapshot["selects"][3]["options"]
+        ],
     }
 
 
@@ -324,7 +397,7 @@ def test_taishin_inventory_recheck_rejects_late_account() -> None:
     with pytest.raises(RuntimeError, match="taishin-twd-history-inventory"):
         TaishinCrawler._require_history_inventory(
             snapshot,
-            [(ACCOUNT, ACCOUNT)],
+            TaishinCrawler._validate_history_form(_form_snapshot()),
         )
 
 

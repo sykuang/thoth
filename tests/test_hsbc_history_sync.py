@@ -246,6 +246,45 @@ class _Page:
         self.waits.append(milliseconds)
 
 
+def test_hsbc_collect_streams_inventory_when_passive_length_is_missing(monkeypatch) -> None:
+    crawler = _crawler()
+    cards = _cards()
+    hit = _card_hit(cards)
+    hit.body_size = None
+    hit.resp_json = None
+    collector = ResponseCollector("card.hsbc.com.tw")
+    collector.hits = [hit]
+    collector.auth_token_events = [{
+        "token": "Bearer synthetic-token",
+        "url": hit.url,
+        "redirected": False,
+        "sequence": 1,
+    }]
+    response = {
+        "url": hit.url,
+        "status": 200,
+        "redirected": False,
+        "contentType": "application/json",
+        "bytes": 100,
+        "body": {"success": True, "error": None, "payload": cards},
+    }
+    page = _Page([response, deepcopy(response)])
+    budgets = []
+
+    def details(_page, _collector, inventory, *, byte_budget):
+        assert inventory == cards
+        budgets.append(byte_budget[0])
+        return {}, {"mode": "full", "domains": []}
+
+    monkeypatch.setattr(crawler, "_collect_card_details", details)
+
+    result = crawler.collect(page, collector)
+
+    assert result.cards == cards
+    assert [arg["url"] for arg in page.args] == [hit.url, hit.url]
+    assert budgets == [4_999_900]
+
+
 def test_hsbc_inventory_rejects_query_filtered_or_redirected_source() -> None:
     def collect(url: str, *, redirected: bool = False) -> ResponseCollector:
         collector = ResponseCollector("card.hsbc.com.tw")
