@@ -250,9 +250,9 @@ def test_prepare_probes_dashboard_then_navigates_login_and_is_fieldless(caplog) 
     page.url = "https://elsewhere.example/"
     crawler.prepare_login_page(page)
     assert page.mock_calls == [
-        call.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000),
+        call.goto("https://ebank.standardchartered.com.tw/scb/", wait_until="commit", timeout=15000),
         call.wait_for_timeout(5000),
-        call.goto(BASE, timeout=15000),
+        call.goto(BASE, wait_until="commit", timeout=15000),
         call.wait_for_timeout(8000),
     ]
 
@@ -260,9 +260,9 @@ def test_prepare_probes_dashboard_then_navigates_login_and_is_fieldless(caplog) 
     foreign.url = "https://evil.example/scb/public/login"
     crawler.prepare_login_page(foreign)
     assert foreign.mock_calls == [
-        call.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000),
+        call.goto("https://ebank.standardchartered.com.tw/scb/", wait_until="commit", timeout=15000),
         call.wait_for_timeout(5000),
-        call.goto(BASE, timeout=15000),
+        call.goto(BASE, wait_until="commit", timeout=15000),
         call.wait_for_timeout(8000),
     ]
 
@@ -274,6 +274,33 @@ def test_prepare_probes_dashboard_then_navigates_login_and_is_fieldless(caplog) 
     assert error.value.__cause__ is None
     assert "PRIVATE" not in str(error.value)
     assert "PRIVATE" not in caplog.text
+
+
+def test_prepare_navigation_uses_commit_without_waiting_for_full_load() -> None:
+    crawler = _crawler()
+    crawler._logged_in = Mock(return_value=False)
+    page = Mock()
+    page.url = "about:blank"
+    destinations = []
+
+    def goto(url, *, timeout, wait_until=None):
+        destinations.append(url)
+        if wait_until != "commit":
+            raise TimeoutError("document load did not finish")
+        page.url = ("https://ebank.standardchartered.com.tw/scb/public/login?lang=tw"
+                    if len(destinations) == 1 and url == BASE or len(destinations) == 2
+                    else "https://ebank.standardchartered.com.tw/scb/")
+
+    page.goto.side_effect = goto
+    crawler.prepare_login_page(page)
+    assert destinations == ["https://ebank.standardchartered.com.tw/scb/", BASE]
+    assert page.url == BASE
+    assert page.mock_calls == [
+        call.goto("https://ebank.standardchartered.com.tw/scb/", wait_until="commit", timeout=15000),
+        call.wait_for_timeout(5000),
+        call.goto(BASE, wait_until="commit", timeout=15000),
+        call.wait_for_timeout(8000),
+    ]
 
 
 def _submit_fixture():

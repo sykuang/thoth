@@ -120,7 +120,7 @@ class ScbCrawler(BankCrawler):
 
     def prepare_login_page(self, page) -> None:
         try:
-            page.goto("https://ebank.standardchartered.com.tw/scb/", timeout=15000)
+            page.goto("https://ebank.standardchartered.com.tw/scb/", wait_until="commit", timeout=15000)
             page.wait_for_timeout(5000)
         except Exception:
             pass
@@ -133,7 +133,7 @@ class ScbCrawler(BankCrawler):
                 != "ebank.standardchartered.com.tw"
                 or LOGIN_PATH_HINT not in current.path.lower()
             ):
-                page.goto(BASE, timeout=15000)
+                page.goto(BASE, wait_until="commit", timeout=15000)
             page.wait_for_timeout(8000)
         except Exception:
             raise ScbLoginError("無法安全準備登入頁面；未送出登入") from None
