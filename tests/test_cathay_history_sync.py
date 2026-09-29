@@ -115,6 +115,73 @@ def test_cathay_twd_response_fails_closed_on_wrong_account_or_truncation():
             )
 
 
+def test_cathay_twd_response_accepts_exact_iso_datetime_range():
+    response = {
+        "success": "true",
+        "returnCode": "0000",
+        "content": {"datas": [{
+            "queryStatus": "Success",
+            "accountNumber": "00001234",
+            "count": 0,
+            "startDate": "2026-08-01T00:00:00",
+            "endDate": "2026-08-30T23:59:59+08:00",
+            "details": [],
+        }]},
+    }
+
+    account = CathayCrawler._validated_twd_account(
+        response, "00001234",
+        start=date(2026, 8, 1), end=date(2026, 8, 30),
+    )
+
+    assert account["count"] == 0
+
+
+def test_cathay_twd_response_normalizes_iso_datetime_account_date():
+    crawler = object.__new__(CathayCrawler)
+
+    transactions = crawler._normalize_twd_transactions([{
+        "txnDateTime": "2026-08-20T10:00:00",
+        "accountDate": "2026-08-20T00:00:00",
+        "description": "synthetic transaction",
+        "expendAmt": "1",
+        "incomeAmt": None,
+        "balance": "99",
+    }])
+
+    assert transactions[0]["account_date"] == "2026-08-20"
+
+
+def test_cathay_no_data_requires_exact_empty_attestation():
+    response = {
+        "success": "true",
+        "returnCode": "0000",
+        "content": {"datas": [{
+            "queryStatus": "NoData",
+            "accountNumber": "00001234",
+            "count": 0,
+            "startDate": "2026-08-01",
+            "endDate": "2026-08-30",
+            "details": [],
+        }]},
+    }
+
+    assert CathayCrawler._validated_twd_account(
+        response, "00001234",
+        start=date(2026, 8, 1), end=date(2026, 8, 30),
+    )["details"] == []
+
+    response["content"]["datas"][0].update({
+        "count": 1,
+        "details": [{"txnDateTime": "2026-08-30T10:00:00", "expendAmt": "1"}],
+    })
+    with pytest.raises(RuntimeError, match="cathay-twd-history-count"):
+        CathayCrawler._validated_twd_account(
+            response, "00001234",
+            start=date(2026, 8, 1), end=date(2026, 8, 30),
+        )
+
+
 @pytest.mark.parametrize(
     "mutation", ["method", "status", "host", "path", "userinfo", "customer_id"],
 )

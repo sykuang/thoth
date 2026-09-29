@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 
 import pytest
 
@@ -200,6 +201,129 @@ def test_ctbc_full_history_queries_all_accounts_and_six_months(monkeypatch):
     assert summary["windows"] == 12
     assert summary["start"] == "2026-03-01"
     assert summary["end"] == "2026-08-30"
+
+
+def test_ctbc_cookie_auth_uses_native_history_form(monkeypatch):
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
+    crawler = object.__new__(CtbcCrawler)
+    crawler.transaction_cursors = {}
+    page = _FetchPage(empty=True)
+    collector = ResponseCollector()
+    deposit = {
+        "demDepBalSummaryResponse": {
+            "infoList": [{"accountId": "acct-a", "balance": "100"}],
+        },
+    }
+    calls = []
+
+    def fetch_native(_page, _collector, account_id, start, end):
+        calls.append((account_id, start, end))
+        return []
+
+    monkeypatch.setattr(
+        CtbcCrawler,
+        "_fetch_native_history_window",
+        staticmethod(fetch_native),
+        raising=False,
+    )
+
+    result = crawler._collect_twd_deposit_history(
+        page,
+        collector,
+        deposit,
+        expected_identities={"acct-a"},
+        as_of=date(2026, 8, 30),
+    )
+
+    assert len(calls) == 6
+    assert all(account_id == "acct-a" for account_id, _, _ in calls)
+    assert validate_history_coverage(
+        result["coverage"],
+        expected_mode="full",
+        expected_domains=frozenset({"twd_transactions"}),
+    )["windows"] == 6
+
+
+@pytest.mark.parametrize("sent_account", ["acct-a", "other-account"])
+def test_ctbc_native_history_form_attests_captured_request(sent_account) -> None:
+    from tests.test_ctbc_login_checkpoints import _launch_browser
+
+    manager, browser = _launch_browser()
+    context = browser.new_context(service_workers="block")
+    collector = ResponseCollector(host_filter="ctbcbank.com")
+    origin = "https://www.ctbcbank.com"
+    history = "/twrbc/twrbc-deposit/qu002/010"
+    api = _CTBC_EBMW_PATH + "?IIhfvu=synthetic-token"
+    envelope = {
+        **dict.fromkeys(
+            (
+                "deviceIxd", "trackingIxd", "txnIxd", "model", "platform",
+                "version", "runtime", "network", "appVer", "clientNo",
+                "token", "locale", "fromSys", "seed", "deviceToken",
+            ),
+            "synthetic",
+        ),
+        "runtimeVer": 1,
+        "clientTime": 1,
+    }
+
+    def route(request_route):
+        request = request_route.request
+        if request.url == origin + history:
+            request_route.fulfill(
+                content_type="text/html",
+                body=f"""
+                <meta charset="utf-8">
+                <div class="tab-pane">
+                  <input formcontrolname="startDt">
+                  <input formcontrolname="endDt">
+                  <button onclick='fetch({json.dumps(api)}, {{
+                    method: "POST", headers: {{"content-type": "application/json"}},
+                    body: JSON.stringify({{
+                      ...{json.dumps(envelope)},
+                      resource: "/twrbc-deposit/qu002/011",
+                      rqData: {{accountId: {json.dumps(sent_account)}, type: "custom",
+                        startDate: document.querySelector("[formcontrolname=startDt]").value.replaceAll("/", ""),
+                        endDate: document.querySelector("[formcontrolname=endDt]").value.replaceAll("/", "")}}
+                    }})
+                  }})'>搜尋</button>
+                </div>
+                """,
+            )
+        elif request.url.startswith(origin + _CTBC_EBMW_PATH):
+            request_route.fulfill(json={
+                "code": "0000",
+                "rsData": {
+                    "dataTime": "synthetic",
+                    "detailList": [],
+                    "dtSort": "synthetic",
+                    "nextKey": "",
+                },
+            })
+        else:
+            request_route.abort()
+
+    context.route("**/*", route)
+    page = context.new_page()
+    collector.attach(page)
+    original_wait = page.wait_for_timeout
+    page.wait_for_timeout = lambda milliseconds: original_wait(min(milliseconds, 50))
+    try:
+        page.goto(origin + history)
+        if sent_account == "acct-a":
+            assert CtbcCrawler._fetch_native_history_window(
+                page, collector, "acct-a", date(2026, 8, 1), date(2026, 8, 31),
+            ) == []
+        else:
+            with pytest.raises(RuntimeError, match="^ctbc-twd-history-fetch$"):
+                CtbcCrawler._fetch_native_history_window(
+                    page, collector, "acct-a", date(2026, 8, 1), date(2026, 8, 31),
+                )
+    finally:
+        collector.detach(page)
+        context.close()
+        browser.close()
+        manager.__exit__(None, None, None)
 
 
 def test_ctbc_checks_final_page_origin_before_forwarding_bearer(monkeypatch):

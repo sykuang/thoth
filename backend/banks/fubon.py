@@ -58,6 +58,28 @@ from backend.core.login_checkpoints import (
 BASE = "https://ebank.taipeifubon.com.tw/B2C/common/Index.faces"
 TWD_HISTORY_URL = "https://ebank.taipeifubon.com.tw/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
 PRE_LOGIN_HINT = "PreLogin.faces"
+
+
+def _fubon_route_matches(parsed, route: str) -> bool:
+    if (
+        parsed.path != route
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        return False
+    is_history = route == urlsplit(TWD_HISTORY_URL).path
+    if not parsed.query:
+        return True
+    if not is_history:
+        return False
+    try:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    return pairs == [("menuId", "CDS0401")]
+
+
 HEADER_LOGIN_BTN_ID = "header_form:header_login"  # 在 frame1，右上「登入」開 modal
 GENERAL_LOGIN_TAB = "一般登入"
 LOGIN_BTN_ID = "btnLogin2"  # 一般登入 form 的登入鈕（txnFrame 內）
@@ -719,14 +741,9 @@ class FubonCrawler(BankCrawler):
         matches = {}
         for candidate in page.frames:
             parsed = urlsplit(candidate.url or "")
-            path = parsed.path
             if (
                 self._is_owned_frame(page, candidate)
-                and parsed.username is None
-                and parsed.password is None
-                and not parsed.query
-                and not parsed.fragment
-                and any(path == route for route in routes)
+                and any(_fubon_route_matches(parsed, route) for route in routes)
             ):
                 matches[id(candidate)] = candidate
         if len(matches) != 1:

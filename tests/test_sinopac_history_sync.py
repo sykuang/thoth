@@ -255,6 +255,49 @@ def test_sinopac_inventory_is_exact_authoritative_set(mutation, guard) -> None:
         SinopacCrawler._twd_inventory(collector)
 
 
+def test_sinopac_inventory_accepts_native_initial_form() -> None:
+    hit = _inventory_hit()
+    hit.req_body = (
+        "Acct=&AcctValue=&CurrName=&QueryType=&AcctName=&Curr=&TextType=&"
+        "BusinessDate=20260831&StartDate=20260801&EndDate=20260831"
+    )
+    collector = ResponseCollector("sinopac.com")
+    collector.hits = [hit]
+
+    assert SinopacCrawler._twd_inventory(collector) == [{
+        "label": LABEL, "identity": ACCOUNT, "currency": "TWD",
+    }]
+
+
+@pytest.mark.parametrize("change", [
+    lambda body: body + "&Acct=",
+    lambda body: body + "&extra=",
+    lambda body: body.replace("Acct=&", "Acct=selected&"),
+    lambda body: body.replace("QueryType=&", "QueryType=3&"),
+    lambda body: body.replace("StartDate=20260801", "StartDate=20260832"),
+    lambda body: body.replace("StartDate=20260801", "StartDate=20260901"),
+    lambda body: body.replace("BusinessDate=20260831", "BusinessDate=20260830"),
+    lambda body: body.replace("StartDate=20260801", "StartDate=20260701"),
+    lambda body: body.replace("BusinessDate=20260831", "BusinessDate="),
+    lambda body: body.replace("EndDate=20260831", "EndDate=2026-08-31"),
+    lambda body: body.replace("CurrName=&", ""),
+    lambda _body: {},
+])
+def test_sinopac_inventory_rejects_unbound_initial_form(change) -> None:
+    hit = _inventory_hit()
+    hit.req_body = change(
+        "Acct=&AcctValue=&CurrName=&QueryType=&AcctName=&Curr=&TextType=&"
+        "BusinessDate=20260831&StartDate=20260801&EndDate=20260831"
+    )
+    collector = ResponseCollector("sinopac.com")
+    collector.hits = [hit]
+
+    with pytest.raises(
+        RuntimeError, match="^sinopac-twd-history-inventory-envelope$"
+    ):
+        SinopacCrawler._twd_inventory(collector)
+
+
 def test_sinopac_inventory_returns_exact_live_contract() -> None:
     collector = ResponseCollector("sinopac.com")
     collector.hits = [_inventory_hit()]

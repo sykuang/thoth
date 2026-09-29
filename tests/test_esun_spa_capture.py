@@ -158,7 +158,7 @@ def test_newer_or_duplicate_invalidates(mode):
         '{"resultCode":"bad","resultBody":{"secret":"NEVER"}}',
         '{"resultCode":"0000","resultCode":"0000","resultBody":{}}',
         '{"resultCode":"0000","resultBody":{"n":NaN}}',
-        "x" * (2 * 1024 * 1024 + 1),
+        pytest.param("x" * (2 * 1024 * 1024 + 1), id="oversized-body"),
     ],
 )
 def test_bad_response_retains_no_body(raw):
