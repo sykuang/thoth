@@ -43,6 +43,7 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
     assert not hasattr(CathayCrawler, "_dismiss_announcements")
     assert [item.name for item in rules[1:]] == [
         "cathay-post-login-notice-dialog",
+        "cathay-post-login-announcement",
         "cathay-unknown-modal", "cathay-unknown-dialog",
     ]
     for notice in rules[1:2]:
