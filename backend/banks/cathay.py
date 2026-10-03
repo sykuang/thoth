@@ -254,6 +254,9 @@ class CathayCrawler(BankCrawler):
         return self._logged_in(page)
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
+        post_login_notice = re.compile(
+            r"^\s*重要通知\s+服務內容提醒\s*我知道了\s*$",
+        )
         return (
             LoginCheckpointRule(
                 name="cathay-login-announcement",
@@ -263,6 +266,17 @@ class CathayCrawler(BankCrawler):
                 container_selector="#divSystemLoginMsgList.show",
                 action_texts=("下一", "下一則", "我知道了", "關閉", "確定"),
                 max_actions=12,
+            ),
+            LoginCheckpointRule(
+                name="cathay-post-login-notice-dialog",
+                bank="cathay",
+                phases=(CheckpointPhase.POST_SUBMIT_SETTLE,),
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector="[role='dialog']",
+                action_texts=("我知道了",),
+                required_body_pattern=post_login_notice,
+                max_actions=1,
+                require_exclusive_action=True,
             ),
             LoginCheckpointRule(
                 name="cathay-unknown-modal",

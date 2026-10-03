@@ -2,14 +2,84 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+import re
+from typing import Any, Iterable
 
 from pydantic import BaseModel
 
 from backend.core import account_classify
+from backend.core.money import native_money
 from backend.server import fx_service
 from backend.server.db_facade import LatestBalance, db_api
 
 ACCOUNT_STALE_DAYS = 7
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+
+def metric_loan_balance_twd(
+    payload: dict[str, Any],
+    expected_currencies: Iterable[str | None] = (),
+) -> int | None:
+    """Convert a normalized TWD-plus-per-currency loan metric exactly once."""
+    raw_by_currency = payload.get("loan_by_currency")
+    if raw_by_currency is None:
+        raw_by_currency = {}
+    if not isinstance(raw_by_currency, dict):
+        return None
+    by_currency: dict[str, Decimal] = {}
+    for raw_currency, raw_amount in raw_by_currency.items():
+        currency = str(raw_currency or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{3}", currency) is None or isinstance(raw_amount, bool):
+            return None
+        if currency in by_currency:
+            return None
+        try:
+            amount = Decimal(str(raw_amount))
+        except (InvalidOperation, ValueError):
+            return None
+        if not amount.is_finite() or abs(amount) > MAX_SAFE_INTEGER:
+            return None
+        if currency == "TWD":
+            if amount != amount.to_integral_value():
+                return None
+        elif amount != amount.quantize(Decimal("0.000001")):
+            return None
+        by_currency[currency] = abs(amount)
+
+    expected = {str(currency or "TWD").strip().upper() for currency in expected_currencies}
+    if any(currency not in by_currency and currency != "TWD" for currency in expected):
+        return None
+    raw_twd = payload.get("loan")
+    if raw_twd is None:
+        twd = by_currency.get("TWD")
+    else:
+        if isinstance(raw_twd, bool):
+            return None
+        try:
+            twd = abs(Decimal(str(raw_twd)))
+        except (InvalidOperation, ValueError):
+            return None
+        if (
+            not twd.is_finite()
+            or twd > MAX_SAFE_INTEGER
+            or twd != twd.to_integral_value()
+        ):
+            return None
+    if twd is None and ("TWD" in expected or not by_currency):
+        return None
+    if twd is not None and "TWD" in by_currency and twd != by_currency["TWD"]:
+        return None
+
+    total = round(float(twd or 0))
+    for currency, amount in by_currency.items():
+        if currency == "TWD":
+            continue
+        converted = fx_service.convert_to_twd(amount, currency)
+        if converted is None:
+            return None
+        total += converted
+    return total if abs(total) <= MAX_SAFE_INTEGER else None
 
 
 class BankAccountBalance(BaseModel):
@@ -70,12 +140,22 @@ def bank_accounts(
     loan = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
     loan_balance = loan.loan_balance if loan else None
     loan_date = _normalize_iso_date(loan.snapshot_date) if loan else None
+    twd_loan_accounts = [
+        account
+        for account in accounts
+        if (account.currency or "TWD").upper() == "TWD"
+        and account_classify.is_liability_type(account.product_type)
+    ]
+    aggregate_fallback_account = (
+        twd_loan_accounts[0].account_no if len(twd_loan_accounts) == 1 else None
+    )
 
     out: list[BankAccountBalance] = []
     for account in accounts:
         balance: float | None = None
         snapshot_date: str | None
-        latest = txn_balances.get(account.account_no)
+        currency = (account.currency or "TWD").upper()
+        latest = txn_balances.get((account.account_no, currency))
         raw_date = _normalize_iso_date(account.raw_balance_date)
         txn_date = _normalize_iso_date(latest.txn_datetime) if latest else None
         if (
@@ -88,32 +168,41 @@ def bank_accounts(
             balance = latest.balance
             snapshot_date = txn_date
         elif account.raw_balance is not None:
-            raw = account.raw_balance
-            balance = raw if isinstance(raw, float) and raw != int(raw) else int(raw)
+            balance = native_money(account.raw_balance, currency)
             snapshot_date = raw_date
         elif latest is not None:
             balance = latest.balance
             snapshot_date = txn_date
-        elif account_classify.is_liability_type(account.product_type) and loan_balance is not None:
+        elif (
+            currency == "TWD"
+            and account_classify.is_liability_type(account.product_type)
+            and account.account_no == aggregate_fallback_account
+            and loan_balance is not None
+        ):
             balance = loan_balance
             snapshot_date = loan_date
         else:
             snapshot_date = _normalize_iso_date(account.updated_at)
 
         balance = account_classify.normalize_account_balance(account.product_type, balance)
-        currency = (account.currency or "TWD").upper()
         twd_estimate: int | None = None
         fx_rate_used: float | None = None
         if balance is not None:
             if currency == "TWD":
-                twd_estimate = round(balance)
+                twd_estimate = int(balance)
                 fx_rate_used = 1.0
             elif include_fx_estimates:
                 try:
                     rate = fx_service.get_rate(currency)
                     if rate is not None:
-                        twd_estimate = fx_service.convert_to_twd(balance, currency)
+                        converted = fx_service.convert_to_twd(balance, currency)
+                        if converted is not None:
+                            checked = native_money(converted, "TWD")
+                            assert isinstance(checked, int)
+                            twd_estimate = checked
                         fx_rate_used = rate
+                except ValueError:
+                    raise
                 except Exception:
                     pass
 
@@ -164,6 +253,8 @@ def latest_twd_asset_balance(bank: str, user_id: int) -> LatestBalance | None:
             return aggregate
         account_dates.append(account.snapshot_date)
         account_total += account.twd_estimate
+        account_total = native_money(account_total, "TWD")
+        assert isinstance(account_total, int)
 
     account_date = min(account_dates)
     aggregate_date = _normalize_iso_date(aggregate.snapshot_date) if aggregate else None

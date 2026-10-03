@@ -1,12 +1,12 @@
 """Canonical credit-card remaining-due facts shared by all bank adapters."""
 from __future__ import annotations
 
-import math
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from backend.core.base import NormalizedCardBillFact, validate_card_bill_facts
+from backend.core.money import native_money
 from backend.core.store import BankStore
 
 
@@ -36,20 +36,18 @@ class CardBillWriteBarrier:
         return self._store.upsert_cards(sanitized, commit=commit)
 
 
-def _money(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
+def _money(value: Any) -> int | None:
     try:
-        amount = Decimal(str(value).replace(",", "").strip())
-    except (InvalidOperation, ValueError, AttributeError):
+        amount = native_money(value, "TWD", optional=True, absolute=True)
+    except ValueError:
         return None
-    if not amount.is_finite() or amount < 0 or amount > MAX_CARD_BILL_MONEY:
+    if amount is None or amount > MAX_CARD_BILL_MONEY:
         return None
-    result = float(amount)
-    return result if math.isfinite(result) else None
+    assert isinstance(amount, int)
+    return amount
 
 
-def card_bill_money(value: Any) -> float | None:
+def card_bill_money(value: Any) -> int | None:
     """Validate a bank-native money scalar before bill arithmetic."""
     return _money(value)
 
@@ -104,7 +102,10 @@ def summarize_persisted_card_bills(
     amounts: list[Decimal] = []
     dates: list[str] = []
     for card in cards:
-        amount = _money(card.get("bill_due_amount"))
+        raw_amount = card.get("bill_due_amount")
+        amount = _money(raw_amount)
+        if raw_amount is not None and amount is None:
+            raise ValueError("invalid persisted card-bill amount")
         updated_on = _iso_date(card.get("updated_at"))
         if amount is None or updated_on is None:
             return None

@@ -349,6 +349,37 @@ for (const accountTabCache of [
   },
   {
     ...validAccountTabCache,
+    balances: [{ ...validAccountTabCache.balances[0], currency: 'usd' }],
+  },
+  {
+    ...validAccountTabCache,
+    balances: [validAccountTabCache.balances[0], { ...validAccountTabCache.balances[0] }],
+  },
+  {
+    ...validAccountTabCache,
+    balances: [{
+      ...validAccountTabCache.balances[0],
+      currency: 'USD',
+      balance: 1e-13,
+    }],
+  },
+  {
+    ...validAccountTabCache,
+    balances: [{
+      ...validAccountTabCache.balances[0],
+      balance: Number.MAX_SAFE_INTEGER + 1,
+      twd_estimate: Number.MAX_SAFE_INTEGER + 1,
+    }],
+  },
+  {
+    ...validAccountTabCache,
+    cards: [{
+      ...validAccountTabCache.cards[0],
+      bill_due_amount: Number.MAX_SAFE_INTEGER + 1,
+    }],
+  },
+  {
+    ...validAccountTabCache,
     accounts: [{ ...validAccountTabCache.accounts[0], fields_set: [7] }],
   },
   {

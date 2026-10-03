@@ -1092,7 +1092,8 @@ def test_manual_account_decimal_input_is_bounded(client, monkeypatch):
     from backend.server import fx_service
 
     monkeypatch.setattr(fx_service, "get_rate", lambda currency: 1.0)
-    assert fx_service.convert_to_twd("9007199254740993", "TWD") == 9007199254740993
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        fx_service.convert_to_twd("9007199254740993", "TWD")
 
 
 def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeypatch):
@@ -1114,6 +1115,16 @@ def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeyp
                 product_type="loan",
                 currency="TWD",
                 balance=-88,
+                snapshot_date="2026-08-08",
+                excluded=False,
+            ),
+            SimpleNamespace(
+                account_no="bank-1",
+                nickname="Loan USD",
+                nickname_overwrite=None,
+                product_type="loan",
+                currency="USD",
+                balance=-3.5,
                 snapshot_date="2026-08-08",
                 excluded=False,
             ),
@@ -1149,8 +1160,16 @@ def test_canonical_list_adapts_manual_bank_and_brokerage_sources(client, monkeyp
     assert response.status_code == 200
     rows = response.json()
     assert {row["source"] for row in rows} == {"manual", "bank_sync", "brokerage_sync"}
-    assert [row["editable"] for row in rows if row["source"] != "manual"] == [False, False, False]
-    assert next(row for row in rows if row["source"] == "bank_sync")["balance"] == "-88"
+    assert [row["editable"] for row in rows if row["source"] != "manual"] == [
+        False, False, False, False,
+    ]
+    bank_rows = [row for row in rows if row["source"] == "bank_sync"]
+    assert bank_rows[0]["balance"] == "-88"
+    assert len({row["id"] for row in bank_rows}) == 3
+    assert {row["id"] for row in bank_rows if row["account_ref"] == "bank-1"} == {
+        "bank_sync:demo:bank-1:TWD",
+        "bank_sync:demo:bank-1:USD",
+    }
     assert next(
-        row for row in rows if row["source_ref"] == "demo:bank-2"
+        row for row in rows if row["source_ref"] == "demo:bank-2:TWD"
     )["balance"] is None

@@ -246,7 +246,7 @@ def test_dispatch_rejects_missing_coverage_for_opted_in_adapter(isolated, monkey
 
     class FakeCrawler:
         HISTORY_COVERAGE_REQUIRED = True
-        HISTORY_COVERAGE_DOMAINS = frozenset({"twd_transactions"})
+        HISTORY_COVERAGE_DOMAINS = frozenset({"account_transactions"})
         cursor_domains = []
 
         def configure_transaction_cursor(self, domain, cursor):
@@ -261,7 +261,7 @@ def test_dispatch_rejects_missing_coverage_for_opted_in_adapter(isolated, monkey
         sr._dispatch_crawler_and_persist("sinopac", user_id=1, headless=True)
 
     assert set(FakeCrawler.cursor_domains) == {
-        "twd_transactions", "card_billed_transactions",
+        "twd_transactions", "account_transactions", "card_billed_transactions",
     }
 
 
@@ -274,7 +274,7 @@ def test_dispatch_defaults_coverage_validation_to_full(isolated, monkeypatch):
 
     class FakeCrawler:
         HISTORY_COVERAGE_REQUIRED = True
-        HISTORY_COVERAGE_DOMAINS = frozenset({"twd_transactions"})
+        HISTORY_COVERAGE_DOMAINS = frozenset({"account_transactions"})
 
         def __init__(self, **_kwargs):
             pass
@@ -296,7 +296,7 @@ def test_dispatch_defaults_coverage_validation_to_full(isolated, monkeypatch):
 
     sr._dispatch_crawler_and_persist("sinopac", user_id=1, headless=True)
 
-    assert seen == [("full", frozenset({"twd_transactions"}))]
+    assert seen == [("full", frozenset({"account_transactions"}))]
 
 
 @pytest.mark.parametrize("legacy_summary", [

@@ -115,6 +115,7 @@ class LoginCheckpointRule:
     required_body_pattern: re.Pattern[str] | None = None
     max_actions: int = 1
     first_match_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
+    require_exclusive_action: bool = False
 
     @property
     def is_clickable(self) -> bool:
@@ -130,6 +131,7 @@ class LoginCheckpointRule:
             or self.action_selector != self.action_selector.strip()
             or not self.phases
             or self.max_actions < 1
+            or type(self.require_exclusive_action) is not bool
             or type(self.first_match_timeout_ms) is not int
             or not (1 <= self.first_match_timeout_ms <= _LOGIN_INSPECTION_TIMEOUT_MS)
         ):
@@ -242,13 +244,23 @@ def _evaluate_rule(
     can_act: Callable[[], bool] | None = None,
 ) -> CheckpointOutcome | None:
     matched = []
+    visible_container_count = 0
+    visible_blocker_count = 0
     for scope in scopes:
+        if rule.require_exclusive_action:
+            blockers = scope.locator(
+                "dialog[open], [role='dialog'], [aria-modal='true'], .modal.show, .modal.in"
+            )
+            visible_blocker_count += sum(
+                item.is_visible() for item in bounded_locator_matches(blockers)
+            )
         containers = scope.locator(rule.container_selector)
         for container in bounded_locator_matches(
             containers, first_timeout_ms=rule.first_match_timeout_ms
         ):
             if not container.is_visible():
                 continue
+            visible_container_count += 1
             nested = container.locator(rule.container_selector)
             if any(item.is_visible() for item in bounded_locator_matches(nested)):
                 continue
@@ -280,18 +292,28 @@ def _evaluate_rule(
                 )
 
     eligible = []
+    visible_actions = 0
     action_labels = {
         normalized: normalized
         for text in rule.action_texts
         if (normalized := " ".join(text.split()))
     }
     for container, fingerprint in matched:
+        if rule.require_exclusive_action:
+            native_actions = container.locator(
+                "button, a[href], input, select, textarea, summary, [role=button]"
+            )
+            visible_actions += sum(
+                item.is_visible() for item in bounded_locator_matches(native_actions)
+            )
         actions = container.locator(rule.action_selector)
         for action in bounded_locator_matches(
             actions, first_timeout_ms=rule.first_match_timeout_ms
         ):
             if not action.is_visible():
                 continue
+            if not rule.require_exclusive_action:
+                visible_actions += 1
             if action_labels:
                 label = action_labels.get(" ".join(action.inner_text().split()))
                 if label is None:
@@ -299,7 +321,17 @@ def _evaluate_rule(
             else:
                 label = None
             eligible.append((container, fingerprint, action, label))
-    if len(eligible) != 1:
+    if (
+        len(eligible) != 1
+        or (
+            rule.require_exclusive_action
+            and (
+                visible_container_count != 1
+                or visible_blocker_count != 1
+                or visible_actions != 1
+            )
+        )
+    ):
         return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
 
     container, fingerprint, action, label = eligible[0]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,6 +150,38 @@ def _history_result(*, empty: bool = False) -> dict:
             "response_count": 1,
         },
     }
+
+
+def test_rakuten_empty_history_accepts_native_header_only_table_state() -> None:
+    RakutenCrawler._validate_history_dom({
+        "table_count": 3,
+        "visible_tables": 1,
+        "headers": [
+            "交易時間", "交易說明 對方帳號或暱稱", "轉入", "轉出",
+            "帳戶餘額", "備註", "",
+        ],
+        "raw_rows": 0,
+        "no_data_count": 1,
+        "invalid_cells": 0,
+        "pager": 0,
+        "busy": 0,
+        "dialogs": 0,
+        "alerts": 0,
+    }, 0)
+
+
+def test_rakuten_history_result_accepts_native_dollar_balance() -> None:
+    result = _history_result(empty=True)
+    result["accounts"][0]["balance"] = "$0"
+
+    assert RakutenCrawler._validated_history_result(result)["status"] == "explicit_empty"
+
+
+def test_rakuten_history_result_accepts_native_text_json_transport() -> None:
+    result = _history_result(empty=True)
+    result["transport"]["content_type"] = "text/json"
+
+    assert RakutenCrawler._validated_history_result(result)["status"] == "explicit_empty"
 
 
 def test_rakuten_history_result_attests_transport_dom_and_explicit_empty() -> None:
@@ -366,6 +399,85 @@ def test_rakuten_account_options_wait_for_stable_nonblank_inventory() -> None:
             )
             with pytest.raises(RuntimeError, match="rakuten-twd-history-inventory"):
                 RakutenCrawler._visible_labels(page, "simple-dropdown2")
+        finally:
+            browser.close()
+
+
+def test_rakuten_native_hidden_account_menu_is_authoritative_inventory() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(f"""
+                <simple-dropdown2 class="show">
+                  <a class="txt_dropdown" aria-expanded="true">帳號 {ACCOUNT}</a>
+                </simple-dropdown2>
+            """)
+            page.locator("simple-dropdown2 a.txt_dropdown").evaluate(
+                """(trigger, account) => {
+                  const menu = document.createElement('div');
+                  menu.className = 'dropdown-menu show';
+                  menu.hidden = true;
+                  const option = document.createElement('a');
+                  option.className = 'dropdown-item';
+                  option.textContent = account;
+                  Object.defineProperty(option, 'innerText', {get: () => ''});
+                  menu.appendChild(option);
+                  trigger.appendChild(menu);
+                }""",
+                ACCOUNT,
+            )
+
+            assert RakutenCrawler._visible_labels(page, "simple-dropdown2") == [ACCOUNT]
+        finally:
+            browser.close()
+
+
+def test_rakuten_native_hidden_account_menu_exposes_every_selectable_option() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(f"""
+                <simple-dropdown2>
+                  <a class="txt_dropdown" aria-expanded="true">帳號 {ACCOUNT}</a>
+                </simple-dropdown2>
+            """)
+            page.locator("simple-dropdown2 a.txt_dropdown").evaluate(
+                """(trigger, accounts) => {
+                  const menu = document.createElement('div');
+                  menu.className = 'dropdown-menu show';
+                  menu.hidden = true;
+                  for (const account of accounts) {
+                    const option = document.createElement('a');
+                    option.className = 'dropdown-item';
+                    option.textContent = account;
+                    menu.appendChild(option);
+                  }
+                  trigger.appendChild(menu);
+                }""",
+                [ACCOUNT, "81234567890124"],
+            )
+
+            options, native_hidden = RakutenCrawler._selection_options(
+                page, "simple-dropdown2"
+            )
+
+            assert native_hidden is True
+            assert [options.nth(i).text_content().strip() for i in range(options.count())] == [
+                ACCOUNT, "81234567890124",
+            ]
+            source = inspect.getsource(RakutenCrawler._select_label)
+            assert 'target.evaluate("element => element.click()")' not in source
+            assert 'trigger.press("ArrowDown")' in source
         finally:
             browser.close()
 

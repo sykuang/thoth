@@ -1,6 +1,8 @@
 """Regression: /transactions/stats should use lightweight stats rows, not full list transform."""
 from __future__ import annotations
 
+import pytest
+
 
 def _register(client, email: str = "tx-stats-fast@palace.example") -> str:
     r = client.post("/auth/register", json={"email": email, "password": "SyntheticTestPassword02!"})
@@ -73,7 +75,7 @@ def test_transactions_stats_prefetches_excluded_maps_once_for_all_banks(monkeypa
     class FakeApi:
         def list_excluded_account_nos_all_banks(self, *, user_id, banks):
             calls["accounts"].append(tuple(banks))
-            return {"hsbc": {"A-EX"}}
+            return {"hsbc": {("A-EX", "TWD")}}
 
         def list_excluded_card_nos_all_banks(self, *, user_id, banks):
             calls["cards"].append(tuple(banks))
@@ -96,7 +98,7 @@ def test_transactions_stats_prefetches_excluded_maps_once_for_all_banks(monkeypa
     assert calls["cards"] == [("hsbc", "ubot")]
     assert len(calls["rows"]) == 2
     for _, account_map, card_map in calls["rows"]:
-        assert account_map == {"hsbc": {"A-EX"}}
+        assert account_map == {"hsbc": {("A-EX", "TWD")}}
         assert card_map == {"hsbc": {"C-EX"}}
 
 
@@ -158,3 +160,37 @@ def test_transactions_stats_uses_lightweight_stats_rows_not_full_txn_rows(client
     assert body["amount_by_month"]["2026-06"]["income"] == 622
     assert body["amount_by_month"]["2026-06"]["expense"] == 1000
     assert body["amount_by_category"]["飲食"] == 1000
+
+
+def test_transactions_stats_rejects_unsafe_aggregate(client, monkeypatch):
+    import backend.server.routers.transactions as tx
+
+    token = _register(client, "tx-stats-overflow@palace.example")
+
+    class Row:
+        def __init__(self):
+            self.__dict__.update(
+                bank="hsbc", kind="twd", date="2026-06-12",
+                amount=9_007_199_254_740_991, category="income", subcategory=None,
+                txn_type=None, flow_type="income", is_subscription=False,
+                income_category=None, account_no="A-1", card_no=None,
+                excluded=False, auto_excluded=False,
+            )
+
+    class FakeApi:
+        def list_excluded_account_nos_all_banks(self, **kwargs):
+            return {}
+
+        def list_excluded_card_nos_all_banks(self, **kwargs):
+            return {}
+
+        def list_txn_stat_rows_for_bank(self, *, bank, **kwargs):
+            return [Row(), Row()] if bank == "hsbc" else []
+
+    monkeypatch.setattr(tx, "db_api", FakeApi())
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    from backend.server.dashboard_cache import clear_dashboard_cache
+    clear_dashboard_cache()
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        client.get("/transactions/stats?bank=hsbc", headers=_auth(token))

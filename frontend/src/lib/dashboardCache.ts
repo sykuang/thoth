@@ -7,7 +7,7 @@ import {
 
 import { computeLocalPortfolio } from './localPortfolio';
 import { computeLocalDashboardStats } from './localStats';
-import { addDecimal } from './decimal';
+import { addDecimal, isNativeCurrencyAmount } from './decimal';
 import type { ReplicaDashboardCache, ReplicaEnvelope } from './replica';
 
 type Row = Record<string, unknown>;
@@ -32,8 +32,14 @@ function nullableFinite(value: unknown): boolean {
   );
 }
 
-function safeInteger(value: unknown): boolean {
-  return typeof value === 'number' && Number.isSafeInteger(value);
+function safeNumber(value: unknown): boolean {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && Math.abs(value) <= Number.MAX_SAFE_INTEGER;
+}
+
+function validCurrencyAmount(value: unknown, currency: unknown, nullable = false): boolean {
+  return isNativeCurrencyAmount(value, currency, nullable);
 }
 
 function validDate(value: unknown, nullable = true): boolean {
@@ -85,11 +91,39 @@ function validRows(value: unknown, validate: (row: Row) => boolean): boolean {
 
 function validBankAccount(row: Row): boolean {
   return typeof row.account_no === 'string'
-    && typeof row.currency === 'string'
+    && typeof row.currency === 'string' && /^[A-Z]{3}$/.test(row.currency)
     && nullableString(row.product_type)
-    && nullableFinite(row.raw_balance)
+    && validCurrencyAmount(row.raw_balance, row.currency, true)
     && validDate(row.raw_balance_date)
     && typeof row.excluded === 'boolean';
+}
+
+function validBankAccounts(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  const identities = new Set<string>();
+  for (const item of value) {
+    const row = record(item);
+    if (!row || !validBankAccount(row)) return false;
+    const identity = `${row.account_no}\u0000${row.currency}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+  }
+  return true;
+}
+
+function validLatestBalances(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  const identities = new Set<string>();
+  for (const item of value) {
+    const row = record(item);
+    if (!row || typeof row.account_no !== 'string' || !row.account_no
+      || typeof row.currency !== 'string' || !/^[A-Z]{3}$/.test(row.currency)
+      || !validCurrencyAmount(row.balance, row.currency)) return false;
+    const identity = `${row.account_no}\u0000${row.currency}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+  }
+  return true;
 }
 
 function validTransactionFact(row: Row): boolean {
@@ -99,12 +133,15 @@ function validTransactionFact(row: Row): boolean {
     && validDate(row.date)
     && validDate(row.consume_date)
     && validDate(row.post_date)
-    && safeInteger(row.amount)
+    && validCurrencyAmount(row.amount, row.currency)
     && ['income', 'expense', 'neutral'].includes(String(row.cashflow_direction))
-    && safeInteger(row.cashflow_amount)
-    && typeof row.currency === 'string'
+    && validCurrencyAmount(row.cashflow_amount, row.currency)
+    && validCurrencyAmount(row.display_amount, row.currency)
+    && (row.balance === null || row.balance === undefined
+      || validCurrencyAmount(row.balance, row.currency))
+    && typeof row.currency === 'string' && /^[A-Z]{3}$/.test(row.currency)
     && nullableString(row.consume_currency)
-    && nullableFinite(row.consume_amount)
+    && (row.consume_amount === null || validCurrencyAmount(row.consume_amount, row.consume_currency))
     && nullableString(row.category)
     && nullableString(row.subcategory)
     && nullableString(row.txn_type)
@@ -121,7 +158,7 @@ function validBalanceFact(value: unknown): boolean {
   const fact = record(value);
   if (!fact) return false;
   return validDate(fact.snapshot_date, false)
-    && nullableFinite(fact.twd_balance);
+    && validCurrencyAmount(fact.twd_balance, 'TWD', true);
 }
 
 function validLoanFact(value: unknown): boolean {
@@ -129,7 +166,8 @@ function validLoanFact(value: unknown): boolean {
   const fact = record(value);
   if (!fact) return false;
   return validDate(fact.snapshot_date)
-    && nullableFinite(fact.amount_twd);
+    && validCurrencyAmount(fact.amount_twd, 'TWD', true)
+    && ['balance_history', 'accounts', 'normalized_balance_metric'].includes(String(fact.source));
 }
 
 function validCardFact(value: unknown): boolean {
@@ -137,7 +175,7 @@ function validCardFact(value: unknown): boolean {
   const fact = record(value);
   if (!fact) return false;
   return validDate(fact.snapshot_date, false)
-    && nullableFinite(fact.amount_twd)
+    && validCurrencyAmount(fact.amount_twd, 'TWD', true)
     && typeof fact.recognized === 'boolean';
 }
 
@@ -150,10 +188,7 @@ function validPortfolioFacts(value: unknown): boolean {
     if (!(key in facts)) return false;
   }
   return validBalanceFact(facts.latest_twd_balance)
-    && validRows(facts.latest_account_transaction_balances, (row) => (
-      typeof row.account_no === 'string'
-      && typeof row.balance === 'number' && Number.isFinite(row.balance)
-    ))
+    && validLatestBalances(facts.latest_account_transaction_balances)
     && validLoanFact(facts.loan_balance)
     && validCardFact(facts.card_unpaid);
 }
@@ -309,7 +344,7 @@ export function projectReplicaDashboard(
   for (const bank of SUPPORTED_BANKS) {
     const partition = record(envelope.partitions[`bank:${bank}`]);
     if (!partition
-      || !validRows(partition.accounts, validBankAccount)
+      || !validBankAccounts(partition.accounts)
       || !Array.isArray(partition.cards)
       || !validRows(partition.transactions, validTransactionFact)
       || !validPortfolioFacts(partition.portfolio_facts)) return undefined;

@@ -35,6 +35,8 @@ from typing import Any
 
 import httpx2 as httpx
 
+from backend.core.money import native_money
+
 # ============================================================
 # Constants
 # ============================================================
@@ -235,7 +237,7 @@ def get_rate(currency: str) -> float | None:
         return None
 
 
-def convert_to_twd(amount: float | int | str | None, currency: str | None) -> int | None:
+def convert_to_twd(amount: Decimal | float | int | str | None, currency: str | None) -> int | None:
     """原幣金額 → TWD 估值 (int 四捨五入).
 
     None 條件:
@@ -248,13 +250,17 @@ def convert_to_twd(amount: float | int | str | None, currency: str | None) -> in
         return None
     if currency is None:
         return None
+    source = native_money(amount, currency, preserve_decimal=True)
     rate = get_rate(currency)
     if rate is None:
         return None
     try:
-        value = Decimal(str(amount)) * Decimal(str(rate))
+        value = Decimal(str(source)) * Decimal(str(rate))
         if not value.is_finite():
             return None
-        return int(value.to_integral_value(rounding=ROUND_HALF_EVEN))
+        rounded = int(value.to_integral_value(rounding=ROUND_HALF_EVEN))
     except (InvalidOperation, ValueError, TypeError):
         return None
+    result = native_money(rounded, "TWD")
+    assert isinstance(result, int)
+    return result

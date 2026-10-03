@@ -95,6 +95,6 @@ def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch):
         cli.cmd_sync(SimpleNamespace(bank="sinopac", headless=True))
 
     assert set(crawler.cursor_domains) == {
-        "twd_transactions", "card_billed_transactions",
+        "twd_transactions", "card_billed_transactions", "account_transactions",
     }
     assert store.closed is True

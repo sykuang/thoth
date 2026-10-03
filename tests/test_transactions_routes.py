@@ -44,7 +44,8 @@ def _seed_bank_db(data_root: Path, bank: str, twd: list[dict] | None = None,
     con.execute("""CREATE TABLE IF NOT EXISTS twd_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_no TEXT NOT NULL, txn_datetime TEXT NOT NULL, account_date TEXT,
-        description TEXT, raw_description TEXT, expend INTEGER, income INTEGER, balance INTEGER,
+        description TEXT, raw_description TEXT, expend REAL, income REAL, balance REAL,
+        currency TEXT NOT NULL DEFAULT 'TWD',
         counterparty_bank TEXT, counterparty_acct TEXT, memo TEXT,
         first_seen TEXT NOT NULL, dedup_key TEXT NOT NULL, category TEXT,
         flow_type TEXT NOT NULL DEFAULT 'expense',
@@ -107,10 +108,11 @@ def _seed_bank_db(data_root: Path, bank: str, twd: list[dict] | None = None,
             )
     for i, t in enumerate(twd or []):
         con.execute(
-            "INSERT INTO twd_transactions (account_no, txn_datetime, description, raw_description, expend, income, balance, counterparty_acct, memo, first_seen, dedup_key, category, flow_type, is_subscription, income_category, subcategory, auto_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO twd_transactions (account_no, txn_datetime, description, raw_description, expend, income, balance, currency, counterparty_acct, memo, first_seen, dedup_key, category, flow_type, is_subscription, income_category, subcategory, auto_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t["account_no"], t["datetime"], t["desc"], t.get("raw_desc", t["desc"]),
              t.get("expend"), t.get("income"),
-             t.get("balance"), t.get("counterparty_acct"), t.get("memo"),
+             t.get("balance"), t.get("currency", "TWD"),
+             t.get("counterparty_acct"), t.get("memo"),
              "2026-06-13", f"twd-{bank}-{i}", t.get("category"),
              t.get("flow_type", "expense"), 1 if t.get("is_subscription") else 0,
              t.get("income_category"), t.get("subcategory"),
@@ -242,6 +244,85 @@ def test_transactions_returns_database_canonical_description_without_api_join(cl
     assert txn["display_description"] == "轉帳 - 0050FUND 基金配息"
     assert txn["memo"] == "0050FUND　基金配息"
     assert txn["raw"]["raw_description"] == "轉帳"
+
+
+def test_transactions_returns_native_currency_and_decimal_amount(client, data_root):
+    token = _register(client)
+    client.post("/accounts", json={"bank": "sinopac", "label": "test"}, headers=_auth(token))
+    _seed_bank_db(data_root, "sinopac", twd=[{
+        "account_no": "01234567890124",
+        "datetime": "2026-08-10T09:00:00",
+        "desc": "FOREIGN TRANSFER",
+        "currency": "USD",
+        "expend": 12.34,
+        "income": None,
+        "balance": 1234.56,
+    }])
+
+    response = client.get("/transactions", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    txn = response.json()["items"][0]
+    assert txn["currency"] == "USD"
+    assert txn["amount"] == -12.34
+    assert txn["cashflow_amount"] == 12.34
+    assert txn["display_amount"] == 12.34
+    assert txn["balance"] == 1234.56
+
+
+def test_account_drilldown_scopes_same_number_by_currency(client, data_root):
+    token = _register(client, email="currency-drilldown@p.com")
+    client.post("/accounts", json={"bank": "sinopac", "label": "test"}, headers=_auth(token))
+    _seed_bank_db(data_root, "sinopac", twd=[
+        {
+            "account_no": "SHARED", "datetime": "2026-08-10T09:00:00",
+            "desc": "TWD", "currency": "TWD", "expend": 1,
+        },
+        {
+            "account_no": "SHARED", "datetime": "2026-08-10T10:00:00",
+            "desc": "USD", "currency": "USD", "expend": 0.000001,
+        },
+    ])
+
+    legacy = client.get("/transactions?account_no=SHARED", headers=_auth(token))
+    assert legacy.status_code == 200, legacy.text
+    assert [row["currency"] for row in legacy.json()["items"]] == ["TWD"]
+
+    usd = client.get(
+        "/transactions?account_no=SHARED&currency=usd",
+        headers=_auth(token),
+    )
+    assert usd.status_code == 200, usd.text
+    assert [row["currency"] for row in usd.json()["items"]] == ["USD"]
+
+    invalid = client.get(
+        "/transactions?account_no=SHARED&currency=US%24",
+        headers=_auth(token),
+    )
+    assert invalid.status_code == 422
+
+
+def test_transactions_stats_do_not_sum_native_currencies_without_fx(client, data_root):
+    token = _register(client, email="native-currency-stats@p.com")
+    client.post("/accounts", json={"bank": "sinopac", "label": "test"}, headers=_auth(token))
+    _seed_bank_db(data_root, "sinopac", twd=[
+        {
+            "account_no": "TWD1", "datetime": "2026-08-10T09:00:00",
+            "desc": "TWD", "currency": "TWD", "expend": 100,
+            "income": None, "balance": 900,
+        },
+        {
+            "account_no": "USD1", "datetime": "2026-08-10T10:00:00",
+            "desc": "USD", "currency": "USD", "expend": 12.34,
+            "income": None, "balance": 1234.56,
+        },
+    ])
+
+    response = client.get("/transactions/stats", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    stats = response.json()
+    assert stats["total"] == 2
+    assert stats["total_expense"] == 100
+    assert stats["total_net"] == -100
 
 
 # ============================================================
@@ -2176,3 +2257,82 @@ def test_patch_tags_mode_invalid_rejected(client, data_root):
                      json={"tags_mode": "add"},
                      headers=_auth(token))
     assert r.status_code == 400
+
+
+def test_transaction_publication_rejects_invalid_native_precision() -> None:
+    from backend.server.routers.transactions import (
+        _billed_to_transaction,
+        _pending_to_transaction,
+        _twd_to_transaction,
+    )
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _twd_to_transaction("demo", {
+            "account_no": "A", "currency": "TWD", "income": 0.5, "expend": 0,
+        })
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _twd_to_transaction("demo", {
+            "account_no": "A", "currency": "TWD",
+            "income": 9_007_199_254_740_991,
+            "expend": -9_007_199_254_740_991,
+        })
+    invalid_foreign = {"card_no": "C", "currency": "USD", "amount": 0.1234567}
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _billed_to_transaction("demo", invalid_foreign)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _pending_to_transaction("demo", invalid_foreign)
+
+
+def test_persisted_splits_fail_closed_without_numeric_coercion() -> None:
+    from backend.server.routers.transactions import (
+        _expand_splits,
+        _parse_splits_overwrite,
+    )
+
+    assert _parse_splits_overwrite('[{"amount":1.9}]') == []
+    assert _parse_splits_overwrite('[{"amount":9007199254740992}]') == []
+    parent = {
+        "id": 1, "amount": -100, "cashflow_amount": 100,
+        "cashflow_direction": "expense",
+        "splits": [{"amount": 60}, {"amount": 30}],
+    }
+    assert _expand_splits(parent) == [parent]
+
+
+def test_stats_cashflow_validates_raw_operands_before_derivation() -> None:
+    from types import SimpleNamespace
+    from backend.server.routers.transactions import _stat_cashflow_amount
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _stat_cashflow_amount(SimpleNamespace(
+            kind="twd", currency="TWD", amount=0,
+            income=0.5, expend=0, txn_type=None,
+        ))
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _stat_cashflow_amount(SimpleNamespace(
+            kind="twd", currency="TWD", amount=0,
+            income=9_007_199_254_740_992,
+            expend=9_007_199_254_740_992,
+            txn_type=None,
+        ))
+
+
+def test_stats_split_children_do_not_reuse_parent_twd_operands() -> None:
+    from backend.server.db_facade.transactions import TxnStatRow
+    from backend.server.routers.transactions import (
+        _expand_stat_split_rows,
+        _stat_cashflow_amount,
+    )
+
+    parent = TxnStatRow(
+        bank="demo", kind="twd", date="2026-09-01",
+        amount=-100, income=0, expend=100, currency="TWD",
+        category="parent", txn_type=None,
+        splits_overwrite=(
+            '[{"amount":60,"category":"food"},'
+            '{"amount":40,"category":"travel"}]'
+        ),
+    )
+    children = _expand_stat_split_rows([parent])
+    assert [child.amount for child in children] == [-60, -40]
+    assert [_stat_cashflow_amount(child) for child in children] == [-60, -40]

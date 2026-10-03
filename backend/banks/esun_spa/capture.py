@@ -3,10 +3,14 @@ Callers must independently require full-valid DOM and recheck immediately before
 Limits bound admitted decoded response bytes, NOT browser RSS. Bodies remain RAM-only.
 """
 
-import json
 import re
 from urllib.parse import urlsplit
-from backend.core.base import ApiHit, ResponseCollector, _HistoryBodyObserver
+from backend.core.base import (
+    ApiHit,
+    ResponseCollector,
+    _HistoryBodyObserver,
+    _strict_json_loads,
+)
 
 ORIGIN = "https://ebank.esunbank.com.tw"
 PATHS = (
@@ -39,19 +43,7 @@ def _json_type(value):
 
 
 def _json(raw):
-
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError("invalid JSON")
-            result[key] = value
-        return result
-
-    def constant(value):
-        raise ValueError("invalid JSON")
-
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    return _strict_json_loads(raw)
 
 
 class SpaCollector(ResponseCollector):
@@ -68,6 +60,7 @@ class SpaCollector(ResponseCollector):
         self._attachment = None
         self._continuation_observation = None
         self.publication_checks = []
+        self._attached_handlers = {}
 
     def attach(self, page):
         if self.page is page:
@@ -82,8 +75,10 @@ class SpaCollector(ResponseCollector):
                 observer.LIMIT, observer.MAX_RECORDS = (LIMIT, self.MAX_QUERY_REQUESTS)
                 observer.TOTAL_LIMIT = TOTAL
                 self.observers[path] = observer
+                observer.start()
             for name, handler in self._handlers():
                 page.on(name, handler)
+                self._attached_handlers[name] = handler
         except BaseException:
             try:
                 self.detach(page)
@@ -99,43 +94,58 @@ class SpaCollector(ResponseCollector):
         )
 
     def detach(self, page=None):
-        if self.page is None:
+        if self.page is None and not self.observers and not self._attached_handlers:
             return
         if page is not None and page is not self.page:
             raise ValueError("foreign page")
         error = None
-        # Keep all listeners and receipts live until the last CDP detach returns.
-        for observer in self.observers.values():
-            try:
-                observer.disconnect()
-            except Exception as exc:
-                error = error or exc
-        for name, handler in self._handlers():
-            try:
-                self.page.remove_listener(name, handler)
-            except Exception as exc:
-                error = error or exc
+        cleanup_page = self.page
         try:
-            for prove in self.publication_checks:
-                prove()
-        except Exception as exc:
-            error = error or exc
-        # close() is now local-only: no dispatch after this final proof.
-        for observer in self.observers.values():
+            # Keep all listeners and receipts live until the last CDP detach returns.
+            for observer in self.observers.values():
+                try:
+                    observer.disconnect()
+                except Exception as exc:
+                    error = error or exc
+            for name, handler in tuple(self._attached_handlers.items()):
+                try:
+                    if cleanup_page is None:
+                        raise RuntimeError("missing cleanup page")
+                    cleanup_page.remove_listener(name, handler)
+                except Exception as exc:
+                    error = error or exc
+                else:
+                    self._attached_handlers.pop(name, None)
             try:
-                observer.close()
+                for prove in self.publication_checks:
+                    prove()
             except Exception as exc:
                 error = error or exc
-        self.observers.clear()
-        # Keep receipts through publication: detach invalidates, never erases proof.
-        self._continuation_observation = None
-        self.owned.clear()
-        self.hits.clear()
-        self._latest_spa.clear()
-        self._attachment = None
-        for data in (self._requests, self._request_main_frame, self._request_frame_urls, self._request_frames):
-            data.clear()
-        self.page = None
+            # close() is now local-only: no dispatch after this final proof.
+            for path, observer in tuple(self.observers.items()):
+                try:
+                    observer.close()
+                except Exception as exc:
+                    error = error or exc
+                else:
+                    self.observers.pop(path, None)
+        finally:
+            self._continuation_observation = None
+            self.owned.clear()
+            self.hits.clear()
+            self._latest_spa.clear()
+            self._attachment = None
+            for data in (
+                self._requests,
+                self._request_main_frame,
+                self._request_frame_urls,
+                self._request_frames,
+            ):
+                data.clear()
+            # A failed listener removal alone still needs its page for retry. CDP-only
+            # cleanup failures retain observers but not the page or financial payloads.
+            if not self._attached_handlers:
+                self.page = None
         if error is not None:
             raise error
 

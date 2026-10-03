@@ -12,8 +12,9 @@ import pytest
 
 import backend.banks.hsbc as hsbc_module
 from backend.banks.hsbc import HsbcCrawler
-from backend.core.base import BankCollectResult, ResponseCollector
+from backend.core.base import BankCollectResult, ResponseCollector, _strict_json_loads
 from backend.core.persist import persist_collected
+from backend.core.persist.hsbc import _validate_hsbc_txn
 from backend.core.store import BankStore
 
 
@@ -29,6 +30,23 @@ def test_hsbc_opts_into_card_billed_history_only() -> None:
     assert frozenset({
         "card_billed_transactions",
     }) == HsbcCrawler.HISTORY_COVERAGE_DOMAINS
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_strict_json_parser_rejects_nonstandard_numeric_constants(constant: str) -> None:
+    with pytest.raises(ValueError):
+        _strict_json_loads(f'{{"value":{constant}}}')
+
+
+@pytest.mark.parametrize("number", ["1e309", "-1e309"])
+def test_strict_json_parser_rejects_float_overflow(number: str) -> None:
+    with pytest.raises(ValueError):
+        _strict_json_loads(f'{{"value":{number}}}')
+
+
+def test_strict_json_parser_rejects_irreversible_float_rounding() -> None:
+    with pytest.raises(ValueError):
+        _strict_json_loads('{"value":9007199254740991.1}')
 
 
 def test_hsbc_full_and_incremental_ranges_use_card_cursor(monkeypatch) -> None:
@@ -202,6 +220,83 @@ def _posted_row(day: date) -> dict:
     }
 
 
+def test_hsbc_domestic_posted_row_accepts_native_signed_twd_metadata() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row.update({"isPositive": False, "foreignAmount": "-12.34 TWD"})
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+
+
+def test_hsbc_domestic_row_allows_bounded_original_currency_annotation() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row["foreignAmount"] = "12.34 USD"
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+    _validate_hsbc_txn(row, start=day, end=day)
+
+
+@pytest.mark.parametrize(
+    ("foreign_amount", "is_positive", "is_foreign"),
+    ((" 12.34 USD", True, False), ("-0 USD", True, True), ("0 USD", False, True)),
+)
+def test_hsbc_collector_and_persistence_share_annotation_canonicalization(
+    foreign_amount: str, is_positive: bool, is_foreign: bool,
+) -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row.update({
+        "foreignAmount": foreign_amount,
+        "isPositive": is_positive,
+        "isForeign": is_foreign,
+    })
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+    _validate_hsbc_txn(row, start=day, end=day)
+
+
+def test_hsbc_domestic_row_ignores_non_authoritative_foreign_metadata() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row["foreignAmount"] = {"not": "authoritative"}
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+    _validate_hsbc_txn(row, start=day, end=day)
+
+
+def test_hsbc_foreign_posted_row_accepts_native_signed_debit_amount() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row.update({"isForeign": True, "isPositive": False, "foreignAmount": "-12.34 USD"})
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+
+
+def test_hsbc_domestic_posted_row_accepts_native_repeated_twd_amount() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row["foreignAmount"] = row["ntdAmount"]
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+
+
+def test_hsbc_domestic_debit_accepts_native_zero_twd_foreign_placeholder() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row.update({"isPositive": False, "foreignAmount": "0 TWD"})
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+
+
+def test_hsbc_domestic_posted_row_accepts_native_zero_twd_foreign_placeholder() -> None:
+    day = date(2026, 8, 31)
+    row = _posted_row(day)
+    row["foreignAmount"] = "0 TWD"
+
+    assert HsbcCrawler._validate_posted_row(row, end=day) == day
+
+
 def _page_response(card_id: str, page_number: int, total_pages: int, rows: list[dict]) -> dict:
     return {
         "url": (
@@ -240,6 +335,8 @@ class _Page:
             "bytes",
             len(json.dumps(response.get("body"), ensure_ascii=False).encode("utf-8")),
         )
+        body = response.pop("body", None)
+        response["text"] = json.dumps(body, ensure_ascii=False)
         return response
 
     def wait_for_timeout(self, milliseconds: int) -> None:
@@ -431,11 +528,11 @@ def test_response_collector_keeps_latest_issued_token_when_responses_reorder() -
 
 
 def test_hsbc_direct_fetches_have_operation_local_deadlines() -> None:
-    for function in (HsbcCrawler._fetch_json, HsbcCrawler._fetch_api_page):
-        source = inspect.getsource(function)
-        assert "AbortController" in source
-        assert "signal:controller.signal" in source
-        assert "clearTimeout(timer)" in source
+    helper_source = inspect.getsource(HsbcCrawler._fetch_api_page)
+    assert "AbortController" in helper_source
+    assert "signal:controller.signal" in helper_source
+    assert "clearTimeout(timer)" in helper_source
+    assert "timeout_ms=30_000" in inspect.getsource(HsbcCrawler._fetch_json)
 
 
 def test_hsbc_embedded_fetch_javascript_compiles() -> None:
@@ -479,7 +576,10 @@ def test_hsbc_failed_json_semantics_still_consume_operation_bytes() -> None:
     class Page:
         @staticmethod
         def evaluate(_script, _args):
-            return {"payload": None, "bytes": 4_900_000}
+            return {
+                "text": '{"success":false,"error":null,"payload":null}',
+                "bytes": 4_900_000,
+            }
 
     budget = [5_000_000]
     assert HsbcCrawler._fetch_json(
@@ -550,9 +650,11 @@ def test_hsbc_detail_stream_overflow_aborts_before_posted_history(monkeypatch) -
 
 def test_hsbc_direct_api_fetch_is_exact_and_never_logs_token_material() -> None:
     source = inspect.getsource(HsbcCrawler._fetch_json)
-    assert "redirect:'error'" in source
-    assert "r.url!==url" in source
-    assert "r.status!==200" in source
+    helper_source = inspect.getsource(HsbcCrawler._fetch_api_page)
+    assert "HsbcCrawler._fetch_api_page" in source
+    assert "redirect:'error'" in helper_source
+    assert "r.url!==url" in helper_source
+    assert "r.status!==200" in helper_source
     assert "token[:" not in inspect.getsource(HsbcCrawler._collect_card_details)
 
 
@@ -563,7 +665,7 @@ def test_hsbc_posted_fetch_refuses_redirects_before_sending_authorization() -> N
 
 
 def test_hsbc_posted_history_has_total_operation_deadline(monkeypatch) -> None:
-    clock = iter((0.0, 121.0))
+    clock = iter((0.0, 301.0))
     monkeypatch.setattr(hsbc_module.time, "monotonic", lambda: next(clock))
     page = _Page([])
 
@@ -581,7 +683,7 @@ def test_hsbc_posted_history_has_total_operation_deadline(monkeypatch) -> None:
 
 
 def test_hsbc_posted_history_rechecks_deadline_after_fetch(monkeypatch) -> None:
-    clock = iter((0.0, 119.0, 121.0))
+    clock = iter((0.0, 299.0, 301.0))
     monkeypatch.setattr(hsbc_module.time, "monotonic", lambda: next(clock))
     page = _Page([_page_response("card-id-7034", 0, 1, [])])
 
@@ -594,6 +696,8 @@ def test_hsbc_posted_history_rechecks_deadline_after_fetch(monkeypatch) -> None:
             start=date(2025, 9, 1),
             end=date(2026, 8, 31),
         )
+
+    assert len(page.args) == 1
 
 
 def test_hsbc_incremental_history_filters_after_complete_bank_pagination() -> None:
@@ -633,7 +737,86 @@ def test_hsbc_incremental_history_filters_after_complete_bank_pagination() -> No
     assert [args["url"].rsplit("=", 1)[-1] for args in page.args] == [
         "0", "1", "2", "3", "0", "1", "2", "3",
     ]
-    assert page.waits == [400, 400, 400]
+    assert page.waits == [400, 400, 400, 400, 400, 400]
+
+
+def test_hsbc_replay_attestation_returns_closed_metadata() -> None:
+    class Page:
+        def __init__(self):
+            self.script = ""
+            self.args = None
+
+        def evaluate(self, script, args):
+            self.script = script
+            self.args = args
+            return {
+                "url": args["url"],
+                "status": 200,
+                "contentType": "application/json",
+                "redirected": False,
+                "bytes": 123,
+                "text": json.dumps({
+                    "success": True,
+                    "error": None,
+                    "payload": args["expectedSnapshot"],
+                }),
+            }
+
+    page = Page()
+    result = HsbcCrawler._attest_api_page(
+        page,
+        url="https://card.hsbc.com.tw/ibk-bff/api/v1/cards/card-id/transactions/posted?pageSize=10&pageNumber=0",
+        token="Bearer synthetic-token",
+        timeout_ms=1000,
+        max_bytes=1000,
+        expected_snapshot={
+            "content": [{"exchangeRate": 0.000001}],
+            "pageInfo": {"currentPageIndex": 0, "totalPages": 1},
+        },
+    )
+
+    assert result is not None
+    assert result["matched"] is True
+    assert "body" not in result
+    assert "text" not in result
+    assert isinstance(page.args["expectedSnapshot"], dict)
+    source = inspect.getsource(HsbcCrawler._attest_api_page)
+    assert "_strict_json_loads" in source
+    assert "JSON.parse" not in source
+
+
+def test_hsbc_fetch_and_replay_reject_duplicate_json_keys() -> None:
+    duplicate_text = (
+        '{"success":false,"success":true,"error":null,'
+        '"payload":{"pageInfo":{},"content":[]}}'
+    )
+
+    class Page:
+        def evaluate(self, _script, args):
+            return {
+                "url": args["url"],
+                "status": 200,
+                "contentType": "application/json",
+                "redirected": False,
+                "bytes": len(duplicate_text),
+                "text": duplicate_text,
+            }
+
+    page = Page()
+    assert HsbcCrawler._fetch_json(
+        page, "https://card.hsbc.com.tw/test", "Bearer x",
+    ) is None
+    assert HsbcCrawler._fetch_api_page(
+        page, url="https://card.hsbc.com.tw/test", token="Bearer x", timeout_ms=100,
+    ) is None
+    assert HsbcCrawler._attest_api_page(
+        page,
+        url="https://card.hsbc.com.tw/test",
+        token="Bearer x",
+        timeout_ms=100,
+        max_bytes=1000,
+        expected_snapshot={"pageInfo": {}, "content": []},
+    ) is None
 
 
 def test_hsbc_snapshot_replay_ignores_volatile_envelope_fields() -> None:
@@ -825,7 +1008,6 @@ def test_hsbc_posted_history_accepts_exact_empty_first_page() -> None:
         "invalid-foreign-flag",
         "invalid-foreign-amount",
         "foreign-flag-with-twd",
-        "foreign-amount-on-domestic",
         "future-transaction-date",
         "empty-description",
         "oversized-description",
@@ -899,8 +1081,6 @@ def test_hsbc_posted_history_fails_closed_on_transport_or_pagination_drift(
         row = responses[0]["body"]["payload"]["content"][0]
         row["isForeign"] = True
         row["foreignAmount"] = "100 TWD"
-    elif mutation == "foreign-amount-on-domestic":
-        responses[0]["body"]["payload"]["content"][0]["foreignAmount"] = "12.34 USD"
     elif mutation == "future-transaction-date":
         responses[0]["body"]["payload"]["content"][0]["transactionDate"] = (
             "9999-12-31T00:00"
@@ -1107,6 +1287,32 @@ def test_hsbc_persistence_revalidates_history_before_writing(store) -> None:
     }
 
 
+def test_hsbc_persistence_accepts_native_signed_domestic_metadata(store) -> None:
+    payload = _persist_payload()
+    row = payload["card_detail"]["4029-****-****-7034"]["posted"][0]
+    row.update({"isPositive": False, "foreignAmount": "-12.34 TWD"})
+
+    persist_collected("hsbc", payload, store)
+
+    saved = store.conn.execute(
+        "SELECT amount, consume_currency, consume_amount FROM card_billed_txns"
+    ).fetchone()
+    assert saved is not None and tuple(saved) == (-100, "TWD", None)
+
+
+def test_hsbc_persistence_accepts_native_signed_foreign_metadata(store) -> None:
+    payload = _persist_payload()
+    row = payload["card_detail"]["4029-****-****-7034"]["posted"][0]
+    row.update({"isPositive": False, "isForeign": True, "foreignAmount": "-12.34 USD"})
+
+    persist_collected("hsbc", payload, store)
+
+    saved = store.conn.execute(
+        "SELECT amount, consume_currency, consume_amount FROM card_billed_txns"
+    ).fetchone()
+    assert saved is not None and tuple(saved) == (-100, "USD", 12.34)
+
+
 def test_hsbc_direct_persister_remains_durable(tmp_path: Path, monkeypatch) -> None:
     from backend.core import store as store_module
     from backend.core.persist.hsbc import persist_hsbc
@@ -1195,6 +1401,83 @@ def test_hsbc_persistence_uses_full_identity_for_details_and_pending(store) -> N
     assert "card_detail_4029_7034" in categories
     assert "card_detail_7034" not in categories
     assert f"card_detail_{identity}" not in categories
+
+
+def test_hsbc_unbilled_accepts_bank_posted_date(store) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    pending = _posted_row(date(2026, 8, 30))
+    pending["description"] = "unbilled-posted-purchase"
+    payload["card_detail"][identity]["unposted"] = [pending]
+
+    persist_collected("hsbc", payload, store)
+
+    row = store.conn.execute(
+        "SELECT post_date FROM card_pending_txns WHERE card_no = ?",
+        (identity,),
+    ).fetchone()
+    assert row["post_date"] == "2026-08-30"
+
+
+def test_hsbc_unbilled_accepts_posted_date_without_transaction_date(store) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    pending = _posted_row(date(2026, 8, 30))
+    pending.pop("transactionDate")
+    payload["card_detail"][identity]["unposted"] = [pending]
+
+    persist_collected("hsbc", payload, store)
+
+    saved = store.conn.execute(
+        "SELECT consume_date, post_date FROM card_pending_txns WHERE card_no = ?",
+        (identity,),
+    ).fetchone()
+    assert saved is not None and tuple(saved) == ("2026-08-30", "2026-08-30")
+
+
+@pytest.mark.parametrize("sentinel", ["0002-11-30T00:00:00", "0002-11-30T00:00Z"])
+def test_hsbc_unbilled_rejects_alternate_ancient_sentinel_without_transaction_date(
+    store, sentinel,
+) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    pending = _posted_row(date(2026, 8, 30))
+    pending.pop("transactionDate")
+    pending["postedDate"] = sentinel
+    payload["card_detail"][identity]["unposted"] = [pending]
+
+    with pytest.raises(ValueError, match="invalid HSBC history transaction"):
+        persist_collected("hsbc", payload, store)
+    assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
+
+
+def test_hsbc_direct_persister_rolls_back_all_writes_on_late_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from backend.core import store as store_module
+    from backend.core.persist.hsbc import persist_hsbc
+
+    monkeypatch.setattr(store_module, "DATA_ROOT", tmp_path)
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("hsbc", user_id=1, source_account_id=7)
+    monkeypatch.setattr(
+        store,
+        "refresh_card_pending",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pending failed")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="pending failed"):
+            persist_hsbc(_persist_payload(), store)
+        store.commit()
+    finally:
+        store.close()
+
+    reopened = BankStore("hsbc", user_id=1, source_account_id=7)
+    try:
+        for table in ("cards", "card_billed_txns", "card_pending_txns", "sync_log"):
+            assert reopened.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    finally:
+        reopened.close()
 
 
 def test_hsbc_authoritative_empty_inventory_survives_collect_serialization(store) -> None:
@@ -1322,7 +1605,6 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "future-transaction-date",
         "invalid-foreign-amount",
         "foreign-flag-with-twd",
-        "foreign-amount-on-domestic",
         "invalid-unposted",
         "oversized-description",
         "short-full-window",
@@ -1335,7 +1617,6 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "invalid-detail-date",
         "invalid-card-date",
         "duplicate-detail-key",
-        "posted-unposted-row",
         "garbage-unposted-placeholder",
         "alternate-unposted-placeholder",
         "missing-card-status",
@@ -1423,8 +1704,6 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
     elif mutation == "foreign-flag-with-twd":
         detail["posted"][0]["isForeign"] = True
         detail["posted"][0]["foreignAmount"] = "100 TWD"
-    elif mutation == "foreign-amount-on-domestic":
-        detail["posted"][0]["foreignAmount"] = "12.34 USD"
     elif mutation == "invalid-unposted":
         detail["unposted"] = "bad"
     elif mutation == "oversized-description":
@@ -1464,8 +1743,6 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
                 {"key": "Credit Limit", "value": "200 TWD"},
             ],
         }
-    elif mutation == "posted-unposted-row":
-        detail["unposted"] = [_posted_row(date(2026, 8, 30))]
     elif mutation == "garbage-unposted-placeholder":
         row = _posted_row(date(2026, 8, 30))
         row["postedDate"] = "0002-garbage"

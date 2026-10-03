@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from backend.server import db
@@ -64,6 +65,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from backend.core import bank_data
+from backend.core.money import native_money
 from backend.core.store import canonical_display_description
 from backend.server.deps import current_user
 from backend.server.dashboard_cache import (
@@ -236,22 +238,30 @@ def _parse_splits_overwrite(raw: Any) -> list[dict[str, Any]]:
         data = json.loads(raw)
     except (TypeError, ValueError):
         return []
-    if not isinstance(data, list):
+    if not isinstance(data, list) or len(data) > MAX_SPLITS:
         return []
     out: list[dict[str, Any]] = []
     for item in data:
         if not isinstance(item, dict):
-            continue
+            return []
+        raw_amount = item.get("amount")
+        if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
+            return []
         try:
-            amount = int(item.get("amount") or 0)
-        except (TypeError, ValueError):
-            continue
+            amount = native_money(raw_amount, "TWD")
+        except ValueError:
+            return []
+        if not isinstance(amount, int) or amount <= 0:
+            return []
+        auto_excluded = item.get("auto_excluded", False)
+        if not isinstance(auto_excluded, bool):
+            return []
         out.append({
-            "amount": abs(amount),
+            "amount": amount,
             "category": item.get("category") or None,
             "subcategory": item.get("subcategory") or None,
             "note": item.get("note") or None,
-            "auto_excluded": bool(item.get("auto_excluded")),
+            "auto_excluded": auto_excluded,
         })
     return out
 
@@ -300,7 +310,7 @@ def _normalize_splits_input(raw: Any, parent_amount: int) -> list[dict[str, Any]
         raw_amount = item.get("amount")
         if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
             raise ValueError("split amount 必須是整數")
-        amount = raw_amount
+        amount = _twd(raw_amount)
         if amount <= 0:
             raise ValueError("split amount 必須大於 0 (方向沿用母筆, 不用負號)")
         auto_excluded = item.get("auto_excluded", False)
@@ -338,6 +348,9 @@ def _expand_splits(t: dict[str, Any]) -> list[dict[str, Any]]:
     splits = t.get("splits") or []
     if not splits:
         return [t]
+    parent_amount = _twd(abs(t.get("cashflow_amount") or t.get("amount") or 0))
+    if sum(s["amount"] for s in splits) != parent_amount:
+        return [t]
     parent_id = t.get("id")
     direction = t.get("cashflow_direction")
     out: list[dict[str, Any]] = []
@@ -366,14 +379,14 @@ def _expand_splits(t: dict[str, Any]) -> list[dict[str, Any]]:
 def _transaction_cashflow(
     amount: int | float,
     txn_type: str | None,
-) -> tuple[str, int]:
+) -> tuple[str, int | float]:
     """Return (cashflow_direction, cashflow_amount) in the user's perspective.
 
     `amount` is kept as bank/card-statement perspective for audit/backward compat.
     These derived fields are the normalized API contract frontend should use for
     filtering, stats, and display direction.
     """
-    amt = int(amount or 0)
+    amt = amount or 0
     if txn_type in ("cashback", "refund", "fee_waiver"):
         # fee_waiver (年費減免/手續費減免/利息減免): 銀行減免費用, 對 user 是正向現金流 (income),
         # 即使 amount<0 (從帳單視角是「貸記」負值) 也算 income; 跟 refund/cashback 同一 branch.
@@ -411,17 +424,31 @@ def _apply_card_date_basis(t: dict[str, Any], card_date_basis: str) -> dict[str,
     return t
 
 
+def _twd(value: Any) -> int:
+    result = native_money(value, "TWD")
+    assert isinstance(result, int)
+    return result
+
+
 def _twd_to_transaction(
-    bank: str, r: db.Row, excluded_accounts: set[str] | None = None,
+    bank: str, r: db.Row,
+    excluded_accounts: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """twd_transactions row → 統一 Transaction shape. 支出負值, 收入正值."""
-    expend = _row_get(r, "expend") or 0
-    income = _row_get(r, "income") or 0
-    amount = income - expend  # net 一律 income - expense
+    currency = str(_row_get(r, "currency") or "TWD").strip().upper()
+    expend = native_money(_row_get(r, "expend"), currency, optional=True) or 0
+    income = native_money(_row_get(r, "income"), currency, optional=True) or 0
+    amount = _twd(income - expend) if currency == "TWD" else native_money(
+        income - expend, currency,
+    )
+    assert isinstance(amount, (int, float))
     date = _normalize_date(_row_get(r, "txn_datetime")) or _normalize_date(_row_get(r, "account_date"))
     account_no = _row_get(r, "account_no")
+    balance = native_money(_row_get(r, "balance"), currency, optional=True)
     # Phase 6 (excluded): 該帳戶被使用者標「不納入淨資產統計」→ 反灰 + 不算 stats
-    is_excluded = bool(excluded_accounts and account_no in excluded_accounts)
+    is_excluded = bool(
+        excluded_accounts and (account_no, currency) in excluded_accounts
+    )
     txn_type = None
     return {
         "id": _row_get(r, "id"),  # L8.5 — frontend detail/PATCH 用
@@ -433,7 +460,7 @@ def _twd_to_transaction(
         "description_overwrite": _row_get(r, "description_overwrite"),  # Phase 8.2: 使用者覆寫
         "amount": amount,
         **_cashflow_fields(amount, txn_type),
-        "currency": "TWD",
+        "currency": currency,
         "category": _row_get(r, "category"),
         "txn_type": txn_type,  # Phase 6 (B-full): twd_transactions 不分類 (expend/income 已分開)
         "flow_type": _row_get(r, "flow_type"),  # Phase 6 (taxonomy): 收支統計閘門
@@ -443,7 +470,7 @@ def _twd_to_transaction(
         "legacy_category": _row_get(r, "legacy_category"),
         "account_no": account_no,
         "account_or_card": _mask_tail(account_no),
-        "balance": _row_get(r, "balance"),
+        "balance": balance,
         # Phase 8.4 (2026-06-15): 暴露 counterparty_acct / memo — desc 是「交易類別名」
         # (台幣匯款 / 手機轉帳 / 利息存入...), 真正交易對象在 counterparty_acct;
         # memo 通常含完整對方資訊 + 摘要 (給 detail modal 看)。
@@ -470,8 +497,8 @@ def _billed_to_transaction(
 ) -> dict[str, Any]:
     """card_billed_txns row → 統一 shape. amount 正值 = 消費 (信用卡視角), 但顯示要 negative
     所以這裡反號: 信用卡消費對使用者就是支出."""
-    amt = _row_get(r, "amount") or 0
-    # 信用卡的 amount 從銀行端通常都是正值 (消費金額), 對使用者財務角度是支出 → -amount
+    currency = str(_row_get(r, "currency") or "TWD").strip().upper()
+    amt = native_money(_row_get(r, "amount"), currency, optional=True) or 0
     # 但 退款/扣繳沖正會是 negative, 保留原值
     if amt > 0:
         amt = -amt
@@ -483,8 +510,14 @@ def _billed_to_transaction(
     #   - consume_currency 缺 / 等於 TWD (純台幣消費)
     #   - consume_amount 缺 / 為 0
     #   - amount 為 0
-    consume_ccy = _row_get(r, "consume_currency")
-    consume_amt_raw = _row_get(r, "consume_amount")
+    consume_ccy = (
+        str(_row_get(r, "consume_currency")).strip().upper()
+        if _row_get(r, "consume_currency") else None
+    )
+    consume_amt_raw = (
+        native_money(_row_get(r, "consume_amount"), consume_ccy, optional=True)
+        if consume_ccy else None
+    )
     fx_rate: float | None = None
     fx_rate_source: str | None = None
     if (
@@ -513,7 +546,7 @@ def _billed_to_transaction(
         "description_overwrite": _row_get(r, "description_overwrite"),  # Phase 8.2
         "amount": amt,
         **_cashflow_fields(amt, txn_type),
-        "currency": _row_get(r, "currency") or "TWD",
+        "currency": currency,
         "category": _row_get(r, "category"),
         "txn_type": txn_type,  # Phase 6 (B-full): spending/cashback/refund/...
         "flow_type": _row_get(r, "flow_type"),  # Phase 6 (taxonomy): 收支統計閘門
@@ -554,10 +587,10 @@ HSBC 等其他銀行 pending 直接存原幣 amount, 不會走這條路徑。
 def _pending_to_transaction(
     bank: str, r: db.Row, excluded_cards: set[str] | None = None,
 ) -> dict[str, Any]:
-    amt = _row_get(r, "amount") or 0
+    currency = str(_row_get(r, "currency") or "TWD").strip().upper()
+    amt = native_money(_row_get(r, "amount"), currency, optional=True) or 0
     if amt > 0:
         amt = -amt
-    currency = _row_get(r, "currency") or "TWD"
     desc = _row_get(r, "description") or ""
 
     # Phase 6: pending fx_rate — 對應「不同銀行不同存法」現況, 禁推算
@@ -578,8 +611,8 @@ def _pending_to_transaction(
         # Case A: 原幣消費, amount 就是原幣值
         consume_currency = currency
         try:
-            consume_amount = abs(float(amt))
-        except (TypeError, ValueError):
+            consume_amount = native_money(amt, currency, absolute=True)
+        except ValueError:
             consume_amount = None
         # fx_rate 留 None (要等出帳)
     else:
@@ -588,8 +621,8 @@ def _pending_to_transaction(
         if m and amt != 0:
             try:
                 consume_currency = m.group("ccy")
-                consume_amount = float(m.group("amt"))
-                if consume_amount > 0:
+                consume_amount = native_money(m.group("amt"), consume_currency)
+                if consume_amount is not None and consume_amount > 0:
                     fx_rate = abs(int(amt)) / consume_amount
                     fx_rate_source = "bank_pending_estimate"
             except (TypeError, ValueError, ZeroDivisionError):
@@ -701,13 +734,27 @@ def _apply_stat_filters(
     return out
 
 
+def _stat_native_amount(row: Any) -> Any:
+    currency = str(getattr(row, "currency", None) or "TWD").strip().upper()
+    income = getattr(row, "income", None)
+    expend = getattr(row, "expend", None)
+    if getattr(row, "kind", None) == "twd" and (income is not None or expend is not None):
+        checked_income = native_money(income, currency, optional=True) or 0
+        checked_expend = native_money(expend, currency, optional=True) or 0
+        amount = native_money(checked_income - checked_expend, currency)
+    else:
+        amount = native_money(getattr(row, "amount", None) or 0, currency)
+    assert amount is not None
+    return amount
+
+
 def _stat_cashflow_direction(row: Any) -> str:
     txn_type = getattr(row, "txn_type", None)
     if txn_type in ("cashback", "refund"):
         return "income"
     if txn_type == "payment":
         return "neutral"
-    amount = getattr(row, "amount", None) or 0
+    amount = _stat_native_amount(row)
     if amount > 0:
         return "income"
     if amount < 0:
@@ -715,8 +762,8 @@ def _stat_cashflow_direction(row: Any) -> str:
     return "neutral"
 
 
-def _stat_cashflow_amount(row: Any) -> int:
-    amount = int(getattr(row, "amount", None) or 0)
+def _stat_cashflow_amount(row: Any) -> Any:
+    amount = _stat_native_amount(row)
     direction = _stat_cashflow_direction(row)
     if direction == "income":
         return abs(amount)
@@ -740,12 +787,17 @@ def _expand_stat_split_rows(rows: list[Any]) -> list[Any]:
         if not splits:
             out.append(r)
             continue
-        parent_amount = _item_get(r, "amount") or 0
+        parent_amount = _stat_native_amount(r)
+        if sum(s["amount"] for s in splits) != abs(parent_amount):
+            out.append(r)
+            continue
         sign = -1 if parent_amount < 0 else 1
         parent_excluded = bool(_item_get(r, "auto_excluded"))
         for s in splits:
             out.append(r.model_copy(update={
                 "amount": sign * int(s["amount"]),
+                "income": None,
+                "expend": None,
                 "category": s.get("category"),
                 "subcategory": s.get("subcategory"),
                 # 母筆整筆排除 → 子項一律排除 (OR, 母筆優先); 同 _expand_splits
@@ -807,6 +859,7 @@ def _collect_transactions(
     user_id: int,
     subcategory: str | None = None,
     account_no: str | None = None,
+    currency: str | None = None,
     card_no: str | None = None,
     card_date_basis: Literal["consume", "post"] = "consume",
 ) -> list[dict[str, Any]]:
@@ -852,7 +905,17 @@ def _collect_transactions(
     if until:
         items = [t for t in items if (t["date"] or "") <= until]
     if account_no:
-        items = [t for t in items if t.get("account_no") == account_no]
+        account_currency = (currency or "TWD").upper()
+        items = [
+            t for t in items
+            if t.get("account_no") == account_no
+            and str(t.get("currency") or "TWD").upper() == account_currency
+        ]
+    elif currency:
+        items = [
+            t for t in items
+            if str(t.get("currency") or "TWD").upper() == currency.upper()
+        ]
     if card_no:
         items = [
             t for t in items
@@ -884,6 +947,10 @@ def list_transactions(
     until: str | None = Query(None, description="結束日 YYYY-MM-DD (含)"),
     account_id: int | None = Query(None, description="指定 BankAccount id, 蓋過 bank"),
     account_no: str | None = Query(None, description="精準篩選台幣帳戶交易 (canonical account number)"),
+    currency: str | None = Query(
+        None, min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$",
+        description="帳戶原生 ISO 幣別；account_no 未指定時預設 TWD",
+    ),
     card_no: str | None = Query(None, description="精準篩選信用卡交易 (canonical/raw card number)"),
     q: str | None = Query(None, description="描述子字串 (case-insensitive)"),
     category: str | None = Query(None, description="分類字串"),
@@ -903,7 +970,8 @@ def list_transactions(
     kinds = ["twd", "billed", "pending"] if kind == "all" else [kind]
     items = _collect_transactions(
         banks, kinds, since, until, q, category, user_id=user["id"],
-        subcategory=subcategory, account_no=account_no, card_no=card_no,
+        subcategory=subcategory, account_no=account_no, currency=currency,
+        card_no=card_no,
         card_date_basis=card_date_basis,
     )
 
@@ -1076,11 +1144,17 @@ def _compute_transactions_stats(
         if is_excluded:
             continue
 
+        # Native-currency rows remain visible/countable, but cannot be added to
+        # TWD money totals without an attested transaction-date FX rate.
+        if (_item_get(t, "currency") or "TWD") != "TWD":
+            continue
+
         cashflow_direction = _item_get(t, "cashflow_direction") or _stat_cashflow_direction(t)
         cashflow_amount = _item_get(t, "cashflow_amount")
         if not isinstance(cashflow_amount, (int, float)):
             cashflow_amount = _stat_cashflow_amount(t)
-        cashflow_amount = int(cashflow_amount)
+        cashflow_amount = native_money(cashflow_amount, "TWD")
+        assert isinstance(cashflow_amount, int)
         abs_cashflow = abs(cashflow_amount)
         flow_type = _item_get(t, "flow_type")
         if flow_type in amount_by_flow_type:
@@ -1131,6 +1205,24 @@ def _compute_transactions_stats(
                 amount_by_category.get(category_value, 0) + abs_cashflow
             )
 
+    for bucket in amount_by_month.values():
+        bucket["income"] = _twd(bucket["income"])
+        bucket["expense"] = _twd(bucket["expense"])
+        bucket["net"] = _twd(bucket["net"])
+    amount_by_category = {key: _twd(value) for key, value in amount_by_category.items()}
+    amount_by_flow_type = {key: _twd(value) for key, value in amount_by_flow_type.items()}
+    subscription_by_month = {key: _twd(value) for key, value in subscription_by_month.items()}
+    amount_by_income_category = {
+        key: _twd(value) for key, value in amount_by_income_category.items()
+    }
+    passive_income_by_month = {
+        key: _twd(value) for key, value in passive_income_by_month.items()
+    }
+    total_income = _twd(total_income)
+    total_expense = _twd(total_expense)
+    subscription_total = _twd(subscription_total)
+    passive_income_total = _twd(passive_income_total)
+    total_net = _twd(total_income - total_expense)
     aggregate_ms = (time.perf_counter() - aggregate_started) * 1000
     perf_log.info(
         "event=transactions.stats section=aggregate user_id=%s duration_ms=%.1f rows=%s months=%s categories=%s income=%s expense=%s",
@@ -1150,7 +1242,7 @@ def _compute_transactions_stats(
         "amount_by_category": dict(sorted(amount_by_category.items(), key=lambda kv: -kv[1])),
         "total_income": total_income,
         "total_expense": total_expense,
-        "total_net": total_income - total_expense,
+        "total_net": total_net,
         # Phase 6 (category taxonomy) 新增 — flow_type 分桶 + 訂閱統計
         "amount_by_flow_type": amount_by_flow_type,
         "subscription_total": subscription_total,
@@ -1450,7 +1542,23 @@ def update_transaction(
             if parent_row is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "找不到此筆交易")
             parent = transform(bank, parent_row)
-            parent_amount = abs(int(parent.get("cashflow_amount") or 0))
+            raw_parent_amount = parent.get("cashflow_amount")
+            if (
+                isinstance(raw_parent_amount, bool)
+                or not isinstance(raw_parent_amount, (int, float))
+                or (
+                    isinstance(raw_parent_amount, float)
+                    and (
+                        not math.isfinite(raw_parent_amount)
+                        or not raw_parent_amount.is_integer()
+                    )
+                )
+            ):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "小數交易目前不可拆帳",
+                )
+            parent_amount = abs(int(raw_parent_amount))
             if parent_amount <= 0:
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+from decimal import Decimal
 import json
 import math
 import os
@@ -42,6 +43,39 @@ from backend.core.login_checkpoints import (
     reduce_login_checkpoint,
     validate_login_checkpoint_outcome,
 )
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _strict_json_loads(value):
+    def reject_duplicates(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise _DuplicateJsonKey(key)
+            result[key] = item
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("non-standard JSON numeric constant")
+
+    def parse_finite_float(raw):
+        value = float(raw)
+        if (
+            not math.isfinite(value)
+            or Decimal(str(value)) != Decimal(raw)
+        ):
+            raise ValueError("JSON numeric overflow")
+        return value
+
+    return json.loads(
+        value,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+        parse_float=parse_finite_float,
+    )
 
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -470,37 +504,51 @@ class _HistoryBodyObserver:
         self.bad = False
         self.session = page.context.new_cdp_session(page)
         self._disconnect_attempted = False
+        self._started = False
         self.handlers = {"Network.requestWillBeSent": self._request}
+        self._attached_handlers = {}
         for name in ("responseReceived", "dataReceived", "loadingFinished", "loadingFailed"):
             self.handlers["Network." + name] = lambda event, kind=name: self._event(kind, event)
-        try:
-            for name, handler in self.handlers.items():
-                self.session.on(name, handler)
-            self.session.send("Network.enable", {"maxPostDataSize": 16_384})
-        except Exception:
-            self.close()
-            raise
+
+    def start(self):
+        if self._started:
+            return
+        for name, handler in self.handlers.items():
+            self.session.on(name, handler)
+            self._attached_handlers[name] = handler
+        self.session.send("Network.enable", {"maxPostDataSize": 16_384})
+        self._started = True
 
     def disconnect(self):
         """Finish event-pumping teardown without erasing publication evidence."""
         if self._disconnect_attempted:
             return
-        self._disconnect_attempted = True
         try:
             self.session.detach()
         except Exception:
             self.bad = True
             raise
+        self._disconnect_attempted = True
 
     def close(self):
         self.bad = True
-        for name, handler in self.handlers.items():
-            with contextlib.suppress(Exception):
+        failure: BaseException | None = None
+        for name, handler in tuple(self._attached_handlers.items()):
+            try:
                 self.session.remove_listener(name, handler)
-        with contextlib.suppress(Exception):
+            except BaseException as exc:
+                failure = failure or exc
+            else:
+                self._attached_handlers.pop(name, None)
+        try:
             self.disconnect()
-        self.records.clear()
-        self.native_requests.clear()
+        except BaseException as exc:
+            failure = failure or exc
+        finally:
+            self.records.clear()
+            self.native_requests.clear()
+        if failure is not None:
+            raise failure
 
     def _request(self, event):
         request_id = event.get("requestId")
@@ -639,6 +687,15 @@ class _HistoryBodyObserver:
 class ResponseCollector:
     """掛在 Playwright page 上，攔截所有 XHR/fetch 的 request+response。"""
 
+    NATIVE_BOUNDED_URLS = {
+        "taishinbank.com.tw": (
+            "https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query",
+        ),
+        "ubot.com.tw": (
+            "https://www.ubot.com.tw/MyBank/IBKB010102",
+        ),
+    }
+
     SKIP_RE = re.compile(
         r"(\.js|\.css|\.ico|\.png|\.jpg|\.svg|\.woff2?|\.gif)(\?|$)"
         r"|/locales/|google|gtm|omtrdc|doubleclick|analytics|datalayer|celebrus|faro|/assets/",
@@ -666,24 +723,63 @@ class ResponseCollector:
         self._response_handler = self._on_response
         self._request_handler = self._on_request
         self._request_failed_handler = self._on_request_failed
+        self._native_body_observers: dict[str, _HistoryBodyObserver] = {}
+        self._attached_listeners: dict[str, Any] = {}
         self._detached = False
 
     def attach(self, page):
         self._detached = False
-        page.on("request", self._request_handler)
-        page.on("requestfailed", self._request_failed_handler)
-        page.on("response", self._response_handler)
+        try:
+            for url in self.NATIVE_BOUNDED_URLS.get(self.host_filter, ()):
+                observer = _HistoryBodyObserver(page, url)
+                observer.LIMIT = observer.TOTAL_LIMIT = 5_000_000
+                observer.MAX_RECORDS = 64
+                self._native_body_observers[url] = observer
+                starter = getattr(observer, "start", None)
+                if callable(starter):
+                    starter()
+            for event, handler in (
+                ("request", self._request_handler),
+                ("requestfailed", self._request_failed_handler),
+                ("response", self._response_handler),
+            ):
+                page.on(event, handler)
+                self._attached_listeners[event] = handler
+        except BaseException:
+            try:
+                self.detach(page)
+            except BaseException:
+                raise RuntimeError("response collector attach cleanup failed") from None
+            raise
 
     def detach(self, page) -> None:
         # HSBC detaches during collect; the shared finally must not remove twice.
         if self._detached:
             return
+        failure: BaseException | None = None
         remove = getattr(page, "remove_listener", None)
         if callable(remove):
-            remove("request", self._request_handler)
-            remove("requestfailed", self._request_failed_handler)
-            remove("response", self._response_handler)
-        self._detached = True
+            for event, handler in tuple(self._attached_listeners.items()):
+                try:
+                    remove(event, handler)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                else:
+                    self._attached_listeners.pop(event, None)
+        else:
+            self._attached_listeners.clear()
+        for url, observer in tuple(self._native_body_observers.items()):
+            try:
+                observer.close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            else:
+                self._native_body_observers.pop(url, None)
+        self._detached = not self._attached_listeners and not self._native_body_observers
+        if failure is not None:
+            raise RuntimeError("response collector cleanup failed") from None
 
     @property
     def request_sequence(self) -> int:
@@ -872,12 +968,14 @@ class ResponseCollector:
                             req_body = {"__oversize__": True}
                         else:
                             try:
-                                parsed_body = json.loads(pd)
+                                parsed_body = _strict_json_loads(pd)
                                 req_body = (
                                     {"__json_null__": True}
                                     if parsed_body is None
                                     else parsed_body
                                 )
+                            except _DuplicateJsonKey:
+                                req_body = {"__duplicate_json_key__": True}
                             except Exception:
                                 req_body = pd
                     else:
@@ -891,33 +989,46 @@ class ResponseCollector:
             if "json" in ct and not metadata_only:
                 if is_bounded_json:
                     minimum_size = 64 if is_ubot_history else 0
-                    if (
+                    raw_body = None
+                    declared_size = body_size
+                    if body_size is None and url in self._native_body_observers:
+                        with contextlib.suppress(Exception):
+                            raw_body = self._native_body_observers[url].read(
+                                resp,
+                                request_frame,
+                                request_frame_url,
+                                lambda: 5_000_000 - self._taishin_json_bytes,
+                                minimum_size,
+                            )
+                    elif (
                         content_encoding.lower() in {"", "identity"}
                         and body_size is not None
                         and minimum_size <= body_size <= 5_000_000
                     ):
                         with contextlib.suppress(Exception):
-                            declared_size = body_size
                             raw_body = resp.body()
-                            body_size = len(raw_body)
-                            within_taishin_budget = True
-                            if is_taishin_json:
-                                self._taishin_json_responses += 1
-                                total = self._taishin_json_bytes + body_size
-                                within_taishin_budget = (
-                                    self._taishin_json_responses <= 64
-                                    and total <= 5_000_000
-                                )
-                                self._taishin_json_bytes = min(total, 5_000_000)
-                            if body_size <= 5_000_000 and within_taishin_budget and (
-                                not (
-                                    is_ubot_history
-                                    or is_taishin_history
-                                    or is_taishin_projected_api
-                                )
-                                or body_size == declared_size
-                            ):
-                                resp_json = json.loads(raw_body)
+                    if raw_body is not None:
+                        body_size = len(raw_body)
+                        within_taishin_budget = True
+                        if is_taishin_json:
+                            self._taishin_json_responses += 1
+                            total = self._taishin_json_bytes + body_size
+                            within_taishin_budget = (
+                                self._taishin_json_responses <= 64
+                                and total <= 5_000_000
+                            )
+                            self._taishin_json_bytes = min(total, 5_000_000)
+                        if body_size <= 5_000_000 and within_taishin_budget and (
+                            declared_size is None
+                            or not (
+                                is_ubot_history
+                                or is_taishin_history
+                                or is_taishin_projected_api
+                            )
+                            or body_size == declared_size
+                        ):
+                            with contextlib.suppress(Exception):
+                                resp_json = _strict_json_loads(raw_body)
                 else:
                     with contextlib.suppress(Exception):
                         resp_json = resp.json()
@@ -1065,7 +1176,9 @@ def validate_card_bill_facts(facts: list[NormalizedCardBillFact], *, facts_ok: b
         raise ValueError("card_bill_facts must be one bank fact or card-scoped facts")
 
 
-HISTORY_DOMAINS = frozenset({"twd_transactions", "card_billed_transactions"})
+HISTORY_DOMAINS = frozenset({
+    "account_transactions", "twd_transactions", "card_billed_transactions",
+})
 
 
 def _history_date(value: Any, error: str) -> date:
@@ -1352,6 +1465,7 @@ class BankCollectResult:
     totals: Any = None
     transaction_text: Any = None
     transaction_url: Any = None
+    account_transactions: Any = None
     twd_account_detail_api_endpoints: Any = None
     twd_account_detail_controls: Any = None
     twd_account_detail_text: Any = None
@@ -1747,11 +1861,11 @@ class BankCrawler(ABC):
                 rules=active_rules,
                 is_authenticated=self.is_authenticated,
                 is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
-                **({"can_act": lambda: (
+                can_act=lambda: (
                     not getattr(self, "_shared_dialog_blocked", False)
                     and self._credential_origin_allowed(page)
                     and not getattr(self, "_shared_dialog_blocked", False)
-                )} if self.name == "esun" else {}),
+                ),
             )
             if not self._credential_origin_allowed(page):
                 reduce_login_checkpoint(

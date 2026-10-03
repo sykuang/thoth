@@ -825,6 +825,26 @@ class EsunCrawler(BankCrawler):
             for prove in collector.publication_checks:
                 prove()
 
+    def _spa_overview_accounts(self, page) -> list[dict]:
+        # The overview (account + 臺幣/外幣 tabs) lives on the 交易明細 page.
+        click = """(label) => { const b = [...document.querySelectorAll('a,button,[role=tab],[role=button],li')]
+            .find(e => e.offsetParent && (e.innerText || '').trim() === label);
+            if (!b) return false; b.click(); return true; }"""
+        texts = []
+        try:
+            # Collection may end on a card page; go home first so 交易明細 is reachable.
+            if page.evaluate(click, "個人首頁") is True:
+                page.wait_for_timeout(6000)
+            if page.evaluate(click, "交易明細") is True:
+                page.wait_for_timeout(6000)
+            texts.append(page.evaluate("document.body.innerText") or "")
+            if page.evaluate(click, "外幣") is True:
+                page.wait_for_timeout(2500)
+                texts.append(page.evaluate("document.body.innerText") or "")
+        except Exception:
+            pass
+        return self._parse_account_overview([{"url": "", "text_preview": t} for t in texts])
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
         self._diagnostic_stage = "collect_validation"
@@ -857,6 +877,12 @@ class EsunCrawler(BankCrawler):
                 prove()
             self._esun_spa_phase = 'incomplete_result' if result.error else 'capture_publication'
             self._diagnostic_stage = "collect_validation"
+            # Live 2026-10-02: the SPA path never published accounts (0 rows). Read the
+            # home overview after every proof has run: TWD tab, then the 外幣 tab.
+            if result.error is None:
+                result.accounts = self._spa_overview_accounts(page)
+                if not result.accounts:
+                    raise RuntimeError("esun-accounts-empty")
             return result
         out: dict = {}
         page.wait_for_timeout(8000)
@@ -1786,9 +1812,11 @@ class EsunCrawler(BankCrawler):
         for fd in frames_data:
             text = fd.get("text_preview") or ""
             # 抓所有 13 碼帳號 + 上下文
-            for m in _re.finditer(r"(?P<cat>臺幣綜存|臺幣活存|外幣活存|外幣綜存|外幣定存|臺幣定存|定期儲蓄存款|薪資戶)\s*\n\s*(?P<acct>\d{13})\s*\n", text):
-                acct_no = m.group("acct")
-                category = m.group("cat")
+            # Live 2026-10-02 SPA renders "<acct> <cat>" on one line; legacy is "<cat>\n<acct>\n".
+            cats = r"臺幣綜存|臺幣活存|外幣活存|外幣綜存|外幣定存|臺幣定存|定期儲蓄存款|薪資戶"
+            for m in _re.finditer(rf"(?:(?P<cat>{cats})\s*\n\s*(?P<acct>\d{{13}})\s*\n|(?<!\d)(?P<acct2>\d{{13}})[ \t\u00a0]+(?P<cat2>{cats})(?![\u4e00-\u9fff]))", text):
+                acct_no = m.group("acct") or m.group("acct2")
+                category = m.group("cat") or m.group("cat2")
                 # 從 acct 後面再 grep 餘額（接著找到下個換行 + 數字 或 USD/TWD pattern）
                 after = text[m.end():m.end() + 200]
                 # 餘額 pattern：純數字、或「USD/TWD 0.00」

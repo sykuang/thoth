@@ -1332,7 +1332,7 @@ function AccountRow({
       assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
       return api(`/portfolio/accounts/${account.bank}/${account.account_no}/excluded`, {
         method: 'PATCH',
-        body: { excluded: next },
+        body: { excluded: next, currency: account.currency },
         skipAuthRetry: true,
       });
     },
@@ -1342,6 +1342,7 @@ function AccountRow({
           cache,
           account.bank,
           account.account_no,
+          account.currency,
           { excluded: next },
         ),
         'optimistic',
@@ -1356,6 +1357,7 @@ function AccountRow({
             cache,
             account.bank,
             account.account_no,
+            account.currency,
             { excluded: context.previous },
           ),
           'rollback',
@@ -1369,6 +1371,7 @@ function AccountRow({
           cache,
           account.bank,
           account.account_no,
+          account.currency,
           { excluded: next },
         ),
         'confirmed',
@@ -1389,7 +1392,7 @@ function AccountRow({
       assertReplicaOwnerEpoch(ownerKey, ownerEpoch);
       return api(`/portfolio/accounts/${account.bank}/${account.account_no}/nickname`, {
         method: 'PATCH',
-        body: { nickname_overwrite: newName },
+        body: { nickname_overwrite: newName, currency: account.currency },
         skipAuthRetry: true,
       });
     },
@@ -1399,6 +1402,7 @@ function AccountRow({
           cache,
           account.bank,
           account.account_no,
+          account.currency,
           { nickname_overwrite: newName },
         ),
         'durable',
@@ -1422,6 +1426,7 @@ function AccountRow({
             bank: account.bank,
             kind: 'twd',
             account_no: account.account_no,
+            currency: account.currency,
             drilldown: String(Date.now()),
           },
         })}

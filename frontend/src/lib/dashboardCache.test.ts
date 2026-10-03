@@ -98,6 +98,8 @@ const malformedFlow: ReplicaEnvelope = {
         amount: -100,
         cashflow_direction: 'expense',
         cashflow_amount: 100,
+        display_amount: 100,
+        balance: null,
         currency: 'TWD',
         consume_currency: null,
         consume_amount: null,
@@ -115,6 +117,89 @@ const malformedFlow: ReplicaEnvelope = {
   },
 };
 equal(projectReplicaDashboard(malformedFlow, [], 'consume'), undefined);
+
+const fractionalTransaction = {
+  ...((malformedFlow.partitions['bank:cathay'] as { transactions: Transaction[] }).transactions[0]),
+  amount: -12.34,
+  cashflow_amount: 12.34,
+  display_amount: 12.34,
+  currency: 'USD',
+  flow_type: null,
+};
+const fractionalEnvelope: ReplicaEnvelope = {
+  ...envelope,
+  partitions: {
+    ...partitions,
+    'bank:cathay': {
+      ...(partitions['bank:cathay'] as Record<string, unknown>),
+      transactions: [fractionalTransaction],
+    },
+  },
+};
+equal(Boolean(projectReplicaDashboard(fractionalEnvelope, [], 'consume')), true);
+equal(projectReplicaDashboard({
+  ...fractionalEnvelope,
+  partitions: {
+    ...fractionalEnvelope.partitions,
+    'bank:cathay': {
+      ...(fractionalEnvelope.partitions['bank:cathay'] as Record<string, unknown>),
+      transactions: [{ ...fractionalTransaction, currency: 'TWD', amount: -0.1234567, cashflow_amount: 0.1234567 }],
+    },
+  },
+}, [], 'consume'), undefined);
+equal(projectReplicaDashboard({
+  ...fractionalEnvelope,
+  partitions: {
+    ...fractionalEnvelope.partitions,
+    'bank:cathay': {
+      ...(fractionalEnvelope.partitions['bank:cathay'] as Record<string, unknown>),
+      transactions: [{ ...fractionalTransaction, amount: -0.1234567, cashflow_amount: 0.1234567 }],
+    },
+  },
+}, [], 'consume'), undefined);
+
+const cathayPartition = partitions['bank:cathay'] as Record<string, unknown>;
+const cathayFacts = cathayPartition.portfolio_facts as Record<string, unknown>;
+function withLatestBalances(latest: unknown[]): ReplicaEnvelope {
+  return {
+    ...envelope,
+    partitions: {
+      ...partitions,
+      'bank:cathay': {
+        ...cathayPartition,
+        portfolio_facts: { ...cathayFacts, latest_account_transaction_balances: latest },
+      },
+    },
+  };
+}
+equal(projectReplicaDashboard(withLatestBalances([
+  { account_no: 'JPY1', balance: 10 },
+]), [], 'consume'), undefined);
+equal(projectReplicaDashboard(withLatestBalances([
+  { account_no: 'USD1', currency: 'USD', balance: 0.1234567 },
+]), [], 'consume'), undefined);
+equal(projectReplicaDashboard(withLatestBalances([
+  { account_no: 'USD1', currency: 'USD', balance: 1e-13 },
+]), [], 'consume'), undefined);
+equal(projectReplicaDashboard(withLatestBalances([
+  { account_no: 'USD1', currency: 'USD', balance: 1 },
+  { account_no: 'USD1', currency: 'USD', balance: 2 },
+]), [], 'consume'), undefined);
+
+const duplicateAccount = {
+  account_no: 'JPY1', currency: 'JPY', product_type: 'fx_deposit',
+  raw_balance: 10, raw_balance_date: '2026-08-10', excluded: false,
+};
+equal(projectReplicaDashboard({
+  ...envelope,
+  partitions: {
+    ...partitions,
+    'bank:cathay': {
+      ...cathayPartition,
+      accounts: [duplicateAccount, { ...duplicateAccount }],
+    },
+  },
+}, [], 'consume'), undefined);
 
 const invalidQuoteTime: ReplicaEnvelope = {
   ...envelope,

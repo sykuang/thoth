@@ -156,6 +156,33 @@ def test_split_rejects_non_positive_amount(client, data_root):
     assert r.status_code == 400
 
 
+def test_fractional_foreign_transaction_rejects_lossy_integer_splits(client, data_root):
+    token = _register(client, email="split-foreign-decimal@p.com")
+    client.post("/accounts", json={"bank": "sinopac", "label": "t"}, headers=_auth(token))
+    _seed_bank_db(
+        data_root, "sinopac",
+        twd=[{
+            "account_no": "USD-1", "datetime": "2026-07-10T12:00:00",
+            "desc": "USD purchase", "expend": 12.34, "currency": "USD",
+        }],
+    )
+    item = client.get(
+        "/transactions?bank=sinopac&kind=twd", headers=_auth(token),
+    ).json()["items"][0]
+
+    response = client.patch(
+        f"/transactions/sinopac/twd/{item['raw']['id']}",
+        json={"splits": [
+            {"amount": 6, "category": "餐飲"},
+            {"amount": 6, "category": "日用品"},
+        ]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert "小數" in response.text
+
+
 @pytest.mark.parametrize(
     ("parent_amount", "splits"),
     [

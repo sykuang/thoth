@@ -39,20 +39,21 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, UTC
-from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.core import account_classify, bank_data
 from backend.core.card_bills import summarize_persisted_card_bills
 from backend.core.card_status import CathayBillStatus, cathay_bill_status
+from backend.core.money import native_money
 from backend.server.deps import current_user
 from backend.server import db, fx_service
 from backend.server.bank_account_projection import (
     bank_accounts as _project_bank_accounts,
     latest_twd_asset_balance,
+    metric_loan_balance_twd,
 )
 from backend.server.dashboard_cache import (
     DEFAULT_DASHBOARD_TTL_SECONDS,
@@ -77,27 +78,31 @@ KNOWN_BANKS = bank_data.KNOWN_BANKS
 
 
 def _to_int(val: Any) -> int | None:
-    """安全把 raw value 轉 int. 支援 '1,234' / '1234.0' / int / None."""
-    if val is None or val == "" or isinstance(val, bool):
-        return None
+    """Validate an optional persisted TWD amount without truncation."""
     try:
-        s = str(val).replace(",", "").strip()
-        if not s or s == "-":
-            return None
-        number = float(s)
-        return int(number) if isfinite(number) else None
-    except (ValueError, TypeError, OverflowError):
+        amount = native_money(val, "TWD", optional=True)
+    except ValueError:
         return None
+    return amount if isinstance(amount, int) else None
+
+
+def _twd(value: Any) -> int:
+    amount = native_money(value, "TWD")
+    assert isinstance(amount, int)
+    return amount
 
 
 def _liability_to_twd(balance: int | float | None, currency: str | None) -> int | None:
     """Canonical liability magnitude converted to TWD; unavailable FX stays unknown."""
-    magnitude = account_classify.normalize_liability_magnitude(balance)
+    normalized_currency = (currency or "TWD").strip().upper()
+    try:
+        magnitude = native_money(balance, normalized_currency, absolute=True)
+    except ValueError:
+        return None
     if magnitude is None:
         return None
-    normalized_currency = (currency or "TWD").upper()
     if normalized_currency == "TWD":
-        return round(magnitude)
+        return int(magnitude)
     try:
         return fx_service.convert_to_twd(magnitude, normalized_currency)
     except Exception:
@@ -124,47 +129,56 @@ def _latest_balance(bank: str, user_id: int) -> tuple[str, int | None] | None:
 
 
 def _latest_loan_balance(bank: str, user_id: int) -> tuple[str, int | None] | None:
-    """銀行貸款餘額：優先讀 balance_history.loan_balance（爬蟲層 sum 過的總額），
-    若該欄位為 NULL 則 fallback sum accounts WHERE product_type IN (loan/mortgage)。
-
-    這條鏈解使用者「所有爬蟲都應該處理好貸款」的鐵律——讓 portfolio 層
-    無論銀行用 balance_history 或 accounts 表存貸款餘額都能讀到。
-
-    Plan B B4: 全 SQL 走 db_facade. Caller 不再傳 con.
-    """
-    # 1. 優先 balance_history.loan_balance
-    lb = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
-    if lb is not None:
-        magnitude = account_classify.normalize_liability_magnitude(lb.loan_balance)
-        return (lb.snapshot_date, int(magnitude) if magnitude is not None else None)
-    # 2. fallback：accounts 有 product_type 為 loan/mortgage 才進 daily_metrics 撈
+    """Return a complete TWD liability total without double-counting TWD accounts."""
+    aggregate = db_api.get_latest_loan_balance(bank=bank, user_id=user_id)
     loan_accts = db_api.list_loan_accounts(bank=bank, user_id=user_id)
+    for account in loan_accts:
+        if account.raw_balance is None:
+            continue
+        try:
+            native_money(account.raw_balance, account.currency or "TWD")
+        except ValueError:
+            return (account.raw_balance_date or "", None)
+    if aggregate is not None:
+        total = account_classify.normalize_liability_magnitude(aggregate.loan_balance)
+        if total is None:
+            return (aggregate.snapshot_date, None)
+        dates: list[str | None] = [aggregate.snapshot_date]
+        for account in loan_accts:
+            if (account.currency or "TWD").upper() == "TWD":
+                continue
+            converted = _liability_to_twd(account.raw_balance, account.currency)
+            if converted is None:
+                return (aggregate.snapshot_date, None)
+            total += converted
+            dates.append(account.raw_balance_date)
+        dated = [date for date in dates if date]
+        return (min(dated) if len(dated) == len(dates) else "", round(total))
     if not loan_accts:
         return None
     account_total = 0
     account_dates: list[str | None] = []
-    account_balances_complete = True
+    complete = True
     for account in loan_accts:
         twd_magnitude = _liability_to_twd(account.raw_balance, account.currency)
         if twd_magnitude is None:
-            account_balances_complete = False
+            complete = False
             break
         account_total += twd_magnitude
         account_dates.append(account.raw_balance_date)
-    if account_balances_complete:
+    if complete:
         dated = [date for date in account_dates if date]
         aggregate_date = min(dated) if len(dated) == len(account_dates) else ""
         return (aggregate_date, account_total)
     latest = _latest_payload(bank, "balance_latest", user_id)
     if not latest:
-        return None
+        return ("", None)
     snapshot_date, payload = latest
-    loan = account_classify.normalize_liability_magnitude(
-        _to_int(payload.get("loan")),
+    loan = metric_loan_balance_twd(
+        payload,
+        (account.currency for account in loan_accts),
     )
-    if loan is None or loan == 0:
-        return None
-    return (snapshot_date, int(loan))
+    return (snapshot_date, loan)
 
 
 def _is_stale(snapshot_iso: str | None) -> bool:
@@ -290,11 +304,12 @@ def _liab_hsbc(payload: list | dict) -> int | None:
     saw_any = False
     for card in payload:
         if not isinstance(card, dict):
-            continue
+            return None
         v = _to_int(card.get("outstanding"))
-        if v is not None:
-            total += v
-            saw_any = True
+        if v is None:
+            return None
+        total += v
+        saw_any = True
     return total if saw_any else None
 
 
@@ -338,7 +353,10 @@ def _included_card_spending_amount(row: Any) -> int:
     legacy JSON or splits that do not reconcile to the parent conservatively
     fall back to the parent amount instead of silently under-counting.
     """
-    parent_amount = abs(_to_int(getattr(row, "amount", None)) or 0)
+    parent_amount_raw = _to_int(getattr(row, "amount", None))
+    if parent_amount_raw is None:
+        raise ValueError("invalid persisted card amount")
+    parent_amount = abs(parent_amount_raw)
     raw = getattr(row, "splits_overwrite", None)
     if not raw:
         return parent_amount
@@ -374,7 +392,10 @@ def _is_card_expense(row: Any) -> bool:
     flow_type = (getattr(row, "flow_type", None) or "").lower()
     if flow_type:
         return flow_type == "expense"
-    return bool(_to_int(getattr(row, "amount", None)) or 0)
+    amount = _to_int(getattr(row, "amount", None))
+    if amount is None:
+        raise ValueError("invalid persisted card amount")
+    return bool(amount)
 
 
 def _pending_belongs_to_month(row: Any, month: str) -> bool:
@@ -501,7 +522,11 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         bank_started = time.perf_counter()
         balance_ms = liab_ms = loan_ms = spending_ms = accounts_ms = 0.0
         section_started = time.perf_counter()
-        balance_info = _latest_balance(bank, user_id)
+        try:
+            balance_info = _latest_balance(bank, user_id)
+        except ValueError:
+            skipped.append(bank)
+            continue
         balance_ms = (time.perf_counter() - section_started) * 1000
         assets: int | None = None
         assets_date: str | None = None
@@ -527,6 +552,9 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
             )
         except db.OperationalError:
             canonical_card = None  # legacy pre-card-fact SQLite schema
+        except ValueError:
+            skipped.append(bank)
+            continue
         if canonical_card is not None:
             liab_snapshot_date, card_unpaid = canonical_card
         else:
@@ -542,16 +570,22 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         # 貸款餘額（信貸/房貸）— 使用者鐵律：所有爬蟲都要處理
         loan_balance: int | None = None
         loan_snapshot_date: str | None = None
+        loan_incomplete = False
         section_started = time.perf_counter()
         loan_info = _latest_loan_balance(bank, user_id)
         loan_ms = (time.perf_counter() - section_started) * 1000
         if loan_info is not None:
             loan_snapshot_date, loan_val = loan_info
             loan_balance = loan_val if loan_val is not None else None
+            loan_incomplete = loan_val is None
 
         # 本月消費 (資訊性) = pending + billed 本月 consume_date sum
         section_started = time.perf_counter()
-        month_spending = _bank_current_month_spending(bank, user_id)
+        try:
+            month_spending = _bank_current_month_spending(bank, user_id)
+        except ValueError:
+            skipped.append(bank)
+            continue
         spending_ms = (time.perf_counter() - section_started) * 1000
 
         # 外幣帳戶 TWD 估值 sum (per-bank, 給總資產 with_fx 用)
@@ -561,6 +595,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         bank_fx_twd = 0
         twd_excluded_deduct = 0    # 台幣存款 excluded → 從 assets 扣
         loan_excluded_deduct = 0   # 貸款 excluded → 從 loan_balance 扣
+        account_projection_incomplete = False
         try:
             section_started = time.perf_counter()
             bank_accounts = _bank_accounts(bank, user_id)
@@ -570,15 +605,20 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
                 ptype = (acc.product_type or "").lower()
                 # 負債帳戶永遠不進 FX 資產；excluded 才從負債 aggregate 扣除。
                 if account_classify.is_liability_type(ptype):
-                    if acc.excluded and acc.balance is not None:
-                        excluded_twd = _liability_to_twd(acc.balance, acc.currency)
-                        if excluded_twd is not None:
-                            loan_excluded_deduct += excluded_twd
+                    if acc.excluded:
+                        if acc.balance is None:
+                            loan_incomplete = True
+                        else:
+                            excluded_twd = _liability_to_twd(acc.balance, acc.currency)
+                            if excluded_twd is None:
+                                loan_incomplete = True
+                            else:
+                                loan_excluded_deduct = _twd(loan_excluded_deduct + excluded_twd)
                     continue
                 if cur == "TWD":
                     # 台幣存款 excluded (非貸款) → 從 assets 扣
                     if acc.excluded and acc.balance is not None:
-                        twd_excluded_deduct += round(acc.balance)
+                        twd_excluded_deduct = _twd(twd_excluded_deduct + round(acc.balance))
                     continue
                 if acc.excluded:
                     continue
@@ -586,37 +626,37 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
                     continue
                 est = convert_to_twd(acc.balance, acc.currency)
                 if est is not None:
-                    bank_fx_twd += est
+                    bank_fx_twd = _twd(bank_fx_twd + est)
         except Exception:
-            # fx_service / sqlite 錯不要 break 整個 summary
-            pass
+            account_projection_incomplete = True
         bank_ms = (time.perf_counter() - bank_started) * 1000
         perf_log.info(
             "event=portfolio.summary section=bank user_id=%s bank=%s duration_ms=%.1f balance_ms=%.1f liab_ms=%.1f loan_ms=%.1f spending_ms=%.1f accounts_ms=%.1f",
             user_id, bank, bank_ms, balance_ms, liab_ms, loan_ms, spending_ms, accounts_ms,
         )
 
-        # 若銀行什麼資料都沒, skip
-        if (assets is None and card_unpaid is None
+        # A known but incomplete liability must fail the whole bank closed;
+        # otherwise assets would publish with silently understated net worth.
+        if account_projection_incomplete or loan_incomplete or (assets is None and card_unpaid is None
                 and loan_balance is None and month_spending == 0
                 and bank_fx_twd == 0):
             skipped.append(bank)
             continue
 
         bank_assets = (assets or 0) - twd_excluded_deduct
-        bank_assets = max(bank_assets, 0)     # 防 deduct 超過 (理論上不會, 保險夾)
+        bank_assets = _twd(max(bank_assets, 0))
         bank_card_unpaid = card_unpaid or 0
         # Phase 6 (excluded): 貸款 excluded → 從 loan_balance 扣
         # 同 assets 邏輯, deduct 後夾在 0 之上防超量
         bank_loan = (loan_balance or 0) - loan_excluded_deduct
-        bank_loan = max(bank_loan, 0)
-        bank_liab = bank_card_unpaid + bank_loan
-        total_assets += bank_assets
-        fx_assets_twd += bank_fx_twd
-        total_card_unpaid += bank_card_unpaid
-        total_loan += bank_loan
-        total_liabilities += bank_liab
-        total_current_month += month_spending
+        bank_loan = _twd(max(bank_loan, 0))
+        bank_liab = _twd(bank_card_unpaid + bank_loan)
+        total_assets = _twd(total_assets + bank_assets)
+        fx_assets_twd = _twd(fx_assets_twd + bank_fx_twd)
+        total_card_unpaid = _twd(total_card_unpaid + bank_card_unpaid)
+        total_loan = _twd(total_loan + bank_loan)
+        total_liabilities = _twd(total_liabilities + bank_liab)
+        total_current_month = _twd(total_current_month + month_spending)
 
         # 取較新的 snapshot date 當該 bank 的 as_of
         bank_dates = [d for d in (assets_date, liab_snapshot_date,
@@ -647,13 +687,17 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
                 continue
             try:
                 estimate = convert_to_twd(amount, currency)
+            except ValueError:
+                raise
             except Exception:
                 continue
             if estimate is not None:
-                brokerage_assets_twd += estimate
+                brokerage_assets_twd = _twd(brokerage_assets_twd + estimate)
         brokerage_as_of = _normalize_iso_date(brokerage_snapshot.get("last_synced_at"))
         if brokerage_as_of and (overall_latest is None or brokerage_as_of > overall_latest):
             overall_latest = brokerage_as_of
+    except ValueError:
+        raise
     except Exception:
         # 券商快照 / FX 失敗不應遮蔽既有銀行 summary。
         pass
@@ -668,6 +712,8 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
             continue
         try:
             estimate = fx_service.convert_to_twd(account.balance, account.currency)
+        except ValueError:
+            raise
         except Exception:
             skipped.append(account.id)
             continue
@@ -677,22 +723,24 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         product_type = account.product_type
         if account_classify.is_liability_type(product_type):
             magnitude = abs(estimate)
-            total_liabilities += magnitude
-            total_loan += magnitude
-            manual_liabilities_twd += magnitude
+            total_liabilities = _twd(total_liabilities + magnitude)
+            total_loan = _twd(total_loan + magnitude)
+            manual_liabilities_twd = _twd(manual_liabilities_twd + magnitude)
         elif (
             product_type == account_classify.ProductType.INVESTMENT
             or account_classify.is_asset_type(product_type)
         ):
             value = max(estimate, 0)
-            manual_assets_twd += value
+            manual_assets_twd = _twd(manual_assets_twd + value)
         manual_as_of = _normalize_iso_date(account.as_of)
         if manual_as_of and (overall_latest is None or manual_as_of > overall_latest):
             overall_latest = manual_as_of
 
-    total_assets_with_fx = (
+    total_assets_with_fx = _twd(
         total_assets + fx_assets_twd + brokerage_assets_twd + manual_assets_twd
     )
+    net_worth = _twd(total_assets - total_liabilities)
+    net_worth_with_fx = _twd(total_assets_with_fx - total_liabilities)
     total_ms = (time.perf_counter() - total_started) * 1000
     perf_log.info(
         "event=portfolio.summary section=total user_id=%s duration_ms=%.1f banks=%s skipped=%s",
@@ -709,8 +757,8 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         "total_card_unpaid": total_card_unpaid,             # frontend 拆分用
         "total_loan": total_loan,                           # frontend 拆分用
         "current_month_spending": total_current_month,
-        "net_worth": total_assets - total_liabilities,                   # TWD only
-        "net_worth_with_fx": total_assets_with_fx - total_liabilities,   # 含外幣與券商估值
+        "net_worth": net_worth,
+        "net_worth_with_fx": net_worth_with_fx,
         "as_of": overall_latest,
         "by_bank": sorted(by_bank, key=lambda b: -((b["assets"] or 0) + (b.get("fx_assets_twd") or 0))),
         "skipped": skipped,
@@ -788,7 +836,10 @@ def portfolio_accounts(user: dict = Depends(current_user)) -> list[BankAccountBa
     """
     result: list[BankAccountBalance] = []
     for bank in KNOWN_BANKS:
-        result.extend(_bank_accounts(bank, user["id"]))
+        try:
+            result.extend(_bank_accounts(bank, user["id"]))
+        except ValueError:
+            continue
     return result
 
 
@@ -798,11 +849,13 @@ def portfolio_accounts(user: dict = Depends(current_user)) -> list[BankAccountBa
 
 class AccountExcludedPayload(BaseModel):
     excluded: bool
+    currency: str = Field(default="TWD", pattern=r"^[A-Z]{3}$")
 
 
 # Phase 8.2 C (2026-06-14): user 覆寫帳戶暱稱
 class AccountNicknamePayload(BaseModel):
     nickname_overwrite: str | None  # None / "" → 清空 (恢復顯示 bank API nickname)
+    currency: str = Field(default="TWD", pattern=r"^[A-Z]{3}$")
 
 
 @router.patch("/accounts/{bank}/{account_no}/nickname")
@@ -831,6 +884,7 @@ def patch_account_nickname(
             result = tx.set_account_nickname(
                 user_id=user["id"],
                 account_no=account_no,
+                currency=payload.currency,
                 nickname_overwrite=payload.nickname_overwrite,
             )
     except BankNotAvailable as e:
@@ -868,6 +922,7 @@ def patch_account_excluded(
             result = tx.set_account_excluded(
                 user_id=user["id"],
                 account_no=account_no,
+                currency=payload.currency,
                 excluded=payload.excluded,
             )
     except BankNotAvailable as e:
@@ -882,8 +937,8 @@ def patch_account_excluded(
     return result.model_dump()
 
 
-def get_excluded_account_nos(user_id: int) -> dict[str, set[str]]:
-    """掃所有銀行 db, 回 {bank: set(excluded account_no)} — limit 本 user.
+def get_excluded_account_nos(user_id: int) -> dict[str, set[tuple[str, str]]]:
+    """掃所有銀行 db, 回 {bank: set((account_no, currency))} — limit 本 user.
 
     給 transactions stats 用 (跳過 excluded 帳戶的 txn).
     沒 accounts 表 / 沒 excluded 欄 / 全空 都安全 fallback 空 dict.

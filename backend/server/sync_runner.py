@@ -717,6 +717,10 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
             "twd_transactions", store.latest_twd_transaction_dates(),
         )
         crawler.configure_transaction_cursor(
+            "account_transactions",
+            getattr(store, "latest_account_transaction_dates", lambda: {})(),
+        )
+        crawler.configure_transaction_cursor(
             "card_billed_transactions", store.latest_card_transaction_dates(),
         )
         result = crawler.run(login_url=login_url, headless=headless)

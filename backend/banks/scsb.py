@@ -535,10 +535,14 @@ class ScsbCrawler(BankCrawler):
         # 從各頁 innerText regex 抽帳號/餘額/卡號
         all_text = "\n".join([out.get("overview_text", ""), out.get("twd_text", ""), out.get("card_text", "")])
         out["accounts"] = self._extract_accounts(all_text)
-        parsed_account_numbers = {account["account_no"] for account in out["accounts"]}
+        parsed_account_identities = {
+            (account["account_no"], account.get("currency") or "TWD")
+            for account in out["accounts"]
+        }
         out["accounts"].extend(
             account for account in overview_twd_inventory
-            if account["account_no"] not in parsed_account_numbers
+            if (account["account_no"], account.get("currency") or "TWD")
+            not in parsed_account_identities
         )
         out["totals"] = self._extract_totals(all_text)
         for raw_text_key in ("overview_text", "twd_text", "card_text"):
@@ -581,19 +585,20 @@ class ScsbCrawler(BankCrawler):
         header_pattern = re.compile(rf"(?P<type>{header_alt})")
 
         accounts = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for m in acct_pattern.finditer(text):
             acct_no = m.group("acct")
-            if acct_no in seen:
+            cur = m.group("cur").replace("NT$", "TWD")
+            identity = (acct_no, cur)
+            if identity in seen:
                 continue
-            seen.add(acct_no)
+            seen.add(identity)
             prefix = text[max(0, m.start() - 180):m.start()]
             candidates = [h for h in header_pattern.finditer(prefix)]
             if not candidates:
                 type_header = None
             else:
                 type_header = candidates[-1].group("type")
-            cur = m.group("cur").replace("NT$", "TWD")
             bal = m.group("bal").replace(",", "")
             accounts.append({
                 "account_no": acct_no,

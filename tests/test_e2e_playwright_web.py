@@ -88,7 +88,7 @@ def servers():
         fe_env["BROWSER"] = "none"  # 不要 expo 開 browser
 
         frontend = subprocess.Popen(
-            ["pnpm", "exec", "expo", "start", "--web", "--port", str(FRONTEND_PORT)],
+            [f"{PROJECT_ROOT}/frontend/node_modules/.bin/expo", "start", "--clear", "--web", "--port", str(FRONTEND_PORT)],
             cwd=f"{PROJECT_ROOT}/frontend",
             env=fe_env,
             stdout=subprocess.DEVNULL,
@@ -157,13 +157,9 @@ def test_register_and_redirect_to_dashboard(servers, browser):
         page.wait_for_selector("input", timeout=10_000)
 
         # 切到 register mode
-        register_btn = page.locator("text=/register|註冊|sign up/i").first
-        if register_btn.count() > 0:
-            try:
-                register_btn.click(timeout=2000)
-                page.wait_for_timeout(500)  # 等 state 更新
-            except Exception:
-                pass
+        register_btn = page.get_by_text("還沒有帳號? 立即註冊", exact=True)
+        register_btn.click(timeout=2000)
+        page.get_by_text("建立新帳號", exact=True).first.wait_for(timeout=5000)
 
         # 重新 wait inputs（state 切換可能 unmount/remount）
         page.wait_for_selector("input", timeout=5_000)
@@ -178,7 +174,7 @@ def test_register_and_redirect_to_dashboard(servers, browser):
         inputs[0].fill(email)
         inputs[1].fill(password)
 
-        submit = page.locator("text=/submit|login|register|登入|註冊/i").last
+        submit = page.get_by_text("註冊", exact=True)
         submit.click()
 
         page.wait_for_timeout(3000)
@@ -211,19 +207,15 @@ def test_browser_actually_hits_backend(servers, browser):
     try:
         page.goto(servers["frontend_url"] + "/login", wait_until="networkidle", timeout=30_000)
         page.wait_for_selector("input", timeout=10_000)
-        register_btn = page.locator("text=/register|註冊|sign up/i").first
-        if register_btn.count() > 0:
-            try:
-                register_btn.click(timeout=2000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
+        register_btn = page.get_by_text("還沒有帳號? 立即註冊", exact=True)
+        register_btn.click(timeout=2000)
+        page.get_by_text("建立新帳號", exact=True).first.wait_for(timeout=5000)
         page.wait_for_selector("input", timeout=5_000)
         inputs = page.locator("input").all()
         unique = int(time.time() * 1000)
         inputs[0].fill(f"netcheck-{unique}@palace.example")
-        inputs[1].fill("playwright-pw")
-        page.locator("text=/submit|login|register|登入|註冊/i").last.click()
+        inputs[1].fill("SyntheticTestPassword04!")
+        page.get_by_text("註冊", exact=True).click()
         page.wait_for_timeout(3000)
 
         register_posts = [

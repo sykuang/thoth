@@ -109,6 +109,20 @@ def _sinopac_card_bill_fact(out: dict):
     )
 
 
+def _sinopac_hidden_changed_reason(state: dict) -> str:
+    if state.get("hiddenChangedFullTransactionRows", 0) > 0:
+        return "empty-hidden-full-transaction"
+    if state.get("hiddenChangedDateRows", 0) > 0:
+        return "empty-hidden-date-cell"
+    if state.get("hiddenChangedNumericRows", 0) > 0:
+        return "empty-hidden-numeric-cell"
+    if state.get("hiddenChangedControlRows", 0) > 0:
+        return "empty-hidden-control"
+    if state.get("hiddenChangedHeaderRows") == state.get("hiddenChangedRows"):
+        return "empty-hidden-header"
+    return "empty-hidden-template-text"
+
+
 class SinopacCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
     SAFE_COLLECT_GUARDS = frozenset({
@@ -130,6 +144,33 @@ class SinopacCrawler(BankCrawler):
         "sinopac-twd-history-response",
         "sinopac-twd-history-response-cardinality",
         "sinopac-twd-history-result-table",
+        "sinopac-twd-history-result-table-binding",
+        "sinopac-twd-history-result-table-empty-marker",
+        "sinopac-twd-history-result-table-empty-multiple-visible-rows",
+        "sinopac-twd-history-result-table-empty-no-row",
+        "sinopac-twd-history-result-table-empty-binding",
+        "sinopac-twd-history-result-table-empty-extra-hidden-rows",
+        "sinopac-twd-history-result-table-empty-hidden-data",
+        "sinopac-twd-history-result-table-empty-hidden-header",
+        "sinopac-twd-history-result-table-empty-hidden-template-text",
+        "sinopac-twd-history-result-table-empty-hidden-transaction",
+        "sinopac-twd-history-result-table-empty-hidden-full-transaction",
+        "sinopac-twd-history-result-table-empty-hidden-date-cell",
+        "sinopac-twd-history-result-table-empty-hidden-numeric-cell",
+        "sinopac-twd-history-result-table-empty-hidden-control",
+        "sinopac-twd-history-result-table-empty-row-count",
+        "sinopac-twd-history-result-table-empty-row-visibility",
+        "sinopac-twd-history-result-table-empty-signature",
+        "sinopac-twd-history-result-table-error",
+        "sinopac-twd-history-result-table-mutation-range",
+        "sinopac-twd-history-result-table-mutation-shape",
+        "sinopac-twd-history-result-table-nonempty-attestation",
+        "sinopac-twd-history-result-table-nonempty-binding",
+        "sinopac-twd-history-result-table-pager",
+        "sinopac-twd-history-result-table-shape",
+        "sinopac-twd-history-result-table-table-count",
+        "sinopac-twd-history-result-table-table-visibility",
+        "sinopac-twd-history-result-table-unknown",
         "sinopac-twd-history-row",
         "sinopac-twd-history-row-budget",
     })
@@ -139,7 +180,7 @@ class SinopacCrawler(BankCrawler):
     LOGIN_FAILED = "login_failed"
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({
-        "twd_transactions",
+        "account_transactions",
     })
 
     _TWD_INVENTORY_PATH = "/ws/bank/transdetail/ws_debitacct.ashx"
@@ -178,7 +219,8 @@ class SinopacCrawler(BankCrawler):
                 )
                 or "mmalogin.aspx" in path
                 or not path.startswith(
-                    ("/mymma/", "/myasset/", "/mma_", "/mma/mymma/")
+                    ("/mymma/", "/myasset/", "/mma_", "/mma/mymma/",
+                     "/mma/bank/easy_index_loan/")
                 )
             ):
                 return False
@@ -529,11 +571,15 @@ class SinopacCrawler(BankCrawler):
             cursor = window_end + timedelta(days=1)
         return windows
 
+    @staticmethod
+    def _history_identity(identity: str, currency: str) -> str:
+        return identity if currency == "TWD" else f"{identity}:{currency}"
+
     def _history_range(
         self, identity: str, *, end: date, mode: str,
     ) -> tuple[date, date]:
         floor = self._history_floor(end)
-        cursor = self.transaction_cursors.get("twd_transactions", {}).get(identity)
+        cursor = self.transaction_cursors.get("account_transactions", {}).get(identity)
         if isinstance(cursor, date) and cursor > end:
             raise RuntimeError("sinopac-twd-history-cursor")
         if mode == "full":
@@ -600,9 +646,7 @@ class SinopacCrawler(BankCrawler):
             dates = {key: cls._yyyymmdd(form[key][0], error) for key in date_keys}
             if (
                 dates["BusinessDate"] != dates["EndDate"]
-                or dates["StartDate"].day != 1
-                or dates["StartDate"].replace(day=1)
-                != dates["EndDate"].replace(day=1)
+                or not 0 <= (dates["EndDate"] - dates["StartDate"]).days <= 31
             ):
                 raise RuntimeError(error)
         payload = hit.resp_json if hit else None
@@ -628,8 +672,7 @@ class SinopacCrawler(BankCrawler):
         ):
             raise RuntimeError("sinopac-twd-history-inventory-envelope")
         inventory = []
-        seen_labels: set[str] = set()
-        seen_identities: set[str] = set()
+        seen_accounts: set[tuple[str, str, str]] = set()
         for row in rows:
             if not isinstance(row, dict) or set(row) != {"DataText", "DataValue", "DisplayText"}:
                 raise RuntimeError("sinopac-twd-history-inventory-row")
@@ -639,12 +682,13 @@ class SinopacCrawler(BankCrawler):
             if (
                 not isinstance(label, str) or not label or label != label.strip()
                 or not isinstance(identity, str) or re.fullmatch(r"\d{14}", identity) is None
-                or currency != "TWD"
-                or label in seen_labels or identity in seen_identities
+                or not isinstance(currency, str) or re.fullmatch(r"[A-Z]{3}", currency) is None
             ):
                 raise RuntimeError("sinopac-twd-history-inventory-identity")
-            seen_labels.add(label)
-            seen_identities.add(identity)
+            account = (label, identity, currency)
+            if account in seen_accounts:
+                raise RuntimeError("sinopac-twd-history-inventory-identity")
+            seen_accounts.add(account)
             inventory.append({"label": label, "identity": identity, "currency": currency})
         return inventory
 
@@ -662,18 +706,23 @@ class SinopacCrawler(BankCrawler):
         if not isinstance(value, str):
             raise RuntimeError(error)
         text = re.sub(r"<[^>]*>", "", value).strip()
-        if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", text) is None:
+        if re.fullmatch(
+            r"[+-]?(?:(?:0|[1-9]\d*)(?:\.\d{1,6})?|[1-9]\d{0,2}(?:,\d{3})+(?:\.\d{1,6})?)",
+            text,
+        ) is None:
             raise RuntimeError(error)
         try:
             amount = Decimal(text.replace(",", ""))
         except InvalidOperation:
             raise RuntimeError(error) from None
-        if not amount.is_finite() or amount != amount.to_integral_value() or abs(amount) > Decimal("2147483647"):
+        if not amount.is_finite() or abs(amount) > Decimal("2147483647"):
             raise RuntimeError(error)
         return amount
 
     @classmethod
-    def _validate_history_row(cls, row, *, start: date, end: date) -> None:
+    def _validate_history_row(
+        cls, row, *, currency: str, start: date, end: date,
+    ) -> None:
         error = "sinopac-twd-history-row"
         if not isinstance(row, dict) or set(row) != cls._HISTORY_ROW_KEYS:
             raise RuntimeError(error)
@@ -697,8 +746,12 @@ class SinopacCrawler(BankCrawler):
         description = _plain_text(row["DataText3"])
         if not description or len(description) > 500:
             raise RuntimeError(error)
-        cls._history_amount(row["DataText4"], error)
-        cls._history_amount(row["DataText5"], error)
+        amount = cls._history_amount(row["DataText4"], error)
+        balance = cls._history_amount(row["DataText5"], error)
+        if currency == "TWD" and any(
+            value != value.to_integral_value() for value in (amount, balance)
+        ):
+            raise RuntimeError(error)
         if any(len(row[f"DataText{i}"]) > 2_000 for i in range(6, 12)):
             raise RuntimeError(error)
 
@@ -735,7 +788,7 @@ class SinopacCrawler(BankCrawler):
             or params.get("BusinessDate") != [business_date]
             or not isinstance(body, dict)
             or set(body) != cls._HISTORY_RESPONSE_KEYS
-            or body.get("Header") != "SUCCESS"
+            or body.get("Header") not in {"SUCCESS", "FAIL"}
             or body.get("MaxMonth") != "3"
         ):
             raise RuntimeError(error)
@@ -748,11 +801,35 @@ class SinopacCrawler(BankCrawler):
             parsed_business_date > as_of
             or begin > start
             or response_end < end
-            or not begin <= default_begin <= default_end <= response_end
+            or not default_begin <= default_end <= as_of
             or body.get("isOBU") not in (None, "Y", "N")
         ):
             raise RuntimeError(error)
         head_info = body.get("HeadInfo")
+        rows = body.get("SubInfo")
+        if not isinstance(rows, list) or len(rows) > 10_000:
+            raise RuntimeError(error)
+        if body["Header"] == "FAIL":
+            if (
+                rows
+                or body.get("Message") != "查無資料"
+                or body.get("RecordCount") is not None
+                or head_info is not None
+            ):
+                raise RuntimeError(error)
+            return {
+                "records": [], "status": "explicit_empty", "rows": 0,
+                "display_fields": [],
+            }
+        empty = not rows
+        if empty:
+            if body.get("Message") != "查無資料" or body.get("RecordCount") is not None:
+                raise RuntimeError(error)
+            if head_info in (None, []):
+                return {
+                    "records": [], "status": "explicit_empty", "rows": 0,
+                    "display_fields": [],
+                }
         if (
             not isinstance(head_info, list)
             or len(head_info) != 9
@@ -762,46 +839,69 @@ class SinopacCrawler(BankCrawler):
                 "HeadText", "MainShow", "OrderIndex",
             } for item in head_info)
             or any(not all(isinstance(value, str) for value in item.values()) for item in head_info)
-            or [item.get("FieldKey") for item in head_info] != [
+            or {item.get("FieldKey") for item in head_info} != {
                 f"DataText{i}" for i in range(1, 10)
-            ]
+            }
         ):
             raise RuntimeError(error)
         orders = [item["OrderIndex"] for item in head_info]
-        if orders not in (
-            [str(i) for i in range(9)],
-            [str(i) for i in range(1, 10)],
+        if any(not order.isdigit() or len(order) > 2 for order in orders):
+            raise RuntimeError(error)
+        numeric_orders = [int(order) for order in orders]
+        if (
+            not 0 <= min(numeric_orders) <= max(numeric_orders) <= 9
+            or len(set(numeric_orders)) <= 1
+            or numeric_orders != sorted(numeric_orders)
         ):
             raise RuntimeError(error)
         for item in head_info:
             if (
-                item["DataAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
-                or item["HeadAlign"].lower() not in {"", "l", "r", "c", "left", "right", "center"}
+                item["DataAlign"].lower() not in {"", "2", "3", "l", "r", "c", "left", "right", "center"}
+                or item["HeadAlign"].lower() not in {"", "2", "3", "l", "r", "c", "left", "right", "center"}
                 or item["MainShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
                 or item["DetailShow"].lower() not in {"", "0", "1", "y", "n", "true", "false"}
                 or not item["FieldWidth"].isdigit()
                 or not 0 <= int(item["FieldWidth"]) <= 1000
                 or not item["HeadText"].strip()
-                or len(item["HeadText"]) > 50
+                or len(item["HeadText"]) > 100
             ):
                 raise RuntimeError(error)
-        rows = body.get("SubInfo")
-        if not isinstance(rows, list) or len(rows) > 10_000:
+        display_fields = [
+            item["FieldKey"] for item in head_info
+            if (
+                item["MainShow"].lower() in {"1", "y", "true"}
+                or item["DetailShow"].lower() in {"1", "y", "true"}
+            )
+        ]
+        if not display_fields:
             raise RuntimeError(error)
-        if not rows:
-            if body.get("Message") != "查無資料" or body.get("RecordCount") is not None:
-                raise RuntimeError(error)
-            return {"records": [], "status": "explicit_empty", "rows": 0}
-        if body.get("Message") not in (None, "") or body.get("RecordCount") != "0":
+        if empty:
+            return {
+                "records": [], "status": "explicit_empty", "rows": 0,
+                "display_fields": display_fields,
+            }
+        record_count = body.get("RecordCount")
+        if (
+            body.get("Message") not in (None, "")
+            or not isinstance(record_count, str)
+            or not record_count.isdigit()
+            or len(record_count) > 5
+            or int(record_count) + 1 != len(rows)
+        ):
             raise RuntimeError(error)
         seen_rows = set()
         for row in rows:
-            cls._validate_history_row(row, start=start, end=end)
+            cls._validate_history_row(
+                row, currency=currency, start=start, end=end,
+            )
             fingerprint = tuple(row[f"DataText{i}"] for i in range(1, 12))
             if fingerprint in seen_rows:
                 raise RuntimeError(error)
             seen_rows.add(fingerprint)
-        return {"records": rows, "status": "complete", "rows": len(rows)}
+        return {
+            "records": rows, "status": "complete", "rows": len(rows),
+            "display_fields": display_fields,
+        }
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """登入後抓帳戶餘額 / 貸款明細 / 信用卡彙總與帳單 / 全卡片 / 資產分析。
@@ -836,11 +936,11 @@ class SinopacCrawler(BankCrawler):
         # === 貸款明細：每個貸款帳號查本金餘額 / 利率 / 到期日 ===
         out["loan"] = self._collect_loans(page, collector)
 
-        # === 台幣交易明細：權威帳戶 inventory + 月窗 coverage ===
-        twd_history = self._collect_transactions(page, collector)
-        out["twd_transactions"] = twd_history["results"]
-        out["debit_accounts"] = twd_history["inventory"]
-        out["history_coverage"] = twd_history["coverage"]
+        # === 全幣別帳戶交易明細：權威 inventory + 月窗 coverage ===
+        account_history = self._collect_transactions(page, collector)
+        out["account_transactions"] = account_history["results"]
+        out["debit_accounts"] = account_history["inventory"]
+        out["history_coverage"] = account_history["coverage"]
 
         # === 信用卡明細：帳單已請款（StatementInquiry HTML）+ 未請款（UnbilledTxInquiry API）===
         out["card_statements"] = self._collect_card_statements(page)
@@ -932,6 +1032,29 @@ class SinopacCrawler(BankCrawler):
             })
         return {"details": details, "fetch_ok": True}
 
+    @staticmethod
+    def _validated_twd_handlers(
+        handlers: object, inventory: list[dict],
+    ) -> list[tuple[int, tuple[str, str, str]]]:
+        if not isinstance(handlers, list):
+            raise RuntimeError("sinopac-twd-history-account-control")
+        pattern = re.compile(
+            r"^setDebitAccount\('([^'\r\n]*)',\s*'(\d{14})',\s*'([A-Z]{3})'\)\s*;?$"
+        )
+        parsed = []
+        for position, handler in enumerate(handlers):
+            match = pattern.fullmatch(handler) if isinstance(handler, str) else None
+            if match is None:
+                raise RuntimeError("sinopac-twd-history-account-control")
+            parsed.append((position, match.groups()))
+        expected = [
+            (item["label"], item["identity"], item["currency"])
+            for item in inventory
+        ]
+        if [groups for _, groups in parsed] != expected:
+            raise RuntimeError("sinopac-twd-history-account-control")
+        return parsed
+
     def _collect_transactions(self, page, collector: ResponseCollector) -> dict:
         """Collect every authoritative TWD account across complete month windows."""
         deadline = time.monotonic() + 600
@@ -974,17 +1097,7 @@ class SinopacCrawler(BankCrawler):
             """() => [...document.querySelectorAll('#divDebitAccount [onclick]')]
               .map(e => e.getAttribute('onclick') || '')"""
         )
-        if not isinstance(handlers, list) or len(handlers) != len(inventory):
-            raise RuntimeError("sinopac-twd-history-account-control")
-        pattern = re.compile(
-            r"^setDebitAccount\('([^'\r\n]*)',\s*'(\d{14})',\s*'([A-Z]{3})'\)\s*;?$"
-        )
-        for handler, item in zip(handlers, inventory, strict=True):
-            match = pattern.fullmatch(handler) if isinstance(handler, str) else None
-            if match is None or match.groups() != (
-                item["label"], item["identity"], item["currency"],
-            ):
-                raise RuntimeError("sinopac-twd-history-account-control")
+        twd_handlers = self._validated_twd_handlers(handlers, inventory)
 
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
         if mode not in {"full", "incremental"}:
@@ -1002,11 +1115,15 @@ class SinopacCrawler(BankCrawler):
             toggle.nth(0).click(timeout=8_000)
             page.wait_for_timeout(300)
             options = page.locator("#divDebitAccount [onclick]")
-            visible = [
-                options.nth(i) for i in range(options.count()) if options.nth(i).is_visible()
-            ]
-            if len(visible) != len(inventory):
+            visible_by_position = {
+                position: options.nth(position)
+                for position in range(options.count())
+                if options.nth(position).is_visible()
+            }
+            positions = [position for position, _ in twd_handlers]
+            if any(position not in visible_by_position for position in positions):
                 raise RuntimeError("sinopac-twd-history-account-control")
+            visible = [visible_by_position[position] for position in positions]
             visible[index].click(timeout=8_000)
             page.wait_for_timeout(300)
             selected = page.evaluate(
@@ -1024,12 +1141,14 @@ class SinopacCrawler(BankCrawler):
             ):
                 raise RuntimeError("sinopac-twd-history-account-control")
 
-            start, end = self._history_range(item["identity"], end=as_of, mode=mode)
+            history_identity = self._history_identity(item["identity"], item["currency"])
+            start, end = self._history_range(history_identity, end=as_of, mode=mode)
             expected.append({
-                "identity": item["identity"],
+                "identity": history_identity,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
             })
+            prior_dom_rows: list[list[object]] = []
             for window_start, window_end in self._history_windows(start, end):
                 ensure_deadline()
                 start_control = page.locator("#StartDate")
@@ -1055,9 +1174,24 @@ class SinopacCrawler(BankCrawler):
                 pre_dom_marker = page.evaluate(
                     """() => { window.__hermesSinopacObserver?.disconnect();
                       clearTimeout(window.__hermesSinopacObserverTimer);
-                      const isEmpty=e => e?.nodeType===1 && e.children.length===0 && (e.textContent||'').trim()==='查無資料';
+                      const width=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'offsetWidth').get;
+                      const height=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'offsetHeight').get;
+                      const rects=Element.prototype.getClientRects;
+                      const visible=e => {const boxed=e instanceof HTMLElement
+                        ? width.call(e)||height.call(e)||rects.call(e).length : rects.call(e).length;
+                        if(!boxed)return false;
+                        for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);
+                          if(n.hidden||n.inert||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||
+                            s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0)return false;}
+                        return true;};
+                      const isEmpty=e => e?.nodeType===1 && !!e.closest?.('#ListingTable') &&
+                        e.children.length===0 && (e.textContent||'').trim()==='查無資料';
                       const stale=new WeakSet([...document.querySelectorAll('body *')].filter(isEmpty));
-                      const state={mutations:0,freshEmpty:false}; window.__hermesSinopacState=state;
+                      const table=document.querySelector('#ListingTable');
+                      if(!table)return null;
+                      const staleHiddenRows=new WeakMap();
+                      for(const row of table.querySelectorAll('tbody tr')) if(!visible(row)) staleHiddenRows.set(row,row.innerHTML);
+                      const state={mutations:0,freshEmptyNodes:new WeakSet(),staleHiddenRows}; window.__hermesSinopacState=state;
                       window.__hermesSinopacObserver=new MutationObserver(records => {
                         state.mutations+=records.length;
                         for(const record of records){
@@ -1067,19 +1201,19 @@ class SinopacCrawler(BankCrawler):
                           for(const node of nodes){
                             if(node.nodeType!==1)continue;
                             const candidates=[node,...node.querySelectorAll('*')];
-                            if(candidates.some(e => isEmpty(e) &&
-                              (record.type==='characterData' || !stale.has(e)))) state.freshEmpty=true;
+                            for(const e of candidates) if(isEmpty(e) &&
+                              (record.type==='characterData' || !stale.has(e))) state.freshEmptyNodes.add(e);
                           }
                         }
                       });
                       window.__hermesSinopacObserver.observe(document.body,{subtree:true,childList:true,attributes:true,characterData:true});
                       window.__hermesSinopacObserverTimer=setTimeout(() => {
                         window.__hermesSinopacObserver?.disconnect();
+                        delete window.__hermesSinopacObserverTimer;
                         delete window.__hermesSinopacObserver; delete window.__hermesSinopacState;
-                        delete window.__hermesSinopacExpectedRows;
+                        delete window.__hermesSinopacExpectedRows; delete window.__hermesSinopacPriorRows;
                       },35000);
-                      const table=document.querySelector('#ListingTable');
-                      if(!table)return null; const value=table.innerHTML; let hash=2166136261;
+                      const value=table.innerHTML; let hash=2166136261;
                       for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i);hash=Math.imul(hash,16777619);}
                       return [value.length,hash>>>0]; }"""
                 )
@@ -1120,24 +1254,33 @@ class SinopacCrawler(BankCrawler):
                 if operation_bytes > 5_000_000:
                     raise RuntimeError("sinopac-twd-history-byte-budget")
                 page.evaluate(
-                    "(rows) => { window.__hermesSinopacExpectedRows = rows; }",
-                    [
-                        [row[f"DataText{i}"] for i in range(1, 10)]
+                    "(rows) => { window.__hermesSinopacExpectedRows = rows.current; window.__hermesSinopacPriorRows = rows.prior; }",
+                    {"current": [
+                        [row[f"DataText{i}"] for i in range(1, 12)]
                         for row in validated["records"]
-                    ],
+                    ], "prior": prior_dom_rows},
                 )
-                dom_probe = r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                dom_probe = r"""() => { const width=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'offsetWidth').get;
+                  const height=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'offsetHeight').get;
+                  const rects=Element.prototype.getClientRects;
+                  const visible=e => {const boxed=e instanceof HTMLElement
+                    ? width.call(e)||height.call(e)||rects.call(e).length : rects.call(e).length;
+                    if(!boxed)return false;
+                  for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);
+                    if(n.hidden||n.inert||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||
+                      s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0)return false;}
+                  return true;};
                   const pagers=[...document.querySelectorAll(
-                    '.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')]
-                    .filter(e => e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
-                      /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
-                      (e.matches('input,select,option') && /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»])$/i.test((e.value||'').trim())) ||
-                      (e.matches('input[type=button],input[type=submit],select,option') && /^\d{1,3}$/.test((e.value||'').trim())) ||
-                      /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test(
+                    '.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],a,button')]
+                    .filter(visible).filter(e => e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
+                      (e.matches('button[onclick],a[onclick]') && /(?:go|set|change|select)?page\s*\(/i.test(e.getAttribute('onclick')||'')) ||
+                      (e.matches('a,button') && /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»])$/i.test((e.textContent||'').replace(/\s+/g,' ').trim())) ||
+                      (e.closest('.pagination,.pager,[class*=pagination i],[class*=pager i]') &&
+                        /^\d{1,3}$/.test(((e.value||e.textContent)||'').trim())) ||
+                      /^(?:下一頁|上一頁|下頁|上頁|next|previous|prev|first|last|[<>«»])$/i.test(
                         (e.textContent||'').replace(/\s+/g,' ').trim()) ||
                       /page|下一|上一|next|previous|prev|first|last/i.test(e.getAttribute('aria-label')||'') ||
                       /^(?:next|prev)$/i.test(e.getAttribute('rel')||'') ||
-                      /(?:page|next|prev|first|last|下一|上一)/i.test(e.getAttribute('onclick')||'') ||
                       /(?:[?&](?:page|p)=|javascript:.*(?:page|next|prev))/i.test(e.getAttribute('href')||'')).length;
                   const notices=[...document.querySelectorAll(
                     '[role=alert],[role=dialog],[aria-modal=true],dialog[open],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay],.alert,.error,.loading,.busy,[aria-busy=true]')]
@@ -1153,18 +1296,54 @@ class SinopacCrawler(BankCrawler):
                   const normalize=value => { const node=document.createElement('div'); node.innerHTML=String(value||'');
                     return (node.textContent||'').replace(/\s+/g,' ').trim(); };
                   const tables=[...document.querySelectorAll('#ListingTable')];
-                  if(tables.length!==1)return {tables:tables.length,rows:0,visibleRows:0,pagers,errors,visible:false,emptyMarker,freshEmpty:window.__hermesSinopacState?.freshEmpty===true,bound:expected.length===0,signature:null,mutations:window.__hermesSinopacState?.mutations||0};
+                  if(tables.length!==1)return {tables:tables.length,rows:0,visibleRows:0,hiddenRows:0,hiddenNonemptyRows:0,hiddenChangedRows:0,hiddenChangedPriorRows:0,hiddenChangedHeaderRows:0,hiddenChangedFullTransactionRows:0,hiddenChangedDateRows:0,hiddenChangedNumericRows:0,hiddenChangedControlRows:0,pagers,errors,visible:false,emptyMarker,freshEmpty:false,bound:false,signature:null,mutations:window.__hermesSinopacState?.mutations||0};
                   const table=tables[0]; const rows=[...table.querySelectorAll('tbody tr')];
-                  const bound=expected.length>0 && rows.length===expected.length*2 && expected.every((row,rowIndex) => {
-                    const cells=[...rows[rowIndex*2].querySelectorAll('td')].map(cell => normalize(cell.innerHTML));
-                    return cells.length===row.length && row.every((value,index) => {
-                      const text=normalize(value); return cells[index]===text; }); });
+                  const visibleRows=rows.filter(visible);
+                  const hiddenRows=rows.filter(row=>!visible(row));
+                  const hiddenNonemptyRows=hiddenRows.filter(row=>normalize(row.innerHTML)!=='').length;
+                  const hiddenHeaderRows=hiddenRows.filter(row=>normalize(row.innerHTML)!==''&&row.querySelectorAll('th').length>0&&row.querySelectorAll('td').length===0).length;
+                  const hiddenTransactionRows=hiddenRows.filter(row=>[...row.querySelectorAll('td')].some(cell=>/^\d{2,4}[\/-]\d{1,2}[\/-]\d{1,2}$/.test(normalize(cell.innerHTML))||/^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$/.test(normalize(cell.innerHTML)))).length;
+                  const hiddenChanged=hiddenRows.filter(row=>window.__hermesSinopacState?.staleHiddenRows?.get(row)!==row.innerHTML);
+                  const hiddenChangedRows=hiddenChanged.length;
+                  const hiddenChangedHeaderRows=hiddenChanged.filter(row=>normalize(row.innerHTML)!==''&&row.querySelectorAll('th').length>0&&row.querySelectorAll('td').length===0).length;
+                  const isDate=value=>/^\d{2,4}[\/-]\d{1,2}[\/-]\d{1,2}$/.test(value);
+                  const isNumber=value=>/^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$/.test(value);
+                  const hiddenChangedDateRows=hiddenChanged.filter(row=>[...row.querySelectorAll('td')].some(cell=>isDate(normalize(cell.innerHTML)))).length;
+                  const hiddenChangedNumericRows=hiddenChanged.filter(row=>[...row.querySelectorAll('td')].some(cell=>isNumber(normalize(cell.innerHTML)))).length;
+                  const hiddenChangedFullTransactionRows=hiddenChanged.filter(row=>{const cells=[...row.querySelectorAll('td')];return cells.length>=6&&cells.some(cell=>isDate(normalize(cell.innerHTML)));}).length;
+                  const hiddenChangedControlRows=hiddenChanged.filter(row=>row.querySelector('input,select,textarea,button,a[href]')).length;
+                  const cellIndexes=[1,2,3,4,5,7];
+                  const rowTuple=row=>{const cells=[...row.querySelectorAll('td')];return JSON.stringify(cellIndexes.map(cellIndex=>normalize(cells[cellIndex]?.innerHTML)));};
+                  const expectedTuple=expectedRow => {
+                    const signedAmount=normalize(expectedRow[3]);
+                    const amountCell=signedAmount.startsWith('-')?3:4;
+                    const otherAmountCell=amountCell===3?4:3;
+                    const responseCells={1:expectedRow[1],2:expectedRow[2],5:expectedRow[4],7:expectedRow[7]};
+                    responseCells[amountCell]=signedAmount.replace(/^[+-]/,'');
+                    responseCells[otherAmountCell]='';
+                    return JSON.stringify(cellIndexes.map(cellIndex=>normalize(responseCells[cellIndex])));};
+                  const domTuples=visibleRows.map(rowTuple).sort();
+                  const responseTuples=expected.map(expectedTuple).sort();
+                  const priorTuples=new Map();
+                  for(const tuple of (window.__hermesSinopacPriorRows||[]).map(expectedTuple))
+                    priorTuples.set(tuple,(priorTuples.get(tuple)||0)+1);
+                  const hiddenChangedPriorRows=hiddenChanged.filter(row=>{const tuple=rowTuple(row), remaining=priorTuples.get(tuple)||0;
+                    if(remaining===0)return false; priorTuples.set(tuple,remaining-1); return true;}).length;
+                  const soleEmptyRow=visibleRows.length===1&&
+                    [...visibleRows[0].querySelectorAll('td')].length===1&&
+                    normalize(visibleRows[0].querySelector('td')?.innerHTML)==='查無資料';
+                  const emptyCell=soleEmptyRow?visibleRows[0].querySelector('td'):null;
+                  const freshEmpty=!!emptyCell&&window.__hermesSinopacState?.freshEmptyNodes.has(emptyCell)===true;
+                  const bound=expected.length===0?soleEmptyRow&&hiddenChangedRows===hiddenChangedPriorRows:
+                    visibleRows.length===expected.length&&domTuples.length===responseTuples.length&&
+                    domTuples.every((value,index)=>value===responseTuples[index]);
                   const value=table.innerHTML; let hash=2166136261;
                   for(let i=0;i<value.length;i++){hash^=value.charCodeAt(i);hash=Math.imul(hash,16777619);}
                   return {tables:1,rows:rows.length,visibleRows:rows.filter(visible).length,
-                    pagers,errors,visible:visible(table),emptyMarker,freshEmpty:window.__hermesSinopacState?.freshEmpty===true,bound,signature:[value.length,hash>>>0],mutations:window.__hermesSinopacState?.mutations||0}; }"""
+                    hiddenRows:hiddenRows.length,hiddenNonemptyRows,hiddenHeaderRows,hiddenTransactionRows,hiddenChangedRows,hiddenChangedPriorRows,hiddenChangedHeaderRows,hiddenChangedFullTransactionRows,hiddenChangedDateRows,hiddenChangedNumericRows,hiddenChangedControlRows,pagers,errors,visible:visible(table),emptyMarker,freshEmpty,bound,signature:[value.length,hash>>>0],mutations:window.__hermesSinopacState?.mutations||0}; }"""
                 stable_dom = None
                 stable_count = 0
+                last_dom_reason = "unknown"
                 for _ in range(10):
                     ensure_deadline()
                     page.wait_for_timeout(500)
@@ -1173,20 +1352,21 @@ class SinopacCrawler(BankCrawler):
                         not isinstance(dom_state, dict)
                         or dom_state.get("pagers") != 0
                         or dom_state.get("errors") != 0
-                        or dom_state.get("bound") is not True
                         or type(dom_state.get("mutations")) is not int
-                        or dom_state["mutations"] <= 0
+                        or dom_state["mutations"] < 0
                     )
                     if validated["rows"]:
                         invalid = (
                             common_invalid
+                            or dom_state.get("bound") is not True
+                            or dom_state["mutations"] <= 0
                             or dom_state.get("tables") != 1
                             or dom_state.get("visible") is not True
                             or dom_state.get("emptyMarker") is not False
                             or dom_state.get("freshEmpty") is not False
                             or type(dom_state.get("rows")) is not int
-                            or dom_state["rows"] != validated["rows"] * 2
-                            or dom_state.get("visibleRows") != dom_state["rows"]
+                            or not validated["rows"] <= dom_state["rows"] <= validated["rows"] + 1
+                            or dom_state.get("visibleRows") != validated["rows"]
                             or not isinstance(dom_state.get("signature"), list)
                             or len(dom_state["signature"]) != 2
                             or any(type(value) is not int for value in dom_state["signature"])
@@ -1195,14 +1375,61 @@ class SinopacCrawler(BankCrawler):
                     else:
                         invalid = (
                             common_invalid
-                            or dom_state.get("tables") != 0
-                            or dom_state.get("rows") != 0
-                            or dom_state.get("visibleRows") != 0
+                            or dom_state.get("bound") is not True
+                            or dom_state.get("tables") != 1
+                            or type(dom_state.get("rows")) is not int
+                            or type(dom_state.get("visibleRows")) is not int
+                            or type(dom_state.get("hiddenRows")) is not int
+                            or type(dom_state.get("hiddenNonemptyRows")) is not int
+                            or type(dom_state.get("hiddenChangedRows")) is not int
+                            or type(dom_state.get("hiddenChangedPriorRows")) is not int
+                            or dom_state["rows"] < 1
+                            or dom_state["rows"] != dom_state["visibleRows"] + dom_state["hiddenRows"]
+                            or dom_state["hiddenChangedRows"] != dom_state["hiddenChangedPriorRows"]
+                            or dom_state.get("visibleRows") != 1
+                            or dom_state.get("visible") is not True
                             or dom_state.get("emptyMarker") is not True
-                            or dom_state.get("freshEmpty") is not True
-                            or dom_state.get("signature") is not None
+                            or not isinstance(dom_state.get("signature"), list)
+                            or len(dom_state["signature"]) != 2
+                            or any(type(value) is not int for value in dom_state["signature"])
                         )
                     if invalid:
+                        if not isinstance(dom_state, dict):
+                            last_dom_reason = "shape"
+                        elif dom_state.get("pagers") != 0:
+                            last_dom_reason = "pager"
+                        elif dom_state.get("errors") != 0:
+                            last_dom_reason = "error"
+                        elif type(dom_state.get("mutations")) is not int:
+                            last_dom_reason = "mutation-shape"
+                        elif dom_state["mutations"] < 0:
+                            last_dom_reason = "mutation-range"
+                        elif dom_state.get("tables") != 1:
+                            last_dom_reason = "table-count"
+                        elif dom_state.get("visible") is not True:
+                            last_dom_reason = "table-visibility"
+                        elif validated["rows"]:
+                            last_dom_reason = (
+                                "nonempty-binding"
+                                if dom_state.get("bound") is not True
+                                else "nonempty-attestation"
+                            )
+                        elif type(dom_state.get("rows")) is not int or dom_state["rows"] < 1:
+                            last_dom_reason = "empty-no-row"
+                        elif dom_state.get("hiddenChangedRows") != 0:
+                            last_dom_reason = _sinopac_hidden_changed_reason(dom_state)
+                        elif dom_state.get("rows") != (
+                            dom_state.get("visibleRows", 0) + dom_state.get("hiddenRows", 0)
+                        ):
+                            last_dom_reason = "empty-extra-hidden-rows"
+                        elif dom_state.get("visibleRows") != 1:
+                            last_dom_reason = "empty-multiple-visible-rows"
+                        elif dom_state.get("emptyMarker") is not True:
+                            last_dom_reason = "empty-marker"
+                        elif dom_state.get("bound") is not True:
+                            last_dom_reason = "empty-binding"
+                        else:
+                            last_dom_reason = "empty-signature"
                         stable_dom = None
                         stable_count = 0
                         continue
@@ -1211,19 +1438,38 @@ class SinopacCrawler(BankCrawler):
                     if stable_count == 2:
                         break
                 else:
-                    raise RuntimeError("sinopac-twd-history-result-table")
+                    raise RuntimeError(
+                        f"sinopac-twd-history-result-table-{last_dom_reason}"
+                    )
                 ensure_deadline()
                 final_dom = page.evaluate(
-                    "() => { const probe = " + dom_probe + "; const result=probe();"
-                    " window.__hermesSinopacObserver?.disconnect();"
+                    "async () => { const probe = " + dom_probe + "; let result=null;"
+                    " const cleanup=()=>{window.__hermesSinopacObserver?.disconnect();"
                     " clearTimeout(window.__hermesSinopacObserverTimer);"
                     " delete window.__hermesSinopacObserverTimer;"
                     " delete window.__hermesSinopacObserver;"
                     " delete window.__hermesSinopacState;"
-                    " delete window.__hermesSinopacExpectedRows; return result; }"
+                    " delete window.__hermesSinopacExpectedRows; delete window.__hermesSinopacPriorRows;};"
+                    " try { for(let attempt=0;attempt<3;attempt++){"
+                    " window.__hermesSinopacObserver?.takeRecords();"
+                    " const beforeMutations=window.__hermesSinopacState?.mutations;"
+                    " result=probe(); await new Promise(resolve=>setTimeout(resolve,0));"
+                    " const records=window.__hermesSinopacObserver?.takeRecords()||[];"
+                    " const afterMutations=window.__hermesSinopacState?.mutations;"
+                    " const settled=probe();"
+                    " if(Number.isInteger(beforeMutations)&&afterMutations===beforeMutations"
+                    " &&records.length===0&&JSON.stringify(settled)===JSON.stringify(result)){"
+                    " return settled; }"
+                    " result=settled;"
+                    " }"
+                    " return null; } finally { cleanup(); } }"
                 )
                 if final_dom != stable_dom:
                     raise RuntimeError("sinopac-twd-history-result-table")
+                prior_dom_rows.extend(
+                    [row[f"DataText{i}"] for i in range(1, 12)]
+                    for row in validated["records"]
+                )
                 ensure_deadline()
                 final_hits = collector.by_endpoint("ws_transdetailMerge.ashx")[before:]
                 if (
@@ -1233,7 +1479,7 @@ class SinopacCrawler(BankCrawler):
                 ):
                     raise RuntimeError("sinopac-twd-history-response-cardinality")
                 receipt = {
-                    "identity": item["identity"],
+                    "identity": history_identity,
                     "start": window_start.isoformat(),
                     "end": window_end.isoformat(),
                     "status": validated["status"],
@@ -1255,14 +1501,14 @@ class SinopacCrawler(BankCrawler):
         if not inventory:
             blockers = page.evaluate(
                 r"""() => { const visible=e => !!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
-                  const pagers=[...document.querySelectorAll('.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],[onclick],[name*=page i],[id*=page i],input,select,option,a,button')].filter(e =>
+                  const pagers=[...document.querySelectorAll('.pagination,.pager,[class*=pagination i],[class*=pager i],[data-page],[aria-label],[rel],a,button')].filter(visible).filter(e =>
                     e.hasAttribute('data-page') || /pagination|pager/i.test(e.className||'') ||
-                    /page/i.test((e.getAttribute('name')||'')+' '+(e.id||'')) ||
+                    (e.matches('button[onclick],a[onclick]') && /(?:go|set|change|select)?page\s*\(/i.test(e.getAttribute('onclick')||'')) ||
+                    (e.closest('.pagination,.pager,[class*=pagination i],[class*=pager i]') && /^\d{1,3}$/.test(((e.value||e.textContent)||'').trim())) ||
                     /next|previous|prev|first|last|下一|上一|page/i.test(e.getAttribute('aria-label')||'') ||
                     /^(?:next|prev)$/i.test(e.getAttribute('rel')||'') ||
-                    /(?:page|next|prev|first|last|下一|上一)/i.test((e.getAttribute('onclick')||'')+(e.getAttribute('href')||'')) ||
-                    (e.matches('input,select,option') && /^(?:下一頁|上一頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test((e.value||'').trim())) ||
-                    /^(?:下一頁|上一頁|next|previous|prev|first|last|[<>«»]|\d{1,3})$/i.test((e.textContent||'').trim())).length;
+                    /(?:[?&](?:page|p)=|javascript:.*(?:page|next|prev))/i.test(e.getAttribute('href')||'') ||
+                    (e.matches('a,button') && /^(?:下一頁|上一頁|next|previous|prev|first|last|[<>«»])$/i.test((e.textContent||'').trim())).length;
                   const notices=[...document.querySelectorAll('dialog[open],[aria-modal=true],.modal.show,.modal.in,progress,[role=progressbar],[class*=spinner],[class*=loading-overlay],[role=alert],[role=dialog],.alert,.error,.loading,.busy,[aria-busy=true]')].filter(visible).length;
                   const textNotices=[...document.querySelectorAll('body *')].filter(e => visible(e) &&
                     e.children.length===0 && /系統錯誤|查詢失敗|請稍後|重試|重新整理|連線中斷|disconnected|retry|error|failed/i.test((e.textContent||'').trim())).length;
@@ -1287,7 +1533,7 @@ class SinopacCrawler(BankCrawler):
             raise RuntimeError("sinopac-twd-history-operation-cardinality")
 
         domain = {
-            "domain": "twd_transactions",
+            "domain": "account_transactions",
             "expected": expected,
             "windows": windows_out,
         }

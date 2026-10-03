@@ -7,6 +7,33 @@ export function formatDecimal(value: string): string | null {
   return `${sign}${grouped}${fraction == null ? '' : `.${fraction}`}`;
 }
 
+export function isNativeCurrencyAmount(
+  value: unknown,
+  currency: unknown,
+  nullable = true,
+): boolean {
+  if (value === null) return nullable;
+  if (typeof value !== 'number' || !Number.isFinite(value)
+    || Math.abs(value) > Number.MAX_SAFE_INTEGER
+    || typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)) return false;
+  if (currency === 'TWD') return Number.isInteger(value);
+  const [coefficient, rawExponent = '0'] = Math.abs(value).toString().toLowerCase().split('e');
+  const fractionDigits = coefficient.split('.')[1]?.length ?? 0;
+  return Math.max(0, fractionDigits - Number(rawExponent)) <= 6;
+}
+
+/** Exact integer aggregation with a JavaScript-safe output boundary. */
+export function sumSafeIntegers(values: Iterable<number>): number {
+  let total = 0n;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value)) throw new RangeError('unsafe integer amount');
+    total += BigInt(value);
+  }
+  const result = Number(total);
+  if (!Number.isSafeInteger(result)) throw new RangeError('unsafe integer aggregate');
+  return result;
+}
+
 export function formatDecimalFixed(value: string, fractionDigits: number): string | null {
   if (!Number.isInteger(fractionDigits) || fractionDigits < 0) return null;
   const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value.trim());

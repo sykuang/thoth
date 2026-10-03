@@ -86,7 +86,7 @@ def test_router_helpers_read_postgres_bank_schema():
                 "payment_due_date": "2026-06-30",
             }
         ])
-        accounts = _bank_accounts(store.conn, "pytest")
+        accounts = _bank_accounts("pytest", 1)
         assert len(accounts) == 1
         assert accounts[0].balance == 12345
         assert accounts[0].nickname == "測試帳戶"

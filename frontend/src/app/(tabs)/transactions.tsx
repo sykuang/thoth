@@ -99,9 +99,11 @@ const TWD_TXN_UNSUPPORTED_BANKS: ReadonlySet<string> = new Set();
 // 原本 transactions.tsx 1531 行 → 拆完約 750 行, 主檔只剩 TransactionsScreen.
 
 export default function TransactionsScreen() {
-  const params = useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; drilldown?: string }>();
+  const params = useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; currency?: string; card_no?: string; drilldown?: string }>();
   const initialBank = typeof params.bank === 'string' ? params.bank : '';
   const accountNo = typeof params.account_no === 'string' ? params.account_no : '';
+  const accountCurrency = typeof params.currency === 'string' ? params.currency : '';
+  const routeAccountCurrency = accountCurrency || (accountNo ? 'TWD' : '');
   const cardNo = typeof params.card_no === 'string' ? params.card_no : '';
   const bp = useBreakpoint();
   const datasetQ = useFrontendDatasetCache();
@@ -113,6 +115,9 @@ export default function TransactionsScreen() {
   const cardDateBasis = prefs.card_date_basis ?? 'consume';
   const [selectedBanks, setSelectedBanks] = useState<string[]>(initialBank ? [initialBank] : []);
   const [activeAccountNo, setActiveAccountNo] = useState(accountNo);
+  const [activeAccountCurrency, setActiveAccountCurrency] = useState(
+    routeAccountCurrency,
+  );
   const [activeCardNo, setActiveCardNo] = useState(cardNo);
   // Phase 8 (2026-06-15 使用者指示): KIND filter (台幣/已出帳/未出帳) 已從 UI 移除。
   // 2026-07-02: 帳戶/卡片 drilldown 仍可帶 params.kind 給 row identity/歷史相容，
@@ -152,11 +157,12 @@ export default function TransactionsScreen() {
   // This effect is the intentional bridge from router state into clearable UI filter state.
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    const routeSignature = [initialBank, accountNo, cardNo, params.drilldown ?? ''].join('|');
+    const routeSignature = [initialBank, accountNo, accountCurrency, cardNo, params.drilldown ?? ''].join('|');
     if (appliedRouteSignatureRef.current === routeSignature) return;
     appliedRouteSignatureRef.current = routeSignature;
     setSelectedBanks(initialBank ? [initialBank] : []);
     setActiveAccountNo(accountNo);
+    setActiveAccountCurrency(routeAccountCurrency);
     setActiveCardNo(cardNo);
     if (accountNo || cardNo || typeof params.drilldown === 'string') {
       setCategory('');
@@ -174,7 +180,7 @@ export default function TransactionsScreen() {
       setBulkSheetOpen(false);
       setFilterOpen(false);
     }
-  }, [initialBank, accountNo, cardNo, params.drilldown]);
+  }, [initialBank, accountNo, accountCurrency, routeAccountCurrency, cardNo, params.drilldown]);
   /* eslint-enable react-hooks/set-state-in-effect */
   // 統一 row identity：txnKey 與 row key 共用 t.id (Transaction type 已標 required)
   const txnKey = (t: Transaction) => `${t.bank}|${t.kind}|${t.id}`;
@@ -213,6 +219,7 @@ export default function TransactionsScreen() {
     initialBank && selectedBanks.length === 1 && selectedBanks[0] === initialBank,
   );
   const effectiveAccountNo = drilldownScopeActive ? activeAccountNo : '';
+  const effectiveAccountCurrency = drilldownScopeActive ? activeAccountCurrency : '';
   const effectiveCardNo = drilldownScopeActive ? activeCardNo : '';
   const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
   const brokerageQ = useQuery({
@@ -227,13 +234,14 @@ export default function TransactionsScreen() {
     let items = datasetQ.data?.transactions ?? [];
     if (selectedBanks.length > 0) items = items.filter((t) => selectedBanks.includes(t.bank));
     if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);
+    if (effectiveAccountCurrency) items = items.filter((t) => t.currency === effectiveAccountCurrency);
     if (effectiveCardNo) items = items.filter((t) => matchesCardDrilldown(t, effectiveCardNo));
     items = items.filter((t) => {
       const d = transactionDateForBasis(t, cardDateBasis);
       return d >= since && d <= until;
     });
     return items;
-  }, [datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]);
+  }, [datasetQ.data, selectedBanks, effectiveAccountNo, effectiveAccountCurrency, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]);
 
   const transactionRefreshing = (
     (datasetQ.isRefetching && !datasetQ.isLoading)
@@ -331,6 +339,7 @@ export default function TransactionsScreen() {
     const map = new Map<string, Omit<Group, 'pct'>>();
     for (const t of filteredItems) {
       if (t.excluded === true || t.auto_excluded === true) continue;
+      if ((t.currency || 'TWD') !== 'TWD') continue;
       const key = t.category || '__null__';
       const g = map.get(key) ?? { key, label: key === '__null__' ? '未分類' : key, subtotal: 0, count: 0 };
       g.subtotal += txnCashflowAmount(t);
@@ -350,6 +359,7 @@ export default function TransactionsScreen() {
 
   function toggleBank(b: string) {
     setActiveAccountNo('');
+    setActiveAccountCurrency('');
     setActiveCardNo('');
     setSelectedBanks((prev) =>
       prev.includes(b) ? prev.filter((x) => x !== b) : [...prev, b],
@@ -359,6 +369,7 @@ export default function TransactionsScreen() {
   function clearFilters() {
     setSelectedBanks([]);
     setActiveAccountNo('');
+    setActiveAccountCurrency('');
     setActiveCardNo('');
     setCategory('');
     setSubcategory('');

@@ -11,6 +11,7 @@ import type {
 } from '@/types/api';
 
 import { projectReplicaDashboard } from './dashboardCache';
+import { isNativeCurrencyAmount, sumSafeIntegers } from './decimal';
 
 export const REPLICA_SCHEMA_VERSION = 2;
 
@@ -337,7 +338,15 @@ function isNullableString(value: unknown): boolean {
 }
 
 function isNullableNumber(value: unknown): boolean {
-  return value === null || (typeof value === 'number' && Number.isFinite(value));
+  return value === null || (
+    typeof value === 'number'
+    && Number.isFinite(value)
+    && Math.abs(value) <= Number.MAX_SAFE_INTEGER
+  );
+}
+
+function isNativeAmount(value: unknown, currency: unknown): boolean {
+  return isNativeCurrencyAmount(value, currency);
 }
 
 function validBankAccount(value: unknown): boolean {
@@ -359,14 +368,17 @@ function validBankBalance(value: unknown): boolean {
   if (!row
     || typeof row.bank !== 'string'
     || typeof row.account_no !== 'string'
-    || typeof row.currency !== 'string'
+    || typeof row.currency !== 'string' || !/^[A-Z]{3}$/.test(row.currency)
     || !isNullableString(row.nickname)
     || !isNullableString(row.product_type)
     || !isNullableString(row.type)
-    || !isNullableNumber(row.balance)
+    || !isNativeAmount(row.balance, row.currency)
     || !isNullableString(row.snapshot_date)
     || typeof row.is_stale !== 'boolean'
-    || !isNullableNumber(row.twd_estimate)
+    || (row.twd_estimate !== null && (
+      typeof row.twd_estimate !== 'number'
+      || !Number.isSafeInteger(row.twd_estimate)
+    ))
     || !isNullableNumber(row.fx_rate_used)
     || typeof row.excluded !== 'boolean') return false;
   return row.nickname_overwrite === undefined || isNullableString(row.nickname_overwrite);
@@ -426,10 +438,19 @@ function validFinancialAccount(value: unknown): boolean {
 
 function validAccountTabCache(value: unknown): value is ReplicaAccountTabCache {
   const cache = asRecord(value);
+  if (!cache
+    || typeof cache.cachedAt !== 'string'
+    || !Array.isArray(cache.balances)
+    || !cache.balances.every(validBankBalance)) return false;
+  const identities = new Set<string>();
+  for (const item of cache.balances) {
+    const row = asRecord(item) as Record<string, unknown>;
+    const identity = `${row.bank}\u0000${row.account_no}\u0000${row.currency}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+  }
   return Boolean(cache)
     && typeof cache?.cachedAt === 'string'
-    && Array.isArray(cache.balances)
-    && cache.balances.every(validBankBalance)
     && Array.isArray(cache.accounts)
     && cache.accounts.every(validBankAccount)
     && Array.isArray(cache.cards)
@@ -472,7 +493,7 @@ function normalizedSplits(row: Record<string, unknown>): TransactionSplit[] | un
       return undefined;
     }
     const amount = Number(split.amount);
-    total += amount;
+    total = sumSafeIntegers([total, amount]);
     splits.push({
       amount,
       category: stringOrNull(split.category),

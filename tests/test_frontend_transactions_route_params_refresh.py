@@ -23,14 +23,14 @@ def test_transactions_route_params_sync_into_mounted_filter_state():
     assert "import { useMemo, useState } from 'react';" not in src
     assert "import { useEffect, useMemo, useRef, useState } from 'react';" in src
     assert "const appliedRouteSignatureRef = useRef<string | null>(null);" in src
-    assert "const routeSignature = [initialBank, accountNo, cardNo, params.drilldown ?? ''].join('|');" in src
+    assert "const routeSignature = [initialBank, accountNo, accountCurrency, cardNo, params.drilldown ?? ''].join('|');" in src
     assert "if (appliedRouteSignatureRef.current === routeSignature) return;" in src
     assert "appliedRouteSignatureRef.current = routeSignature;" in src
-    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; card_no?: string; drilldown?: string }>" in src
+    assert "useLocalSearchParams<{ bank?: string; kind?: string; account_no?: string; currency?: string; card_no?: string; drilldown?: string }>" in src
     assert "useEffect(() => {" in src
     assert "setSelectedBanks(initialBank ? [initialBank] : [])" in src
     assert "setKind(initialKind)" not in src
-    assert "}, [initialBank, accountNo, cardNo, params.drilldown]);" in src
+    assert "}, [initialBank, accountNo, accountCurrency, routeAccountCurrency, cardNo, params.drilldown]);" in src
 
 
 def test_account_drilldown_resets_stale_client_side_filters_and_modes():

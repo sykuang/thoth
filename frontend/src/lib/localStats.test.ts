@@ -34,11 +34,17 @@ const transactions: Transaction[] = [
     currency: 'TWD', category: '其他', account_or_card: null, excluded: true,
     auto_excluded: false, flow_type: 'expense',
   },
+  {
+    id: 5, bank: 'sinopac', kind: 'twd', date: '2026-08-05', datetime: null,
+    description: 'USD debit', amount: -12.34, cashflow_direction: 'expense', cashflow_amount: 12.34,
+    currency: 'USD', category: '其他', account_or_card: null, excluded: false,
+    auto_excluded: false, flow_type: 'expense',
+  },
 ];
 
 const stats = computeLocalDashboardStats(transactions, 'consume');
 deepEqual(stats, {
-  total: 4,
+  total: 5,
   total_income: 100,
   total_expense: 20,
   total_net: 80,
@@ -46,7 +52,7 @@ deepEqual(stats, {
     '2026-08': { income: 100, expense: 20, net: 80, count: 3 },
   },
   amount_by_category: { 訂閱: 20 },
-  by_kind: { twd: 3, billed: 1 },
+  by_kind: { twd: 4, billed: 1 },
   amount_by_flow_type: { expense: 20, income: 100, transfer: 0, investment: 0 },
   subscription_total: 20,
   subscription_by_month: { '2026-08': 20 },

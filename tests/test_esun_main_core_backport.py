@@ -376,6 +376,7 @@ def test_observer_bounds_decoded_total_and_matches_exact_request():
     frame = SimpleNamespace(url=url)
     page = SimpleNamespace(frames=[frame], main_frame=frame, context=SimpleNamespace(new_cdp_session=lambda p: cdp))
     observer = base._HistoryBodyObserver(page, url)
+    observer.start()
     observer.LIMIT = 3
     observer.TOTAL_LIMIT = 3
     observer._request({"requestId": "bad", "request": {"url": url + "?other", "method": "POST", "postData": "x"}, "frameId": "frame"})

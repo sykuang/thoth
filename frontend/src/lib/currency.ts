@@ -15,7 +15,7 @@
  *
  * 小數規則:
  *   - TWD: 取整 (台灣銀行系統都是元為單位)
- *   - 外幣 (consume_amount): 保留 2 位小數 (符合大部分國際匯率慣例)
+ *   - 外幣: 至少保留幣別慣用位數，原生值最多顯示 6 位
  */
 import type { FxDisplayMode, Transaction } from '@/types/api';
 import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
@@ -25,10 +25,10 @@ import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
  * - 正負號由 caller 自己處理 (本 helper 不放 sign)
  * - 小數位數可控
  */
-function formatNumber(n: number, fractionDigits: number = 0): string {
+function formatNumber(n: number, minimumFractionDigits = 0, maximumFractionDigits = minimumFractionDigits): string {
   return n.toLocaleString('zh-TW', {
-    minimumFractionDigits: fractionDigits,
-    maximumFractionDigits: fractionDigits,
+    minimumFractionDigits,
+    maximumFractionDigits,
   });
 }
 
@@ -58,7 +58,9 @@ function currencyFractionDigits(currency: string): number | undefined {
 
 /** 格式化單一金額 → "NT$ 1,234" / "EUR 12.34" / "JPY 1,234" */
 export function formatCurrency(amount: number, currency: string): string {
-  const formatted = formatNumber(Math.abs(amount), currencyFractionDigits(currency) ?? 2);
+  const minimum = currencyFractionDigits(currency) ?? 2;
+  const maximum = currency.trim().toUpperCase() === 'TWD' ? 0 : Math.max(minimum, 6);
+  const formatted = formatNumber(Math.abs(amount), minimum, maximum);
   const prefix = currencyPrefix(currency);
   return prefix ? `${prefix} ${formatted}` : formatted;
 }
@@ -82,10 +84,21 @@ export function formatDecimalCurrency(
   currency: string,
 ): string | null {
   const fractionDigits = currencyFractionDigits(currency);
-  const formatted = fractionDigits == null
+  let formatted = fractionDigits == null
     ? formatDecimal(String(value))
-    : formatDecimalFixed(String(value), fractionDigits);
+    : formatDecimalFixed(
+      String(value),
+      currency.trim().toUpperCase() === 'TWD' ? 0 : Math.max(fractionDigits, 6),
+    );
   if (formatted == null) return null;
+  if (fractionDigits != null && formatted.includes('.')) {
+    const [integer, rawFraction] = formatted.split('.');
+    let fraction = rawFraction;
+    while (fraction.length > fractionDigits && fraction.endsWith('0')) {
+      fraction = fraction.slice(0, -1);
+    }
+    formatted = fraction ? `${integer}.${fraction}` : integer;
+  }
   const negative = formatted.startsWith('-');
   const digits = negative ? formatted.slice(1) : formatted;
   const prefix = currencyPrefix(currency);

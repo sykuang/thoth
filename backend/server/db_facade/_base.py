@@ -69,9 +69,10 @@ class _BaseHelpers:
         *,
         table: str,
         id_col: str,
+        scope_col: str | None = None,
         user_id: int,
         banks: list[str],
-    ) -> dict[str, set[str]] | None:
+    ) -> dict[str, set[Any]] | None:
         """Fast PG path for {bank: excluded account/card nos} without per-bank connections.
 
         SQLite intentionally stays on the legacy per-bank path because each bank
@@ -82,6 +83,8 @@ class _BaseHelpers:
         if db.DB_BACKEND != "postgres" or not banks:
             return None
         if table not in {"accounts", "cards"} or id_col not in {"account_no", "card_no"}:
+            return None
+        if scope_col not in {None, "currency"}:
             return None
         from backend.core import bank_pg
 
@@ -102,8 +105,9 @@ class _BaseHelpers:
                     if not bank:
                         continue
                     safe_bank = bank.replace("'", "''")
+                    scope_sql = f", {scope_col} AS scope" if scope_col else ""
                     parts.append(
-                        f"SELECT '{safe_bank}' AS bank, {id_col} AS no "
+                        f"SELECT '{safe_bank}' AS bank, {id_col} AS no{scope_sql} "
                         f'FROM "{schema}"."{table}" '
                         "WHERE user_id = ? AND COALESCE(excluded, 0) = 1"
                     )
@@ -113,12 +117,13 @@ class _BaseHelpers:
                 rows = con.execute(" UNION ALL ".join(parts), tuple(params)).fetchall()
         except Exception:
             return None
-        out: dict[str, set[str]] = {}
+        out: dict[str, set[Any]] = {}
         for r in rows:
             bank = r["bank"] if isinstance(r, dict) else r[0]
             no = r["no"] if isinstance(r, dict) else r[1]
             if no:
-                out.setdefault(bank, set()).add(no)
+                scope = (r["scope"] if isinstance(r, dict) else r[2]) if scope_col else None
+                out.setdefault(bank, set()).add((no, scope or "TWD") if scope_col else no)
         return out
 
     @staticmethod

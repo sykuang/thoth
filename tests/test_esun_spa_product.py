@@ -50,6 +50,13 @@ def product(browser, monkeypatch, tmp_path):
         monkeypatch.setenv("ESUN_" + name, value)
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "incremental")
+    # Synthetic SPA fixtures have no 交易明細 overview DOM; overview parsing is
+    # covered by tests/test_bank_overview_accounts_20261003.py.
+    monkeypatch.setattr(
+        "backend.banks.esun.EsunCrawler._spa_overview_accounts",
+        lambda self, page: [{"account_no": "0000000000000", "category": "臺幣綜存",
+                             "currency": "TWD", "balance": 0.0}],
+    )
     env_loader = EsunCreds.from_env
     loaded = []
 

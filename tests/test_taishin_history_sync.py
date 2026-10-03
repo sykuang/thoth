@@ -785,6 +785,67 @@ def test_taishin_response_collector_discards_nonallowlisted_json_before_decode()
     assert collector._auth_requests == {}
 
 
+def test_taishin_history_collector_uses_native_body_proof_without_content_length(
+    monkeypatch,
+) -> None:
+    body = json.dumps({"RESULT": "NORMAL", "OUTPUTDATA": {"userList": []}}).encode()
+    endpoint = "https://my.taishinbank.com.tw/TIBNetBank/svc/web1/rb0102/query"
+    created = []
+
+    class Observer:
+        def __init__(self, page, url):
+            assert url == endpoint
+            self.url = url
+            self.closed = False
+            created.append(self)
+
+        def read(self, response, frame, frame_url, remaining, minimum, admit=None):
+            assert response.url == endpoint
+            assert frame_url == "https://my.taishinbank.com.tw/TIBNetBank/rb0102"
+            assert minimum == 0 and remaining() == 5_000_000 and admit is None
+            return body
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("backend.core.base._HistoryBodyObserver", Observer)
+    handlers = {}
+    page = SimpleNamespace()
+    page.on = lambda name, handler: handlers.setdefault(name, handler)
+    page.remove_listener = lambda name, _handler: handlers.pop(name)
+    frame = SimpleNamespace(
+        page=page,
+        url="https://my.taishinbank.com.tw/TIBNetBank/rb0102",
+    )
+    page.main_frame = frame
+    request = SimpleNamespace(
+        url=endpoint,
+        method="POST",
+        headers={},
+        post_data=json.dumps({"account": ACCOUNT, "start": "20250902", "end": "20260902"}),
+        frame=frame,
+        redirected_from=None,
+    )
+    response = SimpleNamespace(
+        url=endpoint,
+        status=200,
+        headers={"content-type": "application/json", "content-encoding": "identity"},
+        request=request,
+        body=lambda: pytest.fail("missing-length response must use the native observer"),
+    )
+
+    collector = ResponseCollector("taishinbank.com.tw")
+    collector.attach(page)
+    collector._on_request(request)
+    collector._on_response(response)
+    collector.detach(page)
+
+    assert collector.hits[0].body_size == len(body)
+    assert collector.hits[0].resp_json == json.loads(body)
+    assert len(created) == 1 and created[0].closed is True
+    assert handlers == {}
+
+
 def test_taishin_response_collector_measures_actual_body_before_json_parse() -> None:
     body = json.dumps({"padding": "x" * 5_000_001}).encode()
     page = SimpleNamespace(main_frame=None)

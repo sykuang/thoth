@@ -35,7 +35,7 @@ def _seed_accounts_db(root: Path, bank: str, *,
 
     accounts: [{account_no, currency, nickname, type, product_type, updated_at?,
                 raw_balance?, raw_balance_date?}, ...]
-    txns:     [{account_no, txn_datetime, balance}, ...]
+    txns:     [{account_no, currency?, txn_datetime, balance}, ...]
     """
     path = root / f"{bank}.sqlite"
     con = sqlite3.connect(str(path))
@@ -43,8 +43,8 @@ def _seed_accounts_db(root: Path, bank: str, *,
     if include_accounts_table:
         con.executescript("""
             CREATE TABLE IF NOT EXISTS accounts (
-                account_no       TEXT PRIMARY KEY,
-                currency         TEXT,
+                account_no       TEXT NOT NULL,
+                currency         TEXT NOT NULL DEFAULT 'TWD',
                 branch           TEXT,
                 nickname         TEXT,
                 type             TEXT,
@@ -52,13 +52,15 @@ def _seed_accounts_db(root: Path, bank: str, *,
                 raw_balance      REAL,
                 raw_balance_date TEXT,
                 excluded         INTEGER NOT NULL DEFAULT 0,
-                updated_at       TEXT NOT NULL
+                updated_at       TEXT NOT NULL,
+                PRIMARY KEY (account_no, currency)
             );
             CREATE TABLE IF NOT EXISTS twd_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_no   TEXT NOT NULL,
+                currency     TEXT,
                 txn_datetime TEXT NOT NULL,
-                balance      INTEGER,
+                balance      REAL,
                 first_seen   TEXT NOT NULL,
                 dedup_key    TEXT NOT NULL
             );
@@ -69,8 +71,9 @@ def _seed_accounts_db(root: Path, bank: str, *,
             CREATE TABLE IF NOT EXISTS twd_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_no   TEXT NOT NULL,
+                currency     TEXT,
                 txn_datetime TEXT NOT NULL,
-                balance      INTEGER,
+                balance      REAL,
                 first_seen   TEXT NOT NULL,
                 dedup_key    TEXT NOT NULL
             );
@@ -91,11 +94,17 @@ def _seed_accounts_db(root: Path, bank: str, *,
                  a.get("updated_at") or now),
             )
     for i, t in enumerate(txns or []):
+        currencies = {
+            (a.get("currency") or "TWD")
+            for a in (accounts or [])
+            if a["account_no"] == t["account_no"]
+        }
+        currency = t.get("currency") or (currencies.pop() if len(currencies) == 1 else "TWD")
         con.execute(
             """INSERT INTO twd_transactions
-               (account_no, txn_datetime, balance, first_seen, dedup_key)
-               VALUES (?, ?, ?, ?, ?)""",
-            (t["account_no"], t["txn_datetime"], t.get("balance"),
+               (account_no, currency, txn_datetime, balance, first_seen, dedup_key)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (t["account_no"], currency, t["txn_datetime"], t.get("balance"),
              now, f"test-{bank}-{i}"),
         )
     con.commit()
@@ -167,6 +176,117 @@ def test_portfolio_accounts_empty(temp_data_root, client, auth_headers):
 # Happy path — 有 accounts + txn balance
 # ============================================================
 
+def test_account_projection_rejects_unsafe_aggregate_total(temp_data_root):
+    _seed_accounts_db(
+        temp_data_root,
+        "sinopac",
+        accounts=[
+            {
+                "account_no": "SAFE-A", "currency": "TWD", "product_type": "deposit",
+                "raw_balance": 4_503_599_627_370_496,
+                "raw_balance_date": "2026-06-12",
+            },
+            {
+                "account_no": "SAFE-B", "currency": "TWD", "product_type": "deposit",
+                "raw_balance": 4_503_599_627_370_497,
+                "raw_balance_date": "2026-06-12",
+            },
+        ],
+    )
+    from backend.server.bank_account_projection import latest_twd_asset_balance
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        latest_twd_asset_balance("sinopac", 1)
+
+
+def test_account_projection_rejects_unsafe_fx_estimate(monkeypatch):
+    from types import SimpleNamespace
+    from backend.server import bank_account_projection
+
+    monkeypatch.setattr(
+        bank_account_projection.db_api,
+        "list_accounts",
+        lambda *args, **kwargs: [SimpleNamespace(
+            account_no="USD-1", currency="USD", product_type="deposit",
+            raw_balance=9_007_199_254_740_991, raw_balance_date="2026-09-01",
+            updated_at="2026-09-01", nickname=None, nickname_overwrite=None,
+            type=None, excluded=False,
+        )],
+    )
+    monkeypatch.setattr(bank_account_projection.db_api, "list_latest_account_txn_balances", lambda **kwargs: {})
+    monkeypatch.setattr(bank_account_projection.db_api, "get_latest_loan_balance", lambda **kwargs: None)
+    monkeypatch.setattr(bank_account_projection.fx_service, "get_rate", lambda currency: 2.0)
+    monkeypatch.setattr(
+        bank_account_projection.fx_service,
+        "convert_to_twd",
+        lambda amount, currency: 18_014_398_509_481_982,
+    )
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        bank_account_projection.bank_accounts("cathay", 1)
+
+
+def test_account_projection_rejects_invalid_raw_native_balance(
+    temp_data_root, client, auth_headers,
+):
+    _seed_accounts_db(
+        temp_data_root,
+        "sinopac",
+        accounts=[{
+            "account_no": "BAD-RAW",
+            "currency": "TWD",
+            "product_type": "loan",
+            "raw_balance": 1000.5,
+            "raw_balance_date": "2026-06-12",
+        }],
+    )
+    from backend.server.bank_account_projection import bank_accounts
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        bank_accounts("sinopac", 1)
+    response = client.get("/portfolio/accounts", headers=auth_headers)
+    assert response.status_code == 200
+    assert all(row["bank"] != "sinopac" for row in response.json())
+
+
+@pytest.mark.parametrize(
+    ("currency", "invalid_balance"),
+    [
+        ("TWD", 1000.5),
+        ("TWD", float("inf")),
+        ("TWD", 9_007_199_254_740_992),
+        ("USD", 0.1234567),
+    ],
+)
+def test_portfolio_accounts_rejects_invalid_persisted_native_transaction_balance(
+    temp_data_root, client, auth_headers, currency, invalid_balance,
+):
+    _seed_accounts_db(
+        temp_data_root,
+        "sinopac",
+        accounts=[{
+            "account_no": "STRICT-NATIVE",
+            "currency": currency,
+            "product_type": "deposit",
+            "raw_balance": 777,
+            "raw_balance_date": "2026-06-12",
+        }],
+        txns=[{
+            "account_no": "STRICT-NATIVE",
+            "currency": currency,
+            "txn_datetime": "2026-06-13T10:00:00",
+            "balance": invalid_balance,
+        }],
+    )
+    from backend.server.db_facade import db_api
+
+    assert db_api.list_latest_account_txn_balances(bank="sinopac", user_id=1) == {}
+    response = client.get("/portfolio/accounts", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    row = next(item for item in response.json() if item["account_no"] == "STRICT-NATIVE")
+    assert row["balance"] == 777
+
+
 def test_portfolio_accounts_with_txn_balance(temp_data_root, client, auth_headers):
     """sinopac 有 accounts + twd_transactions → balance 來自 max(txn_datetime).balance."""
     _seed_accounts_db(temp_data_root, "sinopac",
@@ -190,11 +310,35 @@ def test_portfolio_accounts_with_txn_balance(temp_data_root, client, auth_header
     assert row["bank"] == "sinopac"
     assert row["account_no"] == "90000000197014"
     assert row["currency"] == "TWD"
-    assert row["balance"] == 1088682  # 取最新那筆
+    assert row["balance"] == 1088682
     assert row["snapshot_date"] == "2026-06-12"
     assert row["nickname"] == "營業部DAWHO活期儲蓄存款"
     assert row["product_type"] == "deposit"
     assert row["is_stale"] is False or row["is_stale"] is True  # 取決於跑測時間
+
+
+def test_portfolio_accounts_breaks_latest_timestamp_ties_by_newest_row(
+    temp_data_root, client, auth_headers,
+):
+    _seed_accounts_db(
+        temp_data_root, "sinopac",
+        accounts=[{
+            "account_no": "TIED", "currency": "TWD", "product_type": "deposit",
+        }],
+        txns=[
+            {"account_no": "TIED", "currency": "TWD",
+             "txn_datetime": "2026-06-12T11:19:00", "balance": 100},
+            {"account_no": "TIED", "currency": "TWD",
+             "txn_datetime": "2026-06-12T11:19:00", "balance": 200},
+        ],
+    )
+
+    response = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert response.status_code == 200
+    row = next(item for item in response.json() if item["account_no"] == "TIED")
+    assert row["balance"] == 200
+    assert row["snapshot_date"] == "2026-06-12"
 
 
 # ============================================================
@@ -304,6 +448,161 @@ def test_portfolio_accounts_multiple_currencies(temp_data_root, client, auth_hea
     assert jpy["currency"] == "JPY"
     assert jpy["balance"] == 1201387  # JPY 存在 twd_transactions 直接以 JPY 存
     assert jpy["product_type"] == "fx_deposit"
+
+
+def test_portfolio_accounts_same_number_keeps_currency_scoped_balances(
+    temp_data_root, client, auth_headers,
+):
+    _seed_accounts_db(
+        temp_data_root,
+        "sinopac",
+        accounts=[
+            {"account_no": "SAME", "currency": "TWD", "product_type": "deposit"},
+            {"account_no": "SAME", "currency": "USD", "product_type": "fx_deposit"},
+        ],
+        txns=[
+            {"account_no": "SAME", "currency": "TWD", "txn_datetime": "2026-06-12T11:00:00", "balance": 1000},
+            {"account_no": "SAME", "currency": "USD", "txn_datetime": "2026-06-12T12:00:00", "balance": 12.34},
+        ],
+    )
+
+    response = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert {
+        (row["account_no"], row["currency"]): row["balance"]
+        for row in response.json()
+    } == {("SAME", "TWD"): 1000, ("SAME", "USD"): 12.34}
+
+
+def test_router_migration_replaces_legacy_two_column_account_index(tmp_path):
+    from backend.server import db
+
+    path = tmp_path / "legacy-index.sqlite"
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE accounts (
+            user_id INTEGER NOT NULL DEFAULT 1,
+            account_no TEXT NOT NULL,
+            currency TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, account_no)
+        );
+        CREATE UNIQUE INDEX ux_accounts_user_no
+            ON accounts(user_id, account_no);
+        INSERT INTO accounts (account_no, currency, updated_at)
+            VALUES ('SAME', 'TWD', '2026-09-30T00:00:00');
+    """)
+
+    db._ensure_phase_c_user_id(con, str(path))
+    con.execute(
+        "INSERT INTO accounts (user_id, account_no, currency, updated_at) "
+        "VALUES (1, 'SAME', 'USD', '2026-09-30T00:00:00')"
+    )
+    columns = [
+        row[2]
+        for row in con.execute("PRAGMA index_info(ux_accounts_user_no)").fetchall()
+    ]
+    table_info = con.execute("PRAGMA table_info(accounts)").fetchall()
+    primary_key = [
+        row[1] for row in sorted(table_info, key=lambda row: row[5]) if row[5]
+    ]
+    currency = next(row for row in table_info if row[1] == "currency")
+    con.close()
+
+    assert columns == ["user_id", "account_no", "currency"]
+    assert primary_key == ["user_id", "account_no", "currency"]
+    assert currency[3] == 1
+
+
+def test_router_migration_failure_is_not_cached():
+    from backend.server import db
+
+    class LockedConnection:
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        def rollback(self):
+            pass
+
+    cache_key = "locked-regression"
+    db._PHASE_C_MIGRATED.discard(cache_key)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        db._ensure_phase_c_user_id(LockedConnection(), cache_key)  # type: ignore[arg-type]
+
+    assert cache_key not in db._PHASE_C_MIGRATED
+
+
+def test_router_migration_never_caches_nullable_user_id_schema(tmp_path):
+    from backend.server import db
+
+    path = tmp_path / "nullable-user-id.sqlite"
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE twd_transactions (user_id INTEGER, dedup_key TEXT);
+        CREATE TABLE card_billed_txns (user_id INTEGER, dedup_key TEXT);
+        CREATE TABLE card_pending_txns (user_id INTEGER);
+        CREATE TABLE balance_history (user_id INTEGER, snapshot_date TEXT);
+        CREATE TABLE accounts (
+            user_id INTEGER, account_no TEXT, currency TEXT, updated_at TEXT
+        );
+        CREATE TABLE cards (user_id INTEGER, card_no TEXT);
+        CREATE TABLE daily_metrics (user_id INTEGER, snapshot_date TEXT, category TEXT);
+        CREATE TABLE sync_log (user_id INTEGER);
+    """)
+    cache_key = str(path)
+    db._PHASE_C_MIGRATED.discard(cache_key)
+
+    db._ensure_phase_c_user_id(con, cache_key)
+
+    assert cache_key not in db._PHASE_C_MIGRATED
+    con.close()
+
+
+def test_router_migration_replaces_wrong_existing_unique_index(tmp_path):
+    from backend.server import db
+
+    path = tmp_path / "wrong-index.sqlite"
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE twd_transactions (
+            user_id INTEGER NOT NULL DEFAULT 1, dedup_key TEXT
+        );
+        CREATE INDEX ux_twd_dedup ON twd_transactions(dedup_key);
+    """)
+
+    db._ensure_phase_c_user_id(con, str(path))
+
+    index = next(
+        row for row in con.execute("PRAGMA index_list(twd_transactions)")
+        if row[1] == "ux_twd_dedup"
+    )
+    columns = [
+        row[2] for row in con.execute("PRAGMA index_info(ux_twd_dedup)")
+    ]
+    assert index[2] == 1
+    assert columns == ["user_id", "dedup_key"]
+    con.close()
+
+
+def test_router_migration_revalidates_even_when_path_was_cached():
+    from backend.server import db
+
+    cache_key = "replaced-database"
+    db._PHASE_C_MIGRATED.add(cache_key)
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE accounts (account_no TEXT)")
+
+    db._ensure_phase_c_user_id(con, cache_key)
+
+    columns = {row[1] for row in con.execute("PRAGMA table_info(accounts)")}
+    assert {"user_id", "account_no", "currency"}.issubset(columns)
+    con.close()
 
 
 # ============================================================
@@ -683,8 +982,9 @@ def test_portfolio_accounts_newer_null_txn_balance_keeps_valid_raw_balance(
         projection.db_api,
         "list_latest_account_txn_balances",
         lambda **kwargs: (
-            {"C1": AccountTxnBalance(
-                account_no="C1", txn_datetime="2026-08-11T04:17:46", balance=None,
+            {("C1", "TWD"): AccountTxnBalance(
+                account_no="C1", currency="TWD",
+                txn_datetime="2026-08-11T04:17:46", balance=None,
             )}
             if kwargs["bank"] == "cathay"
             else original(**kwargs)
@@ -783,6 +1083,36 @@ def test_portfolio_accounts_loan_fallback_when_no_raw_balance(
     assert len(rows) == 1
     assert rows[0]["balance"] == -500_000
     assert rows[0]["product_type"] == "loan"
+
+
+def test_portfolio_accounts_never_applies_twd_loan_fallback_to_foreign_account(
+    temp_data_root, client, auth_headers,
+):
+    path = _seed_accounts_db(
+        temp_data_root, "linebank",
+        accounts=[{
+            "account_no": "L-USD", "currency": "USD", "product_type": "loan",
+        }],
+    )
+    con = sqlite3.connect(str(path))
+    con.execute("""CREATE TABLE balance_history (
+        snapshot_date TEXT PRIMARY KEY,
+        twd_balance INTEGER, fx_balance INTEGER, loan_balance INTEGER,
+        updated_at TEXT NOT NULL
+    )""")
+    con.execute(
+        "INSERT INTO balance_history (snapshot_date, loan_balance, updated_at) VALUES (?, ?, ?)",
+        ("2026-06-13", 1000, _utcnow_iso()),
+    )
+    con.commit()
+    con.close()
+
+    response = client.get("/portfolio/accounts", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()[0]["currency"] == "USD"
+    assert response.json()[0]["balance"] is None
+    assert response.json()[0]["twd_estimate"] is None
 
 
 def test_portfolio_accounts_raw_balance_beats_loan_fallback(

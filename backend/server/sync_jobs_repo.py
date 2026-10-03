@@ -21,7 +21,9 @@ from typing import Any, NamedTuple
 
 from backend.server.db import get_conn, now_iso
 
-_HISTORY_DOMAINS = frozenset({"twd_transactions", "card_billed_transactions"})
+_HISTORY_DOMAINS = frozenset({
+    "twd_transactions", "account_transactions", "card_billed_transactions",
+})
 
 
 class StaleSweep(NamedTuple):

@@ -24,6 +24,8 @@
  */
 import type { Transaction } from '@/types/api';
 
+import { sumSafeIntegers } from './decimal';
+
 // ============================================================
 // Filter — 套 category/subcategory/direction/search
 // ============================================================
@@ -220,13 +222,14 @@ export function computePeriodStats(items: Transaction[]): PeriodStats {
   let count = 0;
   for (const t of items) {
     if (t.excluded === true || t.auto_excluded === true) continue;
+    if ((t.currency || 'TWD') !== 'TWD') continue;
     const signed = txnCashflowAmount(t);
     if (signed !== 0) count += 1;
     if (signed > 0) {
-      income += signed;
+      income = sumSafeIntegers([income, signed]);
     } else if (signed < 0) {
-      expense += -signed;
+      expense = sumSafeIntegers([expense, -signed]);
     }
   }
-  return { income, expense, net: income - expense, count };
+  return { income, expense, net: sumSafeIntegers([income, -expense]), count };
 }

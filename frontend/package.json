@@ -62,10 +62,5 @@
     "test:routes": "tsx src/lib/routeParents.test.ts && tsx src/lib/syncRefresh.test.ts && tsx src/lib/pushProvider.test.ts && tsx src/lib/snaptradeUi.test.ts && tsx src/lib/uiContract.test.ts",
     "typecheck": "tsc --noEmit"
   },
-  "private": true,
-  "pnpm": {
-    "patchedDependencies": {
-      "react-native-worklets@0.8.3": "patches/react-native-worklets@0.8.3.patch"
-    }
-  }
+  "private": true
 }

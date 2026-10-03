@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -252,6 +253,25 @@ def test_convert_to_twd_returns_int():
     assert isinstance(twd, int)
     # 1201387 * 0.19945 = 239617.13... → round → 239617
     assert twd == 239617
+
+
+def test_convert_to_twd_preserves_decimal_input_and_rejects_unsafe_output(monkeypatch):
+    monkeypatch.setattr(fx_service, "get_rate", lambda currency: 0.333333)
+    assert fx_service.convert_to_twd(
+        Decimal("9007199254740990.24549"), "USD",
+    ) == 3_002_396_749_180_579
+    monkeypatch.setattr(fx_service, "get_rate", lambda currency: 2.0)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        fx_service.convert_to_twd(9_007_199_254_740_991, "USD")
+    monkeypatch.setattr(fx_service, "get_rate", lambda currency: 0.1)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        fx_service.convert_to_twd(Decimal("9007199254740992"), "USD")
+    monkeypatch.setattr(fx_service, "get_rate", lambda currency: 1_000_000.0)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        fx_service.convert_to_twd(Decimal("0.0000009"), "USD")
+    monkeypatch.setattr(fx_service, "get_rate", lambda currency: 1.0)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        fx_service.convert_to_twd(Decimal("1.5"), "TWD")
 
 
 def test_convert_to_twd_uses_midpoint_rate():

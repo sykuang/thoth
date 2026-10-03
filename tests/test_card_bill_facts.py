@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+import pytest
+
 from backend.core import persist as persist_mod
 from backend.core.card_bills import (
     apply_card_bill_facts,
@@ -34,6 +36,10 @@ def test_summarize_persisted_card_bills_deduplicates_bank_scope_and_sums_hsbc():
     assert summarize_persisted_card_bills("sinopac", [
         bank_rows[0], {**bank_rows[1], "bill_due_amount": None},
     ]) is None
+    with pytest.raises(ValueError, match="invalid persisted card-bill amount"):
+        summarize_persisted_card_bills("hsbc", [
+            bank_rows[0], {**bank_rows[1], "bill_due_amount": 1.9},
+        ])
 
 
 def test_make_card_bill_fact_fails_closed_and_keeps_payment_pair_atomic():
@@ -41,6 +47,7 @@ def test_make_card_bill_fact_fails_closed_and_keeps_payment_pair_atomic():
     assert make_card_bill_fact(remaining_due="NaN") is None
     assert make_card_bill_fact(remaining_due="Infinity") is None
     assert make_card_bill_fact(remaining_due=100_000_001) is None
+    assert make_card_bill_fact(remaining_due=1.9) is None
     assert make_card_bill_fact(remaining_due=10, payment_due_date="not-a-date") is None
 
     assert make_card_bill_fact(

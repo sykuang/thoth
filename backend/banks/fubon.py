@@ -43,7 +43,13 @@ from zoneinfo import ZoneInfo
 from scrapling.fetchers import StealthySession
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector, validate_history_coverage
+from backend.core.base import (
+    BankCollectResult,
+    BankCrawler,
+    ResponseCollector,
+    _OriginGuardProxy,
+    validate_history_coverage,
+)
 from backend.core.card_bills import make_card_bill_fact, publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import TaipeiFubonCreds
@@ -73,11 +79,40 @@ def _fubon_route_matches(parsed, route: str) -> bool:
         return True
     if not is_history:
         return False
+    return parsed.query in {"menuId=CDS0401", "menuId=CDS0401&"}
+
+
+def _fubon_form_action_matches(value: object) -> bool:
+    parsed = urlsplit(str(value or ""))
     try:
-        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+        port = parsed.port
     except ValueError:
         return False
-    return pairs == [("menuId", "CDS0401")]
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "ebank.taipeifubon.com.tw"
+        and port in (None, 443)
+        and _fubon_route_matches(parsed, urlsplit(TWD_HISTORY_URL).path)
+    )
+
+
+def _fubon_twd_post_matches(value: object, method: object) -> bool:
+    parsed = urlsplit(str(value or ""))
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        method == "POST"
+        and parsed.scheme == "https"
+        and parsed.hostname == "ebank.taipeifubon.com.tw"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path == "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
+    )
 
 
 HEADER_LOGIN_BTN_ID = "header_form:header_login"  # 在 frame1，右上「登入」開 modal
@@ -87,7 +122,9 @@ LOGIN_BTN_ID = "btnLogin2"  # 一般登入 form 的登入鈕（txnFrame 內）
 FIELD_M1_CAPTCHA     = "m1_userCaptcha"  # 6 碼純數字
 CAPTCHA_IMG_ID       = "m1_captchaImage"  # 158×30 captcha img
 _DYNAMIC_LOGIN_FIELD_ID = re.compile(r"^m1_[A-Z]{10}$")
-_FUBON_OPTION_VALUE_RE = re.compile(r"^012-\d{3}-(\d{14})-[A-Z]-TW$")
+_FUBON_OPTION_VALUE_RE = re.compile(
+    r"^012-(?:\d{3}-(\d{14})-[A-Z]-TW|\d{2}(\d{14})-TWD-\d{2})$"
+)
 
 
 def _fubon_one_year_floor(end: date) -> date:
@@ -95,8 +132,16 @@ def _fubon_one_year_floor(end: date) -> date:
     return date(year, end.month, min(end.day, monthrange(year, end.month)[1]))
 
 
+def _fubon_months_back(end: date, months: int) -> date:
+    index = end.year * 12 + end.month - 1 - months
+    year, month = divmod(index, 12)
+    month += 1
+    return date(year, month, min(end.day, monthrange(year, month)[1]))
+
+
 def _fubon_history_windows(as_of: date) -> list[dict]:
-    recent_start = as_of - timedelta(days=180)
+    # Live 2026-10-02: the native rdoDay180 preset returned rows dated six calendar months back, not 180 days.
+    recent_start = _fubon_months_back(as_of, 6)
     return [
         {"preset": "rdoDay180_365", "start": _fubon_one_year_floor(as_of).isoformat(), "end": (recent_start - timedelta(days=1)).isoformat()},
         {"preset": "rdoDay180", "start": recent_start.isoformat(), "end": as_of.isoformat()},
@@ -115,7 +160,8 @@ def _validated_fubon_twd_options(options) -> list[dict]:
             continue
         identities = re.findall(r"(?<!\d)\d{10,16}(?!\d)", text or "")
         value_match = _FUBON_OPTION_VALUE_RE.fullmatch(value) if isinstance(value, str) else None
-        canonical_value = len(identities) == 1 and value_match is not None and identities[0] == value_match.group(1)
+        value_identity = next((group for group in value_match.groups() if group), None) if value_match else None
+        canonical_value = len(identities) == 1 and value_identity == identities[0]
         if (type(index) is not int or index != position or not isinstance(text, str)
                 or not canonical_value or value in seen_values
                 or identities[0] in seen_identities):
@@ -184,17 +230,88 @@ def _fubon_card_bill_fact(amount_text: str):
     )
 
 
+def _fubon_preset_diagnostic_guard(
+    hits: list[dict], preset_shapes: list[str],
+) -> str | None:
+    if any(hit.get("presetBound") is True for hit in hits):
+        return None
+    if preset_shapes and all(shape == "missing" for shape in preset_shapes):
+        return "fubon-twd-history-transport-preset-missing"
+    if "duplicate" in preset_shapes:
+        return "fubon-twd-history-transport-preset-duplicate"
+    if "mismatch" in preset_shapes:
+        return "fubon-twd-history-transport-preset-mismatch"
+    return None
+
+
+def _fubon_settled_control_guard(
+    settled: object,
+    option: dict,
+    observed_pairs: set[tuple[str, str]],
+) -> str | None:
+    if not isinstance(settled, dict):
+        return "fubon-twd-history-controls-settled-shape"
+    identities = re.findall(r"(?<!\d)\d{10,16}(?!\d)", settled.get("text") or "")
+    if settled.get("value") != option.get("value") or identities != [option.get("identity")]:
+        return "fubon-twd-history-controls-account"
+    for key in ("detail", "fast", "preset"):
+        if settled.get(key) is not True:
+            return f"fubon-twd-history-controls-{key}"
+    if len(observed_pairs) != 1:
+        return "fubon-twd-history-controls-preset"
+    action, preset = next(iter(observed_pairs))
+    if not all(isinstance(value, str) and 0 < len(value) <= 128 for value in (action, preset)):
+        return "fubon-twd-history-controls-preset"
+    if settled.get("formBound") is not True:
+        return "fubon-twd-history-controls-form"
+    if not isinstance(settled.get("viewState"), str) or not settled["viewState"]:
+        return "fubon-twd-history-controls-viewstate"
+    if not _fubon_form_action_matches(settled.get("formAction")):
+        return "fubon-twd-history-controls-action"
+    return None
+
+
 class FubonCrawler(BankCrawler):
     USES_SHARED_LOGIN_CHECKPOINTS: ClassVar[bool] = True
     SAFE_COLLECT_GUARDS = frozenset({
         "fubon-twd-history-controls",
+        "fubon-twd-history-controls-action",
+        "fubon-twd-history-controls-account",
+        "fubon-twd-history-controls-detail",
+        "fubon-twd-history-controls-fast",
+        "fubon-twd-history-controls-form",
+        "fubon-twd-history-controls-preset",
+        "fubon-twd-history-controls-settled-shape",
+        "fubon-twd-history-controls-viewstate",
         "fubon-twd-history-frame",
         "fubon-twd-history-inventory",
         "fubon-twd-history-navigation",
         "fubon-twd-history-result",
+        "fubon-twd-history-result-account-identity",
+        "fubon-twd-history-result-account-value",
+        "fubon-twd-history-result-busy",
+        "fubon-twd-history-result-failed",
         "fubon-twd-history-result-frame",
-        "fubon-twd-history-stale-result",
+        "fubon-twd-history-result-freshness",
+        "fubon-twd-history-result-mutated",
+
         "fubon-twd-history-transport",
+        "fubon-twd-history-transport-failed",
+        "fubon-twd-history-transport-no-bound-response",
+        "fubon-twd-history-transport-no-action-bound-response",
+        "fubon-twd-history-transport-no-fields-bound-response",
+        "fubon-twd-history-transport-no-form-bound-response",
+        "fubon-twd-history-transport-no-frame-bound-response",
+        "fubon-twd-history-transport-no-preset-bound-response",
+        "fubon-twd-history-transport-preset-duplicate",
+        "fubon-twd-history-transport-preset-mismatch",
+        "fubon-twd-history-transport-preset-missing",
+        "fubon-twd-history-transport-no-viewstate-bound-response",
+        "fubon-twd-history-transport-no-response",
+        "fubon-twd-history-transport-pending",
+        "fubon-twd-history-transport-quiescence",
+        "fubon-twd-history-transport-request-count",
+        "fubon-twd-history-transport-too-many-responses",
     })
     HISTORY_COVERAGE_REQUIRED: ClassVar[bool] = True
     HISTORY_COVERAGE_DOMAINS: ClassVar[frozenset[str]] = frozenset({"twd_transactions"})
@@ -226,12 +343,24 @@ class FubonCrawler(BankCrawler):
             parsed_url = urlsplit(result.get("url") or "")
         except (TypeError, ValueError):
             raise RuntimeError("fubon-twd-history-result") from None
+        snapshot_guards = (
+            ("freshness", isinstance(snapshot, dict) and snapshot.get("resultFresh") is True),
+            ("busy", isinstance(snapshot, dict) and snapshot.get("busy") is False),
+            ("failed", isinstance(snapshot, dict) and snapshot.get("failed") is False),
+            ("account-value", isinstance(snapshot, dict) and snapshot.get("selectedValue") == account_value),
+            ("account-identity", isinstance(snapshot, dict) and snapshot.get("selectedIdentity") == identity),
+
+        )
+        if isinstance(snapshot, dict):
+            for guard, valid in snapshot_guards:
+                if not valid:
+                    raise RuntimeError(f"fubon-twd-history-result-{guard}")
         if (
             not isinstance(identity, str)
             or not re.fullmatch(r"\d{10,16}", identity)
             or not isinstance(account_value, str)
             or (value_match := _FUBON_OPTION_VALUE_RE.fullmatch(account_value)) is None
-            or value_match.group(1) != identity
+            or next((group for group in value_match.groups() if group), None) != identity
             or preset not in {"rdoDay180_365", "rdoDay180"}
             or start_day > end_day
             or status not in {"complete", "explicit_empty"}
@@ -245,31 +374,36 @@ class FubonCrawler(BankCrawler):
             or parsed_url.path != "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
             or not isinstance(transport, dict)
             or set(transport) != {
-                "status", "contentType", "responseCount", "frameBound", "presetBound",
+                "status", "contentType", "responseCount", "matchingResponseCount",
+                "frameBound", "requestBound", "presetBound",
                 "fieldsBound", "viewStateBound", "actionBound", "formBound",
+                "allResponsesBound",
             }
             or type(transport.get("status")) is not int
             or transport.get("status") != 200
             or transport.get("contentType") != "text/plain"
             or type(transport.get("responseCount")) is not int
-            or transport.get("responseCount") != 1
+            or transport["responseCount"] < 1
+            or transport["responseCount"] > 20
+            or type(transport.get("matchingResponseCount")) is not int
+            or transport["matchingResponseCount"] < 1
+            or transport["matchingResponseCount"] > 20
+            or transport["matchingResponseCount"] > transport["responseCount"]
             or transport.get("frameBound") is not True
+            or transport.get("requestBound") is not True
             or transport.get("presetBound") is not True
             or transport.get("fieldsBound") is not True
             or transport.get("viewStateBound") is not True
             or transport.get("actionBound") is not True
             or transport.get("formBound") is not True
+            or transport.get("allResponsesBound") is not True
             or not isinstance(snapshot, dict)
-            or snapshot.get("evidenceFresh") is not True
+            or snapshot.get("resultFresh") is not True
             or snapshot.get("busy") is not False
             or snapshot.get("failed") is not False
             or snapshot.get("selectedValue") != account_value
             or snapshot.get("selectedIdentity") != identity
-            or snapshot.get("selectedPreset") != preset
-            or snapshot.get("windowBound") is not True
-            or snapshot.get("resultContainerBound") is not True
-            or snapshot.get("displayedStart") != start
-            or snapshot.get("displayedEnd") != end
+
         ):
             raise RuntimeError("fubon-twd-history-result")
         pager = snapshot.get("pager")
@@ -327,12 +461,15 @@ class FubonCrawler(BankCrawler):
                 raise RuntimeError("fubon-twd-history-result") from None
             if (
                 snapshot.get("hasGrid") is not True
-                or snapshot.get("nativeTotalFound") is not True
-                or snapshot.get("nativeTotalMarkerCount") != 1
+                or not (
+                    (snapshot.get("nativeTotalFound") is True and snapshot.get("nativeTotalMarkerCount") == 1)
+                    or (snapshot.get("singlePageProof") is True and snapshot.get("nativeTotalMarkerCount") == 0)
+                )
                 or grid_count != 1
                 or row_count <= 0
                 or snapshot.get("emptyMarker") is not None
-                or any(day < start_day or day > end_day for day in dates)
+                # Live 2026-10-02: native rdoDay180_365 also returns the first rdoDay180 day; persistence drops it.
+                or any(day < start_day or day > end_day + timedelta(days=preset == "rdoDay180_365") for day in dates)
             ):
                 raise RuntimeError("fubon-twd-history-result")
         elif (
@@ -716,7 +853,7 @@ class FubonCrawler(BankCrawler):
 
         try:
             page.wait_for_timeout(3000)
-            for _ in range(10):
+            for _ in range(25):
                 page.wait_for_timeout(1000)
                 if self._logged_in(page):
                     return
@@ -770,38 +907,53 @@ class FubonCrawler(BankCrawler):
 
     @staticmethod
     def _capture_twd_response(
-        response, hits: list[dict], expected_frame, preset: str,
-        expected_view_state: str, expected_action: str, form_bound: bool,
+        response, hits: list[dict], expected_frame, form_bound: bool,
+        expected_requests: list[object], preset_shapes: list[str] | None = None,
     ) -> None:
         try:
-            parsed = urlsplit(response.url or "")
             request = response.request
-            fields = parse_qsl(request.post_data or "", keep_blank_values=True)
+            expected_frame = _OriginGuardProxy._unwrap(expected_frame)
+            if not _fubon_twd_post_matches(response.url, request.method):
+                return
+            hit = {
+                "status": response.status,
+                "contentType": (response.headers.get("content-type") or "").split(";", 1)[0].lower(),
+                "frameBound": request.frame is expected_frame,
+                "requestBound": any(request is expected for expected in expected_requests),
+                "_navigation": getattr(request, "is_navigation_request", lambda: False)() is True,
+                "presetBound": False,
+                "fieldsBound": False,
+                "viewStateBound": False,
+                "actionBound": False,
+                "formBound": form_bound is True,
+            }
+            hits.append(hit)
+            post_data = request.post_data or ""
+            if len(post_data) > 32_768:
+                return
+            fields = parse_qsl(post_data, keep_blank_values=True)
             names = [key for key, _value in fields]
             preset_values = [value for key, value in fields if key == "checkedConvenientPeriod"]
+            if preset_shapes is not None:
+                if not preset_values:
+                    preset_shapes.append("missing")
+                elif len(preset_values) != 1:
+                    preset_shapes.append("duplicate")
+                elif not 0 < len(preset_values[0]) <= 128:
+                    preset_shapes.append("mismatch")
+                else:
+                    preset_shapes.append("present")
             view_states = [value for key, value in fields if key == "javax.faces.ViewState"]
             actions = [value for key, value in fields if key == "ajaxAction"]
-            if (
-                parsed.scheme == "https"
-                and parsed.hostname == "ebank.taipeifubon.com.tw"
-                and parsed.port in (None, 443)
-                and parsed.username is None
-                and parsed.password is None
-                and not parsed.query
-                and not parsed.fragment
-                and parsed.path == "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces"
-                and request.method == "POST"
-            ):
-                hits.append({
-                    "status": response.status,
-                    "contentType": (response.headers.get("content-type") or "").split(";", 1)[0].lower(),
-                    "frameBound": request.frame is expected_frame,
-                    "presetBound": preset_values == [preset],
-                    "fieldsBound": sorted(names) == ["ajaxAction", "checkedConvenientPeriod", "javax.faces.ViewState"],
-                    "viewStateBound": view_states == [expected_view_state],
-                    "actionBound": actions == [expected_action],
-                    "formBound": form_bound is True,
-                })
+            action_bound = len(actions) == 1 and bool(actions[0])
+            preset_bound = len(preset_values) == 1 and 0 < len(preset_values[0]) <= 128
+            hit.update({
+                "_presetValue": preset_values[0] if preset_bound else None,
+                "presetBound": preset_bound,
+                "fieldsBound": sorted(names) == ["ajaxAction", "checkedConvenientPeriod", "javax.faces.ViewState"],
+                "viewStateBound": len(view_states) == 1 and bool(view_states[0]),
+                "actionBound": action_bound,
+            })
         except Exception:
             return
 
@@ -814,72 +966,321 @@ class FubonCrawler(BankCrawler):
         return result_frame
 
     def _collect_twd_window(self, page, frame, option: dict, window: dict) -> tuple[dict, dict]:
-        controls = bounded_evaluate(frame, r"""(args) => {
+        control_requests, control_pending, control_failed = [], {}, []
+        raw_frame = _OriginGuardProxy._unwrap(frame)
+
+        def control_request(request):
+            try:
+                parsed = urlsplit(request.url or "")
+                if (
+                    request.method == "POST"
+                    and request.frame is raw_frame
+                    and parsed.scheme == "https"
+                    and parsed.hostname == "ebank.taipeifubon.com.tw"
+                    and parsed.port in (None, 443)
+                    and parsed.path == urlsplit(TWD_HISTORY_URL).path
+                    and not parsed.query
+                    and not parsed.fragment
+                ):
+                    control_requests.append(request)
+                    control_pending[id(request)] = request
+            except Exception:
+                return
+
+        def control_finished(request):
+            control_pending.pop(id(request), None)
+
+        def control_failed_request(request):
+            if id(request) in control_pending:
+                control_failed.append(request)
+            control_pending.pop(id(request), None)
+
+        control_listeners = []
+
+        def remove_control_listeners():
+            failures = []
+            for event, listener in reversed(control_listeners):
+                try:
+                    page.remove_listener(event, listener)
+                    control_listeners.remove((event, listener))
+                except Exception as exc:
+                    failures.append(exc)
+            if failures:
+                raise RuntimeError("fubon-twd-history-listener-cleanup") from failures[0]
+
+        def finish_control_listeners():
+            active_error = sys.exception()
+            try:
+                remove_control_listeners()
+            except Exception as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"listener cleanup failed: {type(cleanup_error).__name__}")
+
+        def add_control_listeners():
+            for event, listener in (
+                ("request", control_request),
+                ("requestfinished", control_finished),
+                ("requestfailed", control_failed_request),
+            ):
+                try:
+                    page.on(event, listener)
+                except Exception:
+                    finish_control_listeners()
+                    raise
+                control_listeners.append((event, listener))
+
+        def wait_control_settle():
+            stable_ticks, prior_count = 0, -1
+            for tick in range(80):
+                page.wait_for_timeout(100)
+                current_count = len(control_requests)
+                if not control_pending and current_count == prior_count:
+                    stable_ticks += 1
+                else:
+                    stable_ticks = 0
+                prior_count = current_count
+                if tick >= 19 and stable_ticks >= 10:
+                    break
+            if control_pending or control_failed or stable_ticks < 10:
+                raise RuntimeError("fubon-twd-history-controls")
+
+        add_control_listeners()
+        try:
+            selected = bounded_evaluate(frame, r"""(args) => {
+                const forms=[...document.querySelectorAll('form#form1')];
+                if(forms.length!==1)return {ok:false};
+                const form=forms[0];
+                const one=(s)=>{const xs=[...document.querySelectorAll(s)];return xs.length===1&&form.contains(xs[0])?xs[0]:null;};
+                const account=one('#form1\\:comboAccount');
+                const states=[...document.querySelectorAll('[name="javax.faces.ViewState"]')];
+                const submit=one('#form1\\:doValidateAndSubmit');
+                let formAction='';
+                try{formAction=new URL(form.getAttribute('action')||form.action,location.href).href;}catch(_e){}
+                const formBound=form.method.toUpperCase()==='POST'
+                    &&states.length===1&&form.contains(states[0]);
+                if(!account||!submit||!formBound||!states[0].value)return {ok:false};
+                account.value=args.value;
+                for(const n of ['input','change'])account['dispatch'+'Event'](new Event(n,{bubbles:true}));
+                if(typeof comboAccountChange==='function')comboAccountChange();
+                if(typeof checkAccountType==='function')checkAccountType();
+                account['dispatch'+'Event'](new Event('blur',{bubbles:true}));
+                const chosen=account.options[account.selectedIndex];
+                return {ok:true,value:chosen?.value||'',text:(chosen?.textContent||'').trim(),
+                    viewState:states[0].value,formBound,formAction};
+            }""", {"value": option["value"]})
+            if (
+                not isinstance(selected, dict)
+                or selected.get("ok") is not True
+                or selected.get("value") != option["value"]
+                or re.findall(r"(?<!\d)\d{10,16}(?!\d)", selected.get("text") or "") != [option["identity"]]
+                or not isinstance(selected.get("viewState"), str)
+                or not selected["viewState"]
+                or selected.get("formBound") is not True
+                or not _fubon_form_action_matches(selected.get("formAction"))
+            ):
+                raise RuntimeError("fubon-twd-history-controls")
+            wait_control_settle()
+        finally:
+            finish_control_listeners()
+
+        def click_control(
+            selector: str, *, expected_preset: str | None = None,
+        ) -> set[tuple[str, str]]:
+            control_requests.clear()
+            control_pending.clear()
+            control_failed.clear()
+            pairs: set[tuple[str, str]] = set()
+            before_checked = bounded_evaluate(frame, r"""(selector) => {
+                const forms=[...document.querySelectorAll('form#form1')];
+                const nodes=[...document.querySelectorAll(selector)];
+                return forms.length===1&&nodes.length===1&&forms[0].contains(nodes[0])
+                    ? nodes[0].checked===true : null;
+            }""", selector)
+            if type(before_checked) is not bool:
+                raise RuntimeError("fubon-twd-history-controls")
+            if before_checked is True and expected_preset is None:
+                return set()
+            add_control_listeners()
+            try:
+                checked = bounded_evaluate(frame, r"""(selector) => {
+                    const forms=[...document.querySelectorAll('form#form1')];
+                    if(forms.length!==1)return false;
+                    const nodes=[...document.querySelectorAll(selector)];
+                    if(nodes.length!==1||!forms[0].contains(nodes[0]))return false;
+                    nodes[0].click();
+                    return nodes[0].checked===true;
+                }""", selector)
+                if checked is not True:
+                    raise RuntimeError("fubon-twd-history-controls")
+                wait_control_settle()
+                for request in control_requests:
+                    post_data = request.post_data or ""
+                    if len(post_data) > 32_768:
+                        continue
+                    fields = parse_qsl(post_data, keep_blank_values=True)
+                    names = [name for name, _value in fields]
+                    actions = [value for name, value in fields if name == "ajaxAction"]
+                    presets = [value for name, value in fields if name == "checkedConvenientPeriod"]
+                    if (
+                        sorted(names) == ["ajaxAction", "checkedConvenientPeriod", "javax.faces.ViewState"]
+                        and len(actions) == 1
+                        and bool(actions[0])
+                        and len(presets) == 1
+                        and bool(presets[0])
+                    ):
+                        pairs.add((actions[0], presets[0]))
+                if len(control_requests) != 1 or len(pairs) != 1:
+                    raise RuntimeError("fubon-twd-history-controls")
+                _action, preset = next(iter(pairs))
+                if not preset or len(preset) > 128:
+                    raise RuntimeError("fubon-twd-history-controls")
+            finally:
+                finish_control_listeners()
+            return pairs
+
+        click_control("#form1\\:rdoTxDetail")
+        click_control("#form1\\:rdoFast")
+        query_control_pairs = click_control(
+            f"#form1\\:{window['preset']}", expected_preset=window["preset"],
+        )
+        settled = bounded_evaluate(frame, r"""(args) => {
             const forms=[...document.querySelectorAll('form#form1')];
-            if(forms.length!==1)return {ok:false};
+            if(forms.length!==1)return null;
             const form=forms[0];
-            const one = (s) => { const xs=[...document.querySelectorAll(s)]; return xs.length===1&&form.contains(xs[0]) ? xs[0] : null; };
-            const account=one('#form1\\:comboAccount'), detail=one('#form1\\:rdoTxDetail');
-            const fast=one('#form1\\:rdoFast');
-            const preset=one(`#form1\\:${CSS.escape(args.preset)}`);
-            const states=[...document.querySelectorAll('[name="javax.faces.ViewState"]')];
-            const actions=[...document.querySelectorAll('[name="ajaxAction"]')];
+            const one=(s)=>{const xs=[...document.querySelectorAll(s)];return xs.length===1&&form.contains(xs[0])?xs[0]:null;};
+            const account=one('#form1\\:comboAccount'),detail=one('#form1\\:rdoTxDetail');
+            const fast=one('#form1\\:rdoFast'),preset=one(`#form1\\:${CSS.escape(args.preset)}`);
             const submit=one('#form1\\:doValidateAndSubmit');
+            const states=[...document.querySelectorAll('[name="javax.faces.ViewState"]')];
+            const chosen=account?.options[account.selectedIndex];
             let formAction='';
             try{formAction=new URL(form.getAttribute('action')||form.action,location.href).href;}catch(_e){}
-            const formBound=form.method.toUpperCase()==='POST'&&formAction===args.formAction
-                &&states.length===1&&form.contains(states[0])&&actions.length===1&&form.contains(actions[0]);
-            if (!account || !detail || !fast || !preset
-                || !submit || !formBound || !states[0].value || !actions[0].value) return {ok:false};
-            account.value=args.value;
-            for (const n of ['input','change']) account['dispatch' + 'Event'](new Event(n,{bubbles:true}));
-            if (typeof comboAccountChange==='function') comboAccountChange();
-            if (typeof checkAccountType==='function') checkAccountType();
-            account['dispatch' + 'Event'](new Event('blur',{bubbles:true})); detail.click();
-            fast.click(); preset.click();
-            const selected=account.options[account.selectedIndex];
-            return {ok:true,value:selected?.value||'',text:(selected?.textContent||'').trim(),detail:detail.checked,
-                fast:fast.checked,preset:preset.checked,
-                viewState:states[0].value,ajaxAction:actions[0].value,formBound};
-        }""", {**window, "value": option["value"], "formAction": TWD_HISTORY_URL})
-        if (
-            not isinstance(controls, dict)
-            or controls.get("ok") is not True
-            or controls.get("value") != option["value"]
-            or re.findall(r"(?<!\d)\d{10,16}(?!\d)", controls.get("text") or "") != [option["identity"]]
-            or controls.get("detail") is not True
-            or controls.get("preset") is not True
-            or not isinstance(controls.get("viewState"), str)
-            or not controls["viewState"]
-            or not isinstance(controls.get("ajaxAction"), str)
-            or not controls["ajaxAction"]
-            or controls.get("formBound") is not True
-            or controls.get("fast") is not True
-        ):
-            raise RuntimeError("fubon-twd-history-controls")
-        marked = bounded_evaluate(frame, r"""() => {
-            const labels=new Set(['查無相關資料','查無交易資料']), evidence=[];
-            for (const table of document.querySelectorAll('table')) if (/帳務日期/.test(table.textContent||'') && /交易時間/.test(table.textContent||'')) evidence.push(table);
-            for (const el of document.querySelectorAll('*')) if (labels.has((el.textContent||'').trim())) evidence.push(el);
-            for (const el of new Set(evidence)) el.setAttribute('data-hermes-stale-evidence','1');
-            return new Set(evidence).size;
+            const formBound=form.method.toUpperCase()==='POST'&&states.length===1&&form.contains(states[0]);
+            if(!account||!detail||!fast||!preset||!submit||!formBound)return null;
+            return {value:chosen?.value||'',text:(chosen?.textContent||'').trim(),
+                detail:detail.checked,fast:fast.checked,preset:preset.checked,
+                viewState:states[0].value,formBound,formAction};
+        }""", {"preset": window["preset"]})
+        settled_guard = _fubon_settled_control_guard(settled, option, query_control_pairs)
+        if settled_guard is not None:
+            raise RuntimeError(settled_guard)
+        controls = settled
+
+        before_result = bounded_evaluate(frame, r"""() => {
+            const forms=[...document.querySelectorAll('form#form1')], form=forms.length===1?forms[0]:null;
+            const headers=['帳務日期','交易時間','摘要','支出金額','存入金額','即時餘額','附註'];
+            const directRows=(table)=>[...table.querySelectorAll(':scope > tr,:scope > thead > tr,:scope > tbody > tr,:scope > tfoot > tr')];
+            const directCells=(row)=>[...row.querySelectorAll(':scope > th,:scope > td')];
+            const cellText=(c)=>{const k=c.cloneNode(true);k.querySelectorAll('script,style,noscript').forEach(n=>n.remove());return (k.textContent||'').trim().replaceAll('\u3000','');};
+            const cellTexts=(row)=>directCells(row).map(cellText);
+            const isHeader=(row)=>{const values=cellTexts(row);return values.length===headers.length&&values.every((value,index)=>value===headers[index]);};
+            const tables=[...document.querySelectorAll('table')].filter(table=>form?.contains(table)&&!table.closest('.popup_com')&&directRows(table).some(isHeader));
+            const labels=new Set(['查無相關資料','查無交易資料']);
+            const empty=[...document.querySelectorAll('*')].filter(el=>form?.contains(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
+            const normalize=(value)=>(value||'').trim().replace(/\s+/g,' ');
+            const signature=JSON.stringify({
+                tables:tables.map(el=>normalize(el.innerText||el.textContent)),
+                empty:empty.map(el=>normalize(el.textContent)),
+            });
+            const hash=(text)=>{let value=2166136261;for(let i=0;i<text.length;i++){value^=text.charCodeAt(i);value=Math.imul(value,16777619);}return(value>>>0).toString(16).padStart(8,'0');};
+            const present=tables.length>0||empty.length>0;
+            return {present,digest:hash(signature)};
         }""")
-        if type(marked) is not int:
-            raise RuntimeError("fubon-twd-history-stale-result")
+        if (
+            not isinstance(before_result, dict)
+            or set(before_result) != {"present", "digest"}
+            or type(before_result.get("present")) is not bool
+            or not isinstance(before_result.get("digest"), str)
+            or re.fullmatch(r"[0-9a-f]{8}", before_result["digest"]) is None
+        ):
+            raise RuntimeError("fubon-twd-history-result-freshness")
         hits = []
+        preset_shapes: list[str] = []
+        submit_pending: set[int] = set()
+        submit_requests: list[object] = []
+        frame_navs = 0
+
+        def submit_navigated(navigated_frame) -> None:
+            nonlocal frame_navs
+            if navigated_frame is _OriginGuardProxy._unwrap(frame):
+                frame_navs += 1
+        submit_request_count = 0
+        submit_failed_flag = False
+
+        def submit_request(request) -> None:
+            nonlocal submit_request_count
+            if _fubon_twd_post_matches(request.url, request.method):
+                submit_request_count += 1
+                submit_requests.append(request)
+                submit_pending.add(id(request))
+
+        def submit_finished(request) -> None:
+            if _fubon_twd_post_matches(request.url, request.method):
+                submit_pending.discard(id(request))
+
+        def submit_failed(request) -> None:
+            nonlocal submit_failed_flag
+            if _fubon_twd_post_matches(request.url, request.method):
+                submit_failed_flag = True
+                submit_pending.discard(id(request))
+
         listener = lambda response: self._capture_twd_response(
-            response, hits, frame, window["preset"], controls["viewState"], controls["ajaxAction"],
-            controls["formBound"],
+            response, hits, frame, controls["formBound"], submit_requests, preset_shapes,
         )
-        page.on("response", listener)
+        submit_listeners = (
+            ("request", submit_request),
+            ("requestfinished", submit_finished),
+            ("requestfailed", submit_failed),
+            ("response", listener),
+            ("framenavigated", submit_navigated),
+        )
+        registered_submit_listeners = []
+
+        def clear_dom_guard(scope) -> None:
+            try:
+                bounded_evaluate(scope, r"""() => {
+                    window.__hermesFubonDomGuard?.disconnect();
+                    delete window.__hermesFubonDomGuard;
+                    delete window.__hermesFubonDomGuardDocument;
+                    delete window.__hermesFubonDomGuardMutations;
+                    delete window.__hermesFubonSubmitDocument;
+                }""")
+            except Exception:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                raise
+
         try:
-            frame.click("#form1\\:doValidateAndSubmit", timeout=8000)
+            for event, callback in submit_listeners:
+                page.on(event, callback)
+                registered_submit_listeners.append((event, callback))
+            radio_submitted = bounded_evaluate(frame, r"""(requested) => {
+                const forms=[...document.querySelectorAll('form#form1')];
+                if(forms.length!==1)return false;
+                const form=forms[0], nodes=[...document.querySelectorAll(`#form1\\:${CSS.escape(requested)}`)];
+                if(nodes.length!==1||!form.contains(nodes[0])||!nodes[0].name)return false;
+                const preset=nodes[0];
+                const checked=[...form.querySelectorAll('input[type="radio"]')]
+                    .filter(node=>node.name===preset.name&&node.checked);
+                const submits=[...document.querySelectorAll('#form1\\:doValidateAndSubmit')];
+                if(preset.checked!==true||checked.length!==1||checked[0]!==preset
+                    ||submits.length!==1||!form.contains(submits[0]))return false;
+                window.__hermesFubonSubmitDocument=document;
+                submits[0].click();
+                return true;
+            }""", window["preset"])
+            if radio_submitted is not True:
+                raise RuntimeError("fubon-twd-history-controls-preset")
             page.wait_for_timeout(9000)
             stable_ticks = 0
             prior_count = len(hits)
             for _ in range(120):
                 page.wait_for_timeout(100)
-                if not hits:
+                if not hits or submit_pending:
+                    stable_ticks = 0
                     continue
                 if len(hits) == prior_count:
                     stable_ticks += 1
@@ -888,34 +1289,155 @@ class FubonCrawler(BankCrawler):
                     stable_ticks = 0
                 if stable_ticks >= 5:
                     break
-            if len(hits) != 1 or stable_ticks < 5:
-                raise RuntimeError("fubon-twd-history-transport")
+            # The native submit is a full-form POST; Fubon answers it with one
+            # HTML document for the same frame, then the new document's AJAX.
+            navigation_bound = (
+                len(hits) >= 2
+                and hits[0].get("contentType") == "text/html"
+                and sum(hit.get("contentType") == "text/html" for hit in hits) == 1
+                and hits[0].get("status") == 200
+                and hits[0].get("frameBound") is True
+                and hits[0].get("requestBound") is True
+                and hits[0].get("_navigation") is True
+                and frame_navs == 1
+            )
+            guarded = bounded_evaluate(frame, r"""(navigated) => {
+                if(!navigated&&window.__hermesFubonSubmitDocument!==document)return false;
+                window.__hermesFubonSubmitDocument=document;
+                window.__hermesFubonDomGuard?.disconnect();
+                window.__hermesFubonDomGuardDocument=document;
+                window.__hermesFubonDomGuardMutations=0;
+                window.__hermesFubonDomGuard=new MutationObserver(records=>{
+                    window.__hermesFubonDomGuardMutations+=records.length;
+                });
+                window.__hermesFubonDomGuard.observe(document.documentElement,{
+                    subtree:true,childList:true,attributes:true,characterData:true,
+                });
+                return true;
+            }""", navigation_bound)
+            if guarded is not True:
+                raise RuntimeError("fubon-twd-history-result-mutated")
         finally:
-            page.remove_listener("response", listener)
-        transport = {**hits[0], "responseCount": len(hits)}
-        if (
-            transport["status"] != 200
-            or transport["contentType"] != "text/plain"
-            or transport["frameBound"] is not True
-            or transport["presetBound"] is not True
-            or transport["fieldsBound"] is not True
-            or transport["viewStateBound"] is not True
-            or transport["actionBound"] is not True
-            or transport["formBound"] is not True
-        ):
-            raise RuntimeError("fubon-twd-history-transport")
-        result_frame = self._bound_twd_result_frame(page, frame)
-        snapshot = bounded_evaluate(result_frame, r"""(args) => {
+            active_error = sys.exception()
+            cleanup_errors = []
+            for event, callback in reversed(registered_submit_listeners):
+                try:
+                    page.remove_listener(event, callback)
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if active_error is not None:
+                try:
+                    clear_dom_guard(frame)
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                try:
+                    clear_dom_guard(frame)
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if active_error is None:
+                    raise RuntimeError("fubon-twd-history-listener-cleanup") from cleanup_errors[0]
+                for cleanup_error in cleanup_errors:
+                    active_error.add_note(
+                        f"listener cleanup failed: {type(cleanup_error).__name__}"
+                    )
+        try:
+            if not hits:
+                raise RuntimeError("fubon-twd-history-transport-no-response")
+            if len(hits) > 20:
+                raise RuntimeError("fubon-twd-history-transport-too-many-responses")
+            bound_hits = [
+                hit for hit in hits
+                if hit.get("status") == 200
+                and hit.get("contentType") == "text/plain"
+                and all(hit.get(key) is True for key in (
+                    "frameBound", "requestBound", "presetBound", "fieldsBound", "viewStateBound",
+                    "actionBound", "formBound",
+                ))
+            ]
+            if not bound_hits:
+                preset_guard = _fubon_preset_diagnostic_guard(hits, preset_shapes)
+                if preset_guard is not None:
+                    raise RuntimeError(preset_guard)
+                guards = (
+                    ("frameBound", "fubon-twd-history-transport-no-frame-bound-response"),
+                    ("requestBound", "fubon-twd-history-transport-no-bound-response"),
+                    ("presetBound", "fubon-twd-history-transport-no-preset-bound-response"),
+                    ("fieldsBound", "fubon-twd-history-transport-no-fields-bound-response"),
+                    ("viewStateBound", "fubon-twd-history-transport-no-viewstate-bound-response"),
+                    ("actionBound", "fubon-twd-history-transport-no-action-bound-response"),
+                    ("formBound", "fubon-twd-history-transport-no-form-bound-response"),
+                )
+                for key, guard in guards:
+                    if not any(hit.get(key) is True for hit in hits):
+                        raise RuntimeError(guard)
+                raise RuntimeError("fubon-twd-history-transport-no-bound-response")
+            all_responses_bound = all(
+                hit.get("status") == 200
+                and hit.get("frameBound") is True
+                and hit.get("requestBound") is True
+                and hit.get("formBound") is True
+                for hit in hits
+            )
+            bound_hit_ids = {id(hit) for hit in bound_hits}
+            if not all_responses_bound or any(
+                hit.get("contentType") == "text/plain" and id(hit) not in bound_hit_ids
+                for hit in hits
+            ):
+                raise RuntimeError("fubon-twd-history-transport-no-bound-response")
+            preset_values = {hit.pop("_presetValue", None) for hit in bound_hits}
+            if len(preset_values) != 1 or not next(iter(preset_values)):
+                raise RuntimeError("fubon-twd-history-transport-preset-mismatch")
+            if submit_pending:
+                raise RuntimeError("fubon-twd-history-transport-pending")
+            if submit_failed_flag:
+                raise RuntimeError("fubon-twd-history-transport-failed")
+            if submit_request_count != len(hits):
+                raise RuntimeError("fubon-twd-history-transport-request-count")
+            if stable_ticks < 5:
+                raise RuntimeError("fubon-twd-history-transport-quiescence")
+            transport = {
+                **{key: value for key, value in bound_hits[0].items() if not key.startswith("_")},
+                "responseCount": len(hits),
+                "matchingResponseCount": len(bound_hits),
+                "allResponsesBound": True,
+            }
+            if (
+                transport["status"] != 200
+                or transport["contentType"] != "text/plain"
+                or transport["frameBound"] is not True
+                or transport["requestBound"] is not True
+                or transport["presetBound"] is not True
+                or transport["fieldsBound"] is not True
+                or transport["viewStateBound"] is not True
+                or transport["actionBound"] is not True
+                or transport["formBound"] is not True
+                or transport["allResponsesBound"] is not True
+            ):
+                raise RuntimeError("fubon-twd-history-transport")
+        except Exception as active_error:
+            try:
+                clear_dom_guard(frame)
+            except Exception as cleanup_error:
+                active_error.add_note(
+                    f"DOM guard cleanup failed: {type(cleanup_error).__name__}"
+                )
+            raise
+        try:
+            result_frame = self._bound_twd_result_frame(page, frame)
+            snapshot = bounded_evaluate(result_frame, r"""(args) => {
             const visible=(el)=>{const r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
                 for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0||n.hidden||(n.getAttribute('aria-hidden')||'').toLowerCase()==='true')return false;}return true;};
+            const forms=[...document.querySelectorAll('form#form1')], form=forms.length===1?forms[0]:null;
             const labels=new Set(['查無相關資料','查無交易資料']);
-            const empty=[...document.querySelectorAll('*')].filter(el=>visible(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
+            const empty=[...document.querySelectorAll('*')].filter(el=>form?.contains(el)&&visible(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
             const headers=['帳務日期','交易時間','摘要','支出金額','存入金額','即時餘額','附註'];
             const directRows=(table)=>[...table.querySelectorAll(':scope > tr,:scope > thead > tr,:scope > tbody > tr,:scope > tfoot > tr')];
             const directCells=(row)=>[...row.querySelectorAll(':scope > th,:scope > td')];
-            const cellTexts=(row)=>directCells(row).map(c=>(c.textContent||'').trim().replaceAll('\u3000',''));
+            const cellText=(c)=>{const k=c.cloneNode(true);k.querySelectorAll('script,style,noscript').forEach(n=>n.remove());return (k.textContent||'').trim().replaceAll('\u3000','');};
+            const cellTexts=(row)=>directCells(row).map(cellText);
             const isHeader=(row)=>{const values=cellTexts(row);return values.length===headers.length&&values.every((value,index)=>value===headers[index]);};
-            const allCandidates=[...document.querySelectorAll('table')].filter(table=>directRows(table).some(isHeader));
+            const allCandidates=[...document.querySelectorAll('table')].filter(table=>form?.contains(table)&&!table.closest('.popup_com')&&directRows(table).some(isHeader));
             const candidates=allCandidates.filter(table=>{const header=directRows(table).find(isHeader);return visible(table)&&visible(header)&&directCells(header).every(visible);});
             const hiddenGridCount=allCandidates.length-candidates.length;
             const grid=candidates.length===1?candidates[0]:null, projected=[];
@@ -927,29 +1449,17 @@ class FubonCrawler(BankCrawler):
                     const dates=values.filter(value=>/^\*?20\d{2}\/\d{1,2}\/\d{1,2}$/.test(value));
                     if(hidden||values.length!==7||dates.length!==1){malformedRowCount++;continue;} projected.push(values);
                 }}
-            const pagerControls=[...document.querySelectorAll('a,button,input,select,[role="button"]')].filter(el=>{
+            const pagerControls=[...document.querySelectorAll('a,button,input:not([type="radio"]):not([type="hidden"]):not([type="checkbox"]),select,[role="button"]')].filter(el=>form?.contains(el)&&!el.closest('.ui-datepicker,[class*="calendar" i]')).filter(el=>{
                 const raw=(el.textContent||el.value||'').trim();
                 const pageNumber=/^\d{1,3}$/.test(raw)&&Number(raw)>1;
                 const meta=[el.textContent,el.value,el.title,el.getAttribute('aria-label'),el.getAttribute('rel'),el.getAttribute('href'),el.getAttribute('onclick'),el.id,el.getAttribute('class'),el.getAttribute('data-page')].filter(Boolean).join(' ');
                 return pageNumber||/(?:下一頁|下頁|next\s*page|page[-_: ]?next|pagenext|rel[=: ]?next|[?&]page=[2-9]\d*)/i.test(meta);
             });
-            const pagerStructures=[...document.querySelectorAll('[class*="pagination" i],[class*="paginator" i],[id*="pagination" i],[id*="paginator" i],[aria-label*="pagination" i],[rel="next" i],[data-page]:not([data-page="1"])')];
+            const pagerStructures=[...document.querySelectorAll('[class*="pagination" i],[class*="paginator" i],[id*="pagination" i],[id*="paginator" i],[aria-label*="pagination" i],[rel="next" i],[data-page]:not([data-page="1"])')].filter(el=>form?.contains(el));
             const pagerNodes=[...new Set([...pagerControls,...pagerStructures])];
-            const account=[...document.querySelectorAll('select#form1\\:comboAccount')], selected=account.length===1?account[0].options[account[0].selectedIndex]:null;
+            const account=[...document.querySelectorAll('select#form1\\:comboAccount')].filter(el=>form?.contains(el)), selected=account.length===1?account[0].options[account[0].selectedIndex]:null;
             const selectedIds=selected?(selected.textContent||'').match(/(?<!\d)\d{10,16}(?!\d)/g)||[]:[];
-            const preset=[...document.querySelectorAll(`#form1\\:${CSS.escape(args.preset)}`)];
             const own=(el)=>[...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE).map(n=>n.textContent||'').join(' ');
-            const periodContainers=[...new Set([...document.querySelectorAll('td,th,label,span,div,p')].filter(el=>visible(el)&&/查詢期間/.test(own(el))).map(el=>el.closest('tr')||el.parentElement||el))];
-            const period=periodContainers.length===1?(periodContainers[0].innerText||''):'';
-            const evidence=grid||(empty.length===1?empty[0]:null);
-            let resultContainer=periodContainers.length===1?evidence:null;
-            while(resultContainer&&!resultContainer.contains(periodContainers[0]))resultContainer=resultContainer.parentElement;
-            const resultContainerBound=!!resultContainer&&!['HTML','BODY','FORM'].includes(resultContainer.tagName);
-            const canonical=(raw)=>{const parts=raw.replaceAll('-','/').split('/').map(Number);return `${parts[0]}-${String(parts[1]).padStart(2,'0')}-${String(parts[2]).padStart(2,'0')}`;};
-            const displayed=(period.match(/20\d{2}[\/-]\d{1,2}[\/-]\d{1,2}/g)||[]).map(canonical);
-            const displayedStart=displayed.length===2?displayed[0]:'';
-            const displayedEnd=displayed.length===2?displayed[1]:'';
-            const windowBound=displayedStart===args.start&&displayedEnd===args.end;
             const text=document.body?.innerText||'';
             const totalAdjacentToGrid=(el)=>{
                 if(!grid)return false;
@@ -959,16 +1469,66 @@ class FubonCrawler(BankCrawler):
                 const siblings=[...grid.parentElement.children];
                 return Math.abs(siblings.indexOf(node)-siblings.indexOf(grid))===1;
             };
-            const nativeTotalMarkers=resultContainerBound?[resultContainer,...resultContainer.querySelectorAll('td,th,label,span,div,p')].map(el=>({el,match:visible(el)?own(el).match(/^\s*共\s*([\d,]+)\s*筆\s*$/):null})).filter(item=>item.match):[];
-            const nativeTotals=nativeTotalMarkers.length===1&&totalAdjacentToGrid(nativeTotalMarkers[0].el)?[Number(nativeTotalMarkers[0].match[1].replaceAll(',',''))].filter(Number.isSafeInteger):[];
+            const nativeTotalMarkers=form?[form,...form.querySelectorAll('td,th,label,span,div,p')].map(el=>({el,match:visible(el)?own(el).match(/^\s*共\s*([\d,]+)\s*筆\s*$/):null})).filter(item=>item.match&&totalAdjacentToGrid(item.el)):[];
+            const nativeTotals=nativeTotalMarkers.length===1?[Number(nativeTotalMarkers[0].match[1].replaceAll(',',''))].filter(Number.isSafeInteger):[];
+            const pageInputs=['resultGrid:dataGridCurrentPage','resultGrid:dataGridCurrentPageSize'].map(id=>[...document.querySelectorAll('input[type="hidden"]')].filter(el=>el.id===id&&form?.contains(el)));
+            const singlePageProof=!!grid&&pageInputs.every(list=>list.length===1)&&pageInputs[0][0].value==='1'&&/^[1-9]\d{0,3}$/.test(pageInputs[1][0].value)&&rawDataRowCount<Number(pageInputs[1][0].value);
             const nativeTotalFound=nativeTotals.length===1;
-            const totalCount=nativeTotalFound?nativeTotals[0]:(empty.length===1?0:-1);
+            const totalCount=nativeTotalFound?nativeTotals[0]:(singlePageProof?rawDataRowCount:(empty.length===1?0:-1));
             const busyText=/(?:資料(?:載入|查詢|處理)中|載入中|查詢中|處理中|請稍候|請稍待|系統忙碌|system is busy|loading|processing|querying|waiting|\bbusy\b)/i.test(text);
             const busy=busyText||[document.documentElement,...document.querySelectorAll('*')].some(el=>visible(el)&&((el.getAttribute('aria-busy')||'').toLowerCase()==='true'||(el.getAttribute('role')||'').toLowerCase()==='progressbar'||el.tagName.toLowerCase()==='progress'||/(?:loading|loader|spinner|progress|processing|querying|waiting|busy|blockui)/i.test([el.id,el.getAttribute('class')].filter(Boolean).join(' '))));
             const structuralErrors=[...document.querySelectorAll('.error,.errorMessage,.alert,.ui-message-error,.ui-messages-error,[role="alert"],dialog,[role="dialog"],[aria-invalid="true"]')].filter(visible);
             const failed=structuralErrors.length>0||/(?:錯誤|失敗|異常|逾時|失效|重新登入|請重新查詢|請稍後再試|連線中斷|連線失敗|無法處理|system error|\berror\b|timeout|expired|failed|retry|try again|disconnected)/i.test(text);
-            return {href:location.href,failed,busy,selectedValue:selected?.value||'',selectedIdentity:selectedIds.length===1?selectedIds[0]:'',selectedPreset:preset.length===1&&preset[0].checked?args.preset:'',windowBound,resultContainerBound,displayedStart,displayedEnd,evidenceFresh:grid?!grid.hasAttribute('data-hermes-stale-evidence'):empty.length===1&&!empty[0].hasAttribute('data-hermes-stale-evidence'),hasGrid:!!grid,gridCandidateCount:candidates.length,hiddenGridCount,pagerNodeCount:pagerNodes.length,structuralErrorCount:structuralErrors.length,gridRows:projected,gridRowCount:projected.length,rawDataRowCount,malformedRowCount,hiddenRowCount,hiddenCellCount,totalCount,nativeTotalFound,nativeTotalMarkerCount:nativeTotalMarkers.length,gridText:grid?'structured':'',emptyMarker:empty.length===1?(empty[0].textContent||'').trim():null,pager:{present:pagerNodes.length>0,actionableNext:pagerNodes.length}};
-        }""", {"identity": option["identity"], "preset": window["preset"], "start": window["start"], "end": window["end"]})
+            const digestEmpty=[...document.querySelectorAll('*')].filter(el=>form?.contains(el)&&labels.has((el.textContent||'').trim())&&![...el.children].some(c=>labels.has((c.textContent||'').trim())));
+            const normalize=(value)=>(value||'').trim().replace(/\s+/g,' ');
+            const signature=JSON.stringify({
+                tables:allCandidates.map(el=>normalize(el.innerText||el.textContent)),
+                empty:digestEmpty.map(el=>normalize(el.textContent)),
+            });
+            const hash=(value)=>{let result=2166136261;for(let i=0;i<value.length;i++){result^=value.charCodeAt(i);result=Math.imul(result,16777619);}return(result>>>0).toString(16).padStart(8,'0');};
+            const resultDigest=hash(signature);
+            return {href:location.href,failed,busy,selectedValue:selected?.value||'',selectedIdentity:selectedIds.length===1?selectedIds[0]:'',resultDigest,hasGrid:!!grid,gridCandidateCount:candidates.length,hiddenGridCount,pagerNodeCount:pagerNodes.length,structuralErrorCount:structuralErrors.length,gridRows:projected,gridRowCount:projected.length,rawDataRowCount,malformedRowCount,hiddenRowCount,hiddenCellCount,totalCount,nativeTotalFound,singlePageProof,nativeTotalMarkerCount:nativeTotalMarkers.length,gridText:grid?'structured':'',emptyMarker:empty.length===1?(empty[0].textContent||'').trim():null,pager:{present:pagerNodes.length>0,actionableNext:pagerNodes.length}};
+            }""", {"identity": option["identity"], "preset": window["preset"], "start": window["start"], "end": window["end"]})
+            if isinstance(snapshot, dict):
+                result_digest = snapshot.pop("resultDigest", None)
+                snapshot["resultFresh"] = (
+                    isinstance(result_digest, str)
+                    and re.fullmatch(r"[0-9a-f]{8}", result_digest) is not None
+                    and (
+                        before_result["present"] is False
+                        or result_digest != before_result["digest"]
+                    )
+                )
+            page.wait_for_timeout(500)
+            dom_guard = bounded_evaluate(result_frame, r"""() => {
+                const observer=window.__hermesFubonDomGuard;
+                const records=observer?.takeRecords()||[];
+                const result={
+                    sameDocument:window.__hermesFubonDomGuardDocument===document,
+                    submitDocument:window.__hermesFubonSubmitDocument===document,
+                    mutations:(window.__hermesFubonDomGuardMutations||0)+records.length,
+                };
+                observer?.disconnect();
+                delete window.__hermesFubonDomGuard;
+                delete window.__hermesFubonDomGuardDocument;
+                delete window.__hermesFubonDomGuardMutations;
+                delete window.__hermesFubonSubmitDocument;
+                return result;
+            }""")
+        except Exception:
+            try:
+                clear_dom_guard(frame)
+            except Exception:
+                pass
+            raise
+        if (
+            not isinstance(dom_guard, dict)
+            or dom_guard.get("sameDocument") is not True
+            or dom_guard.get("submitDocument") is not True
+            or type(dom_guard.get("mutations")) is not int
+            or dom_guard["mutations"] != 0
+        ):
+            raise RuntimeError("fubon-twd-history-result-mutated")
         if not isinstance(snapshot, dict) or snapshot.get("failed") is not False:
             raise RuntimeError("fubon-twd-history-result")
         result = {

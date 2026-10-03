@@ -68,7 +68,7 @@ class TestHelpers:
             store.upsert_accounts([{
                 "account_no": "LOAN-1",
                 "product_type": ProductType.LOAN,
-                "raw_balance": 1234.5,
+                "raw_balance": 1234,
             }])
             store.upsert_balance_history([{
                 "snapshotDate": "2026-08-06",
@@ -85,7 +85,7 @@ class TestHelpers:
 
         assert account is not None
         assert snapshot is not None
-        assert account["raw_balance"] == -1234.5
+        assert account["raw_balance"] == -1234
         assert snapshot["loan_balance"] == 1234
 
 
