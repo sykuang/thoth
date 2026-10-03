@@ -278,6 +278,20 @@ class CathayCrawler(BankCrawler):
                 max_actions=1,
                 require_exclusive_action=True,
             ),
+            # Live 2026-10-03: post-login CUBE announcement modal (e.g. 系統維護公告)
+            # with only 不要再顯示 / 下次再提醒. Dismiss with 下次再提醒 (non-persistent).
+            LoginCheckpointRule(
+                name="cathay-post-login-announcement",
+                bank="cathay",
+                phases=(CheckpointPhase.POST_SUBMIT_SETTLE,),
+                kind=CheckpointKind.DISMISSIBLE_NOTICE,
+                container_selector="[role='dialog']",
+                action_texts=("下次再提醒",),
+                required_body_pattern=re.compile(
+                    r"^\s*\S{0,12}公告\s.+\s不要再顯示\s+下次再提醒\s*$", re.S,
+                ),
+                max_actions=1,
+            ),
             LoginCheckpointRule(
                 name="cathay-unknown-modal",
                 bank="cathay",

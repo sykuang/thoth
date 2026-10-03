@@ -21,7 +21,7 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
     rules = crawler.login_checkpoint_rules()
 
     assert CathayCrawler.USES_SHARED_LOGIN_CHECKPOINTS is True
-    assert len(rules) == 4
+    assert len(rules) == 5  # +cathay-post-login-announcement (2026-10-03 live)
     rule = rules[0]
     assert (
         rule.name,
