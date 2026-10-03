@@ -39,6 +39,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, UTC
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -711,7 +712,10 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         if not account.included_in_net_worth or account.balance is None:
             continue
         try:
-            estimate = fx_service.convert_to_twd(account.balance, account.currency)
+            balance = account.balance
+            if (account.currency or "").strip().upper() == "TWD":
+                balance = Decimal(str(balance)).to_integral_value(rounding=ROUND_HALF_EVEN)
+            estimate = fx_service.convert_to_twd(balance, account.currency)
         except ValueError:
             raise
         except Exception:

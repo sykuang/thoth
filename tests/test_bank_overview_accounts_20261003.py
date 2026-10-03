@@ -68,3 +68,17 @@ def test_scb_deposit_accounts_retry_until_overview_and_parse_masked_rows():
         {"account_no": "12345●●●●●6790", "currency": "USD", "type": "外幣活期存款", "balance": "10"},
     ]
     assert ScbCrawler._deposit_accounts(_ScbPage(text, navigates_on="none")) == []
+
+
+def test_cathay_post_login_announcement_rule_is_narrow():
+    from backend.banks.cathay import CathayCrawler
+
+    rules = {r.name: r for r in CathayCrawler.login_checkpoint_rules(CathayCrawler.__new__(CathayCrawler))}
+    rule = rules["cathay-post-login-announcement"]
+    assert rule.action_texts == ("下次再提醒",)
+    notice = "系統維護公告\n\n2026/10/05(日)01:00~06:00 配合系統維護作業，暫停證券查詢服務。\n不要再顯示\n下次再提醒"
+    assert rule.required_body_pattern.search(notice)
+    assert not rule.required_body_pattern.search("系統維護公告\n請輸入驗證碼\n確定")
+    assert not rule.required_body_pattern.search("重要通知 服務內容提醒 我知道了")
+    names = list(rules)
+    assert names.index("cathay-post-login-announcement") < names.index("cathay-unknown-dialog")

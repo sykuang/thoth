@@ -92,8 +92,26 @@ def query_twd(page, start, end, locale, selected_account, guard, revalidate, *, 
                 require(time.monotonic() < deadline)
                 page.wait_for_timeout(20)
 
+    def bare_one(target):
+        require(target.count() == 1)
+        require(target.is_visible() and target.is_enabled() and target.evaluate(SAFE))
+        return target
+
     @site("form_owner")
     def owner():
+        # Live 2026-10-03: the SPA settles after each click (account swap, overlays);
+        # a single-instant probe failed nondeterministically on slower hosts. Poll the
+        # same predicate until TIMEOUT, then run it once more with labelled sites.
+        deadline = time.monotonic() + TIMEOUT / 1000
+        while time.monotonic() < deadline:
+            try:
+                owner_state(bare_one)
+                return
+            except ValueError:
+                page.wait_for_timeout(50)
+        owner_state(one)
+
+    def owner_state(one):
         dialogs = page.locator('dialog:visible,[role="dialog"]:visible')
         require(dialogs.count() <= 1)
         if dialogs.count():

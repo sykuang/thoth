@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from backend.core.money import native_money
+from decimal import Decimal, InvalidOperation
+
+from backend.core.money import MAX_SAFE_INTEGER, native_money
 
 
 def _num(s) -> int | None:
@@ -21,7 +23,24 @@ def _num_real(s) -> float | int | None:
     return native_money(s, "USD", optional=True)
 
 def _num_to_float(s) -> float | None:
-    """'300,000' / 300000 / '344,282' / None → float | None."""
+    """'300,000' / 300000 / '344,282' / None → float | None.
+
+    Unparseable, non-finite, or out-of-range bank fields are unavailable (None)
+    so callers keep saved values; a representable amount that would lose
+    precision still raises.
+    """
+    if isinstance(s, bool):
+        return None
+    if s is not None:
+        text = str(s).replace(",", "").replace(" ", "").strip()
+        if text in {"", "-"}:
+            return None
+        try:
+            parsed = Decimal(text)
+        except InvalidOperation:
+            return None
+        if not parsed.is_finite() or abs(parsed) > MAX_SAFE_INTEGER:
+            return None
     value = native_money(s, "USD", optional=True)
     if value is None:
         return None
