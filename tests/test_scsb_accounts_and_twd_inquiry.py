@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, call
@@ -85,6 +86,21 @@ NT$20,589,800
     }
 
 
+def test_scsb_accounts_keep_same_number_in_each_currency():
+    accounts = ScsbCrawler._extract_accounts("""
+外幣存款
+12345678901234
+USD 1.00
+外幣存款
+12345678901234
+JPY 2
+""")
+    assert [(row["account_no"], row["currency"]) for row in accounts] == [
+        ("12345678901234", "USD"),
+        ("12345678901234", "JPY"),
+    ]
+
+
 def test_scsb_overview_empty_inventory_requires_explicit_empty_marker():
     assert ScsbCrawler._overview_twd_inventory_authoritative("我的帳戶摘要") is False
     assert ScsbCrawler._overview_twd_inventory_authoritative(
@@ -119,6 +135,35 @@ def test_persist_scsb_first_deposit_remains_asset_not_loan(tmp_path, monkeypatch
     assert got["90000000167058"]["raw_balance"] == 73500
     assert got["90000000247044"]["product_type"] == "loan"
     assert got["90000000247044"]["raw_balance"] == -20589800
+
+
+def test_persist_scsb_keeps_foreign_totals_currency_scoped_and_rounded(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("scsb")
+    try:
+        persist_scsb({"accounts": [
+            {"account_no": "U1", "currency": "USD", "balance": "0.000001", "type_header": "存款"},
+            {"account_no": "U2", "currency": "USD", "balance": "0.2", "type_header": "存款"},
+            {"account_no": "J1", "currency": "JPY", "balance": "1", "type_header": "存款"},
+            {"account_no": "L1", "currency": "USD", "balance": "12.34", "type_header": "貸款"},
+        ]}, store)
+        history = store.conn.execute(
+            "SELECT fx_balance FROM balance_history ORDER BY snapshot_date DESC LIMIT 1"
+        ).fetchone()
+        metric = store.conn.execute(
+            "SELECT payload_json FROM daily_metrics WHERE category='balance_latest'"
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert history is not None and history[0] is None
+    assert metric is not None
+    payload = json.loads(metric[0])
+    assert payload["fx_raw"] is None
+    assert payload["fx_by_currency"] == {"JPY": 1.0, "USD": 0.200001}
+    assert payload["loan_by_currency"] == {"USD": 12.34}
 
 
 def test_scsb_twd_inquiry_accepts_chinese_menu_labels():

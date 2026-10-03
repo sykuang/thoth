@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from backend.core import classify
@@ -400,6 +400,10 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
             raise ValueError("incomplete Fubon TWD history result")
         start = date.fromisoformat(window["start"])
         end = date.fromisoformat(window["end"])
+        if result.get("preset") == "rdoDay180_365":
+            # Native preset overlaps rdoDay180 (required alongside below) by one day; keep rdoDay180's copy.
+            overlap = (end + timedelta(days=1)).isoformat()
+            rows = [row for row in rows if not (row.get("account_date") == overlap and str(row.get("datetime", ""))[:10] == overlap)]
         try:
             valid_rows = all(
                 row.get("account_no") == window["identity"]

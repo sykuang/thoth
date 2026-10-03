@@ -3,12 +3,18 @@ from __future__ import annotations
 from datetime import date
 import json
 from pathlib import Path
+import traceback
 from types import SimpleNamespace
 
 import pytest
 
 from backend.banks.ubot import UbotCrawler
-from backend.core.base import ApiHit, ResponseCollector, validate_history_coverage
+from backend.core.base import (
+    ApiHit,
+    ResponseCollector,
+    _HistoryBodyObserver,
+    validate_history_coverage,
+)
 from backend.core.persist import persist_collected
 from backend.core.persist import ubot as ubot_persist_module
 from backend.core.persist.ubot import persist_ubot
@@ -278,6 +284,22 @@ def test_ubot_nttotal_allows_only_explicit_single_page_metadata(total: dict) -> 
     assert UbotCrawler._nttotal_claims_more_pages(total) is False
 
 
+def test_ubot_accepts_native_json_history_request() -> None:
+    hit = _history_hit()
+    hit.req_body = {
+        "acctNo": ACCOUNT,
+        "beginDate": "20260701",
+        "endDate": "20260731",
+        "sessionId": "opaque-session",
+        "sid": "opaque-sid",
+    }
+
+    assert UbotCrawler._validate_history_hit(
+        hit, identity=ACCOUNT, start=date(2026, 7, 1),
+        end=date(2026, 7, 31), after_sequence=1,
+    ) == {"records": [_row()], "status": "complete", "rows": 1}
+
+
 def test_ubot_accepts_complete_and_exact_ub112_empty() -> None:
     complete = UbotCrawler._validate_history_hit(
         _history_hit(), identity=ACCOUNT, start=date(2026, 7, 1),
@@ -437,6 +459,61 @@ def test_ubot_dom_snapshot_rejects_unchanged_pre_submit_tables() -> None:
             browser.close()
 
 
+def test_ubot_dom_settle_ignores_unrelated_page_mutations() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        page.set_content(
+            '<main><div id="clock"></div><table><tbody><tr><td>old</td></tr></tbody></table></main>'
+        )
+        try:
+            UbotCrawler._mark_twd_dom_boundary(page)
+            page.evaluate("""() => {
+              setTimeout(() => { document.querySelector('td').textContent = 'new'; }, 200);
+              window.__unrelatedClock = setInterval(() => {
+                document.querySelector('#clock').textContent = String(performance.now());
+              }, 100);
+            }""")
+
+            state = UbotCrawler._wait_for_twd_dom_settle(page)
+
+            assert state["quiet_ms"] >= 2_000
+            assert state["stale_tables"] == 0
+        finally:
+            page.evaluate("() => clearInterval(window.__unrelatedClock)")
+            browser.close()
+
+
+def test_ubot_dom_settle_ignores_unrelated_button_mutations() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        page.set_content(
+            '<header><button id="clock">更新</button></header>'
+            '<main><table><tbody><tr><td>old</td></tr></tbody></table></main>'
+        )
+        try:
+            UbotCrawler._mark_twd_dom_boundary(page)
+            page.evaluate("""() => {
+              setTimeout(() => { document.querySelector('td').textContent = 'new'; }, 200);
+              window.__unrelatedClock = setInterval(() => {
+                document.querySelector('#clock').textContent = `更新 ${performance.now()}`;
+              }, 100);
+            }""")
+
+            state = UbotCrawler._wait_for_twd_dom_settle(page)
+
+            assert state["quiet_ms"] >= 2_000
+            assert state["stale_tables"] == 0
+        finally:
+            page.evaluate("() => clearInterval(window.__unrelatedClock)")
+            browser.close()
+
+
 def test_ubot_dom_settle_observes_delayed_pager() -> None:
     from patchright.sync_api import sync_playwright
 
@@ -450,6 +527,44 @@ def test_ubot_dom_settle_observes_delayed_pager() -> None:
               document.querySelector('main').insertAdjacentHTML(
                 'beforeend', '<nav class="pagination"><span>1</span><span>2</span></nav>');
             }, 500)""")
+            assert UbotCrawler._wait_for_twd_dom_settle(page)["pagers"] > 0
+        finally:
+            browser.close()
+
+
+def test_ubot_dom_settle_returns_after_stable_confirmation_window(monkeypatch) -> None:
+    class Page:
+        waits = 0
+
+        def wait_for_timeout(self, milliseconds: int) -> None:
+            assert milliseconds == 500
+            self.waits += 1
+
+    page = Page()
+    monkeypatch.setattr(
+        UbotCrawler,
+        "_twd_dom_snapshot",
+        staticmethod(lambda _page: {"quiet_ms": 10_000, "pagers": 0}),
+    )
+
+    UbotCrawler._wait_for_twd_dom_settle(page)
+
+    assert page.waits == 12
+
+
+def test_ubot_dom_settle_observes_pager_after_initial_quiet_window() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        page = browser.new_page()
+        page.set_content('<main><table><tbody><tr><td>row</td></tr></tbody></table></main>')
+        try:
+            UbotCrawler._mark_twd_dom_boundary(page)
+            page.evaluate("""() => setTimeout(() => {
+              document.querySelector('main').insertAdjacentHTML(
+                'beforeend', '<nav class="pagination"><span>1</span><span>2</span></nav>');
+            }, 5200)""")
             assert UbotCrawler._wait_for_twd_dom_settle(page)["pagers"] > 0
         finally:
             browser.close()
@@ -516,6 +631,250 @@ def test_response_collector_preserves_exact_bounded_ubot_json_bytes() -> None:
 
     assert collector.hits[0].body_size == len(raw)
     assert collector.hits[0].resp_json == _history_hit().resp_json
+
+
+def test_response_collector_rejects_duplicate_ubot_json_request_keys() -> None:
+    collector = ResponseCollector("ubot.com.tw")
+    page = SimpleNamespace()
+    frame = SimpleNamespace(page=page)
+    page.main_frame = frame
+    request = SimpleNamespace(
+        url="https://www.ubot.com.tw/MyBank/IBKB010102",
+        headers={}, method="POST",
+        post_data=json.dumps({
+            "beginDate": "20260701", "endDate": "20260731",
+            "sessionId": "opaque-session", "sid": "opaque-sid",
+        })[:-1] + f',"acctNo":"foreign","acctNo":"{ACCOUNT}"}}',
+        redirected_from=None, frame=frame,
+    )
+    raw = json.dumps(_history_hit().resp_json).encode()
+
+    collector._on_request(request)
+    collector._on_response(SimpleNamespace(
+        url=request.url, request=request, status=200,
+        headers={
+            "content-type": "application/json;charset=utf-8",
+            "content-length": str(len(raw)),
+            "content-encoding": "identity",
+        },
+        body=lambda: raw,
+    ))
+
+    hit = collector.hits[0]
+    with pytest.raises(RuntimeError, match="ubot-twd-history-response"):
+        UbotCrawler._validate_history_hit(
+            hit, identity=ACCOUNT, start=date(2026, 7, 1), end=date(2026, 7, 31),
+            after_sequence=0,
+        )
+
+
+def test_ubot_history_collector_uses_native_body_proof_without_content_length(
+    monkeypatch,
+) -> None:
+    endpoint = "https://www.ubot.com.tw/MyBank/IBKB010102"
+    raw = json.dumps(_history_hit().resp_json).encode()
+    created = []
+
+    class Observer:
+        def __init__(self, page, url):
+            assert url == endpoint
+            self.closed = False
+            created.append(self)
+
+        def read(self, response, frame, frame_url, remaining, minimum, admit=None):
+            assert response.url == endpoint
+            assert frame_url == "https://www.ubot.com.tw/MyBank/#/B0101001"
+            assert minimum == 64 and remaining() == 5_000_000 and admit is None
+            return raw
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("backend.core.base._HistoryBodyObserver", Observer)
+    handlers = {}
+    page = SimpleNamespace()
+    page.on = lambda name, handler: handlers.setdefault(name, handler)
+    page.remove_listener = lambda name, _handler: handlers.pop(name)
+    frame = SimpleNamespace(page=page, url="https://www.ubot.com.tw/MyBank/#/B0101001")
+    page.main_frame = frame
+    request = SimpleNamespace(
+        url=endpoint,
+        headers={},
+        method="POST",
+        post_data=(
+            f"acctNo={ACCOUNT}&beginDate=20260701&endDate=20260731&"
+            "sessionId=opaque-session&sid=opaque-sid"
+        ),
+        redirected_from=None,
+        frame=frame,
+    )
+    response = SimpleNamespace(
+        url=endpoint,
+        request=request,
+        status=200,
+        headers={"content-type": "application/json", "content-encoding": "gzip"},
+        body=lambda: pytest.fail("missing-length response must use the native observer"),
+    )
+
+    collector = ResponseCollector("ubot.com.tw")
+    collector.attach(page)
+    collector._on_request(request)
+    collector._on_response(response)
+    collector.detach(page)
+
+    assert collector.hits[0].body_size == len(raw)
+    assert collector.hits[0].resp_json == _history_hit().resp_json
+    assert len(created) == 1 and created[0].closed is True
+    assert handlers == {}
+
+
+def test_response_collector_attach_failure_keeps_cleanup_retryable(monkeypatch) -> None:
+    removed = []
+    remove_failed = False
+
+    class Page:
+        def on(self, name, _handler):
+            if name == "requestfailed":
+                raise RuntimeError("synthetic attach failure")
+
+        def remove_listener(self, name, _handler):
+            nonlocal remove_failed
+            removed.append(name)
+            if not remove_failed:
+                remove_failed = True
+                raise RuntimeError("synthetic cleanup failure")
+
+    page = Page()
+    collector = ResponseCollector()
+
+    with pytest.raises(RuntimeError, match="response collector attach cleanup failed") as raised:
+        collector.attach(page)
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "synthetic cleanup failure" not in rendered
+    assert collector._detached is False
+
+    collector.detach(page)
+    assert collector._detached is True
+    assert removed == ["request", "request"]
+
+
+def test_response_collector_detach_closes_native_observer_when_listener_removal_fails(
+    monkeypatch,
+) -> None:
+    created = []
+
+    class Observer:
+        def __init__(self, _page, _url):
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("backend.core.base._HistoryBodyObserver", Observer)
+    removed = []
+    failed = False
+
+    def remove_listener(name, _handler):
+        nonlocal failed
+        removed.append(name)
+        if name == "request" and not failed:
+            failed = True
+            raise RuntimeError("synthetic remove failure")
+
+    page = SimpleNamespace(on=lambda *_args: None, remove_listener=remove_listener)
+    collector = ResponseCollector("ubot.com.tw")
+    collector.attach(page)
+
+    with pytest.raises(RuntimeError, match="response collector cleanup failed"):
+        collector.detach(page)
+
+    assert removed == ["request", "requestfailed", "response"]
+    assert len(created) == 1 and created[0].closed is True
+    assert collector._native_body_observers == {}
+    assert collector._detached is False
+
+    collector.detach(page)
+
+    assert removed == ["request", "requestfailed", "response", "request"]
+    assert collector._detached is True
+
+
+def test_response_collector_retries_failed_native_observer_close(monkeypatch) -> None:
+    created = []
+
+    class Observer:
+        def __init__(self, _page, _url):
+            self.close_calls = 0
+            created.append(self)
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("synthetic observer close failure")
+
+    monkeypatch.setattr("backend.core.base._HistoryBodyObserver", Observer)
+    page = SimpleNamespace(on=lambda *_args: None, remove_listener=lambda *_args: None)
+    collector = ResponseCollector("ubot.com.tw")
+    collector.attach(page)
+
+    with pytest.raises(RuntimeError, match="response collector cleanup failed"):
+        collector.detach(page)
+
+    assert collector._detached is False
+    assert len(collector._native_body_observers) == 1
+
+    collector.detach(page)
+
+    assert created[0].close_calls == 2
+    assert collector._native_body_observers == {}
+    assert collector._detached is True
+
+
+def test_native_observer_keeps_listener_retry_after_disconnect_succeeds() -> None:
+    class Session:
+        def __init__(self):
+            self.remove_calls = 0
+            self.detach_calls = 0
+
+        def send(self, method, _params=None):
+            if method == "Runtime.evaluate":
+                return {"result": {"value": True}}
+            return {}
+
+        def on(self, _name, _handler):
+            pass
+
+        def remove_listener(self, _name, _handler):
+            self.remove_calls += 1
+            if self.remove_calls == 1:
+                raise RuntimeError("synthetic dispose failure")
+
+        def detach(self):
+            self.detach_calls += 1
+
+    session = Session()
+    page = SimpleNamespace(
+        context=SimpleNamespace(new_cdp_session=lambda _page: session),
+    )
+    observer = _HistoryBodyObserver(page, "https://example.test/history")
+    observer.start()
+    observer.records["request"] = {"key": ("url", "POST", "sensitive", "frame")}
+    observer.native_requests.append({"postData": "sensitive"})
+
+    with pytest.raises(RuntimeError, match="synthetic dispose failure"):
+        observer.close()
+
+    assert session.detach_calls == 1
+    assert len(observer._attached_handlers) == 1
+    assert observer.records == {}
+    assert observer.native_requests == []
+
+    observer.close()
+
+    assert session.detach_calls == 1
+    assert session.remove_calls == 6
+    assert observer._attached_handlers == {}
 
 
 def test_ubot_collection_reenters_form_for_every_native_month_and_publishes_coverage(

@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
 
 from backend.core import account_classify, bank_pg
+from backend.core.money import native_money
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -42,11 +44,28 @@ DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 _MIGRATED_DBS: set[str] = set()
 
 
-def _migration_cache_key(db_path: Path | None, bank: str) -> str:
+def _migration_cache_key(
+    db_path: Path | None,
+    bank: str,
+    conn: sqlite3.Connection | None = None,
+) -> str:
     if db_path is None:
-        # pg-mode: shared schema 已 migrate 一次後 process 內不再重跑
         return f"pg:{bank}"
-    return str(db_path.resolve())
+    resolved = db_path.resolve()
+    stat = resolved.stat()
+    owns_connection = conn is None
+    if conn is None:
+        conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    try:
+        schema = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL ORDER BY type, name"
+        ).fetchall()
+    finally:
+        if owns_connection:
+            conn.close()
+    fingerprint = hashlib.sha256(repr([tuple(row) for row in schema]).encode()).hexdigest()
+    return f"{resolved}:{stat.st_dev}:{stat.st_ino}:{fingerprint}"
 
 
 def _reset_migration_cache() -> None:
@@ -378,6 +397,7 @@ CREATE TABLE IF NOT EXISTS twd_transactions (
     expend            INTEGER,
     income            INTEGER,
     balance           INTEGER,
+    currency          TEXT NOT NULL DEFAULT 'TWD',
     counterparty_bank TEXT,
     counterparty_acct TEXT,
     memo              TEXT,
@@ -447,7 +467,7 @@ CREATE TABLE IF NOT EXISTS balance_history (
     user_id       INTEGER NOT NULL DEFAULT 1,
     snapshot_date TEXT NOT NULL,
     twd_balance   INTEGER,
-    fx_balance    INTEGER,
+    fx_balance    REAL,
     loan_balance  INTEGER,           -- 2026-06-14 新增: 貸款餘額（負債類，獨立記錄）
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (user_id, snapshot_date)
@@ -463,7 +483,7 @@ CREATE TABLE IF NOT EXISTS balance_history (
 CREATE TABLE IF NOT EXISTS accounts (
     user_id          INTEGER NOT NULL DEFAULT 1,
     account_no       TEXT NOT NULL,
-    currency         TEXT,
+    currency         TEXT NOT NULL DEFAULT 'TWD',
     branch           TEXT,
     nickname         TEXT,
     type             TEXT,
@@ -477,7 +497,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- UI fallback: nickname_overwrite || nickname || account_no
     nickname_overwrite TEXT,
     updated_at       TEXT NOT NULL,
-    PRIMARY KEY (user_id, account_no)
+    PRIMARY KEY (user_id, account_no, currency)
 );
 
 -- 6. 信用卡當前狀態（UPSERT by card_no）
@@ -537,6 +557,123 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 """
 
+def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None:
+    table_info = conn.execute("PRAGMA table_info(accounts)").fetchall()
+    if not table_info:
+        return
+    primary_key = [
+        row["name"]
+        for row in sorted(table_info, key=lambda row: row["pk"])
+        if row["pk"]
+    ]
+    currency_info = next((row for row in table_info if row["name"] == "currency"), None)
+    currencies_canonical = True
+    if currency_info is not None:
+        for row in conn.execute("SELECT DISTINCT currency FROM accounts"):
+            raw_currency = row[0]
+            normalized = str(raw_currency or "TWD").strip().upper()
+            if re.fullmatch(r"[A-Z]{3}", normalized) is None:
+                raise sqlite3.OperationalError("invalid account currency")
+            if raw_currency != normalized:
+                currencies_canonical = False
+    if (
+        primary_key == ["user_id", "account_no", "currency"]
+        and currency_info is not None
+        and currency_info["notnull"] == 1
+        and str(currency_info["dflt_value"]).strip("'\"()") == "TWD"
+        and currencies_canonical
+    ):
+        return
+    source_columns = {row["name"] for row in table_info}
+    if not {"user_id", "account_no", "currency"}.issubset(source_columns):
+        raise sqlite3.OperationalError("accounts identity columns are incomplete")
+    optional = (
+        "branch", "nickname", "type", "product_type", "raw_balance",
+        "raw_balance_date",
+    )
+    select_optional: list[str] = []
+    updated_at = "updated_at" if "updated_at" in source_columns else "''"
+    order_updated = "source.updated_at" if "updated_at" in source_columns else "source.rowid"
+    identity_match = """
+        source.user_id = candidate.user_id
+        AND source.account_no = candidate.account_no
+        AND COALESCE(NULLIF(UPPER(TRIM(source.currency)), ''), 'TWD') =
+            COALESCE(NULLIF(UPPER(TRIM(candidate.currency)), ''), 'TWD')
+    """
+    for column in optional:
+        if column not in source_columns:
+            select_optional.append("NULL")
+            continue
+        required_column = "raw_balance" if column == "raw_balance_date" else column
+        nonempty = (
+            f"AND NULLIF(TRIM(CAST(source.{required_column} AS TEXT)), '') IS NOT NULL"
+            if required_column != "raw_balance" else ""
+        )
+        expression = f"""(
+            SELECT source.{column}
+            FROM accounts_legacy_currency_identity AS source
+            WHERE {identity_match}
+              AND source.{required_column} IS NOT NULL
+              {nonempty}
+            ORDER BY {order_updated} DESC, source.rowid DESC
+            LIMIT 1
+        )"""
+        select_optional.append(f"COALESCE({expression}, '')" if column == "nickname" else expression)
+    excluded = "0"
+    if "excluded" in source_columns:
+        excluded = f"""(
+            SELECT MAX(COALESCE(source.excluded, 0))
+            FROM accounts_legacy_currency_identity AS source
+            WHERE {identity_match}
+        )"""
+    nickname_overwrite = "NULL"
+    if "nickname_overwrite" in source_columns:
+        nickname_overwrite = f"""(
+            SELECT source.nickname_overwrite
+            FROM accounts_legacy_currency_identity AS source
+            WHERE {identity_match}
+              AND NULLIF(TRIM(source.nickname_overwrite), '') IS NOT NULL
+            ORDER BY {order_updated} DESC, source.rowid DESC
+            LIMIT 1
+        )"""
+    conn.execute("ALTER TABLE accounts RENAME TO accounts_legacy_currency_identity")
+    conn.execute("""
+        CREATE TABLE accounts (
+            user_id INTEGER NOT NULL DEFAULT 1,
+            account_no TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'TWD',
+            branch TEXT,
+            nickname TEXT,
+            type TEXT,
+            product_type TEXT,
+            raw_balance REAL,
+            raw_balance_date TEXT,
+            excluded INTEGER NOT NULL DEFAULT 0,
+            nickname_overwrite TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, account_no, currency)
+        )
+    """)
+    conn.execute(f"""
+        INSERT OR REPLACE INTO accounts
+            (user_id, account_no, currency, branch, nickname, type,
+             product_type, raw_balance, raw_balance_date, excluded,
+             nickname_overwrite, updated_at)
+        SELECT user_id, account_no,
+               COALESCE(NULLIF(UPPER(TRIM(currency)), ''), 'TWD'),
+               {', '.join(select_optional)}, {excluded},
+               {nickname_overwrite}, {updated_at}
+        FROM accounts_legacy_currency_identity AS candidate
+        WHERE candidate.rowid = (
+            SELECT source.rowid
+            FROM accounts_legacy_currency_identity AS source
+            WHERE {identity_match}
+            ORDER BY {order_updated} DESC, source.rowid DESC
+            LIMIT 1
+        )
+    """)
+    conn.execute("DROP TABLE accounts_legacy_currency_identity")
+
 
 class BankStore:
     def __init__(
@@ -593,15 +730,58 @@ class BankStore:
             self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
-        # Phase C-Suggestion (2026-06-17): per-process migration cache.
-        # 同 process 同 db_path 已 migrate 過就 skip 30+ PRAGMA + ALTER。
-        # 仍會跑 executescript(SCHEMA) — CREATE TABLE IF NOT EXISTS 不會傷既有表,
-        # 但補 _migrate 才有 ALTER ADD COLUMN / CREATE UNIQUE INDEX (新 schema 差異)。
-        cache_key = _migration_cache_key(self.db_path, bank)
-        if cache_key not in _MIGRATED_DBS:
-            self._migrate()
-            _MIGRATED_DBS.add(cache_key)
+        if bank_pg.enabled():
+            self.conn.ensure_schema_migrations()  # type: ignore[attr-defined]
+        # Cache is bound to file identity plus the complete SQLite schema. A restored
+        # or replaced path is re-audited, while repeated opens of the same authority
+        # avoid the 30+ PRAGMA migration pass.
+        if not bank_pg.enabled():
+            assert isinstance(self.conn, sqlite3.Connection)
+            cache_key = _migration_cache_key(self.db_path, bank, self.conn)
+            if cache_key not in _MIGRATED_DBS:
+                self._migrate()
+                self.conn.commit()
+                cache_key = _migration_cache_key(self.db_path, bank, self.conn)
+                _MIGRATED_DBS.add(cache_key)
+            else:
+                # Schema caching must never authorize malformed identity rows written
+                # in place by an older process or manual repair.
+                _migrate_sqlite_accounts_currency_identity(self.conn)
         self.conn.commit()
+
+    def _migrate_accounts_currency_identity(self) -> None:
+        if bank_pg.enabled():
+            return
+        assert isinstance(self.conn, sqlite3.Connection)
+        _migrate_sqlite_accounts_currency_identity(self.conn)
+
+    def _migrate_balance_history_fx_real(self) -> None:
+        if bank_pg.enabled():
+            return
+        assert isinstance(self.conn, sqlite3.Connection)
+        table_info = self.conn.execute("PRAGMA table_info(balance_history)").fetchall()
+        fx_column = next(row for row in table_info if row["name"] == "fx_balance")
+        if fx_column["type"].upper() == "REAL":
+            return
+        self.conn.execute("ALTER TABLE balance_history RENAME TO balance_history_legacy_fx")
+        self.conn.execute("""
+            CREATE TABLE balance_history (
+                user_id INTEGER NOT NULL DEFAULT 1,
+                snapshot_date TEXT NOT NULL,
+                twd_balance INTEGER,
+                fx_balance REAL,
+                loan_balance INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, snapshot_date)
+            )
+        """)
+        self.conn.execute("""
+            INSERT OR REPLACE INTO balance_history
+                (user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at)
+            SELECT user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at
+            FROM balance_history_legacy_fx
+        """)
+        self.conn.execute("DROP TABLE balance_history_legacy_fx")
 
     def _migrate(self):
         """對既有 DB 補新增欄位（CREATE TABLE IF NOT EXISTS 不會改既有表）。"""
@@ -614,6 +794,11 @@ class BankStore:
         # Keep raw_description for audit/dedup provenance; description is the canonical value.
         twd_cols = {r["name"] for r in self.conn.execute(
             "PRAGMA table_info(twd_transactions)").fetchall()}
+        if "currency" not in twd_cols:
+            self.conn.execute(
+                "ALTER TABLE twd_transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
+            )
+            twd_cols.add("currency")
         if "memo" not in twd_cols:
             self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN memo TEXT")
         raw_description_added = "raw_description" not in twd_cols
@@ -777,6 +962,15 @@ class BankStore:
                 self.conn.execute(
                     f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
                 )
+        account_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(accounts)")
+        }
+        if "currency" not in account_columns:
+            self.conn.execute(
+                "ALTER TABLE accounts ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
+            )
+        self._migrate_accounts_currency_identity()
+        self._migrate_balance_history_fx_real()
         # 舊 DB 在 ALTER 前可能已有「不含 user_id」的 UNIQUE index/legacy UNIQUE column,
         # 升 (user_id, dedup_key) 為複合 unique key。
         # DROP IF EXISTS 是 idempotent (新 DB SCHEMA 用同名 index 但已含 user_id, 也安全)。
@@ -807,14 +1001,26 @@ class BankStore:
         # 新 DB (Phase C 後建) PK 已含 user_id, CREATE INDEX 同名也 idempotent 安全。
         for tbl, idx, cols in (
             ("balance_history", "ux_balance_history_user_snap", "(user_id, snapshot_date)"),
-            ("accounts", "ux_accounts_user_no", "(user_id, account_no)"),
+            ("accounts", "ux_accounts_user_no", "(user_id, account_no, currency)"),
             ("cards", "ux_cards_user_no", "(user_id, card_no)"),
             ("daily_metrics", "ux_daily_metrics_user_snap_cat", "(user_id, snapshot_date, category)"),
         ):
             try:
-                self.conn.execute(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {tbl}{cols}",
+                expected = [column.strip() for column in cols.strip("()").split(",")]
+                current = next(
+                    (
+                        row for row in self.conn.execute(f"PRAGMA index_list({tbl})")
+                        if row["name"] == idx
+                    ),
+                    None,
                 )
+                actual = (
+                    [row["name"] for row in self.conn.execute(f"PRAGMA index_info({idx})")]
+                    if current is not None else []
+                )
+                if current is None or current["unique"] != 1 or actual != expected:
+                    self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
+                    self.conn.execute(f"CREATE UNIQUE INDEX {idx} ON {tbl}{cols}")
             except sqlite3.OperationalError as e:
                 import logging
                 logging.error(
@@ -922,6 +1128,10 @@ class BankStore:
         """Return account-scoped latest persisted TWD transaction dates."""
         return self._transaction_cursor_dates("twd_transactions")
 
+    def latest_account_transaction_dates(self) -> dict[str, date]:
+        """Return currency-scoped latest persisted account transaction dates."""
+        return self._transaction_cursor_dates("account_transactions")
+
     def latest_card_transaction_dates(self) -> dict[str, date]:
         """Return account-scoped latest persisted billed-card transaction dates."""
         return self._transaction_cursor_dates("card_billed_transactions")
@@ -980,17 +1190,28 @@ class BankStore:
                         commit: bool = True) -> int:
         """寫入台幣交易。若 `rules` 提供，每筆 desc 跑 categorize → 寫 category + subcategory + auto_excluded 欄。"""
         from backend.server.categorizer import categorize_with_excluded  # 延遲 import 避免 cli 依賴
+        txns = [dict(txn) for txn in txns]
+        for txn in txns:
+            currency = str(txn.get("currency") or "TWD").strip().upper()
+            for field in ("expend", "income", "balance"):
+                txn[field] = native_money(txn.get(field), currency, optional=True)
+            txn["currency"] = currency
         inserted_count = 0
         now = _now()
         # 先算每筆的 content key（含 balance 當 running-balance tie-breaker），
         # 再附加同鍵出現序號 → 真實重複交易也能各自留存、重抓又能去重
+        currencies = [t.get("currency") or "TWD" for t in txns]
         content_keys = [
-            _dedup_key(t.get("account_no"), t.get("datetime"), t.get("expend"),
-                       t.get("income"), t.get("balance"), t.get("desc"))
-            for t in txns
+            _dedup_key(
+                t.get("account_no") if currency == "TWD"
+                else f'{t.get("account_no")}:{currency}',
+                t.get("datetime"), t.get("expend"), t.get("income"),
+                t.get("balance"), t.get("desc"),
+            )
+            for t, currency in zip(txns, currencies, strict=True)
         ]
         dedup_keys = _with_occurrence(content_keys)
-        for t, key in zip(txns, dedup_keys, strict=True):
+        for t, currency, key in zip(txns, currencies, dedup_keys, strict=True):
             raw_description = t.get("desc")
             description = _canonical_description(raw_description, t.get("memo"))
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
@@ -1002,21 +1223,24 @@ class BankStore:
             self.conn.execute(
                 """INSERT INTO twd_transactions
                    (user_id, account_no, txn_datetime, account_date, description, raw_description,
-                    expend, income,
+                    expend, income, currency,
                     balance, counterparty_bank, counterparty_acct, memo, first_seen, dedup_key,
                     category, subcategory, auto_excluded, flow_type, income_category,
                     is_subscription)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
                 (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
-                 description, raw_description, t.get("expend"), t.get("income"), t.get("balance"),
-                 t.get("counterparty_bank"), t.get("counterparty_acct"), t.get("memo"),
+                 description, raw_description, t.get("expend"), t.get("income"), currency,
+                 t.get("balance"), t.get("counterparty_bank"), t.get("counterparty_acct"),
+                 t.get("memo"),
                  now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
                  1 if _is_subscription(sub) else 0),
             )
             inserted_count += self.conn.total_changes - before_insert
             self._record_transaction_cursor(
-                "twd_transactions", t.get("account_no"), t.get("datetime"),
+                t.get("history_domain") or "twd_transactions",
+                t.get("history_identity") or t.get("account_no"),
+                t.get("datetime"),
             )
         if commit:
             self.conn.commit()
@@ -1025,6 +1249,17 @@ class BankStore:
     # ---- 2. 信用卡已出帳明細：append-only ----
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None) -> int:
         from backend.server.categorizer import categorize_with_excluded
+        txns = [dict(txn) for txn in txns]
+        for txn in txns:
+            currency = str(txn.get("currency") or "TWD").strip().upper()
+            txn["currency"] = currency
+            txn["amount"] = native_money(txn.get("amount"), currency, optional=True)
+            consume_currency = str(txn.get("consume_currency") or currency).strip().upper()
+            if txn.get("consume_amount") is not None:
+                txn["consume_currency"] = consume_currency
+                txn["consume_amount"] = native_money(
+                    txn.get("consume_amount"), consume_currency,
+                )
         inserted_count = 0
         now = _now()
         prepared_txns = []
@@ -1448,6 +1683,17 @@ class BankStore:
                 (self.user_id, scope),
             ).fetchone()
             return int(row["n"] if row else 0)
+        txns = [dict(txn) for txn in txns]
+        for txn in txns:
+            currency = str(txn.get("currency") or "TWD").strip().upper()
+            txn["currency"] = currency
+            txn["amount"] = native_money(txn.get("amount"), currency, optional=True)
+            consume_currency = str(txn.get("consume_currency") or currency).strip().upper()
+            if txn.get("consume_amount") is not None:
+                txn["consume_currency"] = consume_currency
+                txn["consume_amount"] = native_money(
+                    txn.get("consume_amount"), consume_currency,
+                )
         now = _now()
         pending_metadata = self._pending_user_metadata(scope)
         pending_refreshed_at: dict[tuple, list[str]] = {}
@@ -1713,12 +1959,18 @@ class BankStore:
 
     # ---- 4. 餘額走勢：同日 UPSERT ----
     def upsert_balance_history(self, rows: list[dict], commit: bool = True) -> int:
+        rows = [dict(row) for row in rows]
+        for row in rows:
+            row["twdBalance"] = native_money(
+                row.get("twdBalance"), "TWD", optional=True,
+            )
+            row["loanBalance"] = native_money(
+                row.get("loanBalance"), "TWD", optional=True, absolute=True,
+            )
         before = self.conn.total_changes
         now = _now()
         for r in rows:
-            loan_balance = account_classify.normalize_liability_magnitude(
-                r.get("loanBalance"),
-            )
+            loan_balance = r.get("loanBalance")
             self.conn.execute(
                 """INSERT INTO balance_history
                        (user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at)
@@ -1747,25 +1999,38 @@ class BankStore:
         既有 caller 不帶這兩欄就傳 None（不覆蓋之前抓到的）— UPSERT 用 COALESCE
         保護舊值，避免某次爬蟲忘了帶 raw_balance 就把歷史餘額沖掉。
         """
+        accts = [dict(account) for account in accts]
+        for account in accts:
+            if not account.get("account_no"):
+                continue
+            currency = str(account.get("currency") or "TWD").strip().upper()
+            if re.fullmatch(r"[A-Z]{3}", currency) is None:
+                raise ValueError("account currency must be an uppercase ISO code")
+            raw_balance = native_money(
+                account.get("raw_balance"), currency, optional=True,
+            )
+            account["currency"] = currency
+            account["raw_balance"] = account_classify.normalize_account_balance(
+                account.get("product_type"), raw_balance,
+            )
         now = _now()
         for a in accts:
             if not a.get("account_no"):
                 continue
-            raw_balance = account_classify.normalize_account_balance(
-                a.get("product_type"), a.get("raw_balance"),
-            )
+            currency = a["currency"]
+            raw_balance = a.get("raw_balance")
             self.conn.execute(
                 """INSERT INTO accounts
                        (user_id, account_no, currency, branch, nickname, type, product_type,
                         raw_balance, raw_balance_date, updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(user_id, account_no) DO UPDATE SET
+                   ON CONFLICT(user_id, account_no, currency) DO UPDATE SET
                      currency=excluded.currency, branch=excluded.branch, nickname=excluded.nickname,
                      type=excluded.type, product_type=excluded.product_type,
                      raw_balance=COALESCE(excluded.raw_balance, accounts.raw_balance),
                      raw_balance_date=COALESCE(excluded.raw_balance_date, accounts.raw_balance_date),
                      updated_at=excluded.updated_at""",
-                (self.user_id, a.get("account_no"), a.get("currency"), a.get("branch"), a.get("nickname"),
+                (self.user_id, a.get("account_no"), currency, a.get("branch"), a.get("nickname"),
                  a.get("type"), a.get("product_type"),
                  raw_balance, a.get("raw_balance_date"),
                  now),
@@ -1798,6 +2063,12 @@ class BankStore:
           - 帶 True/False → INSERT 用 1/0, UPDATE 也覆寫成 1/0
         為了 UPDATE 保留邏輯, 我們在 Python 判斷 + ON CONFLICT 用 CASE.
         """
+        cards = [dict(card) for card in cards]
+        for card in cards:
+            for field in (
+                "credit_limit", "used_credit", "bill_due_amount", "last_payment_amount",
+            ):
+                card[field] = native_money(card.get(field), "TWD", optional=True)
         now = _now()
         for c in cards:
             if not c.get("number"):
@@ -1847,6 +2118,14 @@ class BankStore:
 
     def update_card_bill_facts(self, facts: list[dict], *, commit: bool = True) -> int:
         """Atomically apply canonical bill facts without regressing a newer payment pair."""
+        facts = [dict(fact) for fact in facts]
+        for fact in facts:
+            fact["bill_due_amount"] = native_money(
+                fact.get("bill_due_amount"), "TWD", optional=True,
+            )
+            fact["last_payment_amount"] = native_money(
+                fact.get("last_payment_amount"), "TWD", optional=True,
+            )
         updated = 0
         now = _now()
         for fact in facts:
@@ -1926,7 +2205,13 @@ class BankStore:
                VALUES (?,?,?,?,?)
                ON CONFLICT(user_id, snapshot_date, category)
                DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
-            (self.user_id, day, category, json.dumps(payload, ensure_ascii=False), now),
+            (
+                self.user_id,
+                day,
+                category,
+                json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                now,
+            ),
         )
         if commit:
             self.conn.commit()

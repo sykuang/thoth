@@ -439,7 +439,7 @@ export function TxnDetailModal({
               <DetailRow label="帳號 / 卡號" value={maskCardNo(txn.account_or_card)} mono />
             )}
             {txn.balance != null && (
-              <DetailRow label="帳戶餘額" value={formatSignedCurrency(txn.balance, 'TWD')} mono />
+              <DetailRow label="帳戶餘額" value={formatSignedCurrency(txn.balance, txn.currency)} mono />
             )}
             {txn.consume_date && <DetailRow label="消費日" value={txn.consume_date} />}
             {(txn.kind === 'billed' || txn.kind === 'pending') && (

@@ -484,6 +484,36 @@ class ScbCrawler(BankCrawler):
             raise ScbLoginError("登入送出後沒有新的驗證碼結果；禁止自動重試")
 
 
+    @staticmethod
+    def _deposit_accounts(page) -> list[dict]:
+        # Live 2026-10-03: from card pages only the menu <em> navigates; the <li>/<a>
+        # wrappers swallow the click. Try innermost first, stop once the page shows.
+        click = """(s) => { const e = [...document.querySelectorAll(s)]
+            .find(e => e.offsetParent && (e.innerText || '').trim() === '帳戶綜覽');
+            if (!e) return false; e.click(); return true; }"""
+        text = ""
+        try:
+            for sel in ("em", "a", "li"):
+                if page.evaluate(click, sel) is not True:
+                    continue
+                page.wait_for_timeout(8000)
+                text = page.evaluate("() => document.body.innerText") or ""
+                if "結構型商品查詢" in text:
+                    break
+            else:
+                return []
+        except Exception:
+            return []
+        out, seen = [], set()
+        for m in re.finditer(r"(?P<name>[^\n]*存款) (?P<acct>\d{3,6}●+\d{3,6})\s*\n\s*存款總金額 (?P<ccy>[A-Z]{3}) (?P<bal>-?[\d,]+(?:\.\d+)?)", text):
+            key = (m["acct"], m["ccy"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"account_no": m["acct"], "currency": m["ccy"], "type": m["name"].strip(),
+                        "balance": m["bal"].replace(",", "")})
+        return out
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """SCB collect：dashboard + 信用卡綜覽 + 每張卡消費明細 + 帳單查詢 dump。
 
@@ -686,6 +716,11 @@ class ScbCrawler(BankCrawler):
                 "resp": h.resp_json, "req_body": h.req_body,
             })
         out["api_responses"] = api_responses
+        # Live 2026-10-03: deposit accounts were never collected. API values are
+        # E2EE hex, so read the rendered 帳戶綜覽 page (masked no. + balance).
+        out["accounts"] = self._deposit_accounts(page)
+        if not out["accounts"]:
+            raise RuntimeError("scb-accounts-empty")
         publish_card_bill_facts(out, [])
         _log(f"[scb][collect] dump {len(api_responses)} 個 endpoint resp_json")
         _log(f"[scb][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint: {out['_all_endpoints'][:15]}")

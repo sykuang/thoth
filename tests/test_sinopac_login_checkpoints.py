@@ -226,6 +226,7 @@ def test_auth_requires_exact_host_known_path_private_identity_and_no_login_field
             "/Myasset/home",
             "/mma_assets/home",
             "/mma/mymma/myasset/mma_assets_summary.aspx",
+            "/mma/bank/easy_index_loan/mma_detail.aspx",
         ):
             assert crawler._logged_in(_page_proxy(real, f"https://mma.sinopac.com{path}"))
         assert not crawler._logged_in(
@@ -541,5 +542,5 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     )
     assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "ad7abf78cc69919905bea2d0272b5368a77a31360cee00620ebd8dd39a44294b"
+        "8f5102e3da15531650d2e9c64c6d24667c42bc8f3ccf6a526c72f34dcca4d253"
     )

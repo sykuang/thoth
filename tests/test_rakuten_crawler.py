@@ -33,7 +33,6 @@ from backend.core.login_checkpoints import (
     CheckpointPhase,
     LoginBudget,
     LoginCheckpointBlocked,
-    LoginInteractionRequired,
     evaluate_login_checkpoint,
 )
 
@@ -131,6 +130,11 @@ def test_shared_login_api_and_rule_inventory() -> None:
     assert not referral.required_body_pattern.search(
         f"非官方{RakutenCrawler.REFERRAL_PROMO_PREFIX}"
     )
+    assert referral.required_body_pattern.search(
+        "推薦獎金活動更新，新戶另享現金回饋\n稍後再看"
+    )
+    assert not referral.required_body_pattern.search("推薦獎金活動更新\n稍後再看")
+    assert not referral.required_body_pattern.search("新戶另享現金回饋\n稍後再看")
     assert ricb.required_body_pattern.search(
         f"{RakutenCrawler.INSURANCE_PROMO_PREFIX}\n活動期間"
     )
@@ -190,6 +194,8 @@ def test_account_number_accepts_display_separators() -> None:
 
 def test_login_adapter_and_prepare_delegate_once(monkeypatch) -> None:
     page = Mock()
+    page.locator.return_value.count.return_value = 0
+    page.frames = []
     crawler = object.__new__(RakutenCrawler)
     shared_login = Mock(return_value=True)
     logged_in = Mock(return_value=True)
@@ -260,6 +266,75 @@ def test_run_recovers_only_late_authenticated_rakuten_terminal(monkeypatch, tmp_
     crawler.logout.assert_called_once_with(page)
 
 
+def test_empty_modal_skeleton_is_not_semantic_login_blocker() -> None:
+    control_selectors: list[str] = []
+
+    class Locator:
+        def __init__(self, text: str, interactive: bool = False):
+            self.text = text
+            self.interactive = interactive
+
+        def count(self) -> int:
+            return 1
+
+        def nth(self, _index: int):
+            return self
+
+        def is_visible(self) -> bool:
+            return True
+
+        def inner_text(self, **_kwargs) -> str:
+            return self.text
+
+        def locator(self, _selector: str):
+            control_selectors.append(_selector)
+            return SimpleNamespace(count=lambda: int(self.interactive), nth=lambda _index: self)
+
+    page = SimpleNamespace(locator=lambda _selector: Locator(""))
+    assert rakuten_mod._semantic_modal_visible(page) is False
+    page = SimpleNamespace(locator=lambda _selector: Locator("登入通知"))
+    assert rakuten_mod._semantic_modal_visible(page) is True
+    page = SimpleNamespace(locator=lambda _selector: Locator("", interactive=True))
+    assert rakuten_mod._semantic_modal_visible(page) is True
+    assert "[role=button]" in control_selectors[-1]
+
+    crawler = object.__new__(RakutenCrawler)
+    unknown = crawler.login_checkpoint_rules()[-1]
+    assert unknown.required_body_pattern is not None
+    assert unknown.required_body_pattern.search("") is None
+    assert unknown.required_body_pattern.search("登入通知") is not None
+
+
+def test_authenticated_state_fails_closed_for_actionable_modal_in_owned_scope(
+    monkeypatch,
+) -> None:
+    main = SimpleNamespace(name="main")
+    child = SimpleNamespace(name="child")
+    page = SimpleNamespace(main_frame=main, frames=[main, child])
+    crawler = object.__new__(RakutenCrawler)
+    crawler._logged_in = Mock(return_value=True)
+    crawler._frame_origin_allowed = Mock(return_value=True)
+
+    monkeypatch.setattr(
+        rakuten_mod,
+        "_semantic_modal_visible",
+        lambda scope: scope is child,
+    )
+
+    assert crawler.is_authenticated(page) is False
+
+
+def test_submit_credentials_rejects_semantic_modal_before_field_access() -> None:
+    crawler = object.__new__(RakutenCrawler)
+    crawler._semantic_modal_visible_in_owned_scope = Mock(return_value=True)
+    page = Mock()
+
+    with pytest.raises(RakutenLoginError, match="未處理互動視窗"):
+        crawler.submit_credentials_once(page)
+
+    page.locator.assert_not_called()
+
+
 def test_late_auth_recovery_rechecks_named_unknown_loading_modal(monkeypatch) -> None:
     ticks = 0
     page = Mock()
@@ -274,6 +349,7 @@ def test_late_auth_recovery_rechecks_named_unknown_loading_modal(monkeypatch) ->
         "_any_visible",
         lambda _page, selector: selector == LOADER_SELECTOR and ticks == 1,
     )
+    monkeypatch.setattr(rakuten_mod, "_semantic_modal_visible", lambda _page: False)
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
     crawler._shared_dialog_blocked = False
@@ -291,7 +367,7 @@ def test_late_auth_recovery_rechecks_named_unknown_loading_modal(monkeypatch) ->
     assert page.wait_for_timeout.call_args_list == [call(1000)] * 4
 
 
-def test_late_auth_recovery_processes_only_known_scoped_modal(monkeypatch) -> None:
+def test_late_auth_recovery_never_actions_a_new_modal_without_scope_provenance() -> None:
     modal_visible = True
 
     class Locator:
@@ -313,6 +389,9 @@ def test_late_auth_recovery_processes_only_known_scoped_modal(monkeypatch) -> No
                 and modal_visible
             )
 
+        def inner_text(self, **_kwargs) -> str:
+            return "已知通知" if modal_visible else ""
+
     page = Mock()
     page.locator.side_effect = Locator
     crawler = object.__new__(RakutenCrawler)
@@ -321,24 +400,12 @@ def test_late_auth_recovery_processes_only_known_scoped_modal(monkeypatch) -> No
     crawler._credential_origin_allowed = Mock(return_value=True)
     crawler._logged_in = Mock(return_value=True)
 
-    def evaluate(*_args, **_kwargs):
-        nonlocal modal_visible
-        modal_visible = False
-        return CheckpointOutcome(
-            CheckpointKind.DISMISSIBLE_NOTICE,
-            rule_name="rakuten-ricb-promo",
-            action_label="略過",
-        )
-
-    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluate)
     error = LoginCheckpointBlocked(
         LoginBudget(credential_submissions=1),
         CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
     )
 
-    assert crawler._recover_late_authentication(page, error)
-    assert page.wait_for_timeout.call_args_list == [call(1000)] * 4
-    assert crawler._logged_in.call_count == 3
+    assert crawler._recover_late_authentication(page, error) is False
 
 
 def test_authenticated_origin_requires_exact_bank_host_and_ebank_prefix() -> None:
@@ -675,16 +742,17 @@ def test_submit_click_timeout_after_dispatch_has_no_fallback(monkeypatch) -> Non
     button.click.assert_called_once_with()
 
 
-def test_post_submit_structural_wait_never_acts_or_resubmits(monkeypatch) -> None:
+def test_pre_submit_semantic_modal_never_acts_or_submits(monkeypatch) -> None:
     crawler, page, _, button, checkpoints, _ = _submit_fixture(
         monkeypatch,
         visible_checkpoint=".modal.show:not(.modal_loading)",
     )
 
-    crawler.submit_credentials_once(page)
+    with pytest.raises(RakutenLoginError, match="未送出登入"):
+        crawler.submit_credentials_once(page)
 
-    button.click.assert_called_once_with()
-    page.wait_for_timeout.assert_called_once_with(1000)
+    button.click.assert_not_called()
+    page.wait_for_timeout.assert_not_called()
     assert all(locator.click.call_count == 0 for locator in checkpoints.values())
 
 
@@ -829,67 +897,7 @@ def test_logout_confirms_bank_modal_before_reporting_success() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    ("kind", "rule_name"),
-    [
-        (CheckpointKind.DUPLICATE_SESSION, "rakuten-duplicate-session"),
-        (CheckpointKind.DISMISSIBLE_NOTICE, "rakuten-referral-promo"),
-    ],
-)
-def test_goto_twd_retries_once_after_known_late_action(
-    monkeypatch,
-    kind: CheckpointKind,
-    rule_name: str,
-) -> None:
-    events: list[str] = []
-    page, nav, subnav = Mock(), Mock(), Mock()
-    nav.first = nav
-    nav.click.side_effect = [RuntimeError("modal intercepted click"), None]
-    page.get_by_role.return_value = nav
-    page.locator.return_value = subnav
-    subnav.first = subnav
-    subnav.click.side_effect = lambda: events.append("click-twd")
-    page.wait_for_selector.side_effect = lambda selector, **kwargs: events.append(
-        f"wait:{selector}:{kwargs['state']}:{kwargs['timeout']}"
-    )
-    page.wait_for_url.side_effect = lambda _predicate, **kwargs: events.append(
-        f"wait-url:{kwargs['timeout']}"
-    )
-    crawler = object.__new__(RakutenCrawler)
-    crawler.name = "rakuten"
-    crawler._credential_origin_allowed = lambda _page: True
-    evaluator = Mock(
-        return_value=CheckpointOutcome(kind, rule_name=rule_name, action_label="known-action")
-    )
-    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
-
-    crawler._goto_twd(page)
-
-    assert nav.click.call_args_list == [call(timeout=5000), call(timeout=5000)]
-    evaluator.assert_called_once()
-    assert evaluator.call_args.args == (page,)
-    assert evaluator.call_args.kwargs["bank"] == "rakuten"
-    assert evaluator.call_args.kwargs["phase"] is CheckpointPhase.POST_SUBMIT_SETTLE
-    assert evaluator.call_args.kwargs["rules"] == crawler.login_checkpoint_rules()
-    predicate = evaluator.call_args.kwargs["is_authenticated"]
-    assert predicate.__self__ is crawler
-    assert predicate.__func__ is RakutenCrawler.is_authenticated
-    assert events == [
-        f"wait:{LOADER_SELECTOR}:hidden:60000",
-        "wait:a.sub-nav-link:has-text('臺幣存款'):visible:15000",
-        "click-twd",
-        "wait-url:30000",
-    ]
-
-
-@pytest.mark.parametrize(
-    "rule_name",
-    ["rakuten-otp-required", "foreign-rule", None],
-)
-def test_goto_twd_invalid_late_outcome_provenance_blocks_without_retry(
-    monkeypatch,
-    rule_name: str | None,
-) -> None:
+def test_goto_twd_semantic_modal_blocks_without_action_or_retry() -> None:
     secret = "PRIVATE_LATE_CLICK_SECRET_987654"
     page, nav = Mock(), Mock()
     nav.first = nav
@@ -897,60 +905,16 @@ def test_goto_twd_invalid_late_outcome_provenance_blocks_without_retry(
     page.get_by_role.return_value = nav
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
-    crawler._credential_origin_allowed = lambda _page: True
-    evaluator = Mock(
-        return_value=CheckpointOutcome(
-            CheckpointKind.DUPLICATE_SESSION,
-            rule_name=rule_name,
-            action_label="unsafe-action",
-            interaction="unsafe-body",
-        )
-    )
-    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
+    crawler._semantic_modal_visible_in_owned_scope = Mock(return_value=True)
 
-    with pytest.raises(LoginCheckpointBlocked) as raised:
+    with pytest.raises(RakutenLoginError, match="未執行視窗操作") as raised:
         crawler._goto_twd(page)
 
     nav.click.assert_called_once_with(timeout=5000)
-    assert raised.value.outcome == CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
     assert secret not in str(raised.value)
-    assert "unsafe-action" not in str(raised.value)
-    assert "unsafe-body" not in str(raised.value)
 
 
-@pytest.mark.parametrize(
-    ("outcome", "error_type"),
-    [
-        (CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name="rakuten-unknown-modal"), LoginCheckpointBlocked),
-        (CheckpointOutcome(CheckpointKind.OTP_REQUIRED, rule_name="rakuten-otp-required", interaction="otp"), LoginInteractionRequired),
-    ],
-)
-def test_goto_twd_terminal_checkpoint_does_not_retry_or_leak_body(
-    monkeypatch,
-    outcome: CheckpointOutcome,
-    error_type: type[Exception],
-) -> None:
-    secret = "private modal body 987654"
-    page, nav = Mock(), Mock()
-    nav.first = nav
-    nav.click.side_effect = RuntimeError(secret)
-    page.get_by_role.return_value = nav
-    crawler = object.__new__(RakutenCrawler)
-    crawler.name = "rakuten"
-    crawler._credential_origin_allowed = lambda _page: True
-    evaluator = Mock(return_value=outcome)
-    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
-
-    with pytest.raises(error_type) as raised:
-        crawler._goto_twd(page)
-
-    nav.click.assert_called_once_with(timeout=5000)
-    evaluator.assert_called_once()
-    assert secret not in str(raised.value)
-    assert "credential_submissions=1" in str(raised.value)
-
-
-def test_goto_twd_authenticated_outcome_rethrows_original_click_error(monkeypatch) -> None:
+def test_goto_twd_authenticated_outcome_rethrows_original_click_error() -> None:
     original = RuntimeError("deposit click failed")
     page, nav = Mock(), Mock()
     nav.first = nav
@@ -958,16 +922,13 @@ def test_goto_twd_authenticated_outcome_rethrows_original_click_error(monkeypatc
     page.get_by_role.return_value = nav
     crawler = object.__new__(RakutenCrawler)
     crawler.name = "rakuten"
-    crawler._credential_origin_allowed = lambda _page: True
-    evaluator = Mock(return_value=CheckpointOutcome(CheckpointKind.AUTHENTICATED))
-    monkeypatch.setattr(rakuten_mod, "evaluate_login_checkpoint", evaluator)
+    crawler._semantic_modal_visible_in_owned_scope = Mock(return_value=False)
 
     with pytest.raises(RuntimeError) as raised:
         crawler._goto_twd(page)
 
     assert raised.value is original
     nav.click.assert_called_once_with(timeout=5000)
-    evaluator.assert_called_once()
 
 
 def test_query_request_and_dom_readiness_fail_closed() -> None:

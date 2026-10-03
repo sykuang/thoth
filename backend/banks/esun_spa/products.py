@@ -1,4 +1,5 @@
 """E.SUN SPA card presence and native IESC bill read, RAM-only and incomplete."""
+from collections.abc import Callable
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -24,6 +25,21 @@ BILL_URLS = {
     'detail': 'https://iesc.esunbank.com/GW/creditBill/getDetailResult',
 }
 BILL_TOTAL = 2 * LIMIT
+
+
+def _cleanup_all(actions):
+    pending = list(actions)
+    for _ in range(2):
+        retry = []
+        for action in pending:
+            try:
+                action()
+            except Exception:
+                retry.append(action)
+        pending = retry
+        if not pending:
+            return
+    raise RuntimeError('E.SUN native bill cleanup incomplete') from None
 
 
 def _official(url):
@@ -162,9 +178,13 @@ def _open_bill(page, bound):
         except Exception:
             pass  # An unavailable bounded observation never becomes a fact.
 
-    context.route('**/*', route_request)
-    context.on('response', response_seen)
+    route_installed = False
+    response_installed = False
     try:
+        context.route('**/*', route_request)
+        route_installed = True
+        context.on('response', response_seen)
+        response_installed = True
         bound()
         with native.expect_popup(timeout=5000) as opened:
             button.click(timeout=TIMEOUT, no_wait_after=True)
@@ -176,6 +196,7 @@ def _open_bill(page, bound):
             observer.LIMIT, observer.TOTAL_LIMIT, observer.MAX_RECORDS = LIMIT, BILL_TOTAL, 16
             observer.WAIT_SECONDS = 1  # Optional diagnostics must not stall the main read.
             observers[kind] = observer
+            observer.start()
         deadline = monotonic() + 7
         while monotonic() < deadline:
             if _official(popup.url) and urlsplit(popup.url).hostname == 'iesc.esunbank.com' and urlsplit(popup.url).path.startswith('/IESC/'):
@@ -187,10 +208,14 @@ def _open_bill(page, bound):
                 native.wait_for_timeout(50)
         return receipt
     finally:
-        context.remove_listener('response', response_seen)
-        context.unroute('**/*', route_request)
-        for observer in observers.values():
-            observer.close()
+        actions: list[Callable[[], object]] = [
+            lambda observer=observer: observer.close() for observer in observers.values()
+        ]
+        if response_installed:
+            actions.append(lambda: context.remove_listener('response', response_seen))
+        if route_installed:
+            actions.append(lambda: context.unroute('**/*', route_request))
+        _cleanup_all(actions)
 
 
 def collect_products(crawler, page, collector, login_baseline):

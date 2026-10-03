@@ -24,7 +24,7 @@ _HSBC_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$"
 )
 _HSBC_MONEY_RE = re.compile(
-    r"^([+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})$"
+    r"^([+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})$"
 )
 _HSBC_SCALAR_RE = re.compile(
     r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$"
@@ -70,37 +70,52 @@ def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> 
     if not isinstance(row, dict):
         raise ValueError("invalid HSBC history transaction")
     description = row.get("description")
-    transaction = _hsbc_history_date(row.get("transactionDate"))
+    transaction_raw = row.get("transactionDate")
+    transaction = (
+        _hsbc_history_date(transaction_raw)
+        if transaction_raw not in (None, "")
+        else None
+    )
     posted_raw = row.get("postedDate")
-    if start is None and posted_raw != "0002-11-30T00:00":
-        raise ValueError("invalid HSBC history transaction")
     posted = None
     if posted_raw not in (None, "", "0002-11-30T00:00"):
         posted = _hsbc_history_date(posted_raw)
     amount, currency = _hsbc_amt(row.get("ntdAmount") or row.get("amount"))
+    is_positive = row.get("isPositive")
     is_foreign = row.get("isForeign")
+    foreign_raw = row.get("foreignAmount")
+    foreign_amount, foreign_currency = _hsbc_amt(foreign_raw)
+    signed_foreign_valid = (
+        isinstance(foreign_amount, (int, float))
+        and not isinstance(foreign_amount, bool)
+        and (foreign_amount == 0 or (foreign_amount < 0) == (is_positive is False))
+    )
     if (
         type(amount) is not int
         or not 0 <= amount <= 100_000_000
         or currency != "TWD"
-        or type(row.get("isPositive")) is not bool
+        or type(is_positive) is not bool
         or type(is_foreign) is not bool
         or not isinstance(description, str)
         or not 0 < len(description.strip()) <= 512
-        or transaction > end
-        or (posted is not None and (transaction > posted or posted > end))
+        or (start is None and transaction is None and posted is None)
+        or (
+            start is None
+            and transaction is None
+            and posted is not None
+            and posted < _hsbc_history_floor(end)
+        )
+        or (start is not None and transaction is None)
+        or (transaction is not None and transaction > end)
+        or (posted is not None and posted > end)
+        or (transaction is not None and posted is not None and transaction > posted)
         or (start is not None and (posted is None or not start <= posted <= end))
-        or (not is_foreign and row.get("foreignAmount") not in (None, "", "-"))
     ):
         raise ValueError("invalid HSBC history transaction")
-    if is_foreign:
-        foreign_amount, foreign_currency = _hsbc_amt(row.get("foreignAmount"))
-        if (
-            isinstance(foreign_amount, bool)
-            or not isinstance(foreign_amount, (int, float))
-            or foreign_currency in (None, "TWD")
-        ):
-            raise ValueError("invalid HSBC history transaction")
+    if is_foreign and (
+        not signed_foreign_valid or foreign_currency in (None, "TWD")
+    ):
+        raise ValueError("invalid HSBC history transaction")
 
 
 def _validate_hsbc_history(data: dict, store: BankStore) -> None:
@@ -272,7 +287,11 @@ def _validate_hsbc_history(data: dict, store: BankStore) -> None:
                     "Credit Limit", "Last Statement Amount", "Last Payment Amount",
                 }:
                     amount, currency = _hsbc_amt(value)
-                    if type(amount) is not int or currency != "TWD":
+                    if (
+                        type(amount) is not int
+                        or currency != "TWD"
+                        or (key == "Credit Limit" and amount < 0)
+                    ):
                         raise ValueError("invalid HSBC card detail")
                 elif key in {
                     "Last Statement Date", "Last Payment Date", "Payment Due Date",
@@ -293,7 +312,7 @@ def _hsbc_amt(s):
         amount = Decimal(match.group(1).replace(",", "")) if match else None
     except InvalidOperation:
         amount = None
-    if amount is None or not amount.is_finite() or not 0 <= amount <= _HSBC_MAX_MONEY:
+    if amount is None or not amount.is_finite() or abs(amount) > _HSBC_MAX_MONEY:
         return None, currency
     if amount == amount.to_integral_value():
         return int(amount), currency
@@ -351,13 +370,13 @@ def _hsbc_card_txn(t: dict) -> dict:
         "card_no": None,            # 由外層帶卡號
         "bill_date": None,          # HSBC 明細 API 未直接給帳單日（卡詳情另有）
         "currency": "TWD",          # 入帳幣別
-        "date": _hsbc_date(t.get("transactionDate")),   # 消費日
+        "date": _hsbc_date(t.get("transactionDate")) or _hsbc_date(t.get("postedDate")),
         "post_date": _hsbc_date(t.get("postedDate")),   # 入帳日（未入帳→None）
         "desc": desc,
         "amount": signed,           # 台幣入帳金額（還款為負）
         "consume_country": None,
         "consume_currency": fx_cur if is_foreign else "TWD",   # 原始消費幣別
-        "consume_amount": fx_val if is_foreign else None,      # 原始外幣金額（保留小數）
+        "consume_amount": abs(fx_val) if is_foreign and fx_val is not None else None,
         "txn_type": classify.classify_hsbc(is_positive, desc, signed),
     }
 
@@ -377,7 +396,7 @@ def _dmy_to_iso(s: str | None) -> str | None:
     except Exception:
         return None
 
-def persist_hsbc(
+def _persist_hsbc(
     data: dict,
     store: BankStore,
     rules: list[dict] | None = None,
@@ -535,3 +554,19 @@ def persist_hsbc(
     if commit:
         store.commit()
     return delta
+
+
+def persist_hsbc(
+    data: dict,
+    store: BankStore,
+    rules: list[dict] | None = None,
+    *,
+    commit: bool = True,
+) -> dict:
+    if not commit:
+        return _persist_hsbc(data, store, rules=rules, commit=False)
+    try:
+        return _persist_hsbc(data, store, rules=rules, commit=True)
+    except Exception:
+        store.rollback()
+        raise

@@ -361,6 +361,36 @@ def test_reminder_insufficient_when_balance_below_due(client: TestClient) -> Non
     assert rem["account_no"] == "TWD1"
 
 
+def test_same_number_foreign_account_never_shadows_twd_auto_debit(
+    client: TestClient,
+) -> None:
+    user_id, token = _register(client)
+    _setup_bank_data("ctbc", user_id, cards=[{
+        "number": "****7016", "payment_due_date": _today_plus(1),
+        "bill_due_amount": 15000.0,
+    }])
+    _setup_bank_data("sinopac", user_id, accounts=[
+        {"account_no": "SHARED", "currency": "JPY", "type": "外幣活存",
+         "raw_balance": 1000000.0, "raw_balance_date": _today_plus(-1)},
+        {"account_no": "SHARED", "currency": "TWD", "type": "活儲",
+         "raw_balance": 8000.0, "raw_balance_date": _today_plus(-1)},
+    ])
+
+    saved = client.put(
+        "/cards/auto-debit/settings/ctbc",
+        headers=_auth(token),
+        json={"account_bank": "sinopac", "account_no": "SHARED"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    reminders = client.get(
+        "/cards/auto-debit/reminders", headers=_auth(token),
+    ).json()
+    assert len(reminders) == 1
+    assert reminders[0]["account_balance"] == 8000.0
+    assert reminders[0]["shortfall"] == 7000.0
+
+
 def test_no_reminder_when_balance_sufficient(client: TestClient) -> None:
     """有設定 + balance >= due → 不該有 reminder."""
     user_id, token = _register(client)

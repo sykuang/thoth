@@ -53,7 +53,7 @@ _PHASE_C_PG_TABLES = (
 # router-side INSERT ... ON CONFLICT (user_id, ...).
 _PHASE_C_PG_INDEXES = (
     ("balance_history", "ux_balance_history_user_snap", "(user_id, snapshot_date)"),
-    ("accounts", "ux_accounts_user_no", "(user_id, account_no)"),
+    ("accounts", "ux_accounts_user_no", "(user_id, account_no, currency)"),
     ("cards", "ux_cards_user_no", "(user_id, card_no)"),
     ("daily_metrics", "ux_daily_metrics_user_snap_cat", "(user_id, snapshot_date, category)"),
     ("twd_transactions", "ux_twd_dedup", "(user_id, dedup_key)"),
@@ -66,22 +66,114 @@ _PHASE_C_PG_INDEXES = (
 #
 # (table, old_pk_column, new_composite_pk_columns)
 _PHASE_C_PG_PK_SWAPS = (
-    ("accounts", "account_no", "(user_id, account_no)"),
+    ("accounts", "account_no", "(user_id, account_no, currency)"),
     ("cards", "card_no", "(user_id, card_no)"),
     ("balance_history", "snapshot_date", "(user_id, snapshot_date)"),
     ("daily_metrics", None, "(user_id, snapshot_date, category)"),  # may be composite already
 )
 
 
+def _merge_pg_account_currency_collisions(conn: Any, schema: str) -> None:
+    columns = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'accounts'",
+            (schema,),
+        ).fetchall()
+    }
+    optional = [
+        column for column in (
+            "branch", "nickname", "type", "product_type", "raw_balance",
+            "raw_balance_date", "excluded", "nickname_overwrite", "updated_at",
+        )
+        if column in columns
+    ]
+    rows = conn.execute(
+        f'SELECT ctid::text, user_id, account_no, currency'
+        f'{"," if optional else ""}{", ".join(optional)} '
+        f'FROM "{schema}"."accounts"'
+    ).fetchall()
+    groups: dict[tuple[Any, Any, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        raw_currency = row[3]
+        currency = str(raw_currency or "TWD").strip().upper()
+        if re.fullmatch(r"[A-Z]{3}", currency) is None:
+            raise RuntimeError("invalid legacy account currency")
+        values = dict(zip(optional, row[4:], strict=True))
+        values.update({"ctid": row[0], "currency": currency})
+        groups.setdefault((row[1], row[2], currency), []).append(values)
+
+    def order_key(row: dict[str, Any]) -> tuple[str, tuple[int, int]]:
+        tid = re.fullmatch(r"\((\d+),(\d+)\)", row["ctid"])
+        return (
+            str(row.get("updated_at") or ""),
+            (int(tid.group(1)), int(tid.group(2))) if tid else (0, 0),
+        )
+
+    for duplicates in groups.values():
+        if len(duplicates) < 2:
+            continue
+        winner = max(duplicates, key=order_key)
+        for duplicate in duplicates:
+            if duplicate is not winner:
+                conn.execute(
+                    f'DELETE FROM "{schema}"."accounts" WHERE ctid = %s::tid',
+                    (duplicate["ctid"],),
+                )
+        assignments = []
+        params = []
+        if "excluded" in optional:
+            assignments.append("excluded = %s")
+            params.append(int(any(bool(row.get("excluded")) for row in duplicates)))
+        if "nickname_overwrite" in optional:
+            nickname = next(
+                (
+                    row.get("nickname_overwrite") for row in sorted(
+                        duplicates, key=order_key, reverse=True,
+                    )
+                    if str(row.get("nickname_overwrite") or "").strip()
+                ),
+                None,
+            )
+            assignments.append("nickname_overwrite = %s")
+            params.append(nickname)
+        for column in (
+            "branch", "nickname", "type", "product_type", "raw_balance",
+            "raw_balance_date",
+        ):
+            if column not in optional:
+                continue
+            candidates = sorted(duplicates, key=order_key, reverse=True)
+            if column == "raw_balance_date":
+                candidates = [row for row in candidates if row.get("raw_balance") is not None]
+            value = None
+            for row in candidates:
+                candidate = row.get(column)
+                if candidate is None:
+                    continue
+                if isinstance(candidate, str) and not candidate.strip():
+                    continue
+                value = candidate
+                break
+            assignments.append(f'"{column}" = %s')
+            params.append(value)
+        if assignments:
+            params.append(winner["ctid"])
+            conn.execute(
+                f'UPDATE "{schema}"."accounts" SET {", ".join(assignments)} '
+                "WHERE ctid = %s::tid",
+                tuple(params),
+            )
+
+
 def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
     """Idempotent: 每張 bank 表如缺 user_id column 就補 + backfill = 1.
 
-    PG mirror of db.py:_ensure_phase_c_user_id. Runs once per process per
-    schema. Failures are swallowed so a missing/broken schema doesn't block
-    Connection creation — actual row-level access will surface the real error.
+    PG mirror of db.py:_ensure_phase_c_user_id. Revalidates each opened schema
+    because a cached schema name can be dropped and recreated in-process.
     """
-    if schema in _PHASE_C_PG_MIGRATED:
-        return
+    _PHASE_C_PG_MIGRATED.discard(schema)
     try:
         # 1) Existing tables in this schema
         cur = conn.execute(
@@ -90,44 +182,148 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
             (schema,),
         )
         existing = {r[0] for r in cur.fetchall()}
+        if not existing:
+            return
+        complete_schema = set(_PHASE_C_PG_TABLES).issubset(existing)
 
         # 2) ADD COLUMN user_id (idempotent via IF NOT EXISTS, PG 9.6+)
         for tbl in _PHASE_C_PG_TABLES:
             if tbl not in existing:
                 continue
+            conn.execute(
+                f'ALTER TABLE "{schema}"."{tbl}" '
+                f'ADD COLUMN IF NOT EXISTS user_id INTEGER NOT NULL DEFAULT 1'
+            )
+            conn.execute(
+                f'UPDATE "{schema}"."{tbl}" SET user_id = 1 '
+                f'WHERE user_id IS NULL OR user_id = 0'
+            )
+            conn.execute(
+                f'ALTER TABLE "{schema}"."{tbl}" '
+                "ALTER COLUMN user_id TYPE INTEGER USING user_id::integer, "
+                "ALTER COLUMN user_id SET DEFAULT 1, "
+                "ALTER COLUMN user_id SET NOT NULL"
+            )
+
+        if "accounts" in existing:
+            conn.execute(
+                f'ALTER TABLE "{schema}"."accounts" '
+                "ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'TWD'"
+            )
+            _merge_pg_account_currency_collisions(conn, schema)
+            conn.execute(
+                f'UPDATE "{schema}"."accounts" '
+                "SET currency = COALESCE(NULLIF(UPPER(TRIM(currency)), ''), 'TWD')"
+            )
+            invalid_currency = conn.execute(
+                f'SELECT 1 FROM "{schema}"."accounts" '
+                "WHERE currency !~ '^[A-Z]{3}$' LIMIT 1"
+            ).fetchone()
+            if invalid_currency is not None:
+                raise RuntimeError("invalid legacy account currency")
+            conn.execute(
+                f'ALTER TABLE "{schema}"."accounts" '
+                "ALTER COLUMN currency SET DEFAULT 'TWD', "
+                "ALTER COLUMN currency SET NOT NULL"
+            )
+
+        # Native-currency account history: preserve ISO currency and fractional units.
+        if "twd_transactions" in existing:
             try:
                 conn.execute(
-                    f'ALTER TABLE "{schema}"."{tbl}" '
-                    f'ADD COLUMN IF NOT EXISTS user_id INTEGER NOT NULL DEFAULT 1'
+                    f'ALTER TABLE "{schema}"."twd_transactions" '
+                    "ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'TWD'"
                 )
-                # Defensive backfill: rows might have been inserted with NULL/0
-                # before ADD COLUMN landed (unlikely with NOT NULL DEFAULT 1
-                # but harmless).
-                conn.execute(
-                    f'UPDATE "{schema}"."{tbl}" SET user_id = 1 '
-                    f'WHERE user_id IS NULL OR user_id = 0'
-                )
+                columns = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = %s AND table_name = %s",
+                        (schema, "twd_transactions"),
+                    ).fetchall()
+                }
+                decimal_columns = [
+                    column for column in ("expend", "income", "balance")
+                    if column in columns
+                ]
+                if decimal_columns:
+                    clauses = ", ".join(
+                        f"ALTER COLUMN {column} TYPE DOUBLE PRECISION "
+                        f"USING {column}::double precision"
+                        for column in decimal_columns
+                    )
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."twd_transactions" {clauses}'
+                    )
             except Exception:
-                # If a single table fails (e.g. permissions, conflicting
-                # constraint), don't block the others. Real query-time errors
-                # will surface in the router.
                 conn.rollback()
-                continue
+                raise
 
-        # 3) Composite UNIQUE INDEX (idempotent CREATE INDEX IF NOT EXISTS)
+        if "balance_history" in existing:
+            columns = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s",
+                    (schema, "balance_history"),
+                ).fetchall()
+            }
+            if "fx_balance" in columns:
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."balance_history" '
+                    "ALTER COLUMN fx_balance TYPE DOUBLE PRECISION "
+                    "USING fx_balance::double precision"
+                )
+
+        # Remove constraint-owned legacy single-column dedup uniqueness first;
+        # PostgreSQL cannot drop its backing index directly.
+        for tbl in ("twd_transactions", "card_billed_txns"):
+            if tbl not in existing:
+                continue
+            constraint_rows = conn.execute(
+                """SELECT con.conname, array_agg(a.attname ORDER BY key.ord)
+                   FROM pg_constraint con
+                   JOIN pg_class t ON t.oid = con.conrelid
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
+                   CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS key(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = key.attnum
+                   WHERE con.contype = 'u' AND n.nspname = %s AND t.relname = %s
+                   GROUP BY con.conname""",
+                (schema, tbl),
+            ).fetchall()
+            for constraint_name, constraint_columns in constraint_rows:
+                if list(constraint_columns) == ["dedup_key"]:
+                    safe_constraint = constraint_name.replace('"', '""')
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."{tbl}" '
+                        f'DROP CONSTRAINT "{safe_constraint}"'
+                    )
+
+        # 3) Composite UNIQUE INDEX. Names already existed on legacy schemas with
+        # single-column definitions, so validate their shape before reusing them.
         for tbl, idx, cols in _PHASE_C_PG_INDEXES:
             if tbl not in existing:
                 continue
-            try:
-                conn.execute(
-                    f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx}" '
-                    f'ON "{schema}"."{tbl}" {cols}'
-                )
-            except Exception:
-                # Old data may have duplicates that violate the new uniqueness;
-                # skip rather than block the read path.
-                conn.rollback()
+            desired = [column.strip() for column in cols.strip("()").split(",")]
+            index_rows = conn.execute(
+                """SELECT a.attname, i.indisunique
+                   FROM pg_index i
+                   CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
+                   JOIN pg_class c ON c.oid = i.indexrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = %s AND c.relname = %s
+                   ORDER BY key.ord""",
+                (schema, idx),
+            ).fetchall()
+            current = [row[0] for row in index_rows]
+            if current == desired and all(row[1] for row in index_rows):
                 continue
+            conn.execute(f'DROP INDEX IF EXISTS "{schema}"."{idx}"')
+            conn.execute(
+                f'CREATE UNIQUE INDEX "{idx}" '
+                f'ON "{schema}"."{tbl}" {cols}'
+            )
 
         # 4) Phase C-pk (2026-06-18): swap legacy single-column PRIMARY KEY
         # to composite (user_id, ...). Without this, multi-tenant INSERT of
@@ -142,17 +338,22 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                 cur = conn.execute(
                     """SELECT a.attname
                        FROM pg_index i
-                       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                       CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ord)
+                       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
                        JOIN pg_class c ON c.oid = i.indrelid
                        JOIN pg_namespace n ON n.oid = c.relnamespace
                        WHERE i.indisprimary
                          AND n.nspname = %s AND c.relname = %s
-                       ORDER BY a.attnum""",
+                       ORDER BY key.ord""",
                     (schema, tbl),
                 )
                 current_pk_cols = [r[0] for r in cur.fetchall()]
-                if "user_id" in current_pk_cols:
-                    continue  # Already composite — skip
+                desired_pk_cols = [
+                    column.strip()
+                    for column in new_pk_cols.strip("()").split(",")
+                ]
+                if current_pk_cols == desired_pk_cols:
+                    continue
 
                 # Find PK constraint name (Postgres autogenerates as <table>_pkey)
                 cur = conn.execute(
@@ -170,7 +371,6 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                         f'ALTER TABLE "{schema}"."{tbl}" '
                         f'ADD PRIMARY KEY {new_pk_cols}'
                     )
-                    conn.commit()
                     continue
 
                 pk_name = pk_name_row[0]
@@ -183,26 +383,23 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                     f'ALTER TABLE "{schema}"."{tbl}" '
                     f'ADD PRIMARY KEY {new_pk_cols}'
                 )
-                conn.commit()
+
             except Exception:
-                # If swap fails (e.g. duplicate rows blocking the new PK),
-                # skip — read path still works via the UNIQUE INDEX, write
-                # path will surface the real error to the user.
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-                continue
+                raise
 
         conn.commit()
     except Exception:
-        # Schema audit itself failed (rare — connection-level issue). Mark as
-        # attempted and move on so we don't keep hammering on every request.
         try:
             conn.rollback()
         except Exception:
             pass
-    _PHASE_C_PG_MIGRATED.add(schema)
+        raise
+    if complete_schema:
+        _PHASE_C_PG_MIGRATED.add(schema)
 
 
 def _reset_phase_c_pg_cache() -> None:
@@ -397,8 +594,8 @@ class Connection:
             self.commit()
             # Phase C (2026-06-18): backfill user_id columns + composite UNIQUE
             # INDEX for legacy PG schemas created before Path A multi-user. SQLite
-            # side has db.py:_ensure_phase_c_user_id; this is the PG mirror.
-            # Per-process per-schema cache means at most one audit per schema.
+            # side has db.py:_ensure_phase_c_user_id; this is the PG mirror and
+            # deliberately revalidates every opened schema authority.
             _ensure_phase_c_user_id_pg(self._conn, self.schema)
         except BaseException as e:
             self._checkout_cm.__exit__(type(e), e, e.__traceback__)
@@ -470,6 +667,9 @@ class Connection:
     def executescript(self, script: str) -> None:
         for stmt in split_statements(script):
             self.execute(stmt)
+
+    def ensure_schema_migrations(self) -> None:
+        _ensure_phase_c_user_id_pg(self._conn, self.schema)
 
     def commit(self) -> None:
         self._conn.commit()

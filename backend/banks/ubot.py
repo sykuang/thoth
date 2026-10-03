@@ -525,17 +525,25 @@ class UbotCrawler(BankCrawler):
             or type(hit.request_sequence) is not int or hit.request_sequence <= after_sequence
             or type(hit.body_size) is not int or not 0 < hit.body_size <= 5_000_000
             or hit.content_type.split(";", 1)[0].strip().lower() != "application/json"
-            or not isinstance(hit.req_body, str)
+            or not isinstance(hit.req_body, (str, dict))
         ):
             raise RuntimeError(error)
-        try:
-            pairs = parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
-        except ValueError:
-            raise RuntimeError(error) from None
-        form: dict[str, list[str]] = {}
-        for key, value in pairs:
-            form.setdefault(key, []).append(value)
         expected_form = {"acctNo", "beginDate", "endDate", "sessionId", "sid"}
+        if isinstance(hit.req_body, dict):
+            form = (
+                {key: [value] for key, value in hit.req_body.items()}
+                if set(hit.req_body) == expected_form
+                and all(isinstance(value, str) for value in hit.req_body.values())
+                else {}
+            )
+        else:
+            try:
+                pairs = parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
+            except ValueError:
+                raise RuntimeError(error) from None
+            form: dict[str, list[str]] = {}
+            for key, value in pairs:
+                form.setdefault(key, []).append(value)
         if (
             set(form) != expected_form or any(len(values) != 1 for values in form.values())
             or form["acctNo"] != [identity]
@@ -655,8 +663,40 @@ class UbotCrawler(BankCrawler):
             [...document.querySelectorAll('table')].map(table => [table, table.innerHTML])
           );
           window.__thothUbotHistoryLastMutation = performance.now();
-          window.__thothUbotHistoryObserver = new MutationObserver(() => {
-            window.__thothUbotHistoryLastMutation = performance.now();
+          const resultSelector = [
+            'table','[aria-busy=true]','[role=progressbar]','[role=status]',
+            '.loading','.spinner','.busy','.processing',
+            '[role=dialog]','[role=alertdialog]','[role=alert]',
+            '.modal','.dialog','.popup','.error','.error-message'
+          ].join(',');
+          const pagerSelector = [
+            'a','button','input','select','[role=button]','nav',
+            '[class*=pagination i]','[class*=paginator i]',
+            '[aria-label*=pagination i]','[aria-label*=pages i]'
+          ].join(',');
+          const isPager = element => {
+            if (!element || typeof element.matches !== 'function' || !element.matches(pagerSelector)) return false;
+            const text = (element.textContent || element.value || '').replace(/\s+/g, ' ').trim();
+            const meta = [element.id, element.getAttribute('class'), element.getAttribute('aria-label'),
+              element.getAttribute('rel'), element.getAttribute('href'), element.getAttribute('onclick'),
+              element.getAttribute('data-page')].filter(Boolean).join(' ');
+            return /^(?:下一頁|下頁|next|[>»]|[2-9]\d*)$/i.test(text) ||
+              /(?:pagination|paginator|page[-_: ]?next|rel[=: ]?next|[?&]page=[2-9]\d*)/i.test(meta);
+          };
+          const touchesResultState = node => {
+            const element = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
+            if (!element) return false;
+            if (element.closest(resultSelector) ||
+                (typeof element.querySelector === 'function' && element.querySelector(resultSelector))) return true;
+            if (isPager(element.closest(pagerSelector))) return true;
+            return typeof element.querySelectorAll === 'function' &&
+              [...element.querySelectorAll(pagerSelector)].some(isPager);
+          };
+          window.__thothUbotHistoryObserver = new MutationObserver(records => {
+            if (records.some(record => touchesResultState(record.target) ||
+                [...record.addedNodes, ...record.removedNodes].some(touchesResultState))) {
+              window.__thothUbotHistoryLastMutation = performance.now();
+            }
           });
           window.__thothUbotHistoryObserver.observe(document.documentElement, {
             subtree: true, childList: true, attributes: true, characterData: true,
@@ -666,6 +706,7 @@ class UbotCrawler(BankCrawler):
     @classmethod
     def _wait_for_twd_dom_settle(cls, page):
         state = None
+        quiet_candidate_at = None
         for elapsed in range(500, 10_001, 500):
             page.wait_for_timeout(500)
             state = cls._twd_dom_snapshot(page)
@@ -673,7 +714,12 @@ class UbotCrawler(BankCrawler):
                 elapsed >= 5_000 and isinstance(state, dict)
                 and state.get("quiet_ms", 0) >= 2_000
             ):
-                return state
+                if quiet_candidate_at is not None and elapsed - quiet_candidate_at >= 1_000:
+                    return state
+                if quiet_candidate_at is None:
+                    quiet_candidate_at = elapsed
+            else:
+                quiet_candidate_at = None
         return state
 
     @staticmethod

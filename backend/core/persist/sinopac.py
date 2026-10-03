@@ -14,8 +14,24 @@ from zoneinfo import ZoneInfo
 
 from backend.core import account_classify, classify
 from backend.core.base import validate_history_coverage
+from backend.core.money import native_money
 from backend.core.store import BankStore
 from backend.core.persist._common import _num, _num_real, _num_to_float
+
+
+def _native_amount(
+    value, currency: str, *, absolute: bool = False,
+) -> Decimal:
+    try:
+        amount = native_money(value, currency, absolute=absolute)
+    except ValueError:
+        raise ValueError("invalid SinoPac native amount") from None
+    assert amount is not None
+    return Decimal(str(amount))
+
+
+def _native_number(amount: Decimal, currency: str) -> int | float:
+    return int(amount) if currency == "TWD" else float(amount)
 
 
 def _sinopac_date(s) -> str | None:
@@ -52,12 +68,11 @@ def _sinopac_split_amount(s):
     txt = _sinopac_strip_html(s).replace(",", "")
     if not txt:
         return None, None
-    if txt.startswith("-"):
-        try: return abs(int(float(txt))), None
-        except (ValueError, TypeError): return None, None
-    txt = txt.lstrip("+")
-    try: return None, int(float(txt))
-    except (ValueError, TypeError): return None, None
+    try:
+        amount = float(Decimal(txt))
+    except (InvalidOperation, ValueError):
+        return None, None
+    return (abs(amount), None) if amount < 0 else (None, amount)
 
 def _mmyy_expired(s: str | None, today_yyyy_mm: str | None = None) -> bool:
     """卡片到期日 'MMYYYY' (DBS '122026') / 'MMYY' (Sinopac '0829') → 是否過期.
@@ -118,11 +133,14 @@ def _strict_date(value, fmt: str, error: str) -> date:
         raise ValueError(error) from None
 
 
-def _strict_amount(value, error: str) -> None:
+def _strict_amount(value, error: str) -> Decimal:
     if not isinstance(value, str):
         raise ValueError(error)
     text = re.sub(r"<[^>]*>", "", value).strip()
-    if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", text) is None:
+    if re.fullmatch(
+        r"[+-]?(?:(?:0|[1-9]\d*)(?:\.\d{1,6})?|[1-9]\d{0,2}(?:,\d{3})+(?:\.\d{1,6})?)",
+        text,
+    ) is None:
         raise ValueError(error)
     try:
         amount = Decimal(text.replace(",", ""))
@@ -130,10 +148,10 @@ def _strict_amount(value, error: str) -> None:
         raise ValueError(error) from None
     if (
         not amount.is_finite()
-        or amount != amount.to_integral_value()
         or abs(amount) > Decimal("2147483647")
     ):
         raise ValueError(error)
+    return amount
 
 
 def _validate_sinopac_history(data: dict, store: BankStore) -> date:
@@ -151,7 +169,7 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
     validate_history_coverage(
         coverage,
         expected_mode=mode,
-        expected_domains=frozenset({"twd_transactions"}),
+        expected_domains=frozenset({"account_transactions"}),
     )
     domain = coverage["domains"][0]
     expected = domain["expected"]
@@ -161,7 +179,7 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
         history_payload = {
             "history_coverage": coverage,
             "debit_accounts": data.get("debit_accounts", []),
-            "twd_transactions": data.get("twd_transactions", []),
+            "account_transactions": data.get("account_transactions", []),
         }
         for chunk in json.JSONEncoder(
             ensure_ascii=False, separators=(",", ":"),
@@ -178,7 +196,7 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
     if not expected:
         empty = domain.get("empty_window")
         inventory = data.get("debit_accounts", [])
-        results = data.get("twd_transactions", [])
+        results = data.get("account_transactions", [])
         if (
             not isinstance(empty, dict)
             or set(empty) != {"start", "end", "status", "pages"}
@@ -202,7 +220,6 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
     if not isinstance(inventory, list) or len(inventory) != len(expected):
         raise ValueError(error)
     inventory_by_identity = {}
-    inventory_labels = set()
     for item in inventory:
         if (
             not isinstance(item, dict)
@@ -210,18 +227,22 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
             or not isinstance(item.get("label"), str)
             or not item["label"]
             or item["label"] != item["label"].strip()
-            or item["label"] in inventory_labels
             or not isinstance(item.get("identity"), str)
             or re.fullmatch(r"\d{14}", item["identity"]) is None
-            or item.get("currency") != "TWD"
-            or item["identity"] in inventory_by_identity
+            or not isinstance(item.get("currency"), str)
+            or re.fullmatch(r"[A-Z]{3}", item["currency"]) is None
         ):
             raise ValueError(error)
-        inventory_labels.add(item["label"])
-        inventory_by_identity[item["identity"]] = item
+        history_identity = (
+            item["identity"] if item["currency"] == "TWD"
+            else f'{item["identity"]}:{item["currency"]}'
+        )
+        if history_identity in inventory_by_identity:
+            raise ValueError(error)
+        inventory_by_identity[history_identity] = item
     if set(inventory_by_identity) != set(expected_by_identity):
         raise ValueError(error)
-    results = data.get("twd_transactions")
+    results = data.get("account_transactions")
     if not isinstance(results, list) or len(results) != len(windows):
         raise ValueError(error)
     receipts = []
@@ -230,18 +251,24 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
         if not isinstance(result, dict):
             raise ValueError(error)
         identity = result.get("account")
+        currency = result.get("currency")
+        history_identity = (
+            identity if currency == "TWD" else f"{identity}:{currency}"
+            if isinstance(identity, str) and isinstance(currency, str) else None
+        )
         receipt = result.get("receipt")
         rows = result.get("records")
         if (
             not isinstance(identity, str)
             or re.fullmatch(r"\d{14}", identity) is None
-            or identity not in expected_by_identity
-            or result.get("currency") != "TWD"
+            or not isinstance(currency, str)
+            or re.fullmatch(r"[A-Z]{3}", currency) is None
+            or history_identity not in expected_by_identity
             or not isinstance(result.get("account_name"), str)
-            or result["account_name"] != inventory_by_identity[identity]["label"]
+            or result["account_name"] != inventory_by_identity[history_identity]["label"]
             or not isinstance(receipt, dict)
             or set(receipt) != {"identity", "start", "end", "status", "pages", "rows"}
-            or receipt.get("identity") != identity
+            or receipt.get("identity") != history_identity
             or type(receipt.get("pages")) is not int
             or receipt.get("pages") != 1
             or not isinstance(rows, list)
@@ -287,15 +314,19 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
                 raise ValueError(error)
             if any(len(row[f"DataText{i}"]) > 2_000 for i in range(6, 12)):
                 raise ValueError(error)
-            _strict_amount(row["DataText4"], error)
-            _strict_amount(row["DataText5"], error)
+            amount = _strict_amount(row["DataText4"], error)
+            balance = _strict_amount(row["DataText5"], error)
+            if currency == "TWD" and any(
+                value != value.to_integral_value() for value in (amount, balance)
+            ):
+                raise ValueError(error)
         receipts.append({key: receipt[key] for key in (
             "identity", "start", "end", "status", "pages",
         )})
     if receipts != windows:
         raise ValueError(error)
 
-    existing = store.latest_twd_transaction_dates()
+    existing = store.latest_account_transaction_dates()
     expected_ends = set()
     for item in expected:
         identity = item["identity"]
@@ -345,36 +376,50 @@ def _persist_sinopac(
     # --- 銀行帳戶（含 TWD/USD/JPY 各幣別行）---
     bb = data.get("bank_balance") or []
     accts = []
-    twd_total = 0
-    fx_total = 0  # 外幣原始金額累加（未經 FX 換算）
+    twd_total_amount = Decimal(0)
+    fx_by_currency_amounts: dict[str, Decimal] = {}
     for grp in bb:
         if not isinstance(grp, dict):
             continue
         for a in grp.get("SubInfo", []) or []:
             acct_no = a.get("AcctValue") or a.get("AcctValueFormat")
-            cur = a.get("Curr", "")
-            bal = _num(a.get("AvailBalance"))
             if not acct_no:
                 continue
+            cur = str(a.get("Curr") or "TWD").strip().upper()
+            if re.fullmatch(r"[A-Z]{3}", cur) is None:
+                raise ValueError("invalid SinoPac balance currency")
+            raw_amount = _native_amount(a.get("AvailBalance"), cur)
+            raw_balance = _native_number(raw_amount, cur)
             raw = {**a, "currency": cur}
             accts.append({
                 "account_no": acct_no, "currency": cur,
                 "branch": None, "nickname": a.get("AcctText"),
                 "type": a.get("AcctText"),
                 "product_type": account_classify.classify_account("sinopac", raw),
-                "raw_balance": _num_real(a.get("AvailBalance")),
+                "raw_balance": raw_balance,
                 "raw_balance_date": today,
             })
-            if cur == "TWD" and bal is not None:
-                twd_total += bal
-            elif bal is not None:
-                fx_total += bal
+            if cur == "TWD":
+                twd_total_amount = _native_amount(
+                    twd_total_amount + raw_amount,
+                    cur,
+                )
+            else:
+                fx_by_currency_amounts[cur] = _native_amount(
+                    fx_by_currency_amounts.get(cur, Decimal(0)) + raw_amount,
+                    cur,
+                )
+    twd_total = int(twd_total_amount)
+    fx_by_currency = {
+        currency: _native_number(amount, currency)
+        for currency, amount in fx_by_currency_amounts.items()
+    }
     # 貸款帳戶：ws_loanaccount + 每帳號 ws_loaninfo 真實明細。
     loan = data.get("loan") or {}
     loan_total = None
+    loan_by_currency: dict[str, Decimal] = {}
     loan_metric_records = []
     if isinstance(loan, dict) and loan.get("fetch_ok") is True:
-        loan_balances = []
         for detail in loan.get("details") or []:
             if not isinstance(detail, dict) or not detail.get("account"):
                 continue
@@ -391,31 +436,55 @@ def _persist_sinopac(
                 "principal_balance": _num_real(record.get("LoanBalance")),
                 "interest_rate": record.get("LoanRate"),
             } for record in records)
-            balances = [
-                abs(value) for value in (_num_real(r.get("LoanBalance")) for r in records)
-                if value is not None
-            ]
-            raw_balance = sum(balances) if balances else None
-            loan_balances.extend(balances)
-            first = records[0] if records else {}
-            cur = first.get("Currency") or "TWD"
-            loan_type = first.get("LoanKind") or "貸款"
-            raw = {"AcctText": loan_type, "currency": cur}
-            accts.append({
-                "account_no": detail["account"],
-                "currency": cur,
-                "branch": None,
-                "nickname": first.get("LoanAcctCName") or loan_type,
-                "type": loan_type,
-                "product_type": account_classify.classify_account("sinopac", raw),
-                "raw_balance": raw_balance,
-                "raw_balance_date": today,
-            })
-        if loan_balances:
-            loan_total = round(sum(loan_balances))
+            records_by_currency = {}
+            for record in records:
+                cur = str(record.get("Currency") or "TWD").strip().upper()
+                records_by_currency.setdefault(cur, []).append(record)
+            for cur, currency_records in records_by_currency.items():
+                if re.fullmatch(r"[A-Z]{3}", cur) is None:
+                    raise ValueError("invalid SinoPac loan currency")
+                balances = [
+                    _native_amount(
+                        record.get("LoanBalance"), cur, absolute=True,
+                    )
+                    for record in currency_records
+                ]
+                raw_amount = _native_amount(
+                    sum(balances, Decimal(0)), cur, absolute=True,
+                )
+                loan_by_currency[cur] = _native_amount(
+                    loan_by_currency.get(cur, Decimal(0)) + raw_amount,
+                    cur,
+                    absolute=True,
+                )
+                raw_balance = _native_number(raw_amount, cur)
+                first = currency_records[0]
+                loan_type = first.get("LoanKind") or "貸款"
+                raw = {"AcctText": loan_type, "currency": cur}
+                accts.append({
+                    "account_no": detail["account"],
+                    "currency": cur,
+                    "branch": None,
+                    "nickname": first.get("LoanAcctCName") or loan_type,
+                    "type": loan_type,
+                    "product_type": account_classify.classify_account("sinopac", raw),
+                    "raw_balance": raw_balance,
+                    "raw_balance_date": today,
+                })
+        if "TWD" in loan_by_currency:
+            loan_total = int(loan_by_currency["TWD"])
+    loan_by_currency_values = {
+        currency: _native_number(amount, currency)
+        for currency, amount in loan_by_currency.items()
+    }
+    fx_total = (
+        next(iter(fx_by_currency.values()))
+        if len(fx_by_currency) == 1
+        else None if fx_by_currency else 0
+    )
     if accts:
         store.upsert_accounts(accts, commit=False)
-    if twd_total or fx_total or loan_total is not None:
+    if twd_total or fx_by_currency or loan_by_currency_values:
         store.upsert_balance_history([{
             "snapshotDate": today,
             "twdBalance": twd_total if twd_total else None,
@@ -424,7 +493,13 @@ def _persist_sinopac(
         }], commit=False)
         delta["balance_days"] = 1
         store.put_daily_metric(
-            "balance_latest", {"twd": twd_total, "fx_raw": fx_total, "loan": loan_total}, today,
+            "balance_latest", {
+                "twd": twd_total,
+                "fx_raw": fx_total,
+                "fx_by_currency": fx_by_currency,
+                "loan": loan_total,
+                "loan_by_currency": loan_by_currency_values,
+            }, today,
             commit=False,
         )
 
@@ -560,7 +635,7 @@ def _persist_sinopac(
     if loan_metric_records:
         store.put_daily_metric("loan", {"records": loan_metric_records}, today, commit=False)
 
-    # --- 台幣交易明細（永豐 ws_transdetailMerge.ashx，欄位 DataText1~11）---
+    # --- 帳戶原幣交易明細（legacy 欄位名 twd_transactions）---
     # DataText 對應：
     #   DataText1 = 交易日 + 時間 (HTML: 'YYYY/MM/DD<br />HH:MM')
     #   DataText2 = 入帳日 (YYYY/MM/DD)
@@ -574,21 +649,26 @@ def _persist_sinopac(
     # `_twd_to_transaction` 統一處理 (`description · counterparty_acct` 對齊 MoneyBook),
     # 所有銀行通用 — 不在 persist 層做。
     twd_new = 0
-    for body in data.get("twd_transactions") or []:
+    for body in data.get("account_transactions") or []:
         if not isinstance(body, dict):
             continue
         acct_no = body.get("account")
+        currency = body.get("currency")
+        history_identity = acct_no if currency == "TWD" else f"{acct_no}:{currency}"
         rows = []
         for t in body.get("records", []) or []:
             expend, income = _sinopac_split_amount(t.get("DataText4"))
             rows.append({
                 "account_no": acct_no,
+                "currency": currency,
+                "history_identity": history_identity,
+                "history_domain": "account_transactions",
                 "datetime": _sinopac_datetime(t.get("DataText1")),
                 "account_date": _sinopac_date(_sinopac_strip_html(t.get("DataText2"))),
                 "desc": _sinopac_strip_html(t.get("DataText3")),
                 "expend": expend,
                 "income": income,
-                "balance": _num(_sinopac_strip_html(t.get("DataText5"))),
+                "balance": _num_real(_sinopac_strip_html(t.get("DataText5"))),
                 "counterparty_bank": None,
                 "counterparty_acct": _sinopac_strip_html(t.get("DataText8"))[:30] or None,
                 "memo": _sinopac_strip_html(t.get("DataText8")) or None,

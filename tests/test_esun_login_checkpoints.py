@@ -766,7 +766,8 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     legacy = collect.body[3:] + crawler.body[start + 1:]
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in legacy).encode()
     assert hashlib.sha256(payload).hexdigest() == (
-        "cfee36ec91a4b13a62769e91dfa1a596e22a86f8280e26775c457e06a996fbb4"
+        # 2026-10-03 live: overview parser also accepts the SPA "<acct> <cat>" line.
+        "3fe2511bcd3716dffebe8df059027a44c2efbeafc95d625e3600d1dc62088dd9"
     )
     # New hash deliberately includes the reviewed SPA dispatch + final proof;
     # four added phase/gate assignments identify SPA entry and final publication.
@@ -775,5 +776,6 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     ).encode()
     assert hashlib.sha256(full).hexdigest() == (
-        "38e200e41a1a180d3e5fa28d165f13008aa1580c6178d87ea3c859f3641743fa"
+        # 2026-10-03 live: SPA path publishes accounts read from the 交易明細 overview.
+        "f37c76d19887649a90a70ecab00081ad0eed4932beb5c270155ac216f59798b0"
     )

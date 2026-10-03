@@ -719,4 +719,5 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ScbCrawler")
     start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
     payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == "ecdd1ba52307cc48f7be0ec46556e30bb0cbec61182867e76830483cba62aaa0"
+    # 2026-10-03 live: collect reads deposit accounts from the 帳戶綜覽 page.
+    assert hashlib.sha256(payload.encode()).hexdigest() == "c3e555032aa2bef7d824d1b59879bc8143c9b4587d51186efd49bb4be6cc31b3"

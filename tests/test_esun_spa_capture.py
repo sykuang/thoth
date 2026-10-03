@@ -129,6 +129,40 @@ def test_passive_native_success():
     assert not p.handlers and all(s.detached for s in p.sessions)
 
 
+def test_failed_detach_clears_sensitive_state_before_cleanup_retry():
+    m = load()
+    p, c = Page(), m.SpaCollector()
+    c.attach(p)
+    observer = c.observers[m.PATHS[0]]
+    observer.records["secret"] = {"key": (m.ORIGIN + m.PATHS[0], "POST", "private-body", "main")}
+    observer.native_requests.append(object())
+    c.hits.append(m.ApiHit(url=m.ORIGIN + m.PATHS[0], method="POST", status=200, req_body="private"))
+    c._latest_spa[m.PATHS[0]] = {"private": "response"}
+    c._requests[1] = 1
+
+    original_detach = observer.session.detach
+    attempts = 0
+
+    def fail_twice():
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise RuntimeError("synthetic CDP detach failure")
+        original_detach()
+
+    observer.session.detach = fail_twice
+    with pytest.raises(RuntimeError, match="synthetic CDP detach failure"):
+        c.detach(p)
+
+    assert c.page is None
+    assert not c.hits and not c._latest_spa and not c._requests
+    assert not observer.records and not observer.native_requests
+    assert m.PATHS[0] in c.observers
+
+    c.detach()
+    assert not c.observers
+
+
 @pytest.mark.parametrize("mode", ["pending", "failed", "reordered", "duplicate"])
 def test_newer_or_duplicate_invalidates(mode):
     m = load()
@@ -158,6 +192,7 @@ def test_newer_or_duplicate_invalidates(mode):
         '{"resultCode":"bad","resultBody":{"secret":"NEVER"}}',
         '{"resultCode":"0000","resultCode":"0000","resultBody":{}}',
         '{"resultCode":"0000","resultBody":{"n":NaN}}',
+        '{"resultCode":"0000","resultBody":{"n":1e309}}',
         pytest.param("x" * (2 * 1024 * 1024 + 1), id="oversized-body"),
     ],
 )

@@ -206,6 +206,9 @@ class TxnStatRow(BaseModel):
     consume_date: str | None = None
     post_date: str | None = None
     amount: int | float | None
+    income: int | float | None = None
+    expend: int | float | None = None
+    currency: str = "TWD"
     category: str | None = None
     subcategory: str | None = None
     txn_type: str | None = None
@@ -313,7 +316,7 @@ class TransactionsReadMixin(_BaseHelpers):
         bank: str,
         user_id: int,
         kinds: list[str],
-        excluded_accounts_by_bank: dict[str, set[str]] | None = None,
+        excluded_accounts_by_bank: dict[str, set[tuple[str, str]]] | None = None,
         excluded_cards_by_bank: dict[str, set[str]] | None = None,
     ) -> list[TxnStatRow]:
         """Lightweight stats input rows for /transactions/stats.
@@ -364,9 +367,12 @@ class TransactionsReadMixin(_BaseHelpers):
                 income_category_expr = "income_category" if "income_category" in cols else "NULL"
                 auto_excluded_expr = "COALESCE(auto_excluded, 0)" if "auto_excluded" in cols else "0"
                 splits_expr = "splits_overwrite" if "splits_overwrite" in cols else "NULL"
+                currency_expr = "currency" if "currency" in cols else "'TWD'"
                 if kind == "twd":
                     account_expr = "account_no" if "account_no" in cols else "NULL"
                     amount_expr = "COALESCE(income, 0) - COALESCE(expend, 0)"
+                    income_expr = "income"
+                    expend_expr = "expend"
                     txn_type_expr = "NULL"
                     card_expr = "NULL"
                     consume_date_expr = "NULL"
@@ -374,6 +380,8 @@ class TransactionsReadMixin(_BaseHelpers):
                 else:
                     account_expr = "NULL"
                     amount_expr = "CASE WHEN amount > 0 AND COALESCE(txn_type, '') NOT IN ('refund', 'cashback', 'payment') THEN -amount ELSE amount END" if "txn_type" in cols else "CASE WHEN amount > 0 THEN -amount ELSE amount END"
+                    income_expr = "NULL"
+                    expend_expr = "NULL"
                     txn_type_expr = "txn_type" if "txn_type" in cols else "NULL"
                     card_expr = "card_no" if "card_no" in cols else "NULL"
                     consume_date_expr = "consume_date" if "consume_date" in cols else "NULL"
@@ -388,6 +396,9 @@ class TransactionsReadMixin(_BaseHelpers):
                         {consume_date_expr} AS consume_date,
                         {post_date_expr} AS post_date,
                         {amount_expr} AS amount,
+                        {income_expr} AS income,
+                        {expend_expr} AS expend,
+                        {currency_expr} AS currency,
                         {category_expr} AS category,
                         {subcategory_expr} AS subcategory,
                         {txn_type_expr} AS txn_type,
@@ -426,6 +437,9 @@ class TransactionsReadMixin(_BaseHelpers):
                         consume_date=normalized_consume_date,
                         post_date=normalized_post_date,
                         amount=r["amount"],
+                        income=r["income"],
+                        expend=r["expend"],
+                        currency=r["currency"] or "TWD",
                         category=r["category"],
                         subcategory=r["subcategory"],
                         txn_type=r["txn_type"],
@@ -435,7 +449,11 @@ class TransactionsReadMixin(_BaseHelpers):
                         account_no=account_no,
                         card_no=card_no,
                         excluded=(
-                            bool(account_no and account_no in excluded_accounts)
+                            bool(
+                                account_no
+                                and (account_no, r["currency"] or "TWD")
+                                in excluded_accounts
+                            )
                             or bool(card_no and card_no in excluded_cards)
                         ),
                         auto_excluded=bool(r["auto_excluded"] or 0),

@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
-from math import isfinite
 from typing import Any
 
 from backend.core import account_classify
 from backend.core.card_bills import summarize_persisted_card_bills
+from backend.core.money import native_money
 from backend.core.store import canonical_display_description
 from backend.server import fx_service
-from backend.server.bank_account_projection import latest_twd_asset_balance
+from backend.server.bank_account_projection import (
+    latest_twd_asset_balance,
+    metric_loan_balance_twd,
+)
 from backend.server.db_facade import db_api
 
 
@@ -38,7 +41,23 @@ def _json_list(value: Any) -> list[Any] | None:
     return parsed if isinstance(parsed, list) else None
 
 
-def _cashflow(amount: int, txn_type: str | None) -> tuple[str, int]:
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+
+def _number(value: Any, currency: str) -> int | float:
+    try:
+        number = native_money(0 if value is None else value, currency)
+    except ValueError:
+        raise ValueError("invalid persisted monetary value") from None
+    assert number is not None
+    return number
+
+
+def _optional_number(value: Any, currency: str) -> int | float | None:
+    return None if value is None else _number(value, currency)
+
+
+def _cashflow(amount: int | float, txn_type: str | None) -> tuple[str, int | float]:
     if txn_type in {"cashback", "refund", "fee_waiver"}:
         return "income", abs(amount)
     if txn_type == "payment" or amount == 0:
@@ -49,21 +68,30 @@ def _cashflow(amount: int, txn_type: str | None) -> tuple[str, int]:
 def _transaction_fact(
     bank: str,
     row: Any,
-    excluded_accounts: set[str],
+    excluded_accounts: set[tuple[str, str]],
     excluded_cards: set[str],
 ) -> dict[str, Any]:
     kind = str(row.kind)
     txn_type = _value(row, "txn_type") if kind != "twd" else None
+    currency = str(_value(row, "currency", "TWD")).strip().upper()
     if kind == "twd":
-        amount = int(_value(row, "income", 0)) - int(_value(row, "expend", 0))
+        amount = _number(
+            _number(_value(row, "income", 0), currency)
+            - _number(_value(row, "expend", 0), currency),
+            currency,
+        )
         date = _date(_value(row, "txn_datetime")) or _date(_value(row, "account_date"))
     else:
-        source_amount = int(_value(row, "amount", 0))
+        source_amount = _number(_value(row, "amount", 0), currency)
         amount = -source_amount if source_amount > 0 else source_amount
         date = _date(_value(row, "consume_date"))
     direction, cashflow_amount = _cashflow(amount, txn_type)
     account_no = _value(row, "account_no")
     card_no = _value(row, "card_no")
+    consume_currency = (
+        str(_value(row, "consume_currency")).strip().upper()
+        if _value(row, "consume_currency") else None
+    )
     return {
         "id": _value(row, "id"),
         "bank": bank,
@@ -80,12 +108,12 @@ def _transaction_fact(
         "cashflow_direction": direction,
         "cashflow_amount": cashflow_amount,
         "display_amount": abs(amount),
-        "currency": str(_value(row, "currency", "TWD")).upper(),
-        "consume_currency": (
-            str(_value(row, "consume_currency")).upper()
-            if _value(row, "consume_currency") else None
+        "currency": currency,
+        "consume_currency": consume_currency,
+        "consume_amount": (
+            _optional_number(_value(row, "consume_amount", None), consume_currency)
+            if consume_currency else None
         ),
-        "consume_amount": _value(row, "consume_amount"),
         "category": _value(row, "category"),
         "subcategory": _value(row, "subcategory"),
         "legacy_category": _value(row, "legacy_category"),
@@ -94,8 +122,12 @@ def _transaction_fact(
         "is_subscription": bool(_value(row, "is_subscription", 0)),
         "income_category": _value(row, "income_category"),
         "account_no": account_no,
+        "account_key": (
+            f"{bank}:account:{account_no}:{currency}"
+            if kind == "twd" and account_no else None
+        ),
         "card_no": card_no,
-        "balance": _value(row, "balance"),
+        "balance": _optional_number(_value(row, "balance", None), currency),
         "counterparty_bank": _value(row, "counterparty_bank"),
         "counterparty_acct": _value(row, "counterparty_acct"),
         "memo": _value(row, "memo"),
@@ -104,7 +136,7 @@ def _transaction_fact(
         ),
         "scope": _value(row, "scope"),
         "excluded": (
-            account_no in excluded_accounts if kind == "twd"
+            (account_no, currency) in excluded_accounts if kind == "twd"
             else card_no in excluded_cards
         ),
         "auto_excluded": bool(_value(row, "auto_excluded", 0)),
@@ -115,16 +147,6 @@ def _transaction_fact(
         "first_seen": _value(row, "first_seen"),
         "refreshed_at": _value(row, "refreshed_at"),
     }
-
-
-def _to_int(value: Any) -> int | None:
-    if value in (None, "", "-") or isinstance(value, bool):
-        return None
-    try:
-        number = float(str(value).replace(",", "").strip())
-        return int(number) if isfinite(number) else None
-    except (TypeError, ValueError, OverflowError):
-        return None
 
 
 def _loan_fact(bank: str, user_id: int) -> dict[str, Any] | None:
@@ -144,18 +166,23 @@ def _loan_fact(bank: str, user_id: int) -> dict[str, Any] | None:
         total = 0
         dates: list[str] = []
         for row in loans:
-            magnitude = account_classify.normalize_liability_magnitude(row.raw_balance)
+            currency = (row.currency or "TWD").strip().upper()
+            try:
+                magnitude = native_money(row.raw_balance, currency, absolute=True)
+            except ValueError:
+                return None
             if magnitude is None:
-                break
-            currency = (row.currency or "TWD").upper()
+                return None
             converted = (
-                round(magnitude)
+                int(magnitude)
                 if currency == "TWD"
                 else fx_service.convert_to_twd(magnitude, currency)
             )
             if converted is None:
                 break
-            total += converted
+            checked_total = native_money(total + converted, "TWD")
+            assert isinstance(checked_total, int)
+            total = checked_total
             if row.raw_balance_date:
                 dates.append(row.raw_balance_date)
         else:
@@ -168,16 +195,17 @@ def _loan_fact(bank: str, user_id: int) -> dict[str, Any] | None:
     metric = db_api.get_latest_metric(bank=bank, category="balance_latest", user_id=user_id)
     if metric is None or not isinstance(metric.payload, dict):
         return None
-    amount = account_classify.normalize_liability_magnitude(
-        _to_int(metric.payload.get("loan")),
+    amount = metric_loan_balance_twd(
+        metric.payload,
+        (row.currency for row in loans),
     )
     return (
         {
             "snapshot_date": metric.snapshot_date,
-            "amount_twd": int(amount),
+            "amount_twd": amount,
             "source": "normalized_balance_metric",
         }
-        if amount not in (None, 0) else None
+        if amount is not None else None
     )
 
 
@@ -185,7 +213,7 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
     """Return typed canonical facts; never expose bank-private metric payloads."""
     accounts = sorted(
         (row.model_dump() for row in db_api.list_accounts(bank=bank, user_id=user_id)),
-        key=lambda row: row["account_no"],
+        key=lambda row: (row["account_no"], row.get("currency") or "TWD"),
     )
     all_cards = sorted(
         (
@@ -195,7 +223,10 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
         key=lambda row: row["card_no"],
     )
     cards = [row for row in all_cards if row["active"]]
-    excluded_accounts = {row["account_no"] for row in accounts if row["excluded"]}
+    excluded_accounts = {
+        (row["account_no"], row.get("currency") or "TWD")
+        for row in accounts if row["excluded"]
+    }
     excluded_cards = db_api.list_excluded_card_nos_all_banks(
         user_id=user_id,
         banks=[bank],
@@ -219,7 +250,7 @@ def collect_bank_replica_facts(bank: str, user_id: int) -> dict[str, Any]:
                 user_id=user_id,
             ).values()
         ),
-        key=lambda row: row["account_no"],
+        key=lambda row: (row["account_no"], row["currency"]),
     )
     balance = latest_twd_asset_balance(bank, user_id)
     card_summary = summarize_persisted_card_bills(bank, all_cards)

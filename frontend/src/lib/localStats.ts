@@ -1,5 +1,6 @@
 import type { CardDateBasis, DashboardStats, Transaction } from '@/types/api';
 
+import { sumSafeIntegers } from './decimal';
 import { transactionDateForBasis } from './transactionTimeline';
 import { txnCashflowAmount, txnCashflowDirection } from './txnFilter';
 
@@ -48,25 +49,36 @@ export function computeLocalDashboardStats(
   for (const transaction of transactions) {
     byKind[transaction.kind] = (byKind[transaction.kind] ?? 0) + 1;
     if (transaction.excluded || transaction.auto_excluded) continue;
+    // Native-currency rows remain visible/countable, but need an attested FX
+    // rate before they can enter TWD dashboard totals.
+    if ((transaction.currency || 'TWD') !== 'TWD') continue;
 
     const month = transactionDateForBasis(transaction, cardDateBasis).slice(0, 7);
     const direction = txnCashflowDirection(transaction);
     const amount = Math.abs(txnCashflowAmount(transaction));
     const flowType = transaction.flow_type;
     if (flowType && flowType in amountByFlowType) {
-      amountByFlowType[flowType] += amount;
+      amountByFlowType[flowType] = sumSafeIntegers([amountByFlowType[flowType], amount]);
     }
     if (transaction.is_subscription && direction === 'expense') {
-      subscriptionTotal += amount;
-      if (month) subscriptionByMonth[month] = (subscriptionByMonth[month] ?? 0) + amount;
+      subscriptionTotal = sumSafeIntegers([subscriptionTotal, amount]);
+      if (month) {
+        subscriptionByMonth[month] = sumSafeIntegers([subscriptionByMonth[month] ?? 0, amount]);
+      }
     }
     if (flowType === 'income' && direction === 'income') {
       const incomeCategory = transaction.income_category;
       if (incomeCategory && incomeCategory in amountByIncomeCategory) {
-        amountByIncomeCategory[incomeCategory] += amount;
+        amountByIncomeCategory[incomeCategory] = sumSafeIntegers([
+          amountByIncomeCategory[incomeCategory], amount,
+        ]);
         if (PASSIVE_INCOME.has(incomeCategory)) {
-          passiveIncomeTotal += amount;
-          if (month) passiveIncomeByMonth[month] = (passiveIncomeByMonth[month] ?? 0) + amount;
+          passiveIncomeTotal = sumSafeIntegers([passiveIncomeTotal, amount]);
+          if (month) {
+            passiveIncomeByMonth[month] = sumSafeIntegers([
+              passiveIncomeByMonth[month] ?? 0, amount,
+            ]);
+          }
         }
       } else {
         incomeUnclassifiedCount += 1;
@@ -76,18 +88,20 @@ export function computeLocalDashboardStats(
       const bucket = amountByMonth[month] ?? { income: 0, expense: 0, net: 0, count: 0 };
       bucket.count += 1;
       if (direction === 'income') {
-        bucket.income += amount;
-        bucket.net += amount;
-        totalIncome += amount;
+        bucket.income = sumSafeIntegers([bucket.income, amount]);
+        bucket.net = sumSafeIntegers([bucket.net, amount]);
+        totalIncome = sumSafeIntegers([totalIncome, amount]);
       } else if (direction === 'expense') {
-        bucket.expense += amount;
-        bucket.net -= amount;
-        totalExpense += amount;
+        bucket.expense = sumSafeIntegers([bucket.expense, amount]);
+        bucket.net = sumSafeIntegers([bucket.net, -amount]);
+        totalExpense = sumSafeIntegers([totalExpense, amount]);
       }
       amountByMonth[month] = bucket;
     }
     if (transaction.category && direction === 'expense') {
-      amountByCategory[transaction.category] = (amountByCategory[transaction.category] ?? 0) + amount;
+      amountByCategory[transaction.category] = sumSafeIntegers([
+        amountByCategory[transaction.category] ?? 0, amount,
+      ]);
     }
   }
 
@@ -95,7 +109,7 @@ export function computeLocalDashboardStats(
     total: transactions.length,
     total_income: totalIncome,
     total_expense: totalExpense,
-    total_net: totalIncome - totalExpense,
+    total_net: sumSafeIntegers([totalIncome, -totalExpense]),
     amount_by_month: sortedDescending(amountByMonth),
     amount_by_category: Object.fromEntries(
       Object.entries(amountByCategory).sort(([, left], [, right]) => right - left),

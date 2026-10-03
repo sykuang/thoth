@@ -1,5 +1,6 @@
 import type { Transaction } from '@/types/api';
 import {
+  computePeriodStats,
   filterCategoryViewItems,
   matchesCardDrilldown,
   transactionSectionTitle,
@@ -58,6 +59,15 @@ deepEqual(
   [transactionSectionTitle('income'), transactionSectionTitle('expense'), transactionSectionTitle('all')],
   ['收入明細', '支出明細', '收支明細'],
   '區段標題必須反映收入/支出 scope',
+);
+
+deepEqual(
+  computePeriodStats([
+    items[1],
+    { ...items[1], id: 4, currency: 'USD', amount: -12.34, cashflow_amount: 12.34 },
+  ]),
+  { income: 0, expense: 100, net: -100, count: 1 },
+  '沒有可信 FX rate 時，原幣交易不得混進 TWD period totals',
 );
 
 deepEqual(

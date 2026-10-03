@@ -257,6 +257,10 @@ def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
     raw_datetime = row.get("actDtTm")
     if not isinstance(raw_datetime, str) or raw_datetime != raw_datetime.strip():
         raise ValueError("invalid row")
+    # Live 2026-10-02: the native qu002 form returns "YYYY-MM-DD HH:MM:SS.ffff"; canonicalize to the API form.
+    if native := re.fullmatch(r"(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})(\.\d+)?", raw_datetime):
+        day, hh, mm, ss, frac = native.groups()
+        raw_datetime = f"{day}-{hh}.{mm}.{ss}{frac or ''}"
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?", raw_datetime):
         raise ValueError("invalid row")
     try:
@@ -278,6 +282,7 @@ def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
     if row.get("dbAmt") is None and row.get("crAmt") is None:
         raise ValueError("invalid row")
     normalized = dict(row)
+    normalized["actDtTm"] = raw_datetime
     for field in ("dbAmt", "crAmt", "balanceAmt"):
         value = row.get(field)
         if value is not None:
@@ -1048,7 +1053,19 @@ class CtbcCrawler(BankCrawler):
             or request_data.get("endDate") != end.strftime("%Y%m%d")
             or request_data.get("type") != "custom"
             or not isinstance(response, dict)
-            or response.get("code") != "0000"
+        ):
+            raise RuntimeError("ctbc-twd-history-fetch")
+        # Live 2026-10-02: a window with no transactions answers code 9201, rsData null, exact desc below.
+        if (
+            response.get("code") == "9201"
+            and response.get("rsData") is None
+            and response.get("desc") == "您查詢的日期區間無明細資料"
+            and response.get("backHome") is False
+            and response.get("kickSimpleIdentity") is False
+        ):
+            return []
+        if (
+            response.get("code") != "0000"
             or not isinstance(response_data, dict)
             or set(response_data) != {"dataTime", "detailList", "dtSort", "nextKey"}
             or not isinstance(response_data.get("detailList"), list)

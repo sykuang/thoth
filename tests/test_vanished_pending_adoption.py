@@ -1024,8 +1024,8 @@ def test_foreign_main_currency_without_original_fields_never_falls_back_to_local
     assert _billed(store)[0]["category"] is None
 
 
-def test_non_integer_settled_amount_drops_only_invalid_split(store):
-    """母筆非整數時不截斷 split；其餘 overlay 搬移，可信消失刪 pending。"""
+def test_non_integer_settled_twd_amount_is_rejected_atomically(store):
+    """Fractional TWD is malformed native money and cannot become a billed row."""
     pending = {
         **PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2,
     }
@@ -1039,16 +1039,13 @@ def test_non_integer_settled_amount_drops_only_invalid_split(store):
         (__import__("json").dumps(splits),),
     )
     store.conn.commit()
-    store.upsert_card_billed([{
-        **pending, "amount": 3267.5, "desc": "正式商戶", "bill_date": "2026-07-20",
-    }], rules=[])
-    store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True)
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        store.upsert_card_billed([{
+            **pending, "amount": 3267.5, "desc": "正式商戶", "bill_date": "2026-07-20",
+        }], rules=[])
 
-    row = store.conn.execute(
-        "SELECT category, splits_overwrite FROM card_billed_txns").fetchone()
-    assert row["category"] == "旅遊"
-    assert row["splits_overwrite"] is None
-    assert _pending_count(store) == 0
+    assert store.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 0
+    assert _pending_count(store) == 1
 
 
 def test_fractional_split_component_drops_only_invalid_split(store):

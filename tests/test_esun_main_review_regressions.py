@@ -63,7 +63,9 @@ def test_delayed_spa_mount_selects_capture_before_any_login_or_repeat(monkeypatc
     submit.assert_not_called()
     # The core attaches this collector before the first credential submission.
     monkeypatch.setattr("backend.banks.esun_spa.capture._HistoryBodyObserver",
-                        lambda *args: SimpleNamespace(disconnect=lambda: None, close=lambda: None))
+                        lambda *args: SimpleNamespace(
+                            start=lambda: None, disconnect=lambda: None, close=lambda: None,
+                        ))
     collector.attach(page)
     try:
         assert collector.snapshot()["collector"] is collector
@@ -92,7 +94,9 @@ def test_delayed_mount_run_attaches_before_login_and_repeated_callback_never_sub
     monkeypatch.setattr(crawler, "_build_fetch_kwargs", lambda: {"__cleanups__": []})
     monkeypatch.setattr(crawler, "attach_shared_dialog_handler", lambda page: None)
     monkeypatch.setattr("backend.banks.esun_spa.capture._HistoryBodyObserver",
-                        lambda *args: SimpleNamespace(disconnect=lambda: None, close=lambda: None))
+                        lambda *args: SimpleNamespace(
+                            start=lambda: None, disconnect=lambda: None, close=lambda: None,
+                        ))
 
     def login(raw_page):
         assert isinstance(crawler.collector, SpaCollector)

@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from backend.server import db
 
 
@@ -179,6 +181,7 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
     assert cathay["accounts"][0]["account_no"] == "1234567890"
     assert cathay["cards"][0]["card_no"] == "****7015"
     assert cathay["transactions"][0]["description"] == "早餐"
+    assert cathay["transactions"][0]["account_key"] == "cathay:account:1234567890:TWD"
     assert cathay["portfolio_facts"]["latest_twd_balance"] == {
         "snapshot_date": "2026-08-09",
         "twd_balance": 1000,
@@ -205,10 +208,10 @@ def test_replica_bootstrap_returns_versioned_user_and_bank_partitions(
     assert cathay["portfolio_facts"]["card_unpaid"]["amount_twd"] == summary["card_unpaid"]
 
 
-def test_replica_omits_parsed_null_account_transaction_balance(
+def test_replica_rejects_malformed_persisted_transaction_balance(
     client, tmp_path, monkeypatch,
 ) -> None:
-    """Malformed non-NULL DB values must not serialize as replica balance:null."""
+    """Malformed non-NULL DB money invalidates replay instead of becoming null or zero."""
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     headers = _auth(_register(client, email="replica-null-balance@palace.example"))
     _seed_bank(tmp_path)
@@ -220,14 +223,8 @@ def test_replica_omits_parsed_null_account_transaction_balance(
     con.commit()
     con.close()
 
-    response = client.get("/replica/bootstrap", headers=headers)
-
-    assert response.status_code == 200, response.text
-    cathay = next(
-        item["data"] for item in response.json()["partitions"]
-        if item["name"] == "bank:cathay"
-    )
-    assert cathay["portfolio_facts"]["latest_account_transaction_balances"] == []
+    with pytest.raises(ValueError, match="invalid persisted monetary value"):
+        client.get("/replica/bootstrap", headers=headers)
 
 
 def _set_cathay_balance_sources(
@@ -525,6 +522,34 @@ def test_replica_transaction_exclusion_uses_all_cards_not_only_active_inventory(
 
     assert facts["cards"] == []
     assert facts["transactions"][0]["excluded"] is True
+
+
+def test_replica_rejects_non_finite_persisted_transaction_money() -> None:
+    from backend.server.replica_facts import _transaction_fact
+
+    row = SimpleNamespace(
+        id=1,
+        kind="twd",
+        income="NaN",
+        expend=0,
+        txn_datetime="2026-08-10T00:00:00",
+        account_no="001",
+        currency="TWD",
+    )
+    with pytest.raises(ValueError, match="invalid persisted monetary value"):
+        _transaction_fact("cathay", row, set(), set())
+
+    for currency, invalid in (("TWD", 0.5), ("USD", 0.1234567)):
+        row.currency = currency
+        row.income = invalid
+        with pytest.raises(ValueError, match="invalid persisted monetary value"):
+            _transaction_fact("cathay", row, set(), set())
+
+    row.currency = "TWD"
+    for unsafe in (9_007_199_254_740_993, 9_223_372_036_854_775_807):
+        row.income = unsafe
+        with pytest.raises(ValueError, match="invalid persisted monetary value"):
+            _transaction_fact("cathay", row, set(), set())
 
 
 def test_replica_payment_is_neutral_but_preserves_display_magnitude() -> None:
@@ -856,6 +881,168 @@ def test_replica_fact_uses_shared_backend_display_description() -> None:
 
     assert fact["description"] == "轉帳 - 0050FUND 基金配息"
     assert fact["display_description"] == "轉帳 - 0050FUND 基金配息"
+
+
+def test_shared_twd_writer_rejects_lossy_values() -> None:
+    from backend.core.money import native_money
+    from backend.core.persist._common import _num, _num_real, _num_to_float
+
+    assert _num("1,000") == 1000
+    assert _num("") is None
+    for invalid in ("1000.5", "9007199254740993", "not-money"):
+        with pytest.raises(ValueError, match="invalid native monetary value"):
+            _num(invalid)
+    for invalid in ("0.1234567", "9007199254740990.1"):
+        with pytest.raises(ValueError, match="invalid native monetary value"):
+            _num_real(invalid)
+        with pytest.raises(ValueError, match="invalid native monetary value"):
+            native_money(invalid, "USD")
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        _num_to_float("9007199254740990.1")
+
+
+def test_transaction_fact_rejects_unsafe_derived_amount() -> None:
+    from backend.server.replica_facts import _transaction_fact
+
+    row = SimpleNamespace(
+        kind="twd", id=1, description="overflow", counterparty_acct=None,
+        memo=None, income=9_007_199_254_740_991, expend=-9_007_199_254_740_991,
+        txn_datetime="2026-08-10", account_no="001", currency="TWD",
+    )
+    with pytest.raises(ValueError, match="invalid .* monetary value"):
+        _transaction_fact("cathay", row, set(), set())
+
+
+def test_loan_fact_rejects_unsafe_account_sum(monkeypatch) -> None:
+    from backend.server import replica_facts
+
+    loans = [
+        SimpleNamespace(currency="TWD", raw_balance=9_007_199_254_740_991, raw_balance_date=None),
+        SimpleNamespace(currency="TWD", raw_balance=9_007_199_254_740_991, raw_balance_date=None),
+    ]
+    monkeypatch.setattr(replica_facts.db_api, "get_latest_loan_balance", lambda **kwargs: None)
+    monkeypatch.setattr(replica_facts.db_api, "list_loan_accounts", lambda **kwargs: loans)
+    monkeypatch.setattr(replica_facts.db_api, "get_latest_metric", lambda **kwargs: None)
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        replica_facts._loan_fact("cathay", 1)
+
+
+def test_normalized_loan_metric_preserves_decimal_before_fx(monkeypatch) -> None:
+    from decimal import Decimal
+    from backend.server import bank_account_projection
+
+    monkeypatch.setattr(
+        bank_account_projection.fx_service,
+        "convert_to_twd",
+        lambda amount, currency: (
+            3_002_396_749_180_579
+            if amount == Decimal("9007199254740990.24549") and currency == "USD"
+            else None
+        ),
+    )
+    assert bank_account_projection.metric_loan_balance_twd({
+        "loan": 0,
+        "loan_by_currency": {"USD": "9007199254740990.24549"},
+    }) == 3_002_396_749_180_579
+
+
+def test_persisted_twd_integer_parser_fails_closed() -> None:
+    from backend.server.db_facade.portfolio import _to_int_safe
+
+    assert _to_int_safe("1000") == 1000
+    assert _to_int_safe(None) is None
+    for value in (True, "1000.5", 0.5, "NaN", 9_007_199_254_740_992):
+        with pytest.raises(ValueError, match="invalid native monetary value"):
+            _to_int_safe(value)
+
+
+def test_normalized_loan_metric_rejects_malformed_or_duplicate_currency_map() -> None:
+    from backend.server.bank_account_projection import metric_loan_balance_twd
+
+    assert metric_loan_balance_twd({"loan": 1_000, "loan_by_currency": []}) is None
+    assert metric_loan_balance_twd({"loan": 1.5}) is None
+    assert metric_loan_balance_twd({
+        "loan": 0.5,
+        "loan_by_currency": {"TWD": 0.5},
+    }) is None
+    assert metric_loan_balance_twd({
+        "loan": 0,
+        "loan_by_currency": {"USD": 0.1234567},
+    }) is None
+    for breakdown in (
+        {"USD": 10, " usd ": 20},
+        {" usd ": 20, "USD": 10},
+    ):
+        assert metric_loan_balance_twd({"loan": 0, "loan_by_currency": breakdown}) is None
+
+
+def test_normalized_zero_loan_metric_remains_authoritative(monkeypatch) -> None:
+    from backend.server import replica_facts
+
+    loans = [SimpleNamespace(currency="TWD", raw_balance=None)]
+    monkeypatch.setattr(replica_facts.db_api, "get_latest_loan_balance", lambda **kwargs: None)
+    monkeypatch.setattr(replica_facts.db_api, "list_loan_accounts", lambda **kwargs: loans)
+    monkeypatch.setattr(
+        replica_facts.db_api,
+        "get_latest_metric",
+        lambda **kwargs: SimpleNamespace(
+            snapshot_date="2026-08-09",
+            payload={"loan": 0, "loan_by_currency": {"TWD": 0}},
+        ),
+    )
+    assert replica_facts._loan_fact("sinopac", 1) == {
+        "snapshot_date": "2026-08-09",
+        "amount_twd": 0,
+        "source": "normalized_balance_metric",
+    }
+
+
+def test_normalized_loan_metric_includes_foreign_currency_once(monkeypatch) -> None:
+    from backend.server import replica_facts
+
+    loans = [
+        SimpleNamespace(currency="TWD", raw_balance=None),
+        SimpleNamespace(currency="USD", raw_balance=None),
+    ]
+    monkeypatch.setattr(replica_facts.db_api, "get_latest_loan_balance", lambda **kwargs: None)
+    monkeypatch.setattr(replica_facts.db_api, "list_loan_accounts", lambda **kwargs: loans)
+    monkeypatch.setattr(
+        replica_facts.db_api,
+        "get_latest_metric",
+        lambda **kwargs: SimpleNamespace(
+            snapshot_date="2026-08-09",
+            payload={"loan": 1_000, "loan_by_currency": {"TWD": 1_000, "USD": 10}},
+        ),
+    )
+    monkeypatch.setattr(
+        replica_facts.fx_service,
+        "convert_to_twd",
+        lambda amount, currency: round(amount * 30) if currency == "USD" else None,
+    )
+
+    assert replica_facts._loan_fact("sinopac", 1) == {
+        "snapshot_date": "2026-08-09",
+        "amount_twd": 1_300,
+        "source": "normalized_balance_metric",
+    }
+
+
+def test_normalized_loan_metric_fails_closed_when_foreign_currency_is_missing(monkeypatch) -> None:
+    from backend.server import replica_facts
+
+    loans = [SimpleNamespace(currency="USD", raw_balance=None)]
+    monkeypatch.setattr(replica_facts.db_api, "get_latest_loan_balance", lambda **kwargs: None)
+    monkeypatch.setattr(replica_facts.db_api, "list_loan_accounts", lambda **kwargs: loans)
+    monkeypatch.setattr(
+        replica_facts.db_api,
+        "get_latest_metric",
+        lambda **kwargs: SimpleNamespace(
+            snapshot_date="2026-08-09",
+            payload={"loan": 1_000, "loan_by_currency": {}},
+        ),
+    )
+    assert replica_facts._loan_fact("sinopac", 1) is None
 
 
 def test_loan_metric_is_ignored_without_a_loan_account(monkeypatch) -> None:

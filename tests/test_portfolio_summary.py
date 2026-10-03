@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from backend.core.bank_data import KNOWN_BANKS
+from backend.core.store import BankStore
 
 # Note: client/TestClient/app fixtures all come from conftest.py to ensure
 # JWT_SECRET / Fernet key / tmp_path isolation. Do NOT add local `client`
@@ -120,6 +121,7 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
             expend       INTEGER,
             income       INTEGER,
             balance      INTEGER,
+            currency     TEXT,
             first_seen   TEXT,
             dedup_key    TEXT
         );
@@ -186,10 +188,11 @@ def _seed_bank_db(root: Path, bank: str, *, balance: int | None = None,
         if a.get("balance") is not None:
             con.execute(
                 """INSERT INTO twd_transactions
-                   (account_no, txn_datetime, account_date, description, expend, income, balance, first_seen, dedup_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (account_no, txn_datetime, account_date, description, expend, income, balance,
+                    currency, first_seen, dedup_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (a["account_no"], "2026-06-13T10:00:00", "2026-06-13",
-                 "test", None, None, a["balance"], now, f"fx-{id(a)}"),
+                 "test", None, None, a["balance"], a["currency"], now, f"fx-{id(a)}"),
             )
     con.commit()
     con.close()
@@ -576,6 +579,226 @@ def test_loan_balance_from_balance_history(temp_data_root, client, auth_headers)
     assert scsb["liabilities"] == 20_589_800
 
 
+def test_loan_aggregate_adds_foreign_accounts_once_and_honors_exclusion(
+    temp_data_root, client, auth_headers, monkeypatch,
+):
+    from backend.server import fx_service
+
+    monkeypatch.setattr(
+        fx_service,
+        "convert_to_twd",
+        lambda amount, currency: round(amount * 30) if currency.upper() == "USD" else None,
+    )
+    _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_balance=1_000,
+        loan_accounts=[
+            {"account_no": "TWD", "currency": "TWD", "balance": 1_000},
+            {"account_no": "USD-IN", "currency": "USD", "balance": 10},
+            {"account_no": "USD-OUT", "currency": "USD", "balance": 5, "excluded": True},
+        ],
+    )
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    sinopac = next(bank for bank in body["by_bank"] if bank["bank"] == "sinopac")
+    assert sinopac["loan_balance"] == 1_450
+    assert sinopac["liabilities"] == 1_300
+    assert body["total_loan"] == 1_300
+
+
+def test_normalized_metric_fallback_includes_foreign_loans(
+    temp_data_root, client, auth_headers, monkeypatch,
+):
+    from backend.server import fx_service
+
+    path = _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_accounts=[
+            {"account_no": "TWD", "currency": "TWD", "balance": None},
+            {"account_no": "USD", "currency": "USD", "balance": None},
+        ],
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?)",
+            (
+                "2026-06-13",
+                "balance_latest",
+                json.dumps({"loan": 1_000, "loan_by_currency": {"TWD": 1_000, "USD": 10}}),
+                _utcnow_iso(),
+            ),
+        )
+    monkeypatch.setattr(
+        fx_service,
+        "convert_to_twd",
+        lambda amount, currency: round(amount * 30) if currency == "USD" else None,
+    )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    sinopac = next(bank for bank in body["by_bank"] if bank["bank"] == "sinopac")
+    assert sinopac["loan_balance"] == 1_300
+    assert body["total_loan"] == 1_300
+
+
+def test_manual_liability_aggregate_rejects_unsafe_sum(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from backend.server import financial_accounts
+    from backend.server.routers import portfolio
+
+    monkeypatch.setattr(portfolio, "KNOWN_BANKS", ())
+    monkeypatch.setattr(
+        portfolio.db,
+        "snaptrade_snapshot",
+        lambda user_id: {"accounts": [], "last_synced_at": None},
+    )
+    monkeypatch.setattr(
+        financial_accounts,
+        "list_manual_accounts",
+        lambda user_id: [
+            SimpleNamespace(
+                id=f"manual:{index}", product_type="loan", currency="TWD",
+                balance=9_007_199_254_740_991, included_in_net_worth=True, as_of=None,
+            )
+            for index in range(2)
+        ],
+    )
+    monkeypatch.setattr(portfolio.fx_service, "convert_to_twd", lambda amount, currency: amount)
+
+    with pytest.raises(ValueError, match="invalid native monetary value"):
+        portfolio._compute_portfolio_summary(1)
+
+
+def test_legacy_card_liability_parsers_reject_fractional_twd() -> None:
+    from backend.server.routers.portfolio import (
+        _liab_cathay,
+        _liab_hsbc,
+        _liab_sinopac,
+        _liab_ubot,
+    )
+
+    assert _liab_cathay({
+        "latest_bill": {"twd": {"billAmount": 1.9, "payBillStatus": "UnPaid"}},
+    }) is None
+    assert _liab_ubot({"TotalData": {"Card": 1.9}}) is None
+    assert _liab_hsbc([{"outstanding": 100}, {"outstanding": 1.9}]) is None
+    assert _liab_sinopac([{
+        "SubInfo": [[{"DataText": "本期應繳", "DataValue": 1.9}]],
+    }]) is None
+
+
+def test_normalized_metric_fallback_rejects_malformed_raw_loan_balance(
+    temp_data_root, client, auth_headers,
+):
+    path = _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_accounts=[{
+            "account_no": "BAD-TWD",
+            "currency": "TWD",
+            "balance": 1000.5,
+        }],
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?)",
+            (
+                "2026-06-13",
+                "balance_latest",
+                json.dumps({"loan": 1_000, "loan_by_currency": {"TWD": 1_000}}),
+                _utcnow_iso(),
+            ),
+        )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    assert body["total_loan"] == 0
+    assert "sinopac" in body["skipped"]
+
+
+def test_normalized_metric_with_unknown_excluded_loan_fails_closed(
+    temp_data_root, client, auth_headers,
+):
+    path = _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_accounts=[{
+            "account_no": "EXCLUDED-UNKNOWN",
+            "currency": "TWD",
+            "balance": None,
+            "excluded": 1,
+        }],
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?)",
+            (
+                "2026-06-13",
+                "balance_latest",
+                json.dumps({"loan": 800_000, "loan_by_currency": {"TWD": 800_000}}),
+                _utcnow_iso(),
+            ),
+        )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    assert body["total_loan"] == 0
+    assert "sinopac" in body["skipped"]
+
+
+def test_normalized_metric_fallback_fails_closed_when_foreign_loan_is_missing(
+    temp_data_root, client, auth_headers,
+):
+    path = _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_accounts=[{"account_no": "USD", "currency": "USD", "balance": None}],
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?)",
+            ("2026-06-13", "balance_latest", json.dumps({"loan": 1_000}), _utcnow_iso()),
+        )
+
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    assert body["total_loan"] == 0
+    assert "sinopac" in body["skipped"]
+
+
+def test_bank_loan_aggregate_with_unknown_excluded_account_fails_closed(
+    temp_data_root, client, auth_headers,
+):
+    _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        loan_balance=1_000,
+        loan_accounts=[
+            {"account_no": "L1", "currency": "TWD", "balance": None, "excluded": True},
+            {"account_no": "L2", "currency": "TWD", "balance": None},
+        ],
+    )
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    assert all(bank["bank"] != "sinopac" for bank in body["by_bank"])
+    assert "sinopac" in body["skipped"]
+    assert body["total_loan"] == 0
+
+
+def test_loan_foreign_only_zero_aggregate_is_not_omitted(
+    temp_data_root, client, auth_headers, monkeypatch,
+):
+    from backend.server import fx_service
+
+    monkeypatch.setattr(fx_service, "convert_to_twd", lambda amount, _currency: round(amount * 30))
+    _seed_bank_db(
+        temp_data_root,
+        "scsb",
+        loan_balance=0,
+        loan_accounts=[{"account_no": "USD", "currency": "USD", "balance": 12.34}],
+    )
+    body = client.get("/portfolio/summary", headers=auth_headers).json()
+    scsb = next(bank for bank in body["by_bank"] if bank["bank"] == "scsb")
+    assert scsb["loan_balance"] == 370
+    assert body["total_loan"] == 370
+
+
 def test_loan_split_card_and_loan_totals(temp_data_root, client, auth_headers):
     """同銀行同時有信用卡未繳 + 貸款，total_liabilities = 兩者相加."""
     _seed_bank_db(temp_data_root, "ubot",
@@ -688,7 +911,7 @@ def test_undated_account_loan_balance_stays_stale(
     assert dbs["stale"] is True
 
 
-def test_partial_account_loan_balances_without_metric_return_unknown(
+def test_partial_account_loan_balances_without_metric_skip_bank(
     temp_data_root, client, auth_headers
 ):
     _seed_bank_db(
@@ -702,13 +925,13 @@ def test_partial_account_loan_balances_without_metric_return_unknown(
     )
 
     body = client.get("/portfolio/summary", headers=auth_headers).json()
-    dbs = next(row for row in body["by_bank"] if row["bank"] == "dbs")
 
-    assert dbs["loan_balance"] is None
+    assert all(row["bank"] != "dbs" for row in body["by_bank"])
+    assert "dbs" in body["skipped"]
     assert body["total_loan"] == 0
 
 
-def test_failed_fx_loan_conversion_uses_complete_metric_fallback(
+def test_failed_fx_loan_conversion_rejects_metric_without_currency_breakdown(
     temp_data_root, client, auth_headers, monkeypatch
 ):
     from backend.server import fx_service
@@ -733,7 +956,8 @@ def test_failed_fx_loan_conversion_uses_complete_metric_fallback(
 
     body = client.get("/portfolio/summary", headers=auth_headers).json()
 
-    assert body["total_loan"] == 800_000
+    assert body["total_loan"] == 0
+    assert "dbs" in body["skipped"]
 
 
 def test_mixed_dated_and_undated_account_loans_stay_stale(
@@ -1109,6 +1333,41 @@ def test_patch_account_excluded_sets_flag(temp_data_root, client, auth_headers):
     )
     r3 = client.get("/portfolio/accounts", headers=auth_headers)
     assert next(a for a in r3.json() if a["account_no"] == "ACC1")["excluded"] is False
+
+
+def test_patch_account_excluded_targets_currency_scoped_account(
+    temp_data_root, client, auth_headers,
+):
+    _seed_bank_db(
+        temp_data_root,
+        "sinopac",
+        fx_accounts=[{"account_no": "ACC1", "currency": "TWD", "balance": 50_000}],
+    )
+
+    store = BankStore("sinopac", user_id=1)
+    try:
+        store.upsert_accounts([{
+            "account_no": "ACC1",
+            "currency": "USD",
+            "nickname": "USD account",
+            "raw_balance": 10,
+        }])
+    finally:
+        store.close()
+
+    response = client.patch(
+        "/portfolio/accounts/sinopac/ACC1/excluded",
+        json={"excluded": True, "currency": "USD"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    rows = [
+        row for row in client.get("/portfolio/accounts", headers=auth_headers).json()
+        if row["bank"] == "sinopac" and row["account_no"] == "ACC1"
+    ]
+    assert {(row["currency"], row["excluded"]) for row in rows} == {
+        ("TWD", False), ("USD", True),
+    }
 
 
 def test_patch_account_excluded_404_unknown_bank(

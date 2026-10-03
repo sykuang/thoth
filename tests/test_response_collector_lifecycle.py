@@ -34,9 +34,10 @@ def test_detach_does_not_hide_listener_errors(error_type):
         raise error
 
     collector = ResponseCollector("card.hsbc.com.tw")
-    with pytest.raises(error_type) as raised:
+    collector._attached_listeners["response"] = object()
+    with pytest.raises(RuntimeError, match="response collector cleanup failed") as raised:
         collector.detach(SimpleNamespace(remove_listener=remove))
-    assert raised.value is error
+    assert raised.value.__cause__ is None
     assert collector._detached is False
 
 

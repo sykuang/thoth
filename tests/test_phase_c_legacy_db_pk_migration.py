@@ -146,11 +146,12 @@ def test_lazy_migration_open_bank_conn_upgrades_legacy_pk(tmp_path, monkeypatch)
     indexes = {r[1] for r in con.execute("PRAGMA index_list(accounts)")}
     assert "ux_accounts_user_no" in indexes, f"composite unique index 沒建: {indexes}"
 
-    # 驗證 INSERT...ON CONFLICT(user_id, account_no) 真的 work
+    # 驗證 multi-currency identity 的 INSERT...ON CONFLICT 真的 work
     con.execute("""
         INSERT INTO accounts (user_id, account_no, currency, updated_at)
         VALUES (1, 'NEW-LAZY', 'TWD', '2026-06-17')
-        ON CONFLICT(user_id, account_no) DO UPDATE SET currency = excluded.currency
+        ON CONFLICT(user_id, account_no, currency)
+        DO UPDATE SET updated_at = excluded.updated_at
     """)
     con.commit()
     n = con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]

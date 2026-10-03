@@ -1,0 +1,9 @@
+packages:
+  - '.'
+
+allowBuilds:
+  esbuild: set this to true or false
+  unrs-resolver: set this to true or false
+
+patchedDependencies:
+  react-native-worklets@0.8.3: patches/react-native-worklets@0.8.3.patch

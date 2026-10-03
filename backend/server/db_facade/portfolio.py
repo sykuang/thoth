@@ -35,6 +35,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from backend.core.money import native_money
 from backend.server import db
 
 from ._base import _BaseHelpers
@@ -80,13 +81,14 @@ class LatestLoanBalance(BaseModel):
 
 
 class AccountTxnBalance(BaseModel):
-    """Per-account latest txn balance (account_no level)."""
+    """Per-account/currency latest transaction balance."""
 
     model_config = ConfigDict(extra="forbid")
 
     account_no: str
+    currency: str
     txn_datetime: str
-    balance: int | None
+    balance: float | int | None
 
 
 class CardMonthAmountRow(BaseModel):
@@ -112,16 +114,19 @@ class CardMonthAmountRow(BaseModel):
 # ============================================================
 
 
+def _native_money_safe(value: Any, currency: Any) -> int | float | None:
+    try:
+        return native_money(value, currency, optional=True)
+    except ValueError:
+        return None
+
+
 def _to_int_safe(value: Any) -> int | None:
     if value is None:
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
+    number = native_money(value, "TWD")
+    assert isinstance(number, int)
+    return number
 
 
 def _parse_payload(raw: Any) -> Any:
@@ -250,10 +255,10 @@ class PortfolioReadMixin(_BaseHelpers):
         *,
         bank: str,
         user_id: int,
-    ) -> dict[str, AccountTxnBalance]:
-        """Per-account 最新一筆 twd_transactions balance.
+    ) -> dict[tuple[str, str], AccountTxnBalance]:
+        """Per-account/currency 最新一筆 account transaction balance.
 
-        SQL 用 correlated subquery 抓 max txn_datetime → 該帳戶最新有 balance 的 row.
+        SQL 以 txn_datetime、id 倒序，穩定選出該帳戶最新有 balance 的 row.
         不 filter currency (sinopac JPY 帳戶 balance 也存在 twd_transactions).
         Bank db 不存在 / 表不存在 / 沒 row → 空 dict.
         """
@@ -261,15 +266,20 @@ class PortfolioReadMixin(_BaseHelpers):
         if con is None:
             return {}
         try:
-            out: dict[str, AccountTxnBalance] = {}
+            out: dict[tuple[str, str], AccountTxnBalance] = {}
             try:
                 rows = con.execute(
-                    """SELECT t1.account_no, t1.balance, t1.txn_datetime
+                    """SELECT t1.account_no, COALESCE(t1.currency, 'TWD') AS currency,
+                              t1.balance, t1.txn_datetime
                        FROM twd_transactions t1
                        WHERE t1.user_id = ? AND t1.balance IS NOT NULL
-                         AND t1.txn_datetime = (
-                           SELECT MAX(t2.txn_datetime) FROM twd_transactions t2
-                           WHERE t2.user_id = ? AND t2.account_no = t1.account_no AND t2.balance IS NOT NULL
+                         AND t1.id = (
+                           SELECT t2.id FROM twd_transactions t2
+                           WHERE t2.user_id = ? AND t2.account_no = t1.account_no
+                             AND COALESCE(t2.currency, 'TWD') = COALESCE(t1.currency, 'TWD')
+                             AND t2.balance IS NOT NULL
+                           ORDER BY t2.txn_datetime DESC, t2.id DESC
+                           LIMIT 1
                          )""",
                     (user_id, user_id),
                 ).fetchall()
@@ -279,11 +289,13 @@ class PortfolioReadMixin(_BaseHelpers):
                 account_no = r["account_no"]
                 if not account_no:
                     continue
-                balance = _to_int_safe(r["balance"])
+                currency = str(r["currency"] or "TWD").strip().upper()
+                balance = _native_money_safe(r["balance"], currency)
                 if balance is None:
                     continue
-                out[account_no] = AccountTxnBalance(
+                out[(account_no, currency)] = AccountTxnBalance(
                     account_no=account_no,
+                    currency=currency,
                     txn_datetime=r["txn_datetime"],
                     balance=balance,
                 )

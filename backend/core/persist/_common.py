@@ -7,43 +7,28 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from backend.core.money import native_money
+
 
 def _num(s) -> int | None:
     """台幣金額字串（'40,956' / '-15' / ''）→ int；空字串/None → None。
     台幣入帳金額無小數，用整數。"""
-    if s is None:
-        return None
-    t = str(s).replace(",", "").replace(" ", "").strip()
-    if t in ("", "-"):
-        return None
-    try:
-        return int(float(t))
-    except (ValueError, TypeError):
-        return None
+    value = native_money(s, "TWD", optional=True)
+    return value if isinstance(value, int) else None
 
-def _num_real(s) -> float | None:
-    """外幣原始金額（'10000.00' / '123.45' / ''）→ float，**保留小數不截斷**。
-    外幣消費金額帶分（如 USD 123.45），不可用 int() 截掉。空字串/None → None。"""
-    if s is None:
-        return None
-    t = str(s).replace(",", "").replace(" ", "").strip()
-    if t in ("", "-"):
-        return None
-    try:
-        return float(t)
-    except (ValueError, TypeError):
-        return None
+def _num_real(s) -> float | int | None:
+    """原幣金額，最多六位小數；空字串/None → None。"""
+    return native_money(s, "USD", optional=True)
 
 def _num_to_float(s) -> float | None:
     """'300,000' / 300000 / '344,282' / None → float | None."""
-    if s is None or s == "":
+    value = native_money(s, "USD", optional=True)
+    if value is None:
         return None
-    try:
-        if isinstance(s, (int, float)):
-            return float(s)
-        return float(str(s).replace(",", "").strip())
-    except Exception:
-        return None
+    result = float(value)
+    if native_money(result, "USD") != value:
+        raise ValueError("invalid native monetary value")
+    return result
 
 def _slash_date_to_iso(s: str | None) -> str | None:
     """'2026/06/05' / '2026/6/5' → '2026-06-05'. CTBC 用."""

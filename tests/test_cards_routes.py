@@ -476,7 +476,7 @@ def test_upsert_cards_persists_step2_fields(tmp_path, monkeypatch):
     store.upsert_cards([
         {"number": "S2-CARD-001", "name": "Step 2 card", "association": "VISA",
          "type": "credit", "is_cube": False,
-         "credit_limit": 300000.0, "used_credit": 12345.67,
+         "credit_limit": 300000.0, "used_credit": 12346,
          "statement_close_date": "2026-06-15", "payment_due_date": "2026-07-05"},
     ])
     rows = list(store.conn.execute(
@@ -486,7 +486,7 @@ def test_upsert_cards_persists_step2_fields(tmp_path, monkeypatch):
     store.close()
     assert len(rows) == 1
     assert rows[0][0] == 300000.0
-    assert rows[0][1] == 12345.67
+    assert rows[0][1] == 12346
     assert rows[0][2] == "2026-06-15"
     assert rows[0][3] == "2026-07-05"
 

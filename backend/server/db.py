@@ -1003,7 +1003,7 @@ _PHASE_C_TABLES = (
 # 讓 INSERT...ON CONFLICT(user_id, ...) 在 legacy DB 也 work。
 _PHASE_C_PK_INDEXES = (
     ("balance_history", "ux_balance_history_user_snap", "(user_id, snapshot_date)"),
-    ("accounts", "ux_accounts_user_no", "(user_id, account_no)"),
+    ("accounts", "ux_accounts_user_no", "(user_id, account_no, currency)"),
     ("cards", "ux_cards_user_no", "(user_id, card_no)"),
     ("daily_metrics", "ux_daily_metrics_user_snap_cat", "(user_id, snapshot_date, category)"),
     ("twd_transactions", "ux_twd_dedup", "(user_id, dedup_key)"),
@@ -1012,46 +1012,95 @@ _PHASE_C_PK_INDEXES = (
 
 
 def _ensure_phase_c_user_id(con: sqlite3.Connection, cache_key: str) -> None:
-    """Idempotent: 每張 bank 表如缺 user_id column 就補 + backfill = 1.
-
-    純 SQLite (BankStore 已正式做; 這是 raw fixture 兜底 net)。
-    PG backend 由 bank_pg 處理，這條 path 只跑在 SQLite。
-    cache_key 用 db_path string，per-process set 去重。
-
-    C-pk (2026-06-17): 同時補 composite UNIQUE INDEX, 對齊 BankStore._migrate
-    末段邏輯, 讓 router-side endpoints 對 legacy DB 跑 INSERT 不爆。
-    """
-    if cache_key in _PHASE_C_MIGRATED:
-        return
+    """Fail-closed SQLite migration for raw/legacy bank databases."""
+    _PHASE_C_MIGRATED.discard(cache_key)
     try:
-        existing = {r["name"] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    except sqlite3.OperationalError:
-        _PHASE_C_MIGRATED.add(cache_key)
-        return
-    for tbl in _PHASE_C_TABLES:
-        if tbl not in existing:
-            continue
-        try:
-            cols = {r[1] for r in con.execute(f"PRAGMA table_info({tbl})")}
-            if "user_id" not in cols:
-                con.execute(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
-                con.execute(f"UPDATE {tbl} SET user_id = 1 WHERE user_id IS NULL OR user_id = 0")
-        except sqlite3.OperationalError:
-            continue
-    # C-pk: 補 composite UNIQUE INDEX (idempotent CREATE IF NOT EXISTS)
-    for tbl, idx, cols in _PHASE_C_PK_INDEXES:
-        if tbl not in existing:
-            continue
-        try:
-            con.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {tbl}{cols}")
-        except sqlite3.OperationalError:
-            # 老 DB 可能有 duplicate row 跑不過 — 不擋 read path
-            continue
-    try:
+        existing = {
+            row["name"]
+            for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not existing:
+            return
+        complete_schema = set(_PHASE_C_TABLES).issubset(existing)
+        for table in _PHASE_C_TABLES:
+            if table not in existing:
+                continue
+            columns = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            if "user_id" not in columns:
+                con.execute(
+                    f"ALTER TABLE {table} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1"
+                )
+                con.execute(
+                    f"UPDATE {table} SET user_id = 1 WHERE user_id IS NULL OR user_id = 0"
+                )
+            if table == "accounts":
+                if "currency" not in columns:
+                    con.execute(
+                        "ALTER TABLE accounts ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
+                    )
+                else:
+                    con.execute(
+                        "UPDATE accounts SET currency = 'TWD' "
+                        "WHERE currency IS NULL OR TRIM(currency) = ''"
+                    )
+
+        if "accounts" in existing:
+            from backend.core.store import _migrate_sqlite_accounts_currency_identity
+
+            _migrate_sqlite_accounts_currency_identity(con)
+            con.execute("DROP INDEX IF EXISTS ux_accounts_user_no")
+        for table, index, columns in _PHASE_C_PK_INDEXES:
+            if table in existing:
+                required_columns = [
+                    column.strip() for column in columns.strip("()").split(",")
+                ]
+                required = set(required_columns)
+                actual = {
+                    row[1] for row in con.execute(f"PRAGMA table_info({table})")
+                }
+                if not required.issubset(actual):
+                    complete_schema = False
+                    continue
+                current = next(
+                    (
+                        row for row in con.execute(f"PRAGMA index_list({table})")
+                        if row[1] == index
+                    ),
+                    None,
+                )
+                current_columns = (
+                    [row[2] for row in con.execute(f"PRAGMA index_info({index})")]
+                    if current is not None else []
+                )
+                if current is None or current[2] != 1 or current_columns != required_columns:
+                    con.execute(f"DROP INDEX IF EXISTS {index}")
+                    con.execute(f"CREATE UNIQUE INDEX {index} ON {table}{columns}")
+        if complete_schema:
+            for table in _PHASE_C_TABLES:
+                user_id = next(
+                    (
+                        row for row in con.execute(f"PRAGMA table_info({table})")
+                        if row[1] == "user_id"
+                    ),
+                    None,
+                )
+                if (
+                    user_id is None
+                    or str(user_id[2]).upper() != "INTEGER"
+                    or user_id[3] != 1
+                    or str(user_id[4]).strip("'()") != "1"
+                ):
+                    complete_schema = False
+                    break
         con.commit()
-    except sqlite3.OperationalError:
-        pass
-    _PHASE_C_MIGRATED.add(cache_key)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+    if complete_schema:
+        _PHASE_C_MIGRATED.add(cache_key)
 # --- Bank-side connection ---
 def open_bank_conn(bank: str) -> Connection | None:
     """Open a connection to one bank's per-bank data store.

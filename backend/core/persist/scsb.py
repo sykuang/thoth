@@ -68,7 +68,7 @@ def _twd_int(value) -> int:
 
 def _validated_balance(value, currency: str | None):
     raw = str(value or "").replace(",", "").strip()
-    if not re.fullmatch(r"-?\d{1,15}(?:\.\d{1,2})?", raw):
+    if not re.fullmatch(r"-?\d{1,15}(?:\.\d{1,6})?", raw):
         return None
     try:
         amount = Decimal(raw)
@@ -430,20 +430,36 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 row["raw_balance"] is not None for row in account_rows
             )
             if balances_complete:
-                # 餘額合計：排除貸款（loan/mortgage 不算 asset）
-                def _is_asset_account(a: dict) -> bool:
-                    pt = account_classify.classify_account("scsb", a)
-                    return account_classify.is_asset_type(pt)
-                twd_total = sum(_validated_balance(a["balance"], a.get("currency")) or 0 for a in accts
-                                if a.get("currency") in ("TWD", "新台幣")
-                                and _is_asset_account(a))
-                fx_total = sum(_validated_balance(a["balance"], a.get("currency")) or 0 for a in accts
-                               if a.get("currency") not in ("TWD", "新台幣")
-                               and _is_asset_account(a))
-                loan_total = sum(_validated_balance(a["balance"], a.get("currency")) or 0 for a in accts
-                                 if a.get("currency") in ("TWD", "新台幣")
-                                 and account_classify.is_liability_type(
-                                     account_classify.classify_account("scsb", a)))
+                twd_total = 0
+                loan_total = 0
+                fx_by_currency = {}
+                loan_by_currency = {}
+                for account in accts:
+                    currency = str(account.get("currency") or "TWD").strip().upper()
+                    is_twd = currency in ("TWD", "新台幣")
+                    balance = _validated_balance(account["balance"], currency) or 0
+                    product_type = account_classify.classify_account("scsb", account)
+                    if account_classify.is_asset_type(product_type):
+                        if is_twd:
+                            twd_total += balance
+                        else:
+                            fx_by_currency[currency] = round(
+                                fx_by_currency.get(currency, 0) + balance,
+                                6,
+                            )
+                    elif account_classify.is_liability_type(product_type):
+                        if is_twd:
+                            loan_total += balance
+                        else:
+                            loan_by_currency[currency] = round(
+                                loan_by_currency.get(currency, 0) + balance,
+                                6,
+                            )
+                fx_total = (
+                    next(iter(fx_by_currency.values()))
+                    if len(fx_by_currency) == 1
+                    else None if fx_by_currency else 0
+                )
                 store.upsert_balance_history([{
                     "snapshotDate": today,
                     "twdBalance": twd_total,
@@ -453,7 +469,10 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
                 delta["balance_days"] = 1
                 store.put_daily_metric("balance_latest",
                                        {"twd": twd_total, "fx_raw": fx_total,
-                                        "loan": loan_total, "n_accounts": len(accts)},
+                                       "fx_by_currency": fx_by_currency,
+                                       "loan": loan_total,
+                                       "loan_by_currency": loan_by_currency,
+                                       "n_accounts": len(accts)},
                                        today, commit=False)
 
         # totals from regex are trusted only when every account balance was readable.

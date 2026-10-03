@@ -1,5 +1,6 @@
 import {
   addDecimal,
+  sumSafeIntegers,
   divideDecimal,
   formatDecimal,
   formatDecimalFixed,
@@ -42,5 +43,18 @@ if (multiplyDecimalToIntegerHalfEven('-3.5', '1') !== -4) throw new Error('-3.5 
 if (multiplyDecimalToIntegerHalfEven('+2.5', '1') !== 2) throw new Error('+2.5 must round half-even to 2');
 if (multiplyDecimalToIntegerHalfEven('1000', '0.2') !== 200) throw new Error('FX conversion failed');
 if (multiplyDecimalToIntegerHalfEven('NaN', '1') !== null) throw new Error('invalid decimal must fail');
+if (sumSafeIntegers([
+  Number.MAX_SAFE_INTEGER,
+  Number.MAX_SAFE_INTEGER,
+  -(Number.MAX_SAFE_INTEGER - 2),
+  -Number.MAX_SAFE_INTEGER,
+]) !== 2) throw new Error('integer sums must not lose intermediate precision');
+let unsafeIntegerSumRejected = false;
+try {
+  sumSafeIntegers([Number.MAX_SAFE_INTEGER, 1]);
+} catch {
+  unsafeIntegerSumRejected = true;
+}
+if (!unsafeIntegerSumRejected) throw new Error('unsafe integer sums must be rejected');
 
 console.log('decimal formatting checks passed');

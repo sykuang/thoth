@@ -48,7 +48,7 @@ def test_account_tab_routes_canonical_refs_not_last_four():
 def test_transactions_tab_filters_by_exact_canonical_ref():
     src = TRANSACTIONS_TSX.read_text()
 
-    assert "account_no?: string; card_no?: string; drilldown?: string" in src
+    assert "account_no?: string; currency?: string; card_no?: string; drilldown?: string" in src
     assert "brokerage_account_id" not in src
     assert "const [activeAccountNo, setActiveAccountNo] = useState(accountNo);" in src
     assert "const [activeCardNo, setActiveCardNo] = useState(cardNo);" in src
@@ -63,8 +63,9 @@ def test_transactions_drilldown_route_params_are_part_of_local_dataset_filter():
     assert "useFrontendDatasetCache()" in src
     assert "let items = datasetQ.data?.transactions ?? [];" in src
     assert "if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);" in src
+    assert "if (effectiveAccountCurrency) items = items.filter((t) => t.currency === effectiveAccountCurrency);" in src
     assert "if (effectiveCardNo) items = items.filter((t) => matchesCardDrilldown(t, effectiveCardNo));" in src
-    assert "[datasetQ.data, selectedBanks, effectiveAccountNo, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]" in src
+    assert "[datasetQ.data, selectedBanks, effectiveAccountNo, effectiveAccountCurrency, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]" in src
 
 
 def test_backend_transactions_endpoint_supports_exact_canonical_ref_filters():
@@ -72,6 +73,7 @@ def test_backend_transactions_endpoint_supports_exact_canonical_ref_filters():
 
     assert "account_no: str | None = Query(None" in src
     assert "card_no: str | None = Query(None" in src
-    assert "items = [t for t in items if t.get(\"account_no\") == account_no]" in src
+    assert "if t.get(\"account_no\") == account_no" in src
+    assert "str(t.get(\"currency\") or \"TWD\").upper() == account_currency" in src
     assert 't.get("card_no") == card_no' in src
     assert 't.get("kind") in {"billed", "pending"} and not t.get("card_no")' in src

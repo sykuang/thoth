@@ -20,6 +20,7 @@ from backend.core.base import (
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
+    _strict_json_loads,
     validate_history_coverage,
 )
 from backend.core.card_bills import (
@@ -749,9 +750,42 @@ class HsbcCrawler(BankCrawler):
             max_bytes = byte_budget[0] if byte_budget is not None else 5_000_000
             if max_bytes <= 0:
                 return None
+            result = HsbcCrawler._fetch_api_page(
+                page,
+                url=url,
+                token=token,
+                timeout_ms=30_000,
+                max_bytes=max_bytes,
+            )
+            if (
+                not isinstance(result, dict)
+                or type(result.get("bytes")) is not int
+                or result["bytes"] < 0
+                or result["bytes"] > max_bytes
+            ):
+                if byte_budget is not None and isinstance(result, dict) and result.get("exceeded") is True:
+                    byte_budget[0] = 0
+                return None
+            if byte_budget is not None:
+                byte_budget[0] -= result["bytes"]
+            body = result.get("body")
+            if not isinstance(body, dict) or body.get("success") is not True:
+                return None
+            if body.get("error") not in (None, "", []):
+                return None
+            return body.get("payload")
+        except Exception:
+            _log("[fetch] HSBC API request failed")
+            return None
+
+    @staticmethod
+    def _fetch_api_page(
+        page, *, url: str, token: str, timeout_ms: int, max_bytes: int = 5_000_000,
+    ):
+        try:
             result = page.evaluate(
-                "async ({url, tok, maxBytes}) => { const controller=new AbortController();"
-                " const timer=setTimeout(()=>controller.abort(),30000); try {"
+                "async ({url, tok, timeoutMs, maxBytes}) => { const controller=new AbortController();"
+                " const timer=setTimeout(()=>controller.abort(),timeoutMs); try {"
                 " const r=await fetch(url,{credentials:'include',redirect:'error',"
                 " signal:controller.signal,"
                 " headers:{'Accept':'application/json','Authorization':tok}});"
@@ -763,41 +797,38 @@ class HsbcCrawler(BankCrawler):
                 " const reader=r.body.getReader(); const chunks=[]; let bytes=0;"
                 " while(true){const part=await reader.read();if(part.done)break;"
                 " bytes+=part.value.byteLength;if(bytes>maxBytes){"
-                " try{await reader.cancel();}catch(_){}"
-                " return {payload:null,bytes,exceeded:true};}"
+                " try{await reader.cancel();}catch(_){}return {bytes,exceeded:true};}"
                 " chunks.push(part.value);}"
                 " const merged=new Uint8Array(bytes);let offset=0;"
                 " for(const chunk of chunks){merged.set(chunk,offset);offset+=chunk.byteLength;}"
-                " let j=null; try{const text=new TextDecoder('utf-8',{fatal:true}).decode(merged);"
-                " j=JSON.parse(text);}catch(_){}"
-                " return {payload:j&&j.success===true&&!j.error?j.payload:null,bytes};"
-                " } catch(_){ return null; } finally { clearTimeout(timer); } }",
-                {"url": url, "tok": token, "maxBytes": max_bytes},
+                " const text=new TextDecoder('utf-8',{fatal:true}).decode(merged);"
+                " return {url:r.url,status:r.status,contentType:r.headers.get('content-type')||'',"
+                " redirected:r.redirected,bytes,text};"
+                " } catch (_) { return null; } finally { clearTimeout(timer); } }",
+                {"url": url, "tok": token, "timeoutMs": timeout_ms, "maxBytes": max_bytes},
             )
             if (
-                not isinstance(result, dict)
-                or type(result.get("bytes")) is not int
-                or result["bytes"] < 0
+                isinstance(result, dict)
+                and result.get("exceeded") is True
+                and type(result.get("bytes")) is int
             ):
+                return result
+            if not isinstance(result, dict) or not isinstance(result.get("text"), str):
                 return None
-            if result["bytes"] > max_bytes or result.get("exceeded") is True:
-                if byte_budget is not None:
-                    byte_budget[0] = 0
-                return None
-            if byte_budget is not None:
-                byte_budget[0] -= result["bytes"]
-            return result.get("payload")
+            result["body"] = _strict_json_loads(result.pop("text"))
+            return result
         except Exception:
-            _log("[fetch] HSBC API request failed")
             return None
 
     @staticmethod
-    def _fetch_api_page(
-        page, *, url: str, token: str, timeout_ms: int, max_bytes: int = 5_000_000,
+    def _attest_api_page(
+        page, *, url: str, token: str, timeout_ms: int, max_bytes: int,
+        expected_snapshot: dict[str, object],
     ):
         try:
-            return page.evaluate(
-                "async ({url, tok, timeoutMs, maxBytes}) => { const controller=new AbortController();"
+            result = page.evaluate(
+                "async ({url,tok,timeoutMs,maxBytes,expectedSnapshot}) => {"
+                " const controller=new AbortController();"
                 " const timer=setTimeout(()=>controller.abort(),timeoutMs); try {"
                 " const r=await fetch(url,{credentials:'include',redirect:'error',"
                 " signal:controller.signal,"
@@ -815,12 +846,34 @@ class HsbcCrawler(BankCrawler):
                 " const merged=new Uint8Array(bytes);let offset=0;"
                 " for(const chunk of chunks){merged.set(chunk,offset);offset+=chunk.byteLength;}"
                 " const text=new TextDecoder('utf-8',{fatal:true}).decode(merged);"
-                " let body=null; try { body=JSON.parse(text); } catch (_) {}"
                 " return {url:r.url,status:r.status,contentType:r.headers.get('content-type')||'',"
-                " redirected:r.redirected,bytes,body};"
+                " redirected:r.redirected,bytes,text};"
                 " } catch (_) { return null; } finally { clearTimeout(timer); } }",
-                {"url": url, "tok": token, "timeoutMs": timeout_ms, "maxBytes": max_bytes},
+                {
+                    "url": url,
+                    "tok": token,
+                    "timeoutMs": timeout_ms,
+                    "maxBytes": max_bytes,
+                    "expectedSnapshot": expected_snapshot,
+                },
             )
+            if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+                return None
+            body = _strict_json_loads(result.pop("text"))
+            if not isinstance(body, dict) or body.get("success") is not True:
+                return None
+            error = body.get("error")
+            if error not in (None, "", []):
+                return None
+            payload = body.get("payload")
+            if not isinstance(payload, dict):
+                return None
+            selected = {
+                "pageInfo": payload.get("pageInfo"),
+                "content": payload.get("content"),
+            }
+            result["matched"] = selected == expected_snapshot
+            return result
         except Exception:
             return None
 
@@ -852,6 +905,7 @@ class HsbcCrawler(BankCrawler):
         except InvalidOperation:
             amount_value = None
         description = row.get("description")
+        is_positive = row.get("isPositive")
         is_foreign = row.get("isForeign")
         if (
             match is None
@@ -859,20 +913,20 @@ class HsbcCrawler(BankCrawler):
             or not amount_value.is_finite()
             or amount_value != amount_value.to_integral_value()
             or not 0 <= amount_value <= Decimal("100000000")
-            or type(row.get("isPositive")) is not bool
+            or type(is_positive) is not bool
             or type(is_foreign) is not bool
             or not isinstance(description, str)
             or not 0 < len(description.strip()) <= 512
             or transaction > posted
             or transaction > end
-            or (not is_foreign and row.get("foreignAmount") not in (None, "", "-"))
         ):
             raise RuntimeError("hsbc-posted-history")
         if is_foreign:
             foreign = row.get("foreignAmount")
+            foreign_text = foreign.strip() if isinstance(foreign, str) else ""
             foreign_match = re.fullmatch(
-                r"([+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})",
-                foreign if isinstance(foreign, str) else "",
+                r"([+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?) ([A-Z]{3})",
+                foreign_text,
             )
             try:
                 foreign_value = (
@@ -886,7 +940,12 @@ class HsbcCrawler(BankCrawler):
                 or foreign_match.group(2) == "TWD"
                 or foreign_value is None
                 or not foreign_value.is_finite()
-                or not 0 <= foreign_value <= Decimal("100000000")
+                or not 0 <= abs(foreign_value) <= Decimal("100000000")
+                or (
+                    foreign_value != 0
+                    and foreign_match.group(1).startswith("-")
+                    != (row["isPositive"] is False)
+                )
             ):
                 raise RuntimeError("hsbc-posted-history")
         return posted
@@ -919,11 +978,11 @@ class HsbcCrawler(BankCrawler):
         page_size = 10
         total_pages = None
         selected_rows = []
-        snapshots: list[str] = []
+        snapshots: list[dict[str, object]] = []
         snapshot_bytes = 0
         pages = 0
         budget = byte_budget if byte_budget is not None else [5_000_000]
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 300
         for page_number in range(500):
             remaining = deadline - time.monotonic()
             if remaining <= 0 or budget[0] <= 0:
@@ -981,13 +1040,14 @@ class HsbcCrawler(BankCrawler):
                 total_pages = effective_total
             elif effective_total != total_pages:
                 raise RuntimeError("hsbc-posted-history")
-            snapshot = json.dumps(
-                {"pageInfo": page_info, "content": rows},
+            snapshot = {"pageInfo": page_info, "content": rows}
+            serialized_snapshot = json.dumps(
+                snapshot,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            snapshot_bytes += len(snapshot.encode("utf-8"))
+            snapshot_bytes += len(serialized_snapshot.encode("utf-8"))
             if snapshot_bytes > 5_000_000:
                 raise RuntimeError("hsbc-posted-history")
             snapshots.append(snapshot)
@@ -1010,12 +1070,13 @@ class HsbcCrawler(BankCrawler):
             if remaining <= 0 or budget[0] <= 0:
                 raise RuntimeError("hsbc-posted-history")
             url = f"{base}?pageSize={page_size}&pageNumber={page_number}"
-            replay = cls._fetch_api_page(
+            replay = cls._attest_api_page(
                 page,
                 url=url,
                 token=token,
                 timeout_ms=min(30_000, max(1, int(remaining * 1000))),
                 max_bytes=budget[0],
+                expected_snapshot=snapshot,
             )
             if (
                 not isinstance(replay, dict)
@@ -1024,32 +1085,17 @@ class HsbcCrawler(BankCrawler):
             ):
                 raise RuntimeError("hsbc-posted-history")
             budget[0] -= replay["bytes"]
-            replay_body = replay.get("body")
-            replay_payload = (
-                replay_body.get("payload") if isinstance(replay_body, dict) else None
-            )
             if (
                 time.monotonic() >= deadline
-                or not isinstance(replay, dict)
                 or replay.get("url") != url
                 or replay.get("status") != 200
                 or not _is_json_content_type(replay.get("contentType"))
                 or replay.get("redirected") is not False
-                or not isinstance(replay_body, dict)
-                or replay_body.get("success") is not True
-                or replay_body.get("error") not in (None, "", [])
-                or not isinstance(replay_payload, dict)
-                or json.dumps(
-                    {
-                        "pageInfo": replay_payload.get("pageInfo"),
-                        "content": replay_payload.get("content"),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ) != snapshot
+                or replay.get("matched") is not True
             ):
                 raise RuntimeError("hsbc-posted-history")
+            if page_number + 1 < len(snapshots):
+                page.wait_for_timeout(400)
 
         status = "complete" if selected_rows else "explicit_empty"
         return {

@@ -1888,6 +1888,33 @@ class TaishinCrawler(BankCrawler):
         except Exception:
             return
 
+    @staticmethod
+    def _overview_accounts(page) -> list[dict]:
+        """Deposit rows from the overview table: 帳號別名 | 帳號 | 利率 | 累計利息 | 帳戶餘額."""
+        js = """() => [...document.querySelectorAll('tr')].map(tr =>
+            [...tr.querySelectorAll('td')].map(td => (td.innerText || '').trim()))"""
+        seen, out = set(), []
+        for f in page.frames:
+            try:
+                rows = f.evaluate(js) or []
+            except Exception:
+                continue
+            for cells in rows:
+                hit = [i for i, c in enumerate(cells) if re.fullmatch(r"\d{4}-\d{2}-\d{7}-\d", c.split("\n")[0])]
+                if len(hit) != 1 or len(cells) < hit[0] + 4:
+                    continue
+                i = hit[0]
+                first, *rest = cells[i].split("\n")
+                acct = first.replace("-", "")
+                bal = cells[i + 3].replace(",", "")
+                if acct in seen or not re.fullmatch(r"-?\d+(?:\.\d+)?", bal):
+                    continue
+                seen.add(acct)
+                out.append({"accountNo": acct, "balance": bal,
+                            "accountTypeName": rest[0] if rest else None,
+                            "userdefineName": None if cells[i - 1] in ("", "未設定") else cells[i - 1]})
+        return out
+
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """台新 collect — C 策略：popup 強行 hide → 直接點 top nav「信用卡」。
 
@@ -1896,6 +1923,11 @@ class TaishinCrawler(BankCrawler):
         """
         out: dict = {}
         page.wait_for_timeout(8000)
+        # Live 2026-10-02: the rb0100 response body is not capturable, but the
+        # landing overview table renders every deposit account; read it first.
+        dom_accounts = self._overview_accounts(page)
+        if not dom_accounts:
+            raise RuntimeError("taishin-accounts-empty")
 
         # ── Step 2: 從所有 frames（含主 page）找 top nav「信用卡」DOM 元素並點 ──
         # 台新 SPA 整個介面在 svc/rwd iframe 內，top nav 也在裡面（不在主 page）
@@ -2069,6 +2101,8 @@ class TaishinCrawler(BankCrawler):
 
         # ── Step 6: retain only non-sensitive API responses needed by persistence ──
         hits_by_endpoint = self._non_sensitive_api_responses(collector.hits)
+        if not (((hits_by_endpoint.get("query") or {}).get("OUTPUTDATA") or {}).get("SavingAccount")):
+            hits_by_endpoint["query"] = {"OUTPUTDATA": {"SavingAccount": dom_accounts}}
         out["api_responses"] = hits_by_endpoint
         parsed = out.get("credit_card_parsed") or {}
         publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])

@@ -90,7 +90,11 @@ includes(dashboard, 'showPortfolioCard &&', 'dashboard must not reserve an empty
 includes(dashboard, 'showKpiCard &&', 'dashboard must not reserve an empty KPI column');
 includes(login, '敏感資料加密保存', 'login value copy must stay user-facing');
 includes(settings, '管理主分類、子分類與自訂標籤', 'settings copy must stay user-facing');
-includes(transactionDetail, "formatSignedCurrency(txn.balance, 'TWD')", 'account balances must preserve their sign');
+includes(transactionDetail, 'formatSignedCurrency(txn.balance, txn.currency)', 'account balances must preserve their native currency and sign');
+includes(transactions, "if ((t.currency || 'TWD') !== 'TWD') continue;", 'category TWD subtotals must not mix native currencies');
+includes(accounts, 'currency: account.currency', 'account drilldown route must carry the selected currency');
+includes(transactions, "accountCurrency || (accountNo ? 'TWD' : '')", 'account drilldown must default legacy routes to TWD');
+includes(transactions, 't.currency === effectiveAccountCurrency', 'account drilldown must filter by account currency');
 includes(apiTypes, 'export type ManualLiabilityRepayment', 'manual liability repayment API type is missing');
 includes(manualAccount, 'RepaymentJournal', 'manual liability accounts must render a repayment journal');
 includes(manualAccount, 'LIABILITY_TYPES.has(account.product_type)', 'repayment journal must stay liability-only');

@@ -6,9 +6,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from backend.core import classify
+from backend.core import account_classify, classify
 from backend.core.store import BankStore
-from backend.core.persist._common import _ubot_date
+from backend.core.persist._common import _num_real, _ubot_date
 
 
 def _scb_due_to_stmt(due_iso: str | None) -> str | None:
@@ -282,4 +282,19 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
     delta["card_current"] = 0
     delta["cards_n"] = cards_n
     store.log_sync(delta)
+    # === Deposit accounts (rendered 帳戶綜覽; masked number is the stable key) ===
+    accts = []
+    for a in data.get("accounts") or []:
+        if not isinstance(a, dict) or not a.get("account_no"):
+            continue
+        raw = {**a, "type": a.get("type") or "活期存款"}
+        accts.append({
+            "account_no": a["account_no"], "currency": a.get("currency") or "TWD", "branch": None,
+            "nickname": None, "type": a.get("type"),
+            "product_type": account_classify.classify_account("scb", raw),
+            "raw_balance": _num_real(a.get("balance")), "raw_balance_date": today,
+        })
+    if accts:
+        store.upsert_accounts(accts)
+    delta["accounts"] = len(accts)
     return delta

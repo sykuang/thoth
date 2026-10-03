@@ -21,7 +21,7 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
     rules = crawler.login_checkpoint_rules()
 
     assert CathayCrawler.USES_SHARED_LOGIN_CHECKPOINTS is True
-    assert len(rules) == 3
+    assert len(rules) == 4
     rule = rules[0]
     assert (
         rule.name,
@@ -42,8 +42,34 @@ def test_cathay_shared_login_api_and_rule_inventory() -> None:
     )
     assert not hasattr(CathayCrawler, "_dismiss_announcements")
     assert [item.name for item in rules[1:]] == [
-        "cathay-unknown-modal", "cathay-unknown-dialog"
+        "cathay-post-login-notice-dialog",
+        "cathay-unknown-modal", "cathay-unknown-dialog",
     ]
+    for notice in rules[1:2]:
+        assert notice.kind is CheckpointKind.DISMISSIBLE_NOTICE
+        assert notice.phases == (CheckpointPhase.POST_SUBMIT_SETTLE,)
+        assert notice.action_texts == ("我知道了",)
+        assert notice.max_actions == 1
+        assert notice.require_exclusive_action is True
+        assert notice.required_body_pattern is not None
+        assert notice.required_body_pattern.fullmatch("重要通知\n服務內容提醒\n我知道了")
+        for unsafe in (
+            "安全通知\n需要裝置驗證\n我知道了",
+            "安全通知\n信任此裝置\n我知道了",
+            "安全通知\n裝置認證\n我知道了",
+            "系統維護通知\n我知道了",
+            "身分認證通知\n我知道了",
+            "CAPTCHA 圖形辨識通知\n我知道了",
+            "工作階段逾時通知\n我知道了",
+            "優惠活動通知\n我知道了",
+            "交易提醒\n我知道了",
+            "一般訊息\n我知道了",
+            "重要通知\n請至新設備完成綁定\n我知道了",
+            "重要通知\n請使用行動銀行核准本次操作\n我知道了",
+            "重要通知\n系統保養期間服務無法使用\n我知道了",
+            "重要通知\n專屬禮遇與紅利點數加倍\n我知道了",
+        ):
+            assert notice.required_body_pattern.fullmatch(unsafe) is None
 
     source = inspect.getsource(CathayCrawler)
     assert "NormalDataCheck" not in source
@@ -60,6 +86,87 @@ def _evaluate(page):
         rules=crawler.login_checkpoint_rules(),
         is_authenticated=lambda _page: False,
     )
+
+
+def _evaluate_post(page):
+    crawler = object.__new__(CathayCrawler)
+    return evaluate_login_checkpoint(
+        page,
+        bank="cathay",
+        phase=CheckpointPhase.POST_SUBMIT_SETTLE,
+        rules=crawler.login_checkpoint_rules(),
+        is_authenticated=lambda _page: True,
+    )
+
+
+def test_cathay_post_login_notice_requires_one_safe_action() -> None:
+    from patchright.sync_api import sync_playwright
+
+    with sync_playwright() as patchright:
+        if not Path(patchright.chromium.executable_path).exists():
+            pytest.skip("Patchright browser binary is not installed")
+        browser = patchright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            for body in (
+                "系統維護通知",
+                "身分認證通知",
+                "CAPTCHA 圖形辨識通知",
+                "工作階段逾時通知",
+                "優惠活動通知",
+            ):
+                page.set_content(
+                    f'<div role="dialog">{body}<button data-ack>我知道了</button></div>'
+                )
+                outcome = _evaluate_post(page)
+                assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
+                assert page.locator("[data-ack]").is_visible()
+
+            page.set_content(
+                '<div role="dialog">重要通知 服務內容提醒'
+                '<button data-ack>我知道了</button><button data-apply>立即申請</button></div>'
+            )
+            assert _evaluate_post(page).kind is CheckpointKind.UNKNOWN_BLOCKER
+            assert page.locator("[data-ack]").is_visible()
+            assert page.locator("[data-apply]").is_visible()
+
+            page.set_content(
+                '<div role="dialog">重要通知 服務內容提醒'
+                '<details><summary>詳細內容</summary></details><button data-ack>我知道了</button></div>'
+            )
+            assert _evaluate_post(page).kind is CheckpointKind.UNKNOWN_BLOCKER
+            assert page.locator("[data-ack]").is_visible()
+
+            page.set_content(
+                '<div role="dialog">重要通知 服務內容提醒'
+                '<button data-ack onclick="this.closest(\'[role=dialog]\').hidden=true">我知道了</button></div>'
+                '<div role="dialog">未分類提示</div>'
+            )
+            assert _evaluate_post(page).kind is CheckpointKind.UNKNOWN_BLOCKER
+            assert page.locator("[data-ack]").is_visible()
+
+            for blocker in (
+                '<dialog open>未分類提示</dialog>',
+                '<div class="modal show">未分類提示</div>',
+            ):
+                page.set_content(
+                    '<div role="dialog">重要通知 服務內容提醒'
+                    '<button data-ack onclick="this.closest(\'[role=dialog]\').hidden=true">我知道了</button></div>'
+                    + blocker
+                )
+                assert _evaluate_post(page).kind is CheckpointKind.UNKNOWN_BLOCKER
+                assert page.locator("[data-ack]").is_visible()
+
+            page.set_content(
+                '<div role="dialog" data-notice>重要通知 服務內容提醒'
+                '<button onclick="this.closest(\'[role=dialog]\').hidden=true">我知道了</button></div>'
+            )
+            outcome = _evaluate_post(page)
+            assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
+            assert outcome.action_label == "我知道了"
+            assert not page.locator("[data-notice]").is_visible()
+        finally:
+            browser.close()
 
 
 def test_cathay_rule_advances_only_the_scoped_announcement() -> None:

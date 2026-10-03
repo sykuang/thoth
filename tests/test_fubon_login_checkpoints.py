@@ -579,6 +579,16 @@ def test_post_submit_inspection_bounds_and_restores_page_timeout() -> None:
     assert timeout == 180000
 
 
+def test_post_submit_allows_slow_single_navigation_without_resubmit() -> None:
+    crawler, page, _frame, _fields, _passwords, _captcha, submit = _submit_fixture()
+    crawler._logged_in = Mock(side_effect=[False] * 24 + [True])
+
+    crawler.submit_credentials_once(page)
+
+    assert crawler._logged_in.call_count == 25
+    submit.click.assert_called_once_with(timeout=8000)
+
+
 def test_submit_ignores_hidden_password_variants_but_keeps_visible_cardinality() -> None:
     crawler, page, _frame, fields, passwords, _captcha, submit = _submit_fixture()
     hidden = Mock()

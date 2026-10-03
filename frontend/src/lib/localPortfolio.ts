@@ -5,7 +5,12 @@ import {
   type Transaction,
 } from '@/types/api';
 
-import { addDecimal, multiplyDecimalExact, multiplyDecimalToIntegerHalfEven } from './decimal';
+import {
+  addDecimal,
+  multiplyDecimalExact,
+  multiplyDecimalToIntegerHalfEven,
+  sumSafeIntegers,
+} from './decimal';
 import type { ReplicaEnvelope } from './replica';
 
 const ASSET_TYPES = new Set(['deposit', 'time_deposit', 'fx_deposit', 'checking']);
@@ -69,26 +74,45 @@ function normalized(value: unknown): string {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
+function accountKey(accountNo: string, currency: unknown): string {
+  const code = typeof currency === 'string' ? currency.trim().toUpperCase() : 'TWD';
+  return `${accountNo}\u0000${code || 'TWD'}`;
+}
+
 function accountBalances(partition: Row, loanAmount: number | undefined): Map<string, number> {
   const transactionBalances = new Map(
     rows(record(partition.portfolio_facts)?.latest_account_transaction_balances)
       .flatMap((row) => {
         const accountNo = typeof row.account_no === 'string' ? row.account_no : undefined;
         const balance = finite(row.balance);
-        return accountNo && balance !== undefined ? [[accountNo, balance] as const] : [];
+        return accountNo && balance !== undefined
+          ? [[accountKey(accountNo, row.currency), balance] as const]
+          : [];
       }),
   );
+  const accounts = rows(partition.accounts);
+  const twdLoans = accounts.filter((account) => (
+    (typeof account.currency === 'string' ? account.currency.trim().toUpperCase() : 'TWD') === 'TWD'
+    && LIABILITY_TYPES.has(normalized(account.product_type))
+  ));
+  const aggregateFallbackKey = twdLoans.length === 1
+    ? accountKey(String(twdLoans[0].account_no ?? ''), 'TWD')
+    : undefined;
   const balances = new Map<string, number>();
-  for (const account of rows(partition.accounts)) {
+  for (const account of accounts) {
     const accountNo = typeof account.account_no === 'string' ? account.account_no : undefined;
     if (!accountNo) continue;
+    const currency = typeof account.currency === 'string'
+      ? account.currency.trim().toUpperCase()
+      : 'TWD';
     const productType = normalized(account.product_type);
     const raw = finite(account.raw_balance);
-    const fallback = transactionBalances.get(accountNo)
-      ?? (LIABILITY_TYPES.has(productType) ? loanAmount : undefined);
+    const key = accountKey(accountNo, currency);
+    const fallback = transactionBalances.get(key)
+      ?? (key === aggregateFallbackKey ? loanAmount : undefined);
     if (raw !== undefined || fallback !== undefined) {
       const balance = raw ?? fallback ?? 0;
-      balances.set(accountNo, LIABILITY_TYPES.has(productType) ? -Math.abs(balance) : balance);
+      balances.set(key, LIABILITY_TYPES.has(productType) ? -Math.abs(balance) : balance);
     }
   }
   return balances;
@@ -116,7 +140,7 @@ function currentMonthSpending(transactions: Transaction[], month: string, bank?:
       continue;
     }
     const amount = finite(transaction.cashflow_amount) ?? Math.abs(transaction.amount);
-    total += Math.abs(amount);
+    total = sumSafeIntegers([total, Math.abs(amount)]);
   }
   return total;
 }
@@ -135,49 +159,79 @@ function bankSummary(
   const cardFact = record(facts.card_unpaid);
   const rawAssets = finite(balanceFact?.twd_balance);
   const rawLoan = finite(loanFact?.amount_twd);
+  const loanSource = typeof loanFact?.source === 'string' ? loanFact.source : '';
   const rawCard = finite(cardFact?.amount_twd);
   const balances = accountBalances(partition, rawLoan);
   let excludedTwd = 0;
   let excludedLoan = 0;
-  let fx = 0;
+  let foreignLoan = 0;
+  let loanIncomplete = rawLoan === undefined && rows(partition.accounts).some(
+    (account) => LIABILITY_TYPES.has(normalized(account.product_type)),
+  );
+  const fxValues: number[] = [];
 
   for (const account of rows(partition.accounts)) {
     const accountNo = typeof account.account_no === 'string' ? account.account_no : '';
     const productType = normalized(account.product_type);
     const currency = typeof account.currency === 'string' ? account.currency.trim().toUpperCase() : 'TWD';
-    const balance = balances.get(accountNo);
+    const balance = balances.get(accountKey(accountNo, currency));
     const excluded = account.excluded === true;
     if (LIABILITY_TYPES.has(productType)) {
-      if (excluded && balance !== undefined) {
-        excludedLoan += convertToTwd(Math.abs(balance), currency, rates) ?? 0;
+      if (currency !== 'TWD' && balance === undefined
+        && loanSource === 'balance_history' && !excluded) loanIncomplete = true;
+      if (currency !== 'TWD' && balance !== undefined) {
+        const converted = convertToTwd(Math.abs(balance), currency, rates);
+        if (loanSource === 'balance_history') {
+          if (!excluded) {
+            if (converted === undefined) loanIncomplete = true;
+            else foreignLoan = sumSafeIntegers([foreignLoan, converted]);
+          }
+        } else if (excluded) {
+          if (converted === undefined) loanIncomplete = true;
+          else excludedLoan = sumSafeIntegers([excludedLoan, converted]);
+        }
+      } else if (excluded && (currency === 'TWD' || loanSource !== 'balance_history')) {
+        if (balance === undefined) loanIncomplete = true;
+        else excludedLoan = sumSafeIntegers([excludedLoan, Math.abs(balance)]);
       }
       continue;
     }
     if (currency === 'TWD') {
       if (excluded && balance !== undefined) {
-        excludedTwd += convertToTwd(balance, currency, rates) ?? 0;
+        excludedTwd = sumSafeIntegers([
+          excludedTwd,
+          convertToTwd(balance, currency, rates) ?? 0,
+        ]);
       }
       continue;
     }
-    if (!excluded && balance !== undefined) fx += convertToTwd(balance, currency, rates) ?? 0;
+    if (!excluded && balance !== undefined) {
+      fxValues.push(convertToTwd(balance, currency, rates) ?? 0);
+    }
   }
 
-  const assets = Math.max((rawAssets ?? 0) - excludedTwd, 0);
-  const loan = Math.max((rawLoan ?? 0) - excludedLoan, 0);
+  const fx = sumSafeIntegers(fxValues);
+  const assets = Math.max(sumSafeIntegers([rawAssets ?? 0, -excludedTwd]), 0);
+  const combinedLoan = rawLoan !== undefined || foreignLoan !== 0
+    ? sumSafeIntegers([rawLoan ?? 0, foreignLoan])
+    : undefined;
+  const loan = Math.max(sumSafeIntegers([combinedLoan ?? 0, -excludedLoan]), 0);
   const card = rawCard ?? 0;
   const spending = currentMonthSpending(transactions, month, bank);
   const cardAsOf = cardFact?.recognized === true ? date(cardFact.snapshot_date) : undefined;
   const asOf = latest(date(balanceFact?.snapshot_date), date(loanFact?.snapshot_date), cardAsOf);
-  const hasData = rawAssets !== undefined || rawLoan !== undefined || rawCard !== undefined
+  if (loanIncomplete) return { assets: 0, fx: 0, card: 0, loan: 0 };
+  const hasData = rawAssets !== undefined || combinedLoan !== undefined || rawCard !== undefined
     || spending !== 0 || fx !== 0;
   return {
     summary: hasData ? {
       bank,
       assets: rawAssets ?? null,
       fx_assets_twd: fx || null,
-      liabilities: rawLoan !== undefined || rawCard !== undefined ? card + loan : null,
+      liabilities: combinedLoan !== undefined || rawCard !== undefined
+        ? sumSafeIntegers([card, loan]) : null,
       card_unpaid: rawCard ?? null,
-      loan_balance: rawLoan ?? null,
+      loan_balance: combinedLoan ?? null,
       current_month_spending: spending,
       stale: isStale(asOf, now),
       as_of: asOf ?? null,
@@ -285,8 +339,11 @@ function manualTotals(envelope: ReplicaEnvelope, rates: Row): {
       if (id) skipped.push(id);
       continue;
     }
-    if (LIABILITY_TYPES.has(productType)) liabilities += Math.abs(converted);
-    else if (productType === 'investment' || ASSET_TYPES.has(productType)) assets += Math.max(converted, 0);
+    if (LIABILITY_TYPES.has(productType)) {
+      liabilities = sumSafeIntegers([liabilities, Math.abs(converted)]);
+    } else if (productType === 'investment' || ASSET_TYPES.has(productType)) {
+      assets = sumSafeIntegers([assets, Math.max(converted, 0)]);
+    }
     asOf = latest(asOf, valuation.asOf);
   }
   return { assets, liabilities, skipped, asOf };
@@ -294,12 +351,12 @@ function manualTotals(envelope: ReplicaEnvelope, rates: Row): {
 
 function brokerageTotals(envelope: ReplicaEnvelope, rates: Row): { assets: number; asOf?: string } {
   const partition = record(envelope.partitions.brokerage) ?? {};
-  let assets = 0;
+  const values: number[] = [];
   for (const account of rows(partition.accounts)) {
     const converted = convertToTwd(account.balance_total, account.balance_currency, rates);
-    if (converted !== undefined) assets += converted;
+    if (converted !== undefined) values.push(converted);
   }
-  return { assets, asOf: date(partition.last_synced_at) };
+  return { assets: sumSafeIntegers(values), asOf: date(partition.last_synced_at) };
 }
 
 export function computeLocalPortfolio(
@@ -312,7 +369,7 @@ export function computeLocalPortfolio(
   const byBank: PortfolioBankSummary[] = [];
   const skipped: string[] = [];
   let totalAssets = 0;
-  let fxAssets = 0;
+  const fxByBank: number[] = [];
   let totalCard = 0;
   let totalLoan = 0;
   let overallAsOf: string | undefined;
@@ -328,22 +385,25 @@ export function computeLocalPortfolio(
     } else {
       skipped.push(name.slice(5));
     }
-    totalAssets += result.assets;
-    fxAssets += result.fx;
-    totalCard += result.card;
-    totalLoan += result.loan;
+    totalAssets = sumSafeIntegers([totalAssets, result.assets]);
+    fxByBank.push(result.fx);
+    totalCard = sumSafeIntegers([totalCard, result.card]);
+    totalLoan = sumSafeIntegers([totalLoan, result.loan]);
   }
 
   const manual = manualTotals(envelope, rates);
   const brokerage = brokerageTotals(envelope, rates);
-  totalLoan += manual.liabilities;
+  const fxAssets = sumSafeIntegers(fxByBank);
+  totalLoan = sumSafeIntegers([totalLoan, manual.liabilities]);
   overallAsOf = latest(overallAsOf, manual.asOf, brokerage.asOf);
   byBank.sort((left, right) => (
-    ((right.assets ?? 0) + (right.fx_assets_twd ?? 0))
-    - ((left.assets ?? 0) + (left.fx_assets_twd ?? 0))
+    sumSafeIntegers([right.assets ?? 0, right.fx_assets_twd ?? 0])
+    - sumSafeIntegers([left.assets ?? 0, left.fx_assets_twd ?? 0])
   ));
-  const totalAssetsWithFx = totalAssets + fxAssets + brokerage.assets + manual.assets;
-  const totalLiabilities = totalCard + totalLoan;
+  const totalAssetsWithFx = sumSafeIntegers([
+    totalAssets, fxAssets, brokerage.assets, manual.assets,
+  ]);
+  const totalLiabilities = sumSafeIntegers([totalCard, totalLoan]);
   return {
     total_assets: totalAssets,
     fx_assets_twd: fxAssets,
@@ -355,8 +415,8 @@ export function computeLocalPortfolio(
     total_card_unpaid: totalCard,
     total_loan: totalLoan,
     current_month_spending: currentMonthSpending(transactions, month),
-    net_worth: totalAssets - totalLiabilities,
-    net_worth_with_fx: totalAssetsWithFx - totalLiabilities,
+    net_worth: sumSafeIntegers([totalAssets, -totalLiabilities]),
+    net_worth_with_fx: sumSafeIntegers([totalAssetsWithFx, -totalLiabilities]),
     as_of: overallAsOf ?? null,
     by_bank: byBank,
     skipped: [...skipped, ...manual.skipped],

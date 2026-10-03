@@ -48,11 +48,14 @@ export function updateCachedBankBalance(
   cache: ReplicaAccountTabCache,
   bank: string,
   accountNo: string,
+  currency: string,
   changes: Partial<BankAccountBalance>,
 ): ReplicaAccountTabCache {
   return {
     ...cache,
-    balances: cache.balances.map((row) => row.bank === bank && row.account_no === accountNo
+    balances: cache.balances.map((row) => row.bank === bank
+      && row.account_no === accountNo
+      && row.currency === currency
       ? { ...row, ...changes }
       : row),
   };

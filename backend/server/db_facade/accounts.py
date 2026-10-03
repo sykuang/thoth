@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from backend.core.money import native_money
 from backend.server import db
 
 from ._base import _BaseHelpers
@@ -115,18 +116,14 @@ def _row_to_account_dict(bank: str, row: Any, has_nick_overwrite: bool) -> dict[
     def _get(col: str, default: Any = None) -> Any:
         return row[col] if col in keys else default
 
+    currency = _get("currency") or "TWD"
     raw_bal = _get("raw_balance")
-    raw_bal_float: float | None = None
-    if raw_bal is not None:
-        try:
-            raw_bal_float = float(raw_bal)
-        except (TypeError, ValueError):
-            raw_bal_float = None
+    raw_bal_float = native_money(raw_bal, currency, optional=True)
 
     return {
         "bank": bank,
         "account_no": _get("account_no") or "",
-        "currency": _get("currency"),
+        "currency": currency,
         "nickname": _get("nickname"),
         "nickname_overwrite": _get("nickname_overwrite") if has_nick_overwrite else None,
         "type": _get("type"),
@@ -227,13 +224,14 @@ class AccountsReadMixin(_BaseHelpers):
         *,
         user_id: int,
         banks: list[str],
-    ) -> dict[str, set[str]]:
-        """掃指定 banks, 回 {bank: set(excluded account_no)} — limit 本 user.
+    ) -> dict[str, set[tuple[str, str]]]:
+        """掃指定 banks, 回 {bank: set((account_no, currency))} — limit 本 user.
 
         給 transactions stats 用 (跳過 excluded 帳戶的 txn).
         """
         fast = self._excluded_nos_all_banks_fast(
-            table="accounts", id_col="account_no", user_id=user_id, banks=banks,
+            table="accounts", id_col="account_no", scope_col="currency",
+            user_id=user_id, banks=banks,
         )
         if fast is not None:
             return fast
@@ -245,11 +243,15 @@ class AccountsReadMixin(_BaseHelpers):
             try:
                 try:
                     rows = con.execute(
-                        "SELECT account_no FROM accounts WHERE user_id = ? AND COALESCE(excluded, 0) = 1",
+                        "SELECT account_no, currency FROM accounts "
+                        "WHERE user_id = ? AND COALESCE(excluded, 0) = 1",
                         (user_id,),
                     ).fetchall()
                     if rows:
-                        out[bank] = {r["account_no"] for r in rows if r["account_no"]}
+                        out[bank] = {
+                            (r["account_no"], r["currency"] or "TWD")
+                            for r in rows if r["account_no"]
+                        }
                 except db.OperationalError:
                     pass
             finally:
@@ -273,19 +275,22 @@ class AccountsWriteMixin(_BaseHelpers):
         *,
         user_id: int,
         account_no: str,
+        currency: str,
         excluded: bool,
     ) -> SetAccountExcludedResult:
         """切換帳戶「納入淨資產統計」flag. raise AccountNotFound 若帳戶不存在."""
         row = self._con.execute(
-            "SELECT account_no FROM accounts WHERE account_no = ? AND user_id = ?",
-            (account_no, user_id),
+            "SELECT account_no FROM accounts "
+            "WHERE account_no = ? AND currency = ? AND user_id = ?",
+            (account_no, currency, user_id),
         ).fetchone()
         if row is None:
             raise AccountNotFound(self._bank, account_no)
         now = self._now_iso()
         self._con.execute(
-            "UPDATE accounts SET excluded = ?, updated_at = ? WHERE account_no = ? AND user_id = ?",
-            (1 if excluded else 0, now, account_no, user_id),
+            "UPDATE accounts SET excluded = ?, updated_at = ? "
+            "WHERE account_no = ? AND currency = ? AND user_id = ?",
+            (1 if excluded else 0, now, account_no, currency, user_id),
         )
         return SetAccountExcludedResult(
             bank=self._bank, account_no=account_no, excluded=excluded, updated_at=now,
@@ -296,6 +301,7 @@ class AccountsWriteMixin(_BaseHelpers):
         *,
         user_id: int,
         account_no: str,
+        currency: str,
         nickname_overwrite: str | None,
     ) -> SetAccountNicknameResult:
         """設/清 user 取的帳戶暱稱. 老 db 沒此欄會 ALTER TABLE 補. raise AccountNotFound."""
@@ -303,16 +309,18 @@ class AccountsWriteMixin(_BaseHelpers):
         if "nickname_overwrite" not in cols:
             self._con.execute("ALTER TABLE accounts ADD COLUMN nickname_overwrite TEXT")
         row = self._con.execute(
-            "SELECT account_no FROM accounts WHERE account_no = ? AND user_id = ?",
-            (account_no, user_id),
+            "SELECT account_no FROM accounts "
+            "WHERE account_no = ? AND currency = ? AND user_id = ?",
+            (account_no, currency, user_id),
         ).fetchone()
         if row is None:
             raise AccountNotFound(self._bank, account_no)
         now = self._now_iso()
         new_nick = nickname_overwrite if nickname_overwrite else None
         self._con.execute(
-            "UPDATE accounts SET nickname_overwrite = ?, updated_at = ? WHERE account_no = ? AND user_id = ?",
-            (new_nick, now, account_no, user_id),
+            "UPDATE accounts SET nickname_overwrite = ?, updated_at = ? "
+            "WHERE account_no = ? AND currency = ? AND user_id = ?",
+            (new_nick, now, account_no, currency, user_id),
         )
         return SetAccountNicknameResult(
             bank=self._bank,

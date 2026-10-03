@@ -1,7 +1,15 @@
 """Closed product read: ordinary popup transport, bounded public-body projection."""
 from types import SimpleNamespace
+import traceback
 
-from backend.banks.esun_spa.products import _project_bill, _official, collect_products
+import pytest
+
+from backend.banks.esun_spa.products import (
+    _cleanup_all,
+    _project_bill,
+    _official,
+    collect_products,
+)
 
 
 def test_official_boundary_and_public_shape():
@@ -13,6 +21,58 @@ def test_official_boundary_and_public_shape():
     assert _project_bill("summary", {"rtnCode": "0000", "billInfo": {"billTotalInfoList": [{"billTotalCurrency": "TWD", "billTotalAmount": "123"}], "paymentDueDate": "2026/09/30"}, "paymentInfoList": [], "feeRewardInfoList": []}) == {"shape": "summary", "totals": 1, "payments": 0}
     assert _project_bill("detail", {"transList": [{"year": "2026", "month": "09", "transDetailList": [{"merchantName": "private"}]}], "cardInfoList": [], "currencyInfoList": []}) == {"shape": "detail", "groups": 1, "rows": 1}
     assert _project_bill("detail", {"transList": [{"transDetailList": "bad"}], "cardInfoList": [], "currencyInfoList": []}) is None
+
+
+def test_cleanup_all_attempts_every_action_and_retries_partial_failures():
+    calls = {"listener": 0, "route": 0, "observer": 0}
+
+    def action(name, fail_once=False):
+        def run():
+            calls[name] += 1
+            if fail_once and calls[name] == 1:
+                raise RuntimeError("synthetic cleanup failure")
+        return run
+
+    _cleanup_all([
+        action("listener", fail_once=True),
+        action("route"),
+        action("observer", fail_once=True),
+    ])
+    assert calls == {"listener": 2, "route": 1, "observer": 2}
+
+    with pytest.raises(RuntimeError, match="cleanup incomplete") as raised:
+        _cleanup_all([action("route", fail_once=True), lambda: (_ for _ in ()).throw(
+            RuntimeError("SYNTHETIC-PRIVATE-CLEANUP"),
+        )])
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "SYNTHETIC-PRIVATE-CLEANUP" not in rendered
+
+
+def test_native_popup_setup_failure_removes_already_installed_route(monkeypatch):
+    from backend.banks.esun_spa import products
+
+    calls = {"route": 0, "unroute": 0}
+
+    class Context:
+        def route(self, *_args):
+            calls["route"] += 1
+
+        def on(self, *_args):
+            raise RuntimeError("setup failed")
+
+        def unroute(self, *_args):
+            calls["unroute"] += 1
+
+    button = SimpleNamespace(
+        count=lambda: 1, is_visible=lambda: True, is_enabled=lambda: True,
+    )
+    native = SimpleNamespace(context=Context(), locator=lambda _selector: button)
+    monkeypatch.setattr(products._OriginGuardProxy, '_unwrap', lambda _page: native)
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        products._open_bill(native, lambda: None)
+
+    assert calls == {"route": 1, "unroute": 1}
 
 
 def test_native_popup_reads_only_owned_official_responses(monkeypatch):

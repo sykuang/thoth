@@ -17,7 +17,10 @@ async function main() {
   const manualGate = new Promise<{ id: string }[]>((resolve) => { releaseManual = resolve; });
   let settled = false;
   const complete = fetchCompleteAccountTabCache({
-    balances: async () => [{ bank: 'cathay', account_no: '1234' }] as never,
+    balances: async () => [
+      { bank: 'cathay', account_no: '1234', currency: 'TWD' },
+      { bank: 'cathay', account_no: '1234', currency: 'USD' },
+    ] as never,
     accounts: async () => [{ id: 1, has_creds: true }] as never,
     cards: async () => [{ bank: 'cathay', card_no: '9999' }] as never,
     manualAccounts: async () => manualGate as never,
@@ -33,8 +36,11 @@ async function main() {
   equal(cache.accounts[0]?.id, 1);
   equal(cache.cards[0]?.card_no, '9999');
   equal(cache.manualAccounts[0]?.id, 'manual-1');
-  const updatedBalance = updateCachedBankBalance(cache, 'cathay', '1234', { excluded: true });
+  const updatedBalance = updateCachedBankBalance(
+    cache, 'cathay', '1234', 'TWD', { excluded: true },
+  );
   equal(updatedBalance.balances[0]?.excluded, true);
+  equal(updatedBalance.balances[1]?.excluded, undefined);
   equal(cache.balances[0]?.excluded, undefined);
   const updatedCard = updateCachedCard(cache, 'cathay', '9999', { excluded: true });
   equal(updatedCard.cards[0]?.excluded, true);

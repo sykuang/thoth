@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 
 import pytest
 
@@ -109,3 +110,19 @@ def test_different_data_roots_dont_share_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(root_b))
     _store.BankStore("cathay", user_id=1)
     assert call_count["n"] == 2, "不同 BANK_DATA_ROOT 各自 cache, 都要跑 _migrate"
+
+
+def test_cache_hit_still_rejects_in_place_invalid_currency(store_mod):
+    store = store_mod.BankStore("cathay", user_id=1)
+    store.conn.execute(
+        "INSERT INTO accounts (user_id, account_no, currency, updated_at) VALUES (1, 'A', 'USD', '')",
+    )
+    store.conn.commit()
+    path = store.db_path
+    store.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE accounts SET currency='US$' WHERE account_no='A'")
+
+    with pytest.raises(sqlite3.OperationalError, match="invalid account currency"):
+        store_mod.BankStore("cathay", user_id=1)

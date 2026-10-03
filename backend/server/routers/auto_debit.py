@@ -152,17 +152,25 @@ def _validate_account_is_eligible(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"無法讀取 {account_bank} 帳戶清單",
         ) from None
-    match = next((a for a in accts if a.account_no == account_no), None)
+    same_number = [account for account in accts if account.account_no == account_no]
+    match = next(
+        (
+            account for account in same_number
+            if _is_eligible_picker_account(account)
+        ),
+        None,
+    )
     if match is None:
+        detail = (
+            f"扣繳戶必須是 TWD 活儲帳戶 (帳號 {account_no})"
+            if same_number
+            else f"找不到帳號 {account_no} (在 {account_bank})"
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"找不到帳號 {account_no} (在 {account_bank})",
+            detail=detail,
         )
-    if not _is_eligible_picker_account(match):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"扣繳戶必須是 TWD 活儲帳戶 (該帳號 currency={match.currency} type={match.type})",
-        )
+
 
 
 # ============================================================
@@ -320,7 +328,11 @@ def build_payment_reminders(user_id: int, today: date | None = None) -> list[dic
             except Exception:
                 accts = []
             acct = next(
-                (a for a in accts if a.account_no == setting.account_no),
+                (
+                    account for account in accts
+                    if account.account_no == setting.account_no
+                    and _is_eligible_picker_account(account)
+                ),
                 None,
             )
             balance = acct.raw_balance if (acct and acct.raw_balance is not None) else 0.0

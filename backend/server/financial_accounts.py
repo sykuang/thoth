@@ -337,15 +337,16 @@ def _bank_accounts(user_id: int) -> list[FinancialAccount]:
             continue
         for account in accounts:
             label = account.nickname_overwrite or account.nickname or account.account_no
+            currency = account.currency.strip().upper()
             result.append(FinancialAccount(
-                id=f"bank_sync:{bank}:{account.account_no}",
+                id=f"bank_sync:{bank}:{account.account_no}:{currency}",
                 source="bank_sync",
-                source_ref=f"{bank}:{account.account_no}",
+                source_ref=f"{bank}:{account.account_no}:{currency}",
                 institution_name=bank,
                 name=label,
                 account_ref=account.account_no,
                 product_type=account.product_type or account_classify.ProductType.UNKNOWN,
-                currency=account.currency,
+                currency=currency,
                 balance=_decimal_text(account.balance) if account.balance is not None else None,
                 as_of=account.snapshot_date,
                 included_in_net_worth=not account.excluded,
