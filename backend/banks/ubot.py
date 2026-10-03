@@ -19,7 +19,7 @@ import os
 import sys
 from calendar import monthrange
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import parse_qsl, urlparse
@@ -298,7 +298,11 @@ def _ubot_card_bill_fact(out: dict):
         remaining_due=remaining,
         statement_close_date=statement_date,
         payment_due_date=summary.get("dueDate"),
-        last_payment_amount=payment_amount,
+        # Bill arithmetic above stays exact; the persisted TWD fact is whole dollars.
+        last_payment_amount=(
+            payment_amount.to_integral_value(rounding=ROUND_HALF_EVEN)
+            if payment_amount is not None else None
+        ),
         last_payment_date=payment_date,
     )
 
