@@ -49,31 +49,18 @@ def find_pairs(rows: list[dict]) -> list[tuple[dict, dict]]:
     return pairs
 
 
-def repair(conn, user_id: int, *, apply: bool) -> list[dict]:
-    cols = ", ".join(("id", "account_no", "txn_datetime", "expend", "income", "balance",
-                      "currency", "first_seen", "dedup_key") + USER_COLUMNS)
-    rows = [dict(r) for r in conn.execute(
-        f"SELECT {cols} FROM twd_transactions WHERE user_id = ?", (user_id,)
-    ).fetchall()]
+def plan(rows: list[dict]) -> list[dict]:
     actions = []
     for old, new in find_pairs(rows):
         currency_moved = (old["currency"] or "TWD") != (new["currency"] or "TWD")
         keep, drop = (new, old) if currency_moved else (old, new)
-        actions.append({"keep": keep["id"], "drop": drop["id"],
-                        "date": str(keep["txn_datetime"])[:10], "currency_moved": currency_moved})
-        if not apply:
-            continue
-        conn.execute("DELETE FROM twd_transactions WHERE id = ? AND user_id = ?",
-                     (drop["id"], user_id))
-        if currency_moved:
-            sets = ", ".join(f"{c} = ?" for c in USER_COLUMNS)
-            conn.execute(f"UPDATE twd_transactions SET {sets} WHERE id = ? AND user_id = ?",
-                         (*(old[c] for c in USER_COLUMNS), keep["id"], user_id))
-        else:
-            conn.execute("UPDATE twd_transactions SET dedup_key = ? WHERE id = ? AND user_id = ?",
-                         (new["dedup_key"], keep["id"], user_id))
-    if apply:
-        conn.commit()
+        actions.append({
+            "keep": keep["id"], "drop": drop["id"], "date": str(keep["txn_datetime"])[:10],
+            "currency_moved": currency_moved,
+            # currency moved: newer row keeps its key and inherits the older row's edits
+            "edits": {c: old[c] for c in USER_COLUMNS} if currency_moved else None,
+            "dedup_key": None if currency_moved else new["dedup_key"],
+        })
     return actions
 
 
@@ -86,12 +73,16 @@ def main(argv: list[str]) -> None:
     for bank in KNOWN_BANKS:
         store = BankStore(bank, user_id=user_id)
         try:
-            actions = repair(store.conn, user_id, apply=apply)
+            actions = plan(store.twd_dedup_rows(USER_COLUMNS))
+            if apply:
+                store.apply_twd_dedup(actions, USER_COLUMNS)
         finally:
             store.close()
         total += len(actions)
         if actions:
-            print("DEDUP", bank, json.dumps(actions), flush=True)
+            print("DEDUP", bank, json.dumps(
+                [{k: a[k] for k in ("keep", "drop", "date", "currency_moved")} for a in actions]
+            ), flush=True)
     print("DEDUP_TOTAL", total, "applied" if apply else "dry-run", flush=True)
 
 

@@ -1,5 +1,12 @@
 from backend.core.store import BankStore
-from backend.core.twd_dedup_repair import repair
+from backend.core.twd_dedup_repair import USER_COLUMNS, plan
+
+
+def repair(store, *, apply):
+    actions = plan(store.twd_dedup_rows(USER_COLUMNS))
+    if apply:
+        store.apply_twd_dedup(actions, USER_COLUMNS)
+    return actions
 
 
 def _insert(store, **row):
@@ -37,16 +44,16 @@ def test_repair_merges_cross_sync_duplicates_only(tmp_path, monkeypatch):
                         balance=1201494, currency="JPY", first_seen="2026-10-03T04:24:04",
                         dedup_key="1:JPY|x~0")
 
-        assert len(repair(store.conn, 7, apply=False)) == 2
+        assert len(repair(store, apply=False)) == 2
         assert len(_rows(store)) == 6  # dry-run writes nothing
 
-        repair(store.conn, 7, apply=True)
+        repair(store, apply=True)
         rows = _rows(store)
         assert set(rows) == {old, twin_a, twin_b, moved}
         assert rows[old]["dedup_key"] == "new~0"
         assert (rows[old]["category"], rows[old]["auto_excluded"]) == ("轉帳", 1)
         assert (rows[moved]["currency"], rows[moved]["category"], rows[moved]["auto_excluded"]) == ("JPY", "利息", 1)
         assert legacy not in rows
-        assert repair(store.conn, 7, apply=False) == []
+        assert repair(store, apply=False) == []
     finally:
         store.close()
