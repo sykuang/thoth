@@ -1270,6 +1270,27 @@ class BankStore:
                     (a["dedup_key"], a["keep"], self.user_id))
         self.conn.commit()
 
+    def card_dedup_rows(self, user_columns: tuple[str, ...]) -> list[dict]:
+        """Card billed rows needed by the one-off cross-sync duplicate repair."""
+        cols = ", ".join(("id", "card_no", "consume_date", "post_date", "description", "amount",
+                          "consume_amount", "first_seen") + user_columns)
+        return [dict(r) for r in self.conn.execute(
+            f"SELECT {cols} FROM card_billed_txns WHERE user_id = ?", (self.user_id,)
+        ).fetchall()]
+
+    def apply_card_dedup(self, actions: list[dict]) -> None:
+        """Delete duplicate card rows and patch survivors in one transaction."""
+        for a in actions:
+            for drop in a["drop"]:
+                self.conn.execute("DELETE FROM card_billed_txns WHERE id = ? AND user_id = ?",
+                                  (drop, self.user_id))
+            if a["edits"]:
+                sets = ", ".join(f"{c} = ?" for c in a["edits"])
+                self.conn.execute(
+                    f"UPDATE card_billed_txns SET {sets} WHERE id = ? AND user_id = ?",
+                    (*a["edits"].values(), a["keep"], self.user_id))
+        self.conn.commit()
+
     # ---- 2. 信用卡已出帳明細：append-only ----
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None) -> int:
         from backend.server.categorizer import categorize_with_excluded
@@ -1320,8 +1341,39 @@ class BankStore:
             for t in txns
         ]
         dedup_keys = _with_occurrence(content_keys)
+        claimed_ids: set[int] = set()
         for t, key in zip(txns, dedup_keys, strict=True):
             post_date = t.get("post_date") or None
+            if post_date and t.get("date") and t.get("amount") is not None and t.get("desc"):
+                # The same posted row can reach us with a different dedup_key: float vs int
+                # money, a statement row without the card number, or a later statement
+                # (new bill_date) relisting it. Reuse one unclaimed equivalent row instead
+                # of inserting a copy; claimed_ids keeps genuine same-batch repeats apart.
+                if self.conn.execute(
+                    "SELECT 1 FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                    (self.user_id, key),
+                ).fetchone() is None:
+                    same = [r["id"] for r in self.conn.execute(
+                        """SELECT id FROM card_billed_txns
+                           WHERE user_id = ? AND consume_date = ? AND post_date = ?
+                             AND amount = ? AND TRIM(description) = TRIM(?)
+                             AND consume_amount IS NOT DISTINCT FROM ?
+                             AND (COALESCE(card_no, '') = COALESCE(?, '')
+                                  OR COALESCE(card_no, '') = '' OR COALESCE(?, '') = '')
+                           ORDER BY id""",
+                        (self.user_id, t.get("date"), post_date, t.get("amount"), t.get("desc"),
+                         t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
+                    ).fetchall() if r["id"] not in claimed_ids]
+                    if same:
+                        claimed_ids.add(same[0])
+                        self._current_billed_ids.append(same[0])
+                        if t.get("card_no"):
+                            self.conn.execute(
+                                "UPDATE card_billed_txns SET card_no = ? WHERE user_id = ? AND id = ?"
+                                " AND COALESCE(card_no, '') = ''",
+                                (t.get("card_no"), self.user_id, same[0]),
+                            )
+                        continue
             if (
                 post_date and t.get("card_no") and t.get("date")
                 and t.get("amount") is not None and t.get("desc")
@@ -1403,6 +1455,7 @@ class BankStore:
             ).fetchone()
             existing = None
             if inserted:
+                claimed_ids.add(inserted["id"])
                 self._new_billed_ids.append(inserted["id"])
                 self._current_billed_ids.append(inserted["id"])
                 inserted_count += 1
@@ -1413,6 +1466,7 @@ class BankStore:
                     (self.user_id, key),
                 ).fetchone()
                 if existing:
+                    claimed_ids.add(existing["id"])
                     self._current_billed_ids.append(existing["id"])
                     if post_date is None and existing["post_date"]:
                         # 舊 store 寫入 consume_date fallback，但 dedup_key 是用來源的

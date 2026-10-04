@@ -57,3 +57,25 @@ def test_repair_merges_cross_sync_duplicates_only(tmp_path, monkeypatch):
         assert repair(store, apply=False) == []
     finally:
         store.close()
+
+
+def test_plan_cards_drops_cross_sync_copies_only():
+    from backend.core.twd_dedup_repair import USER_COLUMNS, plan_cards
+
+    def row(i, card, seen, cat=None, amount=327):
+        return {"id": i, "card_no": card, "consume_date": "2026-07-19", "post_date": "2026-07-22",
+                "description": "優步 ", "amount": amount, "consume_amount": None,
+                "first_seen": seen, **{c: None for c in USER_COLUMNS}, "category": cat}
+
+    # blank-card copy from a later sync goes; carded original stays
+    acts = plan_cards([row(128, "****2869", "2026-08-14", "飲食"), row(2183, "", "2026-09-20")])
+    assert [(a["keep"], a["drop"], a["edits"]) for a in acts] == [(128, [2183], None)]
+    # survivor without card/category inherits them
+    acts = plan_cards([row(1, "", "2026-08-14"), row(297, "****1", "2026-09-20", "飲食")])
+    assert acts[0]["drop"] == [297] and acts[0]["edits"]["card_no"] == "****1"
+    assert acts[0]["edits"]["category"] == "飲食"
+    # same-sync repeats, relisted once: keep both originals
+    acts = plan_cards([row(1, "****1", "d1"), row(2, "****1", "d1"), row(3, "****1", "d2")])
+    assert [a["drop"] for a in acts] == [[3]]
+    # different cards untouched
+    assert plan_cards([row(1, "****1", "d1"), row(2, "****2", "d2")]) == []
