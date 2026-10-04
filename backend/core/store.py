@@ -1246,6 +1246,30 @@ class BankStore:
             self.conn.commit()
         return inserted_count
 
+    def twd_dedup_rows(self, user_columns: tuple[str, ...]) -> list[dict]:
+        """Rows needed by the one-off cross-sync duplicate repair."""
+        cols = ", ".join(("id", "account_no", "txn_datetime", "expend", "income", "balance",
+                          "currency", "first_seen", "dedup_key") + user_columns)
+        return [dict(r) for r in self.conn.execute(
+            f"SELECT {cols} FROM twd_transactions WHERE user_id = ?", (self.user_id,)
+        ).fetchall()]
+
+    def apply_twd_dedup(self, actions: list[dict], user_columns: tuple[str, ...]) -> None:
+        """Drop each duplicate and re-key/re-edit its survivor in one transaction."""
+        sets = ", ".join(f"{c} = ?" for c in user_columns)
+        for a in actions:
+            self.conn.execute("DELETE FROM twd_transactions WHERE id = ? AND user_id = ?",
+                              (a["drop"], self.user_id))
+            if a["edits"] is not None:
+                self.conn.execute(
+                    f"UPDATE twd_transactions SET {sets} WHERE id = ? AND user_id = ?",
+                    (*(a["edits"][c] for c in user_columns), a["keep"], self.user_id))
+            else:
+                self.conn.execute(
+                    "UPDATE twd_transactions SET dedup_key = ? WHERE id = ? AND user_id = ?",
+                    (a["dedup_key"], a["keep"], self.user_id))
+        self.conn.commit()
+
     # ---- 2. 信用卡已出帳明細：append-only ----
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None) -> int:
         from backend.server.categorizer import categorize_with_excluded
