@@ -742,7 +742,13 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
             legacy = parsed_by_number.get(account_no, {})
             if legacy.get("currency") != "TWD":
                 legacy = {}
-            parsed_by_number[account_no] = {**legacy, **account}
+            # The coverage inventory only carries the generic type "deposit";
+            # keep the bank's product label (e.g. 數位活儲) for display.
+            parsed_by_number[account_no] = {
+                **legacy,
+                **account,
+                "type": legacy.get("type") or account["name"],
+            }
         deposit_accounts = list(parsed_by_number.values())
     if deposit_accounts:
         # account_classify 補 product_type (跟 cathay 同 pattern)
