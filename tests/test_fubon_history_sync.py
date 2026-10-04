@@ -1024,3 +1024,19 @@ def test_fubon_native_window_boundaries_match_live_semantics():
         {"preset": "rdoDay180", "start": "2026-04-02", "end": "2026-10-02"},
     ]
     assert _fubon_history_windows(date(2026, 8, 31))[1]["start"] == "2026-02-28"
+
+
+def test_fubon_attested_accounts_keep_display_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    for page_text, expected in ((_payload()["deposit_page_text"], "活儲存款"), ("", "台幣存款")):
+        store = BankStore("fubon", user_id=7, source_account_id=97)
+        try:
+            data = _payload()
+            data["deposit_page_text"] = page_text
+            persist_collected("fubon", data, store)
+            row = store.conn.execute("SELECT type, product_type FROM accounts").fetchone()
+            assert (row["type"], row["product_type"]) == (expected, "deposit")
+        finally:
+            store.close()
+            for path in tmp_path.rglob("*.sqlite*"):
+                path.unlink()
