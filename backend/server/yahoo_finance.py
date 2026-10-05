@@ -108,6 +108,8 @@ def _get_quote_cached(normalized: str, _minute_bucket: int) -> YahooQuote:
     try:
         result = payload["chart"]["result"][0]
         meta = result["meta"]
+        if not isinstance(meta.get("symbol"), str) or not meta["symbol"].strip():
+            raise ValueError("quote symbol is required")
         raw_price = meta["regularMarketPrice"]
         raw_price_text = str(raw_price)
         whole, dot, fraction = raw_price_text.partition(".")
@@ -121,7 +123,12 @@ def _get_quote_cached(normalized: str, _minute_bucket: int) -> YahooQuote:
         ):
             raise ValueError("price must be a bounded fixed-point decimal")
         parsed_price = Decimal(raw_price_text)
-        currency = str(meta["currency"]).strip().upper()
+        raw_currency = str(meta["currency"]).strip()
+        if raw_currency in {"GBp", "GBX"}:
+            parsed_price /= Decimal(100)
+            currency = "GBP"
+        else:
+            currency = raw_currency.upper()
     except (KeyError, IndexError, TypeError, InvalidOperation, ValueError) as exc:
         raise YahooFinanceUnavailable("Yahoo Finance quote response is incomplete") from exc
     if not parsed_price.is_finite() or parsed_price <= 0 or len(currency) != 3:
@@ -137,7 +144,7 @@ def _get_quote_cached(normalized: str, _minute_bucket: int) -> YahooQuote:
     ):
         raise YahooFinanceUnavailable("Yahoo Finance quote timestamp is invalid")
     return YahooQuote(
-        symbol=str(meta.get("symbol") or normalized).strip().upper(),
+        symbol=meta["symbol"].strip().upper(),
         name=str(meta.get("longName") or meta.get("shortName") or normalized).strip(),
         currency=currency,
         exchange_name=str(meta["fullExchangeName"]).strip() if meta.get("fullExchangeName") else None,

@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.core import bank_data
 from backend.server import (
     auto_debit_settings_repo,
-    db,
     fx_service,
     preferences_repo,
     rules_repo,
@@ -21,6 +20,7 @@ from backend.server.deps import current_user
 from backend.server.financial_accounts import manual_replica
 from backend.server.replica_facts import collect_bank_replica_facts
 from backend.server.replica_repo import ReplicaPartition, reconcile_partitions
+from backend.server.snaptrade import SnapTradeService
 
 SCHEMA_VERSION = 2
 
@@ -39,7 +39,7 @@ class ReplicaPullRequest(BaseModel):
 
 def _current_payloads(user_id: int) -> dict[str, dict[str, Any]]:
     manual = manual_replica(user_id)
-    brokerage = db.snaptrade_snapshot(user_id)
+    brokerage = SnapTradeService.snapshot(user_id)
     payloads: dict[str, dict[str, Any]] = {
         "user": {
             "bank_accounts": sorted(

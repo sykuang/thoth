@@ -17,7 +17,7 @@ from backend.server.bank_account_projection import bank_accounts
 
 AccountSource = Literal["manual", "bank_sync", "brokerage_sync"]
 TransactionKind = Literal["opening", "buy", "sell", "fee"]
-ValuationSource = Literal["manual", "yahoo_finance", "manual_fallback"]
+ValuationSource = Literal["manual", "yahoo_finance", "manual_fallback", "yahoo", "mixed", "broker_snapshot"]
 
 
 _ALLOWED_PRODUCT_TYPES = (
@@ -42,6 +42,8 @@ class FinancialAccount(BaseModel):
     manual_balance: str | None = None
     as_of: str | None
     valuation_source: ValuationSource | None = None
+    valuation_as_of: str | None = None
+    valuation_reason: Literal["quote_unavailable", "holdings_unavailable", "positions_unavailable", "cash_unavailable", "invalid_data", "fx_unavailable"] | None = None
     included_in_net_worth: bool
     editable: bool
     deletable: bool
@@ -357,7 +359,9 @@ def _bank_accounts(user_id: int) -> list[FinancialAccount]:
 
 
 def _brokerage_accounts(user_id: int) -> list[FinancialAccount]:
-    snapshot = db.snaptrade_snapshot(user_id)
+    from backend.server.snaptrade import SnapTradeService
+
+    snapshot = SnapTradeService.snapshot(user_id)
     result: list[FinancialAccount] = []
     for account in snapshot["accounts"]:
         provider_id = str(account["id"])
@@ -372,6 +376,9 @@ def _brokerage_accounts(user_id: int) -> list[FinancialAccount]:
             currency=(account.get("balance_currency") or "TWD").upper(),
             balance=account.get("balance_total"),
             as_of=account.get("synced_at"),
+            valuation_source=account.get("valuation_source"),
+            valuation_as_of=account.get("valuation_as_of"),
+            valuation_reason=account.get("valuation_reason"),
             included_in_net_worth=True,
             editable=False,
             deletable=False,

@@ -477,7 +477,7 @@ class SnapTradeService:
             "configured": configured,
             "registered": credentials is not None,
             "connection_count": connection_count,
-            "last_synced_at": self.snapshot(user_id)["last_synced_at"],
+            "last_synced_at": db.snaptrade_snapshot(user_id)["last_synced_at"],
         }
 
     def connection_url(self, user_id: int, redirect_uri: str) -> str:
@@ -781,4 +781,6 @@ class SnapTradeService:
 
     @staticmethod
     def snapshot(user_id: int) -> dict[str, Any]:
-        return db.snaptrade_snapshot(user_id)
+        from backend.server.brokerage_valuation import value_snapshot
+
+        return value_snapshot(db.snaptrade_snapshot(user_id))
