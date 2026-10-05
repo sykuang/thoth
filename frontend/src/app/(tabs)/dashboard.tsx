@@ -6,9 +6,9 @@
  * 手機 (xs): 1 col stack
  * 全頁 NativeWind + dark mode token
  */
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Platform,
@@ -22,10 +22,11 @@ import { useBreakpoint } from '@/hooks/useBreakpoint';
 import { useFrontendDatasetCache } from '@/hooks/useFrontendDatasetCache';
 import { api } from '@/lib/api';
 import { formatSignedCurrency } from '@/lib/currency';
+import { computeLocalPaymentReminders, taipeiPaymentDay } from '@/lib/localPaymentReminders';
+import { addMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
 import { useAuthStore } from '@/stores/auth';
 import {
   type DashboardStats,
-  type PaymentReminder,
   type PortfolioSummary,
   type SyncJob,
 } from '@/types/api';
@@ -55,14 +56,11 @@ export default function Dashboard() {
     },
   });
 
-  // Phase L10 (2026-06-20): 繳費提醒 (信用卡 auto-debit + 餘額不足/未設定)
-  const remindersQ = useQuery<PaymentReminder[]>({
-    queryKey: ['auto-debit', 'reminders', ownerKey, ownerEpoch],
-    queryFn: () => ownerApi<PaymentReminder[]>('/cards/auto-debit/reminders'),
-    enabled: Boolean(ownerKey),
-    // days_until_due 是日期衍生值；app 跨日後回前景時不能沿用昨天的 cache。
-    refetchOnWindowFocus: 'always',
-  });
+  const [paymentDay, setPaymentDay] = useState(taipeiPaymentDay);
+  const reminders = useMemo(() => computeLocalPaymentReminders(
+    datasetQ.data?.paymentReminderInputs, paymentDay,
+  ), [datasetQ.data?.paymentReminderInputs, paymentDay]);
+  const remindersLoading = reminders === undefined && (!datasetQ.isFetched || datasetQ.isRefetching);
 
   // W (2026-06-17): 砍 lastJobByAccount — UI 已沒 per-account 最後同步時間顯示
   // (PortfolioHeader 重寫後 metadata 大砍, account 卡片只顯示主號 + 餘額).
@@ -111,13 +109,18 @@ export default function Dashboard() {
 
   const dashboardMonthRef = useRef(new Date().toISOString().slice(0, 7));
   useEffect(() => {
+    const updateDay = () => setPaymentDay(taipeiPaymentDay());
+    updateDay();
+    // Root AppState wiring already drives focusManager on native.
+    const unsubscribe = focusManager.subscribe(focused => { if (focused) updateDay(); });
     const timer = setInterval(() => {
+      updateDay();
       const month = new Date().toISOString().slice(0, 7);
       if (month === dashboardMonthRef.current) return;
       dashboardMonthRef.current = month;
       void qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
     }, 60_000);
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); unsubscribe(); };
   }, [qc]);
 
   // Sync completion refreshes the canonical replica; portfolio and stats are projected locally.
@@ -187,7 +190,20 @@ export default function Dashboard() {
 
         {/* Phase L10 (2026-06-20) — 繳費提醒 (auto-debit 沒設 / 餘額不足 + 3 天內到期)
             H2 位置: KPI 後, Subscription 前. 空 list 自動 hide. */}
-        <PaymentRemindersCard reminders={remindersQ.data ?? []} />
+        {reminders !== undefined ? <PaymentRemindersCard reminders={reminders} /> : (
+          <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 mb-4">
+            <Text className="text-ink-700 dark:text-ink-200 text-small">
+              {remindersLoading ? '載入繳費提醒…' : '暫時無法載入繳費提醒，請稍後再試。'}
+            </Text>
+            {!remindersLoading && (
+              <Pressable accessibilityRole="button" testID="payment-reminders-retry"
+                className="self-start mt-3 rounded-xl bg-brand-600 px-4 py-2"
+                onPress={() => { void datasetQ.refetch(); }}>
+                <Text className="text-white text-small">重新載入</Text>
+              </Pressable>
+            )}
+          </View>
+        )}
 
         {(showSubscription || showPassive) && (
           <View className={isDesktop ? 'flex-row gap-4' : ''}>
@@ -300,7 +316,7 @@ function KpiBar({
     : currentMonth;
 
   const net = monthData.net;
-  const netColor = net >= 0
+  const netColor = !String(net).startsWith('-')
     ? 'text-accent-600 dark:text-accent-500'
     : 'text-red-600 dark:text-red-400';
 
@@ -443,21 +459,17 @@ function PassiveIncomeCard({
   const byMonth = stats?.passive_income_by_month ?? {};
   const amountByMonth = stats?.amount_by_month ?? {};
   const passive = byMonth[currentMonthKey] ?? 0;
-  if (!passive) return null;  // 本月 0 或 undefined 不顯示
+  if (moneySign(passive) === 0) return null;  // 本月 0 或 undefined 不顯示
 
   const monthIncome = amountByMonth[currentMonthKey]?.income ?? 0;
-  const passivePct = monthIncome > 0
-    ? Math.round((passive / monthIncome) * 1000) / 10
-    : 0;
+  const passivePct = moneyPercentage(passive, monthIncome, 1);
   const ytdPassive = Object.entries(byMonth)
     .filter(([month]) => month.startsWith(`${currentYear}-`))
-    .reduce((sum, [, amount]) => sum + amount, 0);
+    .reduce<Money>((sum, [, amount]) => addMoney(sum, amount), 0);
   const ytdIncome = Object.entries(amountByMonth)
     .filter(([month]) => month.startsWith(`${currentYear}-`))
-    .reduce((sum, [, bucket]) => sum + bucket.income, 0);
-  const ytdPct = ytdIncome > 0
-    ? Math.round((ytdPassive / ytdIncome) * 1000) / 10
-    : 0;
+    .reduce<Money>((sum, [, bucket]) => addMoney(sum, bucket.income), 0);
+  const ytdPct = moneyPercentage(ytdPassive, ytdIncome, 1);
 
   return (
     <View
@@ -525,6 +537,11 @@ function PortfolioHeader({
     );
   }
   if (!portfolio) return null;
+  const valuationWarning = portfolio.brokerage_valuation_incomplete ? (
+    <Text className="text-amber-600 dark:text-amber-400 text-small mt-2">
+      部分券商估值資料不足，請至帳戶查看
+    </Text>
+  ) : null;
 
   // 任何資料都沒抓到 → 顯示一張明確空狀態,不要整塊消失讓使用者以為 UI 壞了。
   if (
@@ -540,6 +557,7 @@ function PortfolioHeader({
         testID="portfolio-header-empty"
       >
         <Text className="text-ink-900 dark:text-ink-50 text-h3 mb-1">資產統計尚無資料</Text>
+        {valuationWarning}
         <Text className="text-ink-500 dark:text-ink-400 text-small">
           已登入但目前沒有可統計的銀行餘額或卡片資料。請到「帳戶」確認各銀行是否已同步並有資料列。
         </Text>
@@ -600,6 +618,7 @@ function PortfolioHeader({
             {formatSignedCurrency(netWorthDisplay, 'TWD')}
           </Text>
         </View>
+        {valuationWarning}
         {/* === 行 2: 本月消費 + 更新時間（一行內，左 label 右 value）=== */}
         <View className="flex-row items-baseline justify-between mt-1">
           <View className="flex-row items-baseline gap-2">

@@ -267,7 +267,7 @@ export default function ManualAccountScreen() {
           {isNew ? '新增手動帳戶' : '編輯手動帳戶'}
         </Text>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-5">
-          投資帳戶優先以 Yahoo 持股市值估算；查價失敗時保留手動目前總值。歷史成交價不會冒充現價。
+          投資帳戶以 Yahoo 股價估算市值；查不到股價時使用手動輸入的總值。
         </Text>
 
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-5">

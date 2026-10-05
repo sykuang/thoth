@@ -44,7 +44,7 @@ def test_snaptrade_connection_and_accounts_live_on_canonical_surfaces():
     assert "(activity.trade_date ?? activity.settlement_date ?? '').slice(0, 10)" in transactions
     assert "enabled: (statusQuery.data?.connection_count ?? 0) > 0" not in sections
     assert "if (!status?.connection_count) return null" not in sections
-    assert "持股資料更新至" in sections
+    assert "持倉更新" in sections
     assert "交易資料更新至" not in sections
     assert "帳戶總覽顯示於「帳戶」；交易明細顯示於「交易」" in sections
     assert "交易明細顯示於「明細」" not in sections
@@ -80,9 +80,30 @@ def test_brokerage_account_row_opens_holdings_detail_not_transactions():
     assert "brokerage_account_id" not in transactions
 
     holdings_section = sections[sections.index("export function SnapTradeHoldingsSection"):]
-    assert "持股資料更新至：{account.synced_at}" in holdings_section
+    assert "持倉更新 ${formatLocalDateTime(account.synced_at)}" in holdings_section
+    assert "holdingTotalCost(position)" in holdings_section
+    assert ">成本<" in holdings_section
+    assert ">目前市值<" in holdings_section
     assert "transactions_last_successful_sync" not in holdings_section
     assert "transactions_first_transaction_date" not in holdings_section
+
+
+def test_connection_health_and_accounts_repair_use_existing_settings_surface():
+    sections = SECTIONS.read_text()
+    settings = sections[:sections.index("export function SnapTradeAccountsSection")]
+    accounts = sections[sections.index("export function SnapTradeAccountsSection"):sections.index("function ActionButton")]
+    assert 'testID="snaptrade-connection-settings"' in settings
+    assert "formatSnapTradeConnectionStatus(status)" in settings
+    assert "status?.connections?.map" in settings
+    assert "connection.disabled === true" in settings
+    assert "connection.disabled === false" in settings
+    assert "onPress={() => openPortal(connection.id!)}" in settings
+    assert "修復連線" in settings
+    assert "connection.disabled === true" in accounts
+    assert "券商連線已停用" in accounts
+    assert "上次成功同步的快照" in accounts
+    assert "router.push('/(tabs)/settings')" in accounts
+    assert "label=\"前往設定修復\"" in accounts
 
 
 def test_brokerage_detail_reports_query_errors_without_global_unsupported_banner():
@@ -94,15 +115,23 @@ def test_brokerage_detail_reports_query_errors_without_global_unsupported_banner
     assert "券商交易讀取失敗" in transactions
 
 
-def test_bank_scoped_transactions_ignore_unrelated_brokerage_query_states():
-    transactions = TRANSACTIONS.read_text()
+def test_portal_repair_refreshes_health_before_sync_and_keeps_target_scoped():
+    settings = SECTIONS.read_text().split("export function SnapTradeAccountsSection")[0]
+    assert "...(reconnect ? { reconnect } : {})" in settings
+    assert "readyPortal.reconnect !== reconnect" in settings
+    assert "connect.data?.ownerKey === ownerKey" in settings
+    assert "connect.data?.ownerEpoch === ownerEpoch" in settings
+    assert "assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch)" in settings
+    assert settings.count("assertReplicaOwnerEpoch(connection.ownerKey, connection.ownerEpoch)") >= 3
+    assert "assertReplicaOwnerEpoch(readyPortal.ownerKey, readyPortal.ownerEpoch)" in settings
+    assert "const refreshed = await statusQuery.refetch({ throwOnError: true })" in settings
+    assert "shouldSyncAfterSnapTradePortal(result.type, refreshed.data, connection.reconnect)" in settings
+    assert settings.index("shouldSyncAfterSnapTradePortal(result.type") < settings.index("await sync.mutateAsync()")
+    assert "if (result.type === 'success')" not in settings
 
-    assert "const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;" in transactions
-    assert "brokerageScopeActive && brokerageQ.isError" in transactions
-    assert "brokerageScopeActive && brokerageQ.isLoading" in transactions
-    assert "enabled: brokerageScopeActive" in transactions
-    assert "const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;" in transactions
-    assert "const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;" in transactions
+
+# Bank/account scope and independent source states are rendered behaviorally in
+# frontend/src/lib/transactionsScreen.test.cjs (tsx --test), not source substrings.
 
 
 def test_brokerage_amounts_use_shared_currency_formatter():

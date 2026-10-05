@@ -351,14 +351,14 @@ export default function LoginScreen() {
 
                   <Field
                     label="X-API-Key"
-                    hint="(對應後端 SERVER_API_KEY env;後端未設定時可留空)"
+                    hint="(選填)"
                   >
                     <View className="flex-row items-center gap-2">
                       <TextInput
                         className="flex-1 border border-ink-200 dark:border-ink-700 rounded-xl px-3.5 py-2.5 text-body bg-white dark:bg-ink-800 text-ink-900 dark:text-ink-50"
                         value={apiKeyInput}
                         onChangeText={setApiKeyInput}
-                        placeholder="(選填 — backend 沒設就空白)"
+                        placeholder="選填"
                         placeholderTextColor="#94a3b8"
                         autoCapitalize="none"
                         autoCorrect={false}
@@ -382,7 +382,7 @@ export default function LoginScreen() {
 
                   {Platform.OS !== 'web' && (
                     <Text className="text-ink-400 dark:text-ink-500 text-micro mb-3 -mt-1">
-                      🔒 兩者都會加密存進 iOS Keychain (AFTER_FIRST_UNLOCK)
+                      🔒 會加密保存在這台裝置
                     </Text>
                   )}
 

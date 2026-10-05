@@ -74,6 +74,7 @@ export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }:
       });
     },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
       qc.invalidateQueries({ queryKey: ['auto-debit', 'settings'] });
       qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
       onClose();
@@ -88,6 +89,7 @@ export function AutoDebitSettingModal({ visible, onClose, cardBank, bankLabel }:
       });
     },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['frontend-dataset'] });
       qc.invalidateQueries({ queryKey: ['auto-debit', 'settings'] });
       qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });
       onClose();

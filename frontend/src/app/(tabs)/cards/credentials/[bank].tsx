@@ -492,7 +492,7 @@ export default function PerBankCredentialsScreen() {
             <Text className="text-ink-900 dark:text-ink-50 text-h1">{bankLabel}</Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small">
               管理該銀行的登入帳號 — 同一家銀行可建多個 (主帳 / 老婆 / 公司)。
-              所有帳密 server 端 Fernet 加密保存; API 不會回傳原文。
+              登入資料會加密保存，不會在畫面顯示密碼。
             </Text>
           </View>
         </View>

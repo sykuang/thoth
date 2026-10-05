@@ -33,6 +33,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { MonthCarousel } from '@/components/transactions/MonthCarousel';
 import { BrokerageTxnRow } from '@/components/transactions/BrokerageTxnRow';
 import { TxnRow } from '@/components/transactions/TxnRow';
+import { addMoney, absMoney, moneySign, moneyPercentage, type Money } from '@/lib/money';
 import { TxnDetailModal } from '@/components/transactions/TxnDetailModal';
 import {
   type Granularity,
@@ -40,10 +41,10 @@ import {
   periodRange,
   periodDisplayLabel,
 } from '@/lib/period';
-import { api, formatApiError } from '@/lib/api';
+import { formatApiError } from '@/lib/api';
 import { categorySortRank, sortCategoryKeys } from '@/lib/category-color';
 import { formatCurrency, formatSignedCurrency } from '@/lib/currency';
-import { mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
+import { isTransactionVisibleForBasis, mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
 import {
   applyTxnFilters,
   aggregateByCategory,
@@ -107,12 +108,14 @@ export default function TransactionsScreen() {
   const cardNo = typeof params.card_no === 'string' ? params.card_no : '';
   const bp = useBreakpoint();
   const datasetQ = useFrontendDatasetCache();
+  const { ownerKey, ownerEpoch, ownerApi } = datasetQ;
   const preferencesQ = usePreferences();
   const prefs = preferencesQ.hasServerData
     ? preferencesQ.data
     : (datasetQ.data?.preferences ?? preferencesQ.data);
   const fxMode = prefs.fx_display_mode;
   const cardDateBasis = prefs.card_date_basis ?? 'consume';
+  const showSnaptradeTransactions = prefs.show_snaptrade_transactions === true;
   const [selectedBanks, setSelectedBanks] = useState<string[]>(initialBank ? [initialBank] : []);
   const [activeAccountNo, setActiveAccountNo] = useState(accountNo);
   const [activeAccountCurrency, setActiveAccountCurrency] = useState(
@@ -184,7 +187,11 @@ export default function TransactionsScreen() {
   /* eslint-enable react-hooks/set-state-in-effect */
   // 統一 row identity：txnKey 與 row key 共用 t.id (Transaction type 已標 required)
   const txnKey = (t: Transaction) => `${t.bank}|${t.kind}|${t.id}`;
+  const hiddenSelectionKeys = new Set((datasetQ.data?.transactions ?? [])
+    .filter(t => !isTransactionVisibleForBasis(t, cardDateBasis)).map(txnKey));
+  const eligibleSelectedKeys = new Set([...selectedKeys].filter(key => !hiddenSelectionKeys.has(key)));
   function toggleSelect(t: Transaction) {
+    if (t.kind === 'loan_repayment') return;
     const k = txnKey(t);
     setSelectedKeys((prev) => {
       const next = new Set(prev);
@@ -199,8 +206,9 @@ export default function TransactionsScreen() {
   }
 
   const bankAccountsQ = useQuery<BankAccount[]>({
-    queryKey: ['accounts'],
-    queryFn: () => api<BankAccount[]>('/accounts'),
+    queryKey: ['accounts', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<BankAccount[]>('/accounts'),
+    enabled: Boolean(ownerKey),
   });
 
   // Transactions come from the local replica; account/card read models remain on
@@ -221,11 +229,13 @@ export default function TransactionsScreen() {
   const effectiveAccountNo = drilldownScopeActive ? activeAccountNo : '';
   const effectiveAccountCurrency = drilldownScopeActive ? activeAccountCurrency : '';
   const effectiveCardNo = drilldownScopeActive ? activeCardNo : '';
-  const brokerageScopeActive = selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
+  const brokerageScopeActive = showSnaptradeTransactions && selectedBanks.length === 0 && !effectiveAccountNo && !effectiveCardNo;
+  const brokerageRelevant = brokerageScopeActive && viewMode === 'list'
+    && !category && !subcategory && direction === 'all' && !selectionMode;
   const brokerageQ = useQuery({
-    queryKey: ['snaptrade', 'portfolio'],
-    queryFn: () => api<SnapTradePortfolio>('/snaptrade/portfolio'),
-    enabled: brokerageScopeActive,
+    queryKey: ['snaptrade', 'portfolio', ownerKey, ownerEpoch],
+    queryFn: () => ownerApi<SnapTradePortfolio>('/snaptrade/portfolio'),
+    enabled: brokerageRelevant && Boolean(ownerKey),
   });
   const activeBrokeragePortfolio = brokerageScopeActive ? brokerageQ.data : undefined;
 
@@ -246,7 +256,7 @@ export default function TransactionsScreen() {
   const transactionRefreshing = (
     (datasetQ.isRefetching && !datasetQ.isLoading)
     || datasetQ.isRefreshingChanges
-    || (brokerageScopeActive && brokerageQ.isRefetching)
+    || (brokerageRelevant && brokerageQ.isRefetching)
   );
 
   // chip 來源 (主類 chip) — 不被 category/subcategory/direction/search filter 影響,
@@ -284,7 +294,7 @@ export default function TransactionsScreen() {
   }, [activeBrokeragePortfolio, brokerageScopeActive, granularity, selectedPeriod]);
 
   const visibleBrokerageActivities = useMemo(() => {
-    if (viewMode !== 'list' || category || subcategory || direction !== 'all' || selectionMode) return [];
+    if (!brokerageRelevant) return [];
     const needle = search.trim().toLowerCase();
     if (!needle) return brokeragePeriodActivities;
     const accounts = new Map((activeBrokeragePortfolio?.accounts ?? []).map((account) => [account.id, account]));
@@ -298,7 +308,7 @@ export default function TransactionsScreen() {
         account?.name,
       ].some((value) => value?.toLowerCase().includes(needle));
     });
-  }, [brokeragePeriodActivities, activeBrokeragePortfolio, viewMode, category, subcategory, direction, search, selectionMode]);
+  }, [brokeragePeriodActivities, activeBrokeragePortfolio, brokerageRelevant, search]);
 
   const timelineItems = useMemo(
     () => mergeTransactionTimeline(
@@ -335,21 +345,21 @@ export default function TransactionsScreen() {
   //   - 2026-07-05 A 方案: 排序改固定生活記帳順序，不按 pct；否則「飲食」仍可能
   //     在分類 view 跑到底，跟上方 category chips 修法不一致。
   const groupedByCategory = useMemo(() => {
-    type Group = { key: string; label: string; subtotal: number; count: number; pct: number };
+    type Group = { key: string; label: string; subtotal: Money; count: number; pct: number };
     const map = new Map<string, Omit<Group, 'pct'>>();
     for (const t of filteredItems) {
       if (t.excluded === true || t.auto_excluded === true) continue;
       if ((t.currency || 'TWD') !== 'TWD') continue;
       const key = t.category || '__null__';
       const g = map.get(key) ?? { key, label: key === '__null__' ? '未分類' : key, subtotal: 0, count: 0 };
-      g.subtotal += txnCashflowAmount(t);
+      g.subtotal = addMoney(g.subtotal, txnCashflowAmount(t));
       g.count += 1;
       map.set(key, g);
     }
     const groups = Array.from(map.values());
-    const total = groups.reduce((s, g) => s + Math.abs(g.subtotal), 0);
+    const total = groups.reduce<Money>((s, g) => addMoney(s, absMoney(g.subtotal)), 0);
     return groups
-      .map<Group>((g) => ({ ...g, pct: total > 0 ? (Math.abs(g.subtotal) / total) * 100 : 0 }))
+      .map<Group>((g) => ({ ...g, pct: moneyPercentage(g.subtotal, total) }))
       .sort((a, b) => {
         const rankDiff = categorySortRank(a.key) - categorySortRank(b.key);
         if (rankDiff !== 0) return rankDiff;
@@ -386,6 +396,11 @@ export default function TransactionsScreen() {
     + Number(subcategory !== '')
     + Number(search.trim().length > 0);
   const brokerageAccountCount = activeBrokeragePortfolio?.accounts.length ?? 0;
+  const noKnownSources = availableBanks.length === 0 && brokerageAccountCount === 0;
+  const sourceInventoryUnknown = noKnownSources && (bankAccountsQ.data === undefined
+    || (showSnaptradeTransactions && brokerageQ.data === undefined));
+  const sourcesPending = datasetQ.isPending || (brokerageRelevant && brokerageQ.isPending);
+  const brokerageUnavailable = brokerageRelevant && brokerageQ.isError && !brokerageQ.data;
   const isUnsupportedAccountDrilldown = Boolean(
     effectiveAccountNo && selectedBanks.length === 1 && TWD_TXN_UNSUPPORTED_BANKS.has(selectedBanks[0]),
   );
@@ -394,7 +409,7 @@ export default function TransactionsScreen() {
   // computePeriodStats(rawItems) 取代. 砍掉 day/year/month 三分支邏輯,
   // 因為全 snapshot 已在 frontend，monthStats 永遠從 rawItems 算就準.
   const incomeAmt = monthStats?.income ?? 0;
-  const expenseAmt = Math.abs(monthStats?.expense ?? 0);
+  const expenseAmt = absMoney(monthStats?.expense ?? 0);
 
   // Period label 給 section header / CategorySummary 用
   const periodLabel = periodDisplayLabel(granularity, selectedPeriod);
@@ -410,7 +425,8 @@ export default function TransactionsScreen() {
           refreshing={transactionRefreshing}
           onRefresh={() => {
             void datasetQ.refreshSnapshot();
-            if (brokerageScopeActive) void brokerageQ.refetch();
+            if (showSnaptradeTransactions && (brokerageRelevant || (sourceInventoryUnknown && brokerageQ.data === undefined))) void brokerageQ.refetch();
+            if (sourceInventoryUnknown) void bankAccountsQ.refetch();
           }}
           tintColor="#7c3aed"
         />
@@ -612,16 +628,31 @@ export default function TransactionsScreen() {
         {/* Full filter controls live in the button-triggered sheet below; keep the list compact. */}
 
         {/* ===== 主表 / 載入 / 錯誤 ===== */}
-        {viewMode === 'list' && brokerageScopeActive && brokerageQ.isError && (
-          <Text className="text-red-600 dark:text-red-400 text-small mb-3">
+        {datasetQ.isError && (datasetQ.data || filteredCount > 0) && (
+          <Text testID="txn-dataset-error" accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mb-3">
+            銀行交易讀取失敗，保留已載入的交易：{formatApiError(datasetQ.error)}
+          </Text>
+        )}
+        {datasetQ.isPending && filteredCount > 0 && (
+          <Text testID="txn-dataset-loading" accessibilityLiveRegion="polite" className="text-ink-500 dark:text-ink-400 text-small mb-3">
+            銀行交易載入中，先顯示已載入的交易
+          </Text>
+        )}
+        {brokerageRelevant && brokerageQ.isError && (
+          <Text testID="txn-brokerage-error" accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mb-3">
             券商交易讀取失敗：{formatApiError(brokerageQ.error)}
           </Text>
         )}
-        {datasetQ.isLoading || (brokerageScopeActive && brokerageQ.isLoading) ? (
+        {brokerageRelevant && brokerageQ.isPending && (
+          <Text testID="txn-brokerage-loading" accessibilityLiveRegion="polite" className="text-ink-500 dark:text-ink-400 text-small mb-3">
+            券商交易載入中，先顯示已載入的交易
+          </Text>
+        )}
+        {filteredCount === 0 && sourcesPending ? (
           <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
             <ActivityIndicator />
           </View>
-        ) : datasetQ.isError ? (
+        ) : filteredCount === 0 && !datasetQ.data && datasetQ.isError ? (
           <View className="bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 rounded-2xl p-5">
             <Text className="text-red-700 dark:text-red-300 text-h3 mb-2">查詢失敗</Text>
             <Text className="text-red-700 dark:text-red-400 text-small">
@@ -629,23 +660,30 @@ export default function TransactionsScreen() {
             </Text>
           </View>
         ) : filteredCount === 0 ? (
-          <View className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
-            <Text className="text-ink-400 dark:text-ink-500 text-h3 mb-1">
-              {brokerageScopeActive && brokerageQ.isError
+          <View testID="txn-empty" className="bg-white dark:bg-ink-900 rounded-2xl p-8 items-center shadow-card">
+            <Text
+              testID={brokerageUnavailable ? undefined : sourceInventoryUnknown ? 'txn-sources-unknown' : noKnownSources ? 'txn-no-sources' : undefined}
+              className="text-ink-400 dark:text-ink-500 text-h3 mb-1"
+            >
+              {brokerageUnavailable
                 ? '券商交易目前無法載入'
-                : availableBanks.length === 0 && brokerageAccountCount === 0
-                  ? '還沒有任何交易來源'
+                : sourceInventoryUnknown
+                  ? '此篩選沒有任何交易'
+                : noKnownSources
+                  ? showSnaptradeTransactions ? '還沒有任何交易來源' : '目前顯示範圍沒有交易來源'
                 : isUnsupportedAccountDrilldown
                   ? '此銀行尚未支援存款交易明細同步'
                   : '此篩選沒有任何交易'}
             </Text>
             <Text className="text-ink-500 dark:text-ink-400 text-small text-center">
-              {brokerageScopeActive && brokerageQ.isError
+              {brokerageUnavailable || sourceInventoryUnknown
                 ? '請下拉重新整理'
-                : availableBanks.length === 0 && brokerageAccountCount === 0
-                  ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                : noKnownSources
+                  ? showSnaptradeTransactions
+                    ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
+                    : '可到「帳戶」新增銀行帳戶，或在「設定」開啟「顯示 SnapTrade 交易明細」'
                 : isUnsupportedAccountDrilldown
-                  ? '目前這家銀行只同步到帳戶餘額，尚未同步存款交易明細；清除篩選也不會出現此帳戶的明細。'
+                  ? '這家銀行目前只同步餘額，沒有交易明細。'
                   : '試試清除篩選或執行同步'}
             </Text>
           </View>
@@ -716,13 +754,13 @@ export default function TransactionsScreen() {
                       }
                     }}
                     onLongPress={() => {
-                      if (!selectionMode) {
+                      if (!selectionMode && item.transaction.kind !== 'loan_repayment') {
                         setSelectionMode(true);
                         setSelectedKeys(new Set([txnKey(item.transaction)]));
                       }
                     }}
-                    selected={selectionMode && selectedKeys.has(txnKey(item.transaction))}
-                    selectionMode={selectionMode}
+                    selected={selectionMode && eligibleSelectedKeys.has(txnKey(item.transaction))}
+                    selectionMode={selectionMode && item.transaction.kind !== 'loan_repayment'}
                   />
                 ))
               ) : (
@@ -731,15 +769,15 @@ export default function TransactionsScreen() {
                 // 按 pct 降序, 大宗在頂
                 groupedByCategory.map((g) => {
                   const barColor =
-                    g.subtotal > 0
+                    moneySign(g.subtotal) > 0
                       ? 'bg-accent-500 dark:bg-accent-500'
-                      : g.subtotal < 0
+                      : moneySign(g.subtotal) < 0
                         ? 'bg-red-500 dark:bg-red-500'
                         : 'bg-ink-400 dark:bg-ink-500';
                   const amountColor =
-                    g.subtotal > 0
+                    moneySign(g.subtotal) > 0
                       ? 'text-accent-600 dark:text-accent-500'
-                      : g.subtotal < 0
+                      : moneySign(g.subtotal) < 0
                         ? 'text-red-600 dark:text-red-400'
                         : 'text-ink-500 dark:text-ink-400';
                   return (
@@ -993,20 +1031,20 @@ export default function TransactionsScreen() {
           <Text className="text-ink-600 dark:text-ink-300 text-h3">✕</Text>
         </Pressable>
         <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">
-          已選 {selectedKeys.size} 筆
+          已選 {eligibleSelectedKeys.size} 筆
         </Text>
         <Pressable
           onPress={() => setBulkSheetOpen(true)}
-          disabled={selectedKeys.size === 0}
+          disabled={eligibleSelectedKeys.size === 0}
           className={`px-4 py-2 rounded-xl ${
-            selectedKeys.size === 0
+            eligibleSelectedKeys.size === 0
               ? 'bg-ink-200 dark:bg-ink-700'
               : 'bg-brand-600 active:bg-brand-700'
           }`}
           testID="txn-selection-bar-edit"
         >
           <Text className={`text-body font-semibold ${
-            selectedKeys.size === 0 ? 'text-ink-400 dark:text-ink-500' : 'text-white'
+            eligibleSelectedKeys.size === 0 ? 'text-ink-400 dark:text-ink-500' : 'text-white'
           }`}>
             編輯
           </Text>
@@ -1017,7 +1055,7 @@ export default function TransactionsScreen() {
     {/* Phase 9.2: BulkEditSheet — 跨平台 modal, 收 N 筆 Promise.all 連發 single PATCH */}
     <BulkEditSheet
       visible={bulkSheetOpen}
-      targets={Array.from(selectedKeys)
+      targets={Array.from(eligibleSelectedKeys)
         .map((k): BulkTarget | null => {
           const [bank, kind, idStr] = k.split('|');
           const id = parseInt(idStr, 10);

@@ -99,7 +99,7 @@ export default function NewBankAccountScreen() {
         <Text className="text-ink-900 dark:text-ink-50 text-h1 mb-2">新增銀行帳號</Text>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
           選銀行 + 取個名字, 下一步填登入欄位 (ID / 密碼 / 使用者名稱)。
-          所有帳密 server 端 Fernet 加密保存。
+          登入資料會加密保存。
         </Text>
 
         {/* Step 1: 選銀行 */}

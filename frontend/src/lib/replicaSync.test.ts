@@ -7,6 +7,7 @@ import {
   loadCompleteReplicaDataset,
   makeReplicaOwnerKey,
   patchReplicaAccountTabCache,
+  projectReplicaDataset,
   ReplicaSyncCancelledError,
   syncReplica,
   updateReplicaAccountTabCache,
@@ -192,6 +193,13 @@ async function main() {
       .preferences.card_date_basis),
     'post',
   );
+  for (const enabled of [true, false]) {
+    await updateReplicaPreferences(serializedStore, ownerKey, getReplicaOwnerEpoch(ownerKey), {
+      fx_display_mode: 'always_twd', show_snaptrade_transactions: enabled,
+    });
+    const restored = JSON.parse(JSON.stringify(await serializedStore.load(ownerKey))) as ReplicaEnvelope;
+    equal(projectReplicaDataset(restored).preferences.show_snaptrade_transactions, enabled);
+  }
   const accountTabCache = {
     cachedAt: '2026-08-10T03:00:00Z',
     balances: [

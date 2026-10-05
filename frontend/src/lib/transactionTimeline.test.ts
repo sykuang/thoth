@@ -1,4 +1,4 @@
-import type { BrokerageAccount, BrokerageActivity, Transaction } from '@/types/api';
+import type { BankTransaction, BrokerageAccount, BrokerageActivity, Transaction } from '@/types/api';
 import { mergeTransactionTimeline, transactionDateForBasis } from './transactionTimeline';
 
 const bankRows = [
@@ -58,7 +58,7 @@ const crossMonthCard = {
   post_date: '2026-08-02',
   amount: -100,
   currency: 'TWD',
-} as Transaction;
+} as BankTransaction;
 if (transactionDateForBasis(crossMonthCard, 'consume') !== '2026-07-31') {
   throw new Error('consume-date basis regressed');
 }
@@ -78,8 +78,23 @@ if (postBasisTimeline[0].source !== 'bank' || postBasisTimeline[0].transaction.i
   throw new Error('post-date timeline ordering regressed');
 }
 const emptyPostCard = { ...crossMonthCard, post_date: '   ' };
-if (transactionDateForBasis(emptyPostCard, 'post') !== '2026-07-31') {
-  throw new Error('empty post-date must fall back to consumption date');
+for (const kind of ['billed', 'pending'] as const) {
+  for (const post_date of [null, undefined, '', '   ']) {
+    const unposted = { ...emptyPostCard, kind, post_date };
+    if (transactionDateForBasis(unposted, 'post') !== '') {
+      throw new Error('post basis must not recognize a card without a real post date');
+    }
+    if (transactionDateForBasis(unposted, 'consume') !== '2026-07-31') {
+      throw new Error('consume basis must retain unposted cards');
+    }
+    const undatedBank = { ...bankRows[0], date: null };
+    const postedPending = { ...crossMonthCard, kind: 'pending' as const, id: 10 };
+    const timeline = mergeTransactionTimeline([unposted, undatedBank, postedPending], brokerageRows, accounts, 'post');
+    if (timeline.length !== 4 || !timeline.some(row => row.source === 'bank' && row.transaction === postedPending)
+      || timeline.some(row => row.source === 'bank' && row.transaction === unposted)) {
+      throw new Error('post timeline must hide only unposted cards, retaining posted pending, undated TWD and brokerage');
+    }
+  }
 }
 
 console.log('transaction timeline checks passed');

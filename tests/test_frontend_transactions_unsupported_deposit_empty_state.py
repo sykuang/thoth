@@ -19,5 +19,5 @@ def test_account_drilldown_empty_state_mentions_unsupported_twd_sync() -> None:
     assert "const isUnsupportedAccountDrilldown = Boolean(" in src
     assert "effectiveAccountNo && selectedBanks.length === 1 && TWD_TXN_UNSUPPORTED_BANKS.has(selectedBanks[0])" in src
     assert "此銀行尚未支援存款交易明細同步" in src
-    assert "尚未同步存款交易明細" in src
+    assert "沒有交易明細" in src
     assert "富邦存款交易明細 crawler 尚未實作" not in src

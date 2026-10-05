@@ -27,6 +27,7 @@ import {
   View,
 } from 'react-native';
 import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
+import { RegexPatternInput } from '@/components/RegexPatternInput';
 
 import { api, ApiError, formatApiError } from '@/lib/api';
 import { sortCategoryKeys } from '@/lib/category-color';
@@ -159,7 +160,7 @@ export default function CategoriesScreen() {
 
   // 二次確認包 (web 用 confirm, native 用 Alert) — 防使用者手滑
   function confirmReset() {
-    const msg = '此動作會砍掉所有自訂規則重塞預設, 無法復原, 確定要繼續？';
+    const msg = '這會刪除所有自訂規則並恢復預設，無法復原，確定要繼續？';
     if (Platform.OS === 'web') {
        
       if (window.confirm(msg)) resetMut.mutate();
@@ -198,9 +199,9 @@ export default function CategoriesScreen() {
   });
 
   const recategorizeMut = useMutation<RecategorizeResult, ApiError, void>({
-    mutationFn: () => api<RecategorizeResult>('/rules/recategorize', { method: 'POST' }),
+    mutationFn: () => api<RecategorizeResult>('/rules/recategorize?force=false', { method: 'POST' }),
     onSuccess: (data) => {
-      // Phase C-fe Warning #1 (2026-06-17): backend rewrite 所有 txn category,
+      // 套用規則只更新未分類交易；同步失效相關列表與統計快取。
       // 必須 invalidate transactions + portfolio summary (current_month_spending
       // 按 category 算), 不然 user 切回 transactions tab 在 staleTime 30s 內看到舊 category。
       qc.invalidateQueries({ queryKey: ['transactions'] });
@@ -208,7 +209,7 @@ export default function CategoriesScreen() {
       qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] });
       setStatus({
         kind: 'ok',
-        msg: `重新分類完成：${data.updated}/${data.total_rows} 筆更新`,
+        msg: `套用完成：${data.updated} 筆未分類交易已更新`,
       });
     },
     onError: (e) => setStatus({ kind: 'err', msg: formatApiError(e) }),
@@ -220,7 +221,7 @@ export default function CategoriesScreen() {
       .map((l) => l.trim())
       .filter((l) => l.length > 0);
     if (!form.pattern || lines.length === 0) {
-      setStatus({ kind: 'err', msg: '請填 pattern 並輸入至少一行範例文字' });
+      setStatus({ kind: 'err', msg: '請填寫比對文字並輸入至少一行範例' });
       return;
     }
     previewMut.mutate({ pattern: form.pattern, sample_texts: lines });
@@ -239,14 +240,12 @@ export default function CategoriesScreen() {
         value={editForm.name}
         onChangeText={(t) => setEditForm({ ...editForm, name: t })}
       />
-      <TextInput
+      <RegexPatternInput
+        testID="rules-edit-pattern"
         className={inputBase}
         placeholder="Regex pattern"
-        placeholderTextColor="#94a3b8"
         value={editForm.pattern}
         onChangeText={(t) => setEditForm({ ...editForm, pattern: t })}
-        autoCapitalize="none"
-        autoCorrect={false}
       />
       <TextInput
         className={inputBase}
@@ -280,7 +279,7 @@ export default function CategoriesScreen() {
       </View>
       <View>
         <Text className="text-ink-700 dark:text-ink-300 text-small font-semibold mb-2">
-          子分類 (選填，留空 = 整主類 match)
+          子分類（選填）
         </Text>
         {editForm.category ? (
           <CategorySubChips
@@ -316,7 +315,7 @@ export default function CategoriesScreen() {
             🚫 不算收支
           </Text>
           <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-            命中此 rule 的交易自動排除 (還款/轉帳/退款/回饋等)
+            符合此規則的交易不納入統計（還款／轉帳／退款／回饋等）
           </Text>
         </View>
         <Switch
@@ -404,14 +403,12 @@ export default function CategoriesScreen() {
               value={form.name}
               onChangeText={(t) => setForm({ ...form, name: t })}
             />
-            <TextInput
+            <RegexPatternInput
+              testID="rules-create-pattern"
               className={inputBase}
               placeholder="Regex pattern（如 北捷|台鐵|高鐵）"
-              placeholderTextColor="#94a3b8"
               value={form.pattern}
               onChangeText={(t) => setForm({ ...form, pattern: t })}
-              autoCapitalize="none"
-              autoCorrect={false}
             />
             {/* Phase 8 (2026-06-15 使用者指示): 分類改 dynamic chip pick + 自訂 input */}
             <View>
@@ -467,7 +464,7 @@ export default function CategoriesScreen() {
               )}
               <TextInput
                 className={inputBase}
-                placeholder="或輸入自訂子分類 (留空 = 整主類 match)"
+                placeholder="或輸入自訂子分類（選填）"
                 placeholderTextColor="#94a3b8"
                 value={form.subcategory}
                 onChangeText={(t) => setForm({ ...form, subcategory: t })}
@@ -491,7 +488,7 @@ export default function CategoriesScreen() {
                   🚫 不算收支
                 </Text>
                 <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-                  命中此 rule 的交易自動排除 (還款/轉帳/退款/回饋等)
+                  符合此規則的交易不納入統計（還款／轉帳／退款／回饋等）
                 </Text>
               </View>
               <Switch
@@ -639,16 +636,14 @@ export default function CategoriesScreen() {
         {showPreview ? (
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
           <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">
-            預覽 match（一行一筆範例文字）
+            預覽比對（一行一筆範例）
           </Text>
-          <TextInput
+          <RegexPatternInput
+            testID="rules-preview-pattern"
             className={inputBase}
             placeholder="Regex pattern"
-            placeholderTextColor="#94a3b8"
             value={form.pattern}
             onChangeText={(pattern) => setForm({ ...form, pattern })}
-            autoCapitalize="none"
-            autoCorrect={false}
           />
           <TextInput
             className={`${inputBase} h-24 mt-3`}
@@ -689,8 +684,11 @@ export default function CategoriesScreen() {
           <Text className="text-ink-500 dark:text-ink-400 text-small mt-1">
             這些操作會大量改動既有規則或交易，執行前請先確認。
           </Text>
-        {/* Recat all + reset: 手機與桌機都用直列，避免危險操作搶寬。 */}
+        {/* 套用到未分類 + reset: 手機與桌機都用直列，避免操作搶寬。 */}
         <View className="gap-2 mt-4">
+          <Text className="text-ink-500 dark:text-ink-400 text-small">
+            僅套用已啟用的規則，已有分類的交易不會變更。
+          </Text>
           <Pressable
             className={`bg-ink-100 dark:bg-ink-800 active:bg-ink-200 dark:active:bg-ink-700 rounded-xl py-3 items-center ${
               recategorizeMut.isPending ? 'opacity-50' : ''
@@ -699,7 +697,7 @@ export default function CategoriesScreen() {
             disabled={recategorizeMut.isPending}
           >
             <Text className="text-ink-900 dark:text-ink-50 text-h3">
-              {recategorizeMut.isPending ? '處理中…' : '重新分類所有交易'}
+              {recategorizeMut.isPending ? '處理中…' : '套用所有規則到未分類'}
             </Text>
           </Pressable>
           {/* Phase 8 (2026-06-15 使用者指示): 一鍵恢復預設 */}

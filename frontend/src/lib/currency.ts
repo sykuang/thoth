@@ -18,6 +18,7 @@
  *   - 外幣: 至少保留幣別慣用位數，原生值最多顯示 6 位
  */
 import type { FxDisplayMode, Transaction } from '@/types/api';
+import { moneySign } from './money';
 import { formatDecimal, formatDecimalFixed } from '@/lib/decimal';
 
 /**
@@ -57,7 +58,8 @@ function currencyFractionDigits(currency: string): number | undefined {
 }
 
 /** 格式化單一金額 → "NT$ 1,234" / "EUR 12.34" / "JPY 1,234" */
-export function formatCurrency(amount: number, currency: string): string {
+export function formatCurrency(amount: number | string, currency: string): string {
+  if (typeof amount === 'string') return `${currencyPrefix(currency)} ${formatDecimal(amount.replace(/^[+-]/, '')) ?? '—'}`;
   const minimum = currencyFractionDigits(currency) ?? 2;
   const maximum = currency.trim().toUpperCase() === 'TWD' ? 0 : Math.max(minimum, 6);
   const formatted = formatNumber(Math.abs(amount), minimum, maximum);
@@ -67,11 +69,12 @@ export function formatCurrency(amount: number, currency: string): string {
 
 /** 顯示 signed numeric 金額；aggregate/KPI 不再各自拼 `$`。 */
 export function formatSignedCurrency(
-  amount: number,
+  amount: number | string,
   currency: string,
   showPositiveSign = false,
 ): string {
-  const sign = amount < 0 ? '-' : showPositiveSign && amount > 0 ? '+' : '';
+  const direction = moneySign(amount);
+  const sign = direction < 0 ? '-' : showPositiveSign && direction > 0 ? '+' : '';
   return `${sign}${formatCurrency(amount, currency)}`;
 }
 
@@ -137,6 +140,10 @@ export type AmountRender = {
  *   (避免 HSBC pending 把 currency=EUR 但 consume_currency 也是 EUR 算外幣兩次)
  */
 export function renderAmount(txn: Transaction, mode: FxDisplayMode = 'auto'): AmountRender {
+  if (txn.kind === 'loan_repayment') return {
+    primary: `${txn.display_sign}${currencyPrefix(txn.currency)} ${formatDecimal(txn.display_amount) ?? '—'}`,
+    sub: null, direction: txn.component === 'principal' ? 'zero' : 'expense',
+  };
   // Phase 6 (B-full): txn_type 決定 direction, 不是純看 amount 符號。
   // 銀行從帳單視角給回饋/退款負值 → 對使用者是正向現金流, 必須顯示綠色正號。
   // payment (還款) 是 transfer, 顯示為中性 (zero), 不算 income 也不算 expense。

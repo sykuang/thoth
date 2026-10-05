@@ -16,12 +16,12 @@ import { maskCardNo } from './mask';
 export function formatTransactionSource(
   bankLabel: string,
   source: {
-    kind: 'twd' | 'billed' | 'pending';
+    kind: 'twd' | 'billed' | 'pending' | 'loan_repayment';
     accountNo: string | null | undefined;
     accountOrCard: string | null | undefined;
   },
 ): string {
-  const accountNo = source.kind === 'twd' ? source.accountNo?.trim() : null;
+  const accountNo = (source.kind === 'twd' || source.kind === 'loan_repayment') ? source.accountNo?.trim() : null;
   if (accountNo) return `${bankLabel} - ${accountNo}`;
 
   const masked = maskCardNo(source.accountOrCard);

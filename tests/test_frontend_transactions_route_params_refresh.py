@@ -56,13 +56,17 @@ def test_transactions_tab_has_pull_to_refresh_that_forces_snapshot_refetch():
     src = TRANSACTIONS_TSX.read_text()
 
     assert "RefreshControl," in src
-    assert "|| (brokerageScopeActive && brokerageQ.isRefetching)" in src
+    assert "|| (brokerageRelevant && brokerageQ.isRefetching)" in src
     assert "refreshControl={" in src
     assert "<RefreshControl" in src
     assert "refreshing={transactionRefreshing}" in src
     assert "onRefresh={() => {" in src
     assert "void datasetQ.refreshSnapshot();" in src
-    assert "if (brokerageScopeActive) void brokerageQ.refetch();" in src
+    refresh = src[src.index("onRefresh={() => {"):src.index('tintColor="#7c3aed"')]
+    assert "brokerageRelevant" in refresh
+    assert "void brokerageQ.refetch();" in refresh
+    # Exact relevant-source and unknown-inventory recovery behavior is exercised
+    # by transactionsScreen.test.cjs through the actual onRefresh callback.
     assert "void Promise.all([datasetQ.refreshSnapshot(), brokerageQ.refetch()]);" not in src
 
 
@@ -143,8 +147,8 @@ def test_bank_filter_options_are_union_of_credential_and_dataset_banks():
     src = TRANSACTIONS_TSX.read_text()
     block = src[src.index("const bankAccountsQ = useQuery<BankAccount[]>"):src.index("const rawItems = useMemo")]
 
-    assert "queryKey: ['accounts']" in block
-    assert "api<BankAccount[]>('/accounts')" in block
+    assert "queryKey: ['accounts', ownerKey, ownerEpoch]" in block
+    assert "ownerApi<BankAccount[]>('/accounts')" in block
     assert "const banks = new Set<string>();" in block
     assert "if (a.has_creds) banks.add(String(a.bank));" in block
     assert "datasetQ.data?.accounts" not in block

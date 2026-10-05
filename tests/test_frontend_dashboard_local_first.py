@@ -27,6 +27,7 @@ def test_dashboard_does_not_read_or_persist_server_aggregates() -> None:
         "'/accounts'",
         "'/portfolio/summary'",
         "'/transactions/stats'",
+        "'/cards/auto-debit/reminders'",
         "fetchCompleteDashboardCache",
         "hasNewerDashboardRevision",
         "persistDashboardCache",
@@ -38,21 +39,18 @@ def test_dashboard_does_not_read_or_persist_server_aggregates() -> None:
 def test_dashboard_keeps_only_live_owner_bound_reads() -> None:
     source = DASHBOARD.read_text(encoding="utf-8")
 
-    for query_key in (
-        "['sync', 'jobs', ownerKey, ownerEpoch]",
-        "['auto-debit', 'reminders', ownerKey, ownerEpoch]",
-    ):
-        assert query_key in source
+    assert "['sync', 'jobs', ownerKey, ownerEpoch]" in source
+    assert "datasetQ.data?.paymentReminderInputs" in source
     owner_hook = OWNER_HOOK.read_text(encoding="utf-8")
     assert "guardReplicaOwnerRequest" in owner_hook
     assert "authRetryGuard: () => assertReplicaOwnerEpoch(ownerKey, ownerEpoch)" in owner_hook
 
 
-def test_sync_completion_refreshes_only_canonical_replica_and_live_reminders() -> None:
+def test_sync_completion_refreshes_canonical_replica_for_local_reminders() -> None:
     source = DASHBOARD.read_text(encoding="utf-8")
 
     assert "qc.invalidateQueries({ queryKey: ['frontend-dataset'] });" in source
-    assert "qc.invalidateQueries({ queryKey: ['auto-debit', 'reminders'] });" in source
+
     assert "queryKey: ['portfolio']" not in source
     assert "queryKey: ['transactions']" not in source
     assert "queryKey: ['accounts']" not in source
