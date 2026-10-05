@@ -12,6 +12,16 @@ import pytest
 REDIRECT_URI = "thoth:///investments"
 
 
+@pytest.fixture(autouse=True)
+def _offline_quotes(monkeypatch):
+    from backend.server import yahoo_finance
+
+    def unavailable(_):
+        raise yahoo_finance.YahooFinanceUnavailable('synthetic unavailable quote')
+
+    monkeypatch.setattr(yahoo_finance, 'get_quote', unavailable)
+
+
 class FakeSnapTradeGateway:
     def __init__(self) -> None:
         self.fail_positions = False

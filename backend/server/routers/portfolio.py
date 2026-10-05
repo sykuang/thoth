@@ -510,6 +510,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
     total_assets = 0
     fx_assets_twd = 0           # 外幣帳戶 TWD 估值 sum (給 frontend 大字用)
     brokerage_assets_twd = 0    # SnapTrade account total；不重加 cash / positions
+    brokerage_valuation_incomplete = False
     manual_assets_twd = 0       # 手動存款 + 投資 current valuation（breakdown only）
     manual_liabilities_twd = 0  # 手動貸款 current valuation（breakdown only）
     total_liabilities = 0       # 信用卡未繳 + 貸款餘額
@@ -680,20 +681,27 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         })
 
     try:
-        brokerage_snapshot = db.snaptrade_snapshot(user_id)
+        from backend.server.snaptrade import SnapTradeService
+
+        brokerage_snapshot = SnapTradeService.snapshot(user_id)
         for account in brokerage_snapshot["accounts"]:
+            brokerage_valuation_incomplete |= bool(account.get("valuation_reason"))
             amount = account.get("balance_total")
             currency = account.get("balance_currency")
             if amount is None or not currency:
+                brokerage_valuation_incomplete = True
                 continue
             try:
                 estimate = convert_to_twd(amount, currency)
             except ValueError:
                 raise
             except Exception:
+                brokerage_valuation_incomplete = True
                 continue
             if estimate is not None:
                 brokerage_assets_twd = _twd(brokerage_assets_twd + estimate)
+            else:
+                brokerage_valuation_incomplete = True
         brokerage_as_of = _normalize_iso_date(brokerage_snapshot.get("last_synced_at"))
         if brokerage_as_of and (overall_latest is None or brokerage_as_of > overall_latest):
             overall_latest = brokerage_as_of
@@ -701,7 +709,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         raise
     except Exception:
         # 券商快照 / FX 失敗不應遮蔽既有銀行 summary。
-        pass
+        brokerage_valuation_incomplete = True
 
     # 手動帳戶共用既有 product taxonomy 與 summary buckets。交易明細只作
     # journal；不以歷史成交價冒充 current valuation。First-party manual store
@@ -754,6 +762,7 @@ def _compute_portfolio_summary(user_id: int) -> dict[str, Any]:
         "total_assets": total_assets,                       # TWD only (真實)
         "fx_assets_twd": fx_assets_twd,                     # 銀行外幣帳戶 TWD 估值
         "brokerage_assets_twd": brokerage_assets_twd,       # 券商帳戶 TWD 估值
+        "brokerage_valuation_incomplete": brokerage_valuation_incomplete,
         "manual_assets_twd": manual_assets_twd,             # 手動資產獨立 bucket
         "manual_liabilities_twd": manual_liabilities_twd,   # 手動負債 breakdown（已含 total_liabilities）
         "total_assets_with_fx": total_assets_with_fx,       # 含銀行外幣、券商與手動資產估值

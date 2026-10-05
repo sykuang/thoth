@@ -50,6 +50,7 @@ def test_get_preferences_returns_default_when_unset(client: TestClient) -> None:
     assert r.json() == {
         "fx_display_mode": "auto",
         "card_date_basis": "consume",
+        "show_snaptrade_transactions": False,
     }
 
 
@@ -87,6 +88,46 @@ def test_put_preferences_partial_update_preserves_unknown_fields(
     r = client.put("/users/me/preferences", headers=h, json={})
     assert r.status_code == 200
     assert r.json()["fx_display_mode"] == "always_original"
+
+
+def test_snaptrade_visibility_roundtrip_is_partial_and_user_scoped(client: TestClient) -> None:
+    h = {"Authorization": f"Bearer {_register_and_login(client)}"}
+    for enabled in (True, False):
+        r = client.put(
+            "/users/me/preferences", headers=h,
+            json={"show_snaptrade_transactions": enabled},
+        )
+        assert r.status_code == 200
+        assert r.json()["show_snaptrade_transactions"] is enabled
+        # An unrelated update and null (the existing optional-field contract)
+        # must preserve both true and explicitly persisted false.
+        r = client.put(
+            "/users/me/preferences", headers=h,
+            json={"fx_display_mode": "always_twd", "show_snaptrade_transactions": None},
+        )
+        assert r.status_code == 200
+        persisted = client.get("/users/me/preferences", headers=h).json()
+        assert persisted["show_snaptrade_transactions"] is enabled
+        assert persisted["fx_display_mode"] == "always_twd"
+        assert persisted["card_date_basis"] == "consume"
+
+    other = client.post(
+        "/auth/register", json={"email": "other@test.com", "password": "real-password-123"},
+    )
+    assert other.status_code == 201
+    other_h = {"Authorization": f"Bearer {other.json()['token']}"}
+    client.put("/users/me/preferences", headers=h, json={"show_snaptrade_transactions": True})
+    assert client.get("/users/me/preferences", headers=other_h).json()["show_snaptrade_transactions"] is False
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1, [], {}])
+def test_snaptrade_visibility_rejects_non_boolean(client: TestClient, value) -> None:
+    h = {"Authorization": f"Bearer {_register_and_login(client)}"}
+    r = client.put(
+        "/users/me/preferences", headers=h, json={"show_snaptrade_transactions": value},
+    )
+    assert r.status_code == 422
+    assert client.get("/users/me/preferences", headers=h).json()["show_snaptrade_transactions"] is False
 
 
 def test_put_preferences_invalid_enum_rejected(client: TestClient) -> None:
