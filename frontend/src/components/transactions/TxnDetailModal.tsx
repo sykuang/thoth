@@ -9,7 +9,7 @@
  *   不再 inline chip 多選, 用 @/components/Dropdown 統一 affordance.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -25,6 +25,8 @@ import { CategoryPicker } from '@/components/CategoryPicker';
 import { Dropdown } from '@/components/Dropdown';
 import { TagPicker } from '@/components/TagPicker';
 import { ApiError, api, formatApiError } from '@/lib/api';
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
+import { assertReplicaOwnerEpoch } from '@/lib/replica';
 import { sortCategoryKeys } from '@/lib/category-color';
 import {
   formatSignedCurrency,
@@ -58,12 +60,82 @@ export type TxnDetailModalProps = {
   onClose: () => void;
 };
 
-export function TxnDetailModal({
+export function TxnDetailModal(props: TxnDetailModalProps) {
+  if (props.txn?.kind === 'loan_repayment') return <LoanTxnDetail key={`${props.txn.bank}:${props.txn.id}`} {...props} txn={props.txn} />;
+  return <EditableTxnDetailModal {...props} txn={props.txn} />;
+}
+
+export function LoanTxnDetail(props: Omit<TxnDetailModalProps, 'txn'> & {txn: import('@/types/api').LoanTransaction}) {
+    const {txn} = props;
+    const qc = useQueryClient();
+    const owner = useOwnerBoundApi();
+    const [session] = useState(owner);
+    const {ownerKey, ownerEpoch, request: ownerApi} = session;
+    const isCurrent = () => {
+      if (!ownerKey || owner.ownerKey !== ownerKey || owner.ownerEpoch !== ownerEpoch) return false;
+      try { assertReplicaOwnerEpoch(ownerKey, ownerEpoch); return true; } catch { return false; }
+    };
+    const live = useRef(true);
+    useEffect(() => {
+      live.current = true;
+      return () => { live.current = false; };
+    }, []);
+    const close = () => {
+      if (!live.current) return;
+      live.current = false;
+      props.onClose();
+    };
+    const [editCat, setEditCat] = useState(txn.category ?? '');
+    const [editSub, setEditSub] = useState(txn.subcategory ?? '');
+    const [editIgnored, setEditIgnored] = useState(txn.auto_excluded ?? false);
+    const categoriesQ = useQuery({queryKey:['rules','categories',ownerKey,ownerEpoch], queryFn:() => ownerApi<{categories:string[]}>('/rules/categories'), enabled:isCurrent(), staleTime:60_000});
+    const subcategoriesQ = useQuery({queryKey:['rules','subcategories',editCat,ownerKey,ownerEpoch], queryFn:() => ownerApi<{subcategories:string[]}>(`/rules/subcategories?category=${encodeURIComponent(editCat)}`), enabled:isCurrent() && !!editCat, staleTime:60_000});
+    const patchMut = useMutation({
+      mutationFn: (body: {category:string|null; subcategory:string|null; auto_excluded:boolean}) => ownerApi<import('@/types/api').LoanTransaction>(`/transactions/${txn.bank}/loan_repayment/${encodeURIComponent(txn.id)}`, {method:'PATCH',body}),
+      onSuccess: () => { if (isCurrent()) close(); },
+      onSettled: () => {
+        if (!isCurrent()) return;
+        qc.invalidateQueries({queryKey:['transactions']});
+        qc.invalidateQueries({queryKey:['frontend-dataset']});
+        qc.invalidateQueries({queryKey:['portfolio','summary']});
+      },
+    });
+    const current = isCurrent();
+    useEffect(() => {
+      if (!current && live.current) {
+        live.current = false;
+        props.onClose();
+      }
+    }, [current, props.onClose]);
+    const hasChange = editCat !== (txn.category ?? '') || editSub !== (txn.subcategory ?? '') || editIgnored !== (txn.auto_excluded ?? false);
+    if (!current) return null;
+    const amount = renderAmount(txn, props.fxMode);
+    return <Modal visible onRequestClose={close} animationType="slide" presentationStyle="pageSheet">
+      <ScrollView testID="loan-detail" className="bg-white dark:bg-ink-900" contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{padding:24}}>
+        <Text className="text-h2 text-ink-900 dark:text-ink-50">{txn.description}</Text>
+        <Text className={amount.direction === 'zero' ? 'text-ink-500 dark:text-ink-400' : 'text-red-600 dark:text-red-400'}>{amount.primary}</Text>
+        <Text className="text-ink-700 dark:text-ink-300">{formatTransactionSource(BANK_LABELS[txn.bank as SupportedBank] ?? txn.bank, {kind:txn.kind, accountNo:txn.account_no, accountOrCard:txn.account_or_card})}</Text>
+        {Object.entries({sub_account:'子帳號',currency:'幣別',due_date:'應繳日期',paid_on:'繳款日期',status:'繳款狀態',principal:'本金',interest:'利息',penalty:'違約金',paid_total:'繳款總額',principal_balance:'本金餘額',query_start:'查詢起日',query_end:'查詢迄日'}).map(([key,label]) => <DetailRow key={key} label={label} value={String(txn.loan_repayment[key as keyof typeof txn.loan_repayment] ?? '—')} />)}
+        <CategoryPicker label="主分類" value={editCat} onChange={next => {setEditCat(next); if (next !== editCat) setEditSub('');}} options={sortCategoryKeys([...new Set([...(categoriesQ.data?.categories ?? []), ...editCat ? [editCat] : []])]).map(value => ({label:value,value}))} disabled={categoriesQ.isLoading || patchMut.isPending} testID="txn-detail-category-dropdown" />
+        {editCat ? <Dropdown label="子分類" value={editSub} onChange={setEditSub} options={[...new Set([...(subcategoriesQ.data?.subcategories ?? []), ...editSub ? [editSub] : []])].map(value => ({label:value,value}))} clearLabel="(無子分類)" disabled={subcategoriesQ.isLoading || patchMut.isPending} testID="txn-detail-subcategory-dropdown" /> : null}
+        <Pressable accessibilityRole="switch" accessibilityLabel="忽略這筆" accessibilityState={{checked:editIgnored}} disabled={patchMut.isPending} testID="txn-detail-ignore-toggle" onPress={() => setEditIgnored(value => !value)} className="flex-row items-center justify-between rounded-xl border border-ink-200 dark:border-ink-700 p-3 my-3">
+          <View><Text className="text-ink-900 dark:text-ink-50">忽略這筆</Text><Text className="text-ink-500">勾起來 → 不納入本月消費 / 收支統計</Text></View>
+          <View className={`w-12 h-7 rounded-full justify-center px-0.5 ${editIgnored ? 'bg-brand-600' : 'bg-ink-300 dark:bg-ink-600'}`}><View className={`w-6 h-6 rounded-full bg-white ${editIgnored ? 'self-end' : 'self-start'}`} /></View>
+        </Pressable>
+        {txn.excluded && <Text className="text-ink-500">此帳戶已排除，不納入統計。</Text>}
+        {patchMut.isError && <Text accessibilityRole="alert" className="text-red-600">{formatApiError(patchMut.error)}</Text>}
+        <Pressable accessibilityRole="button" testID="txn-detail-save" disabled={!isCurrent() || !hasChange || patchMut.isPending} onPress={() => {if (live.current && isCurrent() && hasChange && !patchMut.isPending) patchMut.mutate({category:editCat || null,subcategory:editSub || null,auto_excluded:editIgnored});}} className="py-3 rounded-xl bg-brand-600 items-center"><Text className="text-white">{patchMut.isPending ? '儲存中…' : '儲存'}</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="關閉貸款明細" className="py-4" onPress={close}><Text className="text-brand-600 dark:text-brand-400">關閉</Text></Pressable>
+      </ScrollView>
+    </Modal>;
+}
+
+function EditableTxnDetailModal({
   txn,
   fxMode,
   cardDateBasis = 'consume',
   onClose,
-}: TxnDetailModalProps) {
+}: Omit<TxnDetailModalProps, 'txn'> & {txn: import('@/types/api').BankTransaction | null}) {
   const qc = useQueryClient();
   const [editCat, setEditCat] = useState('');
   const [editSub, setEditSub] = useState('');
@@ -72,7 +144,15 @@ export function TxnDetailModal({
   const [editIgnored, setEditIgnored] = useState(false);  // Phase 9.3: 忽略不納入統計
   const [editSplits, setEditSplits] = useState<DraftSplit[]>([]);  // Phase 10: 分類拆帳
   const [tagPickerVisible, setTagPickerVisible] = useState(false);  // Phase 9.1
-  const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+
+  // The top pickers and each part's picker share the same split draft.
+  // editCat/editSub remain the parent's values for the parent PATCH payload.
+  const isSplitChild = txn?.split_of != null;
+  const [selectedSplitIndex, setSelectedSplitIndex] = useState(-1);
+  const selectedSplit = isSplitChild ? editSplits[selectedSplitIndex] : undefined;
+  const categoryValue = isSplitChild ? (selectedSplit?.category ?? '') : editCat;
+  const subcategoryValue = isSplitChild ? (selectedSplit?.subcategory ?? '') : editSub;
 
   // Phase 8.2: 主類列表 (完整 /rules/categories — 跟 filter 上方共用 source).
   // 2026-07-06: API 為了 distinct 用 SQL ORDER BY category，會把「飲食」排到最底；
@@ -90,12 +170,12 @@ export function TxnDetailModal({
 
   // Phase 8.2: 子類列表 — 主類選定才撈
   const subcategoriesQ = useQuery<{ subcategories: string[] }, ApiError>({
-    queryKey: ['rules', 'subcategories', editCat],
+    queryKey: ['rules', 'subcategories', categoryValue],
     queryFn: () =>
       api<{ subcategories: string[] }>(
-        `/rules/subcategories?category=${encodeURIComponent(editCat)}`,
+        `/rules/subcategories?category=${encodeURIComponent(categoryValue)}`,
       ),
-    enabled: txn !== null && !!editCat,
+    enabled: txn !== null && !!categoryValue,
     staleTime: 60_000,
   });
 
@@ -104,17 +184,29 @@ export function TxnDetailModal({
   // 使用者點子項要編輯時, 必須改的是母筆 —— 這裡把 txn 正規化成「編輯目標」:
   //   子項 → 用 split_of 撈母筆 (帶完整 splits)
   //   母筆 → 直接用
-  const isSplitChild = txn?.split_of != null;
   const editTargetId = isSplitChild ? txn?.split_of : txn?.id;
-  const parentQ = useQuery<Transaction, ApiError>({
+  const parentQ = useQuery<import('@/types/api').BankTransaction, ApiError>({
     queryKey: ['transactions', 'detail', txn?.bank, txn?.kind, editTargetId],
     queryFn: () =>
-      api<Transaction>(`/transactions/${txn!.bank}/${txn!.kind}/${editTargetId}`),
+      api<import('@/types/api').BankTransaction>(`/transactions/${txn!.bank}/${txn!.kind}/${editTargetId}`),
     enabled: txn !== null && isSplitChild,
     staleTime: 10_000,
   });
   // 子項在母筆載回前先用自己顯示 (避免閃爍), 但編輯欄位以母筆為準
   const editTarget = isSplitChild ? (parentQ.data ?? null) : txn;
+  const selectionKey = JSON.stringify([txn?.bank, txn?.kind, txn?.id, txn?.split_of, txn?.split_index]);
+  const [editContext, setEditContext] = useState<{ target: NonNullable<typeof editTarget>; selectionKey: string; splitChild: boolean } | null>(null);
+  const targetReady = editTarget != null && editContext?.target === editTarget &&
+    editContext.selectionKey === selectionKey && (!isSplitChild || (
+    Number.isInteger(txn?.split_index) && txn!.split_index! >= 0 &&
+    txn!.split_index! < (editTarget.splits?.length ?? 0)
+  ));
+  const activeContext = useRef(editContext);
+  useLayoutEffect(() => {
+    activeContext.current = targetReady ? editContext : null;
+    return () => { activeContext.current = null; };
+  }, [editContext, targetReady]);
+  const categoryEditable = targetReady && (!isSplitChild || selectedSplit != null);
 
   // txn 變了重設輸入框（每次開新 modal）— 必須 useEffect 因為純 setState side effect
   useEffect(() => {
@@ -123,8 +215,9 @@ export function TxnDetailModal({
     // 不能用 useMemo (state 是 user 編輯後可變的), 不能用 key 重 mount
     // (modal animation 會炸). 標準 derived-state-reset pattern.
     // Phase 10: 依 editTarget (子項時是母筆) 初始化, 不是 txn 本身。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setEditContext(editTarget ? { target: editTarget, selectionKey, splitChild: isSplitChild } : null);
     if (editTarget) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditCat(editTarget.category ?? '');
        
       setEditSub(editTarget.subcategory ?? '');
@@ -136,17 +229,19 @@ export function TxnDetailModal({
       setEditIgnored(editTarget.auto_excluded ?? false);  // Phase 9.3: 沿用 backend flag
        
       setEditSplits(toDraftSplits(editTarget.splits));  // Phase 10
+      setSelectedSplitIndex(txn?.split_index ?? -1);
        
       setTagPickerVisible(false);  // Phase 9.1: 重置 picker
        
       setStatus(null);
     }
-  }, [editTarget]);
+  }, [editTarget, selectionKey, txn?.split_index, isSplitChild]);
 
   const patchMut = useMutation<
     Transaction,
     ApiError,
     {
+      context: typeof editContext;
       category: string;
       subcategory: string;
       description_overwrite: string;
@@ -158,14 +253,15 @@ export function TxnDetailModal({
     },
     { listSnaps: [readonly unknown[], unknown][]; statsSnaps: [readonly unknown[], unknown][] }
   >({
-    mutationFn: ({ category, subcategory, description_overwrite, tags, auto_excluded, splits }) => {
-      if (!txn || editTargetId == null) throw new Error('no txn');
+    mutationFn: ({ context, category, subcategory, description_overwrite, tags, auto_excluded, splits }) => {
+      if (!context || activeContext.current !== context) throw new Error('no valid edit target');
+      const target = context.target;
       // Phase 10: 一律 PATCH 母筆 (子項 id 帶 '#' 後綴, backend 不認)
       return api<Transaction>(
-        `/transactions/${txn.bank}/${txn.kind}/${editTargetId}`,
+        `/transactions/${target.bank}/${target.kind}/${target.id}`,
         {
           method: 'PATCH',
-          body: { category, subcategory, description_overwrite, tags, auto_excluded, splits },
+          body: { ...(!context.splitChild ? { category, subcategory } : {}), description_overwrite, tags, auto_excluded, splits },
         },
       );
     },
@@ -191,7 +287,7 @@ export function TxnDetailModal({
     // 安全網: onSettled 仍 invalidate, server truth 在 ~300ms 後回來覆蓋 optimistic,
     // 任何小算錯都會 self-heal.
     onMutate: async (vars) => {
-      if (!txn || vars.splitsChanged) return { listSnaps: [], statsSnaps: [] };
+      if (!txn || activeContext.current !== vars.context || isSplitChild || vars.splitsChanged) return { listSnaps: [], statsSnaps: [] };
 
       await qc.cancelQueries({ queryKey: ['transactions'] });
 
@@ -266,18 +362,17 @@ export function TxnDetailModal({
 
       return { listSnaps, statsSnaps };
     },
-    onError: (e, _vars, ctx) => {
+    onError: (e, vars, ctx) => {
       // Rollback: snapshot 全部還原
       if (ctx) {
         for (const [key, data] of ctx.listSnaps) qc.setQueryData(key, data);
         for (const [key, data] of ctx.statsSnaps) qc.setQueryData(key, data);
       }
-      setStatus({ kind: 'err', msg: formatApiError(e) });
+      if (activeContext.current === vars.context) setStatus(formatApiError(e));
     },
-    onSuccess: () => {
-      setStatus({ kind: 'ok', msg: '已儲存' });
-      // 給 250ms 顯示提示, 再關 modal
-      setTimeout(onClose, 350);
+    onSuccess: (_data, vars) => {
+      // Close before refetch replaces the draft context; stale sessions stay guarded.
+      if (activeContext.current === vars.context) onClose();
     },
     onSettled: () => {
       // Server truth 覆蓋 optimistic — 任何 sub / auto_excluded 沒 optimistic 的欄位
@@ -334,6 +429,7 @@ export function TxnDetailModal({
       return (
         d.amount !== o.amount ||
         d.category !== o.category ||
+        d.subcategory !== o.subcategory ||
         d.note !== o.note ||
         d.auto_excluded !== o.auto_excluded
       );
@@ -341,7 +437,7 @@ export function TxnDetailModal({
   const splitError = validateDrafts(editSplits, splitParentAmount);
 
   const hasChange =
-    base != null &&
+    targetReady && base != null &&
     (editCat !== (base.category ?? '') ||
       editSub !== (base.subcategory ?? '') ||
       editDesc.trim() !== (base.description_overwrite ?? '') ||
@@ -448,7 +544,7 @@ export function TxnDetailModal({
                 <DetailRow
                   label="認列方式"
                   value={cardDateBasis === 'post' && !postDate
-                    ? '暫按消費日（尚未取得入帳日）'
+                    ? '未納入入帳日顯示與統計（尚未取得入帳日）'
                     : cardDateBasis === 'post' ? '入帳日' : '消費日'}
                 />
               </>
@@ -493,26 +589,38 @@ export function TxnDetailModal({
           <View className="mb-3">
             <CategoryPicker
               label="主分類"
-              value={editCat}
+              value={categoryValue}
               onChange={(next) => {
+                if (!categoryEditable || activeContext.current !== editContext) return;
+                if (isSplitChild) {
+                  setEditSplits(drafts => drafts.map(d => d === selectedSplit
+                    ? { ...d, category: next, subcategory: next === d.category ? d.subcategory : '' }
+                    : d));
+                  return;
+                }
                 setEditCat(next);
                 // 換主類自動清子類, 避免「餐廳」套到「交通」
                 if (next !== editCat) setEditSub('');
               }}
               options={categoryOptions}
               placeholder={categoriesQ.isLoading ? '載入中…' : '請選擇主分類'}
-              disabled={categoriesQ.isLoading}
+              disabled={categoriesQ.isLoading || !categoryEditable}
               testID="txn-detail-category-dropdown"
               modalTitle="選擇分類"
             />
 
             {/* 子類 — 選了主類才顯示 */}
-            {editCat ? (
+            {categoryValue ? (
               <View className="mt-3">
                 <Dropdown
                   label="子分類"
-                  value={editSub}
-                  onChange={setEditSub}
+                  value={subcategoryValue}
+                  onChange={next => {
+                    if (!categoryEditable || activeContext.current !== editContext) return;
+                    if (isSplitChild) {
+                      setEditSplits(drafts => drafts.map(d => d === selectedSplit ? { ...d, subcategory: next } : d));
+                    } else setEditSub(next);
+                  }}
                   options={(subcategoriesQ.data?.subcategories ?? []).map((s) => ({
                     label: s,
                     value: s,
@@ -525,6 +633,7 @@ export function TxnDetailModal({
                         : '(無子分類)'
                   }
                   disabled={
+                    !categoryEditable ||
                     subcategoriesQ.isLoading ||
                     (subcategoriesQ.data?.subcategories ?? []).length === 0
                   }
@@ -622,7 +731,14 @@ export function TxnDetailModal({
           {!editIgnored && splitParentAmount > 0 ? (
             <SplitEditor
               drafts={editSplits}
-              onChange={setEditSplits}
+              onChange={(next, removedIndex) => {
+                if (!targetReady || activeContext.current !== editContext) return;
+                // Local indexes suffice: removal shifts the selected slot; deleting
+                // that slot or cancelling splits disables top pickers, never retargets.
+                if (next.length === 0 || removedIndex === selectedSplitIndex) setSelectedSplitIndex(-1);
+                else if (removedIndex != null && removedIndex < selectedSplitIndex) setSelectedSplitIndex(selectedSplitIndex - 1);
+                setEditSplits(next);
+              }}
               parentAmount={splitParentAmount}
               categoryOptions={categoryOptions}
               categoriesLoading={categoriesQ.isLoading}
@@ -631,21 +747,9 @@ export function TxnDetailModal({
 
           {/* Status */}
           {status && (
-            <View
-              className={`rounded-xl p-3 mb-3 ${
-                status.kind === 'ok'
-                  ? 'bg-accent-100 dark:bg-accent-950'
-                  : 'bg-red-100 dark:bg-red-950'
-              }`}
-            >
-              <Text
-                className={`text-small ${
-                  status.kind === 'ok'
-                    ? 'text-accent-700 dark:text-accent-300'
-                    : 'text-red-700 dark:text-red-300'
-                }`}
-              >
-                {status.msg}
+            <View className="rounded-xl p-3 mb-3 bg-red-100 dark:bg-red-950">
+              <Text className="text-small text-red-700 dark:text-red-300">
+                {status}
               </Text>
             </View>
           )}
@@ -661,8 +765,10 @@ export function TxnDetailModal({
               </Text>
             </Pressable>
             <Pressable
-              onPress={() =>
+              onPress={() => {
+                if (!targetReady || activeContext.current !== editContext || patchMut.isPending || !hasChange || splitError !== null) return;
                 patchMut.mutate({
+                  context: editContext,
                   category: editCat,
                   subcategory: editSub,
                   description_overwrite: editDesc.trim(),
@@ -670,8 +776,8 @@ export function TxnDetailModal({
                   auto_excluded: editIgnored,
                   splits: toApiSplits(editSplits),
                   splitsChanged,
-                })
-              }
+                });
+              }}
               disabled={patchMut.isPending || !hasChange || splitError !== null}
               className={`flex-1 py-3 rounded-xl bg-brand-600 active:bg-brand-500 ${
                 patchMut.isPending || !hasChange || splitError !== null ? 'opacity-40' : ''

@@ -22,6 +22,7 @@ import { KeyboardAwareScrollView } from '@/components/KeyboardAwareScrollView';
 import { SnapTradeConnectionSettings } from '@/components/SnapTradeSections';
 
 import { usePreferences } from '@/hooks/usePreferences';
+import { formatApiError } from '@/lib/api';
 import { biometricAvailable } from '@/lib/biometric';
 import { clearCredentials, hasCredentials } from '@/lib/credentials';
 import {
@@ -49,6 +50,8 @@ export default function SettingsHomeScreen() {
           <FxDisplayToggle />
           <View className="h-px bg-ink-100 dark:bg-ink-800 my-3" />
           <CardDateBasisToggle />
+          <View className="h-px bg-ink-100 dark:bg-ink-800 my-3" />
+          <SnapTradeTransactionsToggle />
         </SettingsGroup>
 
         <SettingsGroup title="分類與自動化" testID="settings-classification-group">
@@ -268,7 +271,7 @@ function CardDateBasisToggle() {
     >
       <Text className="text-ink-500 dark:text-ink-400 text-small mb-3">
         此設定會影響明細篩選、月份歸屬與統計。銀行尚未提供入帳日時，
-        該筆會標示「消費日」並暫按消費日認列。
+        選擇入帳日時該筆不顯示也不納入統計；切回消費日仍可查看。
       </Text>
       <View
         className={`self-start flex-row bg-ink-100 dark:bg-ink-800 rounded-lg p-1 ${
@@ -301,6 +304,45 @@ function CardDateBasisToggle() {
         })}
       </View>
     </SettingsDisclosure>
+  );
+}
+
+function SnapTradeTransactionsToggle() {
+  const { data: prefs, mutate, isLoading, hasServerData, isMutating, error, mutationError } = usePreferences();
+  const disabled = isLoading || !hasServerData || isMutating;
+
+  return (
+    <View className="py-4">
+      <View className="flex-row items-center gap-3">
+        <View className="flex-1">
+          <Text className="text-ink-900 dark:text-ink-50 text-body font-semibold">
+            顯示 SnapTrade 交易明細
+          </Text>
+          <Text className="text-ink-500 dark:text-ink-400 text-small mt-0.5">
+            僅影響交易明細列表，不影響帳戶持倉。
+          </Text>
+        </View>
+        <Switch
+          value={prefs.show_snaptrade_transactions === true}
+          onValueChange={(next) => {
+            if (!disabled) mutate({ show_snaptrade_transactions: next });
+          }}
+          disabled={disabled}
+          accessibilityLabel="顯示 SnapTrade 交易明細"
+          testID="settings-snaptrade-transactions-toggle"
+        />
+      </View>
+      {error && (
+        <Text accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mt-2">
+          設定讀取失敗：{formatApiError(error)}
+        </Text>
+      )}
+      {mutationError && (
+        <Text accessibilityLiveRegion="polite" className="text-red-600 dark:text-red-400 text-small mt-2">
+          設定儲存失敗，請重試：{formatApiError(mutationError)}
+        </Text>
+      )}
+    </View>
   );
 }
 

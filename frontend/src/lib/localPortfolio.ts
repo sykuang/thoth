@@ -349,14 +349,16 @@ function manualTotals(envelope: ReplicaEnvelope, rates: Row): {
   return { assets, liabilities, skipped, asOf };
 }
 
-function brokerageTotals(envelope: ReplicaEnvelope, rates: Row): { assets: number; asOf?: string } {
+function brokerageTotals(envelope: ReplicaEnvelope, rates: Row): { assets: number; incomplete: boolean; asOf?: string } {
   const partition = record(envelope.partitions.brokerage) ?? {};
   const values: number[] = [];
+  let incomplete = false;
   for (const account of rows(partition.accounts)) {
     const converted = convertToTwd(account.balance_total, account.balance_currency, rates);
+    if (account.valuation_reason || converted === undefined) incomplete = true;
     if (converted !== undefined) values.push(converted);
   }
-  return { assets: sumSafeIntegers(values), asOf: date(partition.last_synced_at) };
+  return { assets: sumSafeIntegers(values), incomplete, asOf: date(partition.last_synced_at) };
 }
 
 export function computeLocalPortfolio(
@@ -408,6 +410,7 @@ export function computeLocalPortfolio(
     total_assets: totalAssets,
     fx_assets_twd: fxAssets,
     brokerage_assets_twd: brokerage.assets,
+    brokerage_valuation_incomplete: brokerage.incomplete,
     manual_assets_twd: manual.assets,
     manual_liabilities_twd: manual.liabilities,
     total_assets_with_fx: totalAssetsWithFx,

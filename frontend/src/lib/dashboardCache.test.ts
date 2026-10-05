@@ -52,6 +52,13 @@ const envelope: ReplicaEnvelope = {
   partitions,
   syncedAt: '2026-08-11T00:00:00Z',
 };
+import { projectReplicaDataset } from './replica';
+const withLoan = JSON.parse(JSON.stringify(envelope));
+withLoan.partitions['bank:cathay'].loan_repayments = [{id:'loan:v1:cache',bank:'cathay',source_account_id:1,account_no:'123',sub_account:'',currency:'TWD',due_date:'2026-08-10',paid_on:'2026-08-10',status:'paid',query_start:null,query_end:null,principal:'9007199254740993.01',interest:'9007199254740993.1',penalty:'0.2',paid_total:'18014398509481986.31',principal_balance:'1'}];
+const loanCache = projectReplicaDataset(withLoan).dashboardCache;
+equal(loanCache?.stats.total_expense, '9007199254740993.3');
+equal(loanCache?.stats.amount_by_month['2026-08'].net, '-9007199254740993.3');
+equal(loanCache?.portfolio.total_assets, 1234);
 const cache = projectReplicaDashboard(envelope, [], 'consume', new Date('2026-08-11T12:00:00Z'));
 equal(cache?.cachedAt, envelope.syncedAt);
 equal(cache?.accounts.length, 1);

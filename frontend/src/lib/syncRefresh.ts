@@ -16,6 +16,7 @@ const ACCOUNT_REFRESH_QUERY_KEYS: QueryKey[] = [
   ['transactions'],
   ['frontend-dataset'],
   ['portfolio'],
+  ['snaptrade', 'portfolio'],
   ['cards'],
   ['accounts'],
   ['auto-debit', 'reminders'],
@@ -31,6 +32,9 @@ export function invalidateSyncNotificationQueries(
   queryClient: QueryInvalidator,
   data: NotificationData,
 ): void {
+  if (data.kind === 'payment_reminder') {
+    void queryClient.invalidateQueries({ queryKey: ['frontend-dataset'] });
+  }
   if (typeof data.kind === 'string' && SYNC_KINDS.has(data.kind)) {
     invalidateAccountQueries(queryClient);
   }

@@ -36,13 +36,18 @@ export function transactionDateForBasis(
 ): string {
   if (transaction.kind === 'billed' || transaction.kind === 'pending') {
     if (basis === 'post') {
-      return transaction.post_date?.trim() || transaction.consume_date?.trim()
-        || transaction.date?.trim() || '';
+      return transaction.post_date?.trim() || '';
     }
     return transaction.consume_date?.trim() || transaction.date?.trim()
       || transaction.post_date?.trim() || '';
   }
   return transaction.date ?? '';
+}
+
+/** Posting is a date fact, not billed/pending status. Keep undated non-card rows. */
+export function isTransactionVisibleForBasis(transaction: Transaction, basis: CardDateBasis): boolean {
+  return basis !== 'post' || (transaction.kind !== 'billed' && transaction.kind !== 'pending')
+    || transactionDateForBasis(transaction, basis) !== '';
 }
 
 export function mergeTransactionTimeline(
@@ -53,7 +58,7 @@ export function mergeTransactionTimeline(
 ): TransactionTimelineItem[] {
   const accountsById = new Map(accounts.map((account) => [account.id, account]));
   return [
-    ...bankRows.map<TransactionTimelineItem>((transaction, sortIndex) => {
+    ...bankRows.filter(transaction => isTransactionVisibleForBasis(transaction, cardDateBasis)).map<TransactionTimelineItem>((transaction, sortIndex) => {
       const sortDay = transactionDateForBasis(transaction, cardDateBasis);
       const useTransactionTime = cardDateBasis === 'consume'
         || (transaction.kind !== 'billed' && transaction.kind !== 'pending');

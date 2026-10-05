@@ -163,7 +163,7 @@ export type ApiInit = Omit<RequestInit, 'body'> & {
   skipAuthRetry?: boolean;
   /** Revalidate an owner/session boundary before token rotation and retry. */
   authRetryGuard?: () => void;
-  /** Stable key for sharing auth recovery only within one owner/session epoch. */
+  /** Legacy caller label; recovery is always keyed by the auth store session. */
   authRetryKey?: string;
   /** If true, returns void on 204 instead of attempting JSON parse. */
   raw?: boolean;
@@ -175,6 +175,8 @@ export type ApiInit = Omit<RequestInit, 'body'> & {
    *  detect when even Face ID re-login produced a token that 401s, meaning the
    *  stored credentials are no longer valid (password changed, account deleted). */
   _retriedAfterBiometric?: boolean;
+  /** Internal: reuse a sibling's newer credentials at most once. */
+  _retriedWithLatestToken?: boolean;
 };
 
 // ============================================================
@@ -197,20 +199,37 @@ export type ApiInit = Omit<RequestInit, 'body'> & {
 const refreshGate = new SessionPromiseGate<string>();
 
 function currentAuthSessionKey(): string {
-  const { serverUrl, email, token, refreshToken } = useAuthStore.getState();
-  return JSON.stringify([serverUrl, email, token, refreshToken]);
+  const { serverUrl, email, apiKey, sessionEpoch } = useAuthStore.getState();
+  return JSON.stringify([serverUrl, email, apiKey, sessionEpoch]);
+}
+
+function currentAuthCredentialsKey(): string {
+  const { token, refreshToken } = useAuthStore.getState();
+  return JSON.stringify([token, refreshToken]);
+}
+
+/** A recovery may rotate credentials, but never replace a newer login or token pair. */
+function captureAuthRecovery(authRetryGuard?: () => void): () => string | null {
+  const sessionKey = currentAuthSessionKey();
+  const credentialsKey = currentAuthCredentialsKey();
+  return () => {
+    if (currentAuthSessionKey() !== sessionKey) {
+      throw new ApiError(409, { detail: 'auth session changed during recovery' });
+    }
+    authRetryGuard?.();
+    return currentAuthCredentialsKey() !== credentialsKey ? useAuthStore.getState().token : null;
+  };
 }
 
 /** 並發 401 的單例 refresh：只讓同一 owner/session epoch 共用 promise。 */
 async function getOrStartRefresh(
-  authRetryKey: string | undefined,
   authRetryGuard?: () => void,
 ): Promise<string> {
   authRetryGuard?.();
-  const gateKey = authRetryKey ?? currentAuthSessionKey();
+  const gateKey = currentAuthSessionKey();
   return refreshGate.getOrStart(gateKey, async () => {
     authRetryGuard?.();
-    const authSessionKeyAtStart = currentAuthSessionKey();
+    const newerToken = captureAuthRecovery(authRetryGuard);
     const store = useAuthStore.getState();
     const refresh = store.refreshToken;
     if (!refresh) {
@@ -237,6 +256,8 @@ async function getOrStartRefresh(
       clearTimeout(timer);
     }
 
+    const recoveredBeforeBody = newerToken();
+    if (recoveredBeforeBody) return recoveredBeforeBody;
     if (!resp.ok) {
       throw new ApiError(resp.status, await safeReadJson(resp));
     }
@@ -247,9 +268,8 @@ async function getOrStartRefresh(
     if (!data.access_token || !data.refresh_token) {
       throw new ApiError(500, { detail: 'malformed refresh response' });
     }
-    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
-      throw new ApiError(409, { detail: 'auth session changed during refresh' });
-    }
+    const recovered = newerToken();
+    if (recovered) return recovered;
     authRetryGuard?.();
     useAuthStore.getState().setTokens(data.access_token, data.refresh_token);
     return data.access_token;
@@ -297,19 +317,23 @@ function hardLogout(): void {
 const biometricReLoginGate = new SessionPromiseGate<string>();
 
 async function getOrStartBiometricReLogin(
-  authRetryKey: string | undefined,
   authRetryGuard?: () => void,
 ): Promise<string> {
   authRetryGuard?.();
-  const gateKey = authRetryKey ?? currentAuthSessionKey();
+  const gateKey = currentAuthSessionKey();
   return biometricReLoginGate.getOrStart(gateKey, async () => {
     authRetryGuard?.();
-    const authSessionKeyAtStart = currentAuthSessionKey();
+    const newerToken = captureAuthRecovery(authRetryGuard);
     const active = useAuthStore.getState();
-    if (!(await hasCredentials())) {
+    const available = await hasCredentials();
+    const recoveredBeforePrompt = newerToken();
+    if (recoveredBeforePrompt) return recoveredBeforePrompt;
+    if (!available) {
       throw new ApiError(401, { detail: 'no saved credentials' });
     }
     const creds = await loadCredentials('使用 Face ID 重新登入 Thoth');
+    const recoveredAfterPrompt = newerToken();
+    if (recoveredAfterPrompt) return recoveredAfterPrompt;
     if (!creds) {
       throw new ApiError(401, { detail: 'biometric cancelled' });
     }
@@ -319,9 +343,8 @@ async function getOrStartBiometricReLogin(
     })) {
       throw new ApiError(409, { detail: 'saved credentials do not match active session' });
     }
-    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
-      throw new ApiError(409, { detail: 'auth session changed before biometric re-login' });
-    }
+    const recoveredBeforeLogin = newerToken();
+    if (recoveredBeforeLogin) return recoveredBeforeLogin;
     authRetryGuard?.();
     const form = new URLSearchParams();
     form.append('username', creds.email);
@@ -346,6 +369,8 @@ async function getOrStartBiometricReLogin(
     } finally {
       clearTimeout(timer);
     }
+    const recoveredBeforeBody = newerToken();
+    if (recoveredBeforeBody) return recoveredBeforeBody;
     if (!resp.ok) {
       throw new ApiError(resp.status, await safeReadJson(resp));
     }
@@ -353,29 +378,92 @@ async function getOrStartBiometricReLogin(
     if (!data.access_token) {
       throw new ApiError(500, { detail: 'malformed re-login response' });
     }
-    if (currentAuthSessionKey() !== authSessionKeyAtStart) {
-      throw new ApiError(409, { detail: 'auth session changed during biometric re-login' });
-    }
+    const recovered = newerToken();
+    if (recovered) return recovered;
     authRetryGuard?.();
     useAuthStore
       .getState()
-      .setAuth(data.access_token, creds.email, data.refresh_token ?? null);
+      .setTokens(data.access_token, data.refresh_token ?? null);
     return data.access_token;
   });
 }
 
+/** Only the anonymous probe is retryable; never wrap the sync mutation in a retry. */
+async function warmUpSync(baseUrl: string, signal: AbortSignal | null | undefined, assertActive: () => void): Promise<void> {
+  const aborted = () => signal?.reason ?? new DOMException('Aborted', 'AbortError');
+  if (signal?.aborted) throw aborted();
+  const controller = new AbortController();
+  const deadline = Date.now() + 120_000;
+  const timeoutError = new ApiError(0, { detail: '伺服器暖機超過 120 秒，未送出同步' });
+  let interrupt!: (reason: unknown) => void;
+  const interrupted = new Promise<never>((_, reject) => { interrupt = reject; });
+  const onAbort = () => {
+    controller.abort();
+    interrupt(signal?.aborted ? aborted() : timeoutError);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(onAbort, 120_000);
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    for (;;) {
+      assertActive();
+      if (signal?.aborted) throw aborted();
+      if (controller.signal.aborted || Date.now() >= deadline) throw timeoutError;
+      try {
+        const health = await Promise.race([fetch(`${baseUrl}/healthz`, {
+          method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'manual',
+          headers: { Accept: 'application/json' }, signal: controller.signal,
+        }), interrupted]);
+        if (![502, 503, 504].includes(health.status)) {
+          if (!health.ok) throw new ApiError(health.status, { detail: '伺服器尚未就緒，未送出同步' });
+          const data: unknown = await Promise.race([health.json(), interrupted]);
+          if (signal?.aborted) throw aborted();
+          if (Date.now() >= deadline) throw timeoutError;
+          if (!data || typeof data !== 'object' || !('status' in data) || data.status !== 'ok') {
+            throw new ApiError(502, { detail: '伺服器健康檢查格式錯誤，未送出同步' });
+          }
+          return;
+        }
+      } catch (error) {
+        // Expo native FetchError extends Error, unlike browser fetch's TypeError.
+        const transportError = error instanceof TypeError ||
+          (error instanceof Error && error.message.startsWith('fetch failed: '));
+        if (controller.signal.aborted || !transportError) throw error;
+      }
+      await Promise.race([
+        new Promise((resolve) => { retryTimer = setTimeout(resolve, 2000); }),
+        interrupted,
+      ]);
+    }
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(retryTimer);
+    signal?.removeEventListener('abort', onAbort);
+    controller.abort();
+  }
+}
+
 export async function api<T = unknown>(path: string, init: ApiInit = {}): Promise<T> {
-  let requestAuthSessionKey = init.skipAuth ? null : currentAuthSessionKey();
+  const requestAuthSessionKey = init.skipAuth ? null : currentAuthSessionKey();
   const assertRequestAuthSession = () => {
     if (requestAuthSessionKey !== null && currentAuthSessionKey() !== requestAuthSessionKey) {
       throw new ApiError(409, { detail: 'auth session changed during request' });
     }
     init.authRetryGuard?.();
   };
-  const adoptRecoveredAuthSession = () => {
-    init.authRetryGuard?.();
-    requestAuthSessionKey = currentAuthSessionKey();
+  const baseUrl = getBaseUrl();
+  const isSync = init.method?.toUpperCase() === 'POST' && /^\/sync\/(all|account\/[^/?#]+)$/.test(path);
+  const assertSyncReady = () => {
+    if (init.signal?.aborted) throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    if (getBaseUrl() !== baseUrl) throw new ApiError(409, { detail: 'server changed during sync warmup' });
+    assertRequestAuthSession();
   };
+  if (isSync) {
+    assertSyncReady();
+    await warmUpSync(baseUrl, init.signal, assertSyncReady);
+    assertSyncReady();
+  }
+  const requestCredentialsKey = currentAuthCredentialsKey();
   const headers: Record<string, string> = {
     Accept: 'application/json',
     ...(init.headers as Record<string, string> | undefined),
@@ -414,7 +502,8 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
 
   let res: Response;
   try {
-    res = await fetch(`${getBaseUrl()}${path}`, {
+    if (isSync) assertSyncReady();
+    res = await fetch(`${baseUrl}${path}`, {
       ...init,
       headers,
       body: reqBody,
@@ -435,62 +524,82 @@ export async function api<T = unknown>(path: string, init: ApiInit = {}): Promis
   // 例外：(a) skipAuth=true 的 request (login/register/refresh 自己) 不 retry。
   //       (b) 已經 retry 過一次的 request 直接 logout 防無限迴圈。
   if (res.status === 401 && init.skipAuthRetry) {
-    throw new ApiError(401, await safeReadJson(res));
+    const body = await safeReadJson(res);
+    if (!init.skipAuth) assertRequestAuthSession();
+    throw new ApiError(401, body);
   }
   if (res.status === 401 && !init.skipAuth) {
+    const reuseNewerCredentials = (): Promise<T> | null => {
+      assertRequestAuthSession();
+      if (currentAuthCredentialsKey() === requestCredentialsKey || !useAuthStore.getState().token) return null;
+      if (init._retriedWithLatestToken) {
+        throw new ApiError(401, { detail: 'credentials changed during retry' });
+      }
+      return api<T>(path, { ...init, _retriedWithLatestToken: true });
+    };
+    const failUnauthorized = (detail: string): Promise<T> => {
+      const retry = reuseNewerCredentials();
+      if (retry) return retry;
+      hardLogout();
+      throw new ApiError(401, { detail });
+    };
+    const retry = reuseNewerCredentials();
+    if (retry) return retry;
     const hasCredentialsForActiveSession = async () => {
       const available = await hasCredentials();
       assertRequestAuthSession();
-      return available;
+      return available && currentAuthCredentialsKey() === requestCredentialsKey;
     };
     if (init._retriedAfterBiometric) {
-      hardLogout();
-      throw new ApiError(401, { detail: 'unauthorized after biometric re-login' });
+      return failUnauthorized('unauthorized after biometric re-login');
     }
     if (init._retriedAfterRefresh) {
       if (await hasCredentialsForActiveSession()) {
+        const retry = reuseNewerCredentials();
+        if (retry) return retry;
         try {
-          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
-          adoptRecoveredAuthSession();
+          await getOrStartBiometricReLogin(assertRequestAuthSession);
+          assertRequestAuthSession();
           return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
           assertRequestAuthSession();
         }
       }
-      hardLogout();
-      throw new ApiError(401, { detail: 'unauthorized after refresh retry' });
+      return failUnauthorized('unauthorized after refresh retry');
     }
     if (!useAuthStore.getState().refreshToken) {
       if (await hasCredentialsForActiveSession()) {
+        const retry = reuseNewerCredentials();
+        if (retry) return retry;
         try {
-          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
-          adoptRecoveredAuthSession();
+          await getOrStartBiometricReLogin(assertRequestAuthSession);
+          assertRequestAuthSession();
           return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
           assertRequestAuthSession();
         }
       }
-      hardLogout();
-      throw new ApiError(401, { detail: 'unauthorized' });
+      return failUnauthorized('unauthorized');
     }
     try {
-      await getOrStartRefresh(init.authRetryKey, assertRequestAuthSession);
-      adoptRecoveredAuthSession();
-    } catch {
-      // A stale request must fail without Face ID or hard-logout of the newly
-      // active session.
+      await getOrStartRefresh(assertRequestAuthSession);
       assertRequestAuthSession();
+    } catch {
+      // A failed old refresh must not prompt or log out newer credentials.
+      const retry = reuseNewerCredentials();
+      if (retry) return retry;
       if (await hasCredentialsForActiveSession()) {
+        const retry = reuseNewerCredentials();
+        if (retry) return retry;
         try {
-          await getOrStartBiometricReLogin(init.authRetryKey, assertRequestAuthSession);
-          adoptRecoveredAuthSession();
+          await getOrStartBiometricReLogin(assertRequestAuthSession);
+          assertRequestAuthSession();
           return api<T>(path, { ...init, _retriedAfterBiometric: true });
         } catch {
           assertRequestAuthSession();
         }
       }
-      hardLogout();
-      throw new ApiError(401, { detail: 'refresh failed' });
+      return failUnauthorized('refresh failed');
     }
     assertRequestAuthSession();
     return api<T>(path, { ...init, _retriedAfterRefresh: true });

@@ -27,12 +27,13 @@ import type { TransactionSplit } from '@/types/api';
 export type DraftSplit = {
   amount: string;
   category: string;
+  subcategory: string;
   note: string;
   auto_excluded: boolean;
 };
 
 export function emptyDraftSplit(): DraftSplit {
-  return { amount: '', category: '', note: '', auto_excluded: false };
+  return { amount: '', category: '', subcategory: '', note: '', auto_excluded: false };
 }
 
 /** 已存在的 splits → 編輯草稿。無拆帳時回 []。 */
@@ -41,6 +42,7 @@ export function toDraftSplits(splits: TransactionSplit[] | undefined): DraftSpli
   return splits.map((s) => ({
     amount: String(s.amount),
     category: s.category ?? '',
+    subcategory: s.subcategory ?? '',
     note: s.note ?? '',
     auto_excluded: s.auto_excluded === true,
   }));
@@ -51,6 +53,7 @@ export function toApiSplits(drafts: DraftSplit[]): TransactionSplit[] {
   return drafts.map((d) => ({
     amount: Number.parseInt(d.amount, 10) || 0,
     category: d.category || null,
+    subcategory: d.subcategory || null,
     note: d.note.trim() || null,
     auto_excluded: d.auto_excluded,
   }));
@@ -83,7 +86,7 @@ export function validateDrafts(
 
 export type SplitEditorProps = {
   drafts: DraftSplit[];
-  onChange: (next: DraftSplit[]) => void;
+  onChange: (next: DraftSplit[], removedIndex?: number) => void;
   /** 母筆金額 (絕對值), 子項總和必須等於它. */
   parentAmount: number;
   categoryOptions: DropdownOption[];
@@ -164,7 +167,7 @@ export function SplitEditor({
             </Text>
             {drafts.length > 2 ? (
               <Pressable
-                onPress={() => onChange(drafts.filter((_, idx) => idx !== i))}
+                onPress={() => onChange(drafts.filter((_, idx) => idx !== i), i)}
                 className="px-2 py-0.5"
                 testID={`txn-detail-split-remove-${i}`}
               >
@@ -206,7 +209,7 @@ export function SplitEditor({
           <CategoryPicker
             label=""
             value={d.category}
-            onChange={(next) => patchAt(i, { category: next })}
+            onChange={(next) => patchAt(i, { category: next, subcategory: next === d.category ? d.subcategory : '' })}
             options={categoryOptions}
             placeholder={categoriesLoading ? '載入中…' : '請選擇分類'}
             disabled={categoriesLoading}

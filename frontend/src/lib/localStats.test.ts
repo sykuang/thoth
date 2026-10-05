@@ -1,4 +1,4 @@
-import type { Transaction } from '@/types/api';
+import type { BankTransaction } from '@/types/api';
 
 import { computeLocalDashboardStats } from './localStats';
 
@@ -8,7 +8,7 @@ function deepEqual(actual: unknown, expected: unknown): void {
   }
 }
 
-const transactions: Transaction[] = [
+const transactions: BankTransaction[] = [
   {
     id: 1, bank: 'cathay', kind: 'twd', date: '2026-08-01', datetime: null,
     description: '配息', amount: 100, cashflow_direction: 'income', cashflow_amount: 100,
@@ -81,5 +81,18 @@ const tiePercent = computeLocalDashboardStats([
   },
 ], 'consume');
 deepEqual(tiePercent.passive_income_pct, 6.2);
+
+// Unknown posting dates must be removed before every aggregation, not just months.
+const postedPending: BankTransaction = { ...transactions[1], kind: 'pending', id: 20 };
+const undatedBank: BankTransaction = { ...transactions[0], id: 21, date: null };
+const visible = [...transactions, postedPending, undatedBank];
+const unposted = (['billed', 'pending'] as const).flatMap(kind =>
+  [null, undefined, '', '  '].flatMap(post_date => [
+    { ...transactions[1], kind, post_date },
+    { ...transactions[0], kind, post_date, consume_date: transactions[0].date },
+    { ...transactions[0], kind, post_date, income_category: null },
+  ]));
+deepEqual(computeLocalDashboardStats([...visible, ...unposted], 'post'), computeLocalDashboardStats(visible, 'post'));
+deepEqual(computeLocalDashboardStats([...visible, ...unposted], 'consume').total, visible.length + unposted.length);
 
 console.log('local dashboard stats parity tests passed');

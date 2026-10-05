@@ -14,6 +14,7 @@ const expected = [
   ['transactions'],
   ['frontend-dataset'],
   ['portfolio'],
+  ['snaptrade', 'portfolio'],
   ['cards'],
   ['accounts'],
   ['auto-debit', 'reminders'],
@@ -28,7 +29,7 @@ function collect(run: (client: { invalidateQueries: (filters: { queryKey: readon
 equal(collect((client) => invalidateAccountQueries(client)), expected);
 equal(collect((client) => invalidateSyncNotificationQueries(client, { kind: 'sync_done' })), expected);
 equal(collect((client) => invalidateSyncNotificationQueries(client, { kind: 'sync_all_failed' })), expected);
-equal(collect((client) => invalidateSyncNotificationQueries(client, { kind: 'payment_reminder' })), []);
+equal(collect((client) => invalidateSyncNotificationQueries(client, { kind: 'payment_reminder', bill_due_amount: 999999 })), [['frontend-dataset']]);
 equal(collect((client) => invalidateSyncNotificationQueries(client, {})), []);
 
 console.log('sync refresh query invalidation tests passed');

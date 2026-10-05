@@ -11,6 +11,8 @@ import type {
 } from '@/types/api';
 
 import { projectReplicaDashboard } from './dashboardCache';
+import { extractPaymentReminderInputs, type PaymentReminderInputs } from './localPaymentReminders';
+import { projectLoanRepayment, validLoanRepaymentFact } from './loanRepayments';
 import { isNativeCurrencyAmount, sumSafeIntegers } from './decimal';
 
 export const REPLICA_SCHEMA_VERSION = 2;
@@ -56,6 +58,8 @@ export type ReplicaEnvelope = {
 
 export type ReplicaTransactionDataset = {
   cursor: string;
+  paymentReminderInputs?: PaymentReminderInputs;
+  loanRepaymentsAvailable?: boolean;
   transactions: Transaction[];
   preferences: UserPreferences;
   dashboardCache?: ReplicaDashboardCache;
@@ -429,7 +433,7 @@ function validFinancialAccount(value: unknown): boolean {
   }
   if (row.manual_balance !== undefined && !isNullableString(row.manual_balance)) return false;
   if (row.valuation_source !== null && ![
-    'manual', 'yahoo_finance', 'manual_fallback',
+    'manual', 'yahoo_finance', 'manual_fallback', 'yahoo', 'mixed', 'broker_snapshot',
   ].includes(String(row.valuation_source))) return false;
   return typeof row.included_in_net_worth === 'boolean'
     && typeof row.editable === 'boolean'
@@ -508,7 +512,7 @@ function normalizedSplits(row: Record<string, unknown>): TransactionSplit[] | un
   return total === parentAmount ? splits : undefined;
 }
 
-function projectParent(row: Record<string, unknown>): Transaction {
+function projectParent(row: Record<string, unknown>): import('@/types/api').BankTransaction {
   const amount = numberOrNull(row.amount) ?? 0;
   const cashflowAmount = Math.abs(numberOrNull(row.cashflow_amount) ?? amount);
   const displayAmount = Math.abs(numberOrNull(row.display_amount) ?? amount);
@@ -644,6 +648,18 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
         datetime: parent.datetime ?? '',
       });
     }
+    if (partition.loan_repayments !== undefined) {
+      if (!Array.isArray(partition.loan_repayments) || !partition.loan_repayments.every(validLoanRepaymentFact)) {
+        throw new Error('Invalid loan repayment facts');
+      }
+      for (const fact of partition.loan_repayments) {
+        if (fact.bank !== bank) throw new Error('Loan repayment bank mismatch');
+        const excluded = asRows(partition.accounts).some(account => account.account_no === fact.account_no
+          && account.excluded === true);
+        const rows = projectLoanRepayment(fact, excluded);
+        if (rows.length) groups.push({rows, bankOrder, kindOrder:3, id:fact.id, date:fact.paid_on ?? '', datetime:''});
+      }
+    }
     bankOrder += 1;
   }
   groups.sort((left, right) => {
@@ -676,11 +692,15 @@ export function projectReplicaDataset(envelope: ReplicaEnvelope): ReplicaTransac
       ? fxDisplayMode
       : 'auto',
     card_date_basis: preferences.card_date_basis === 'post' ? 'post' : 'consume',
+    show_snaptrade_transactions: preferences.show_snaptrade_transactions === true,
   };
   return {
     cursor,
+    loanRepaymentsAvailable: Object.entries(envelope.partitions).filter(([name]) => name.startsWith('bank:'))
+      .every(([, value]) => Array.isArray((value as Record<string, unknown>).loan_repayments)),
     transactions,
     preferences: projectedPreferences,
+    paymentReminderInputs: extractPaymentReminderInputs(envelope),
     dashboardCache: projectReplicaDashboard(
       envelope,
       transactions,

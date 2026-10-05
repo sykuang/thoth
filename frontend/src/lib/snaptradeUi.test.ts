@@ -1,6 +1,7 @@
-import { formatSnapTradeUiError } from './snaptradeUi';
+import { holdingTotalCost, formatSnapTradeUiError, formatSnapTradeConnectionStatus, shouldSyncAfterSnapTradePortal } from './snaptradeUi';
+import type { SnapTradeStatus } from '../types/api';
 
-function assertEqual(actual: string, expected: string): void {
+function assertEqual(actual: string | null, expected: string | null): void {
   if (actual !== expected) throw new Error(`expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
@@ -25,4 +26,58 @@ assertEqual(
   'SnapTrade API 回報：連線失敗，請重新授權',
 );
 
-console.log('SnapTrade UI error tests passed');
+const registered: SnapTradeStatus = {
+  configured: true, registered: true, connection_count: 2, last_synced_at: null,
+};
+assertEqual(formatSnapTradeConnectionStatus(registered), '連線狀態未知，請重新整理');
+assertEqual(formatSnapTradeConnectionStatus({ ...registered, connections: [
+  { id: 'active', brokerage_name: 'Active Broker', disabled: false },
+  { id: 'disabled', brokerage_name: 'Disabled Broker', disabled: true },
+  { id: null, brokerage_name: null, disabled: null },
+] }), '有效 1 個 · 待修復 1 個 · 狀態未知 1 個');
+assertEqual(formatSnapTradeConnectionStatus({ ...registered, connections: [
+  { id: 'disabled', brokerage_name: null, disabled: true },
+] }), '有效 0 個 · 待修復 1 個 · 狀態未知 0 個');
+assertEqual(formatSnapTradeConnectionStatus({ ...registered, connections: [] }), '已建立 SnapTrade 使用者，尚未連結券商');
+assertEqual(formatSnapTradeConnectionStatus({ ...registered, registered: false }), '尚未開始連結');
+assertEqual(formatSnapTradeConnectionStatus({ ...registered, configured: false }), '伺服器尚未設定 SnapTrade');
+
+const repaired: SnapTradeStatus = { ...registered, connections: [
+  { id: 'auth-repair', brokerage_name: 'Synthetic Broker', disabled: false },
+] };
+for (const result of ['cancel', 'dismiss', 'locked']) {
+  if (shouldSyncAfterSnapTradePortal(result, repaired, 'auth-repair')) throw new Error('Cancelled portal must not sync');
+}
+for (const status of [undefined, registered, { ...repaired, connections: [] }, {
+  ...repaired, connections: [{ ...repaired.connections![0], disabled: true }],
+}, {
+  ...repaired, connections: [{ ...repaired.connections![0], disabled: null }],
+}, {
+  ...repaired, connections: [...repaired.connections!, { id: 'other', brokerage_name: null, disabled: true }],
+}]) {
+  if (shouldSyncAfterSnapTradePortal('success', status, 'auth-repair')) throw new Error('Callback is not proof of active connections');
+}
+if (shouldSyncAfterSnapTradePortal('success', repaired, 'missing')) throw new Error('Missing repair target is not repaired');
+if (!shouldSyncAfterSnapTradePortal('success', repaired, 'auth-repair')) throw new Error('Verified repair should sync');
+if (!shouldSyncAfterSnapTradePortal('success', repaired)) throw new Error('Normal connection should still sync');
+
+for (const asset_type of ['CS', 'STOCK', 'EQUITY', 'ETF', 'ET', ' etf ']) {
+  const position = Object.freeze({ asset_type, quantity: '2.5', average_cost: '12.34' });
+  assertEqual(holdingTotalCost(position), '30.85');
+  assertEqual(JSON.stringify(position), JSON.stringify({ asset_type, quantity: '2.5', average_cost: '12.34' }));
+}
+for (const [quantity, average_cost, expected] of [
+  ['-2.5', '12.34', '-30.85'], ['+2.5', '12.34', '30.85'],
+  ['0', '12.34', '0'], ['-0', '12.34', '0'], ['2', '0', '0'],
+  ['9007199254740993', '0.01', '90071992547409.93'],
+  [null, '2', null], [undefined, '2', null], ['', '2', null], ['NaN', '2', null],
+  ['--2', '2', null], ['- 2', '2', null], ['1e3', '2', null],
+  ['2', null, null], ['2', undefined, null], ['2', '', null], ['2', '-1', null],
+  ['2', 'NaN', null], ['2', '1e2', null], ['2', '1,000', null],
+] as const) {
+  assertEqual(holdingTotalCost({ asset_type: 'CS', quantity, average_cost }), expected);
+}
+for (const asset_type of ['OPTION', 'OP', 'BOND', null, undefined, '']) {
+  assertEqual(holdingTotalCost({ asset_type, quantity: '2', average_cost: '12.34' }), null);
+}
+console.log('SnapTrade UI tests passed');

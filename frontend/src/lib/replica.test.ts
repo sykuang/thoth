@@ -175,7 +175,18 @@ const dataset = projectReplicaDataset(envelope as ReplicaEnvelope);
 deepEqual(dataset.preferences, {
   fx_display_mode: 'always_original',
   card_date_basis: 'post',
+  show_snaptrade_transactions: false,
 });
+for (const value of [true, false, undefined, null, 'true', 'false', 1, 0]) {
+  const restored: ReplicaEnvelope = JSON.parse(JSON.stringify({
+    ...envelope,
+    partitions: { ...envelope.partitions, user: { preferences: { show_snaptrade_transactions: value } } },
+  }));
+  equal(projectReplicaDataset(restored).preferences.show_snaptrade_transactions, value === true);
+}
+for (const user of [undefined, {}, { preferences: null }]) {
+  equal(projectReplicaDataset({ ...envelope, partitions: { user } }).preferences.show_snaptrade_transactions, false);
+}
 equal(dataset.transactions.length, 5);
 const children = dataset.transactions.filter((row) => row.split_of === 1);
 deepEqual(children.map((row) => row.id), ['1#0', '1#1']);
@@ -395,4 +406,9 @@ for (const accountTabCache of [
   equal(projectReplicaDataset(corrupt).accountTabCache, undefined);
 }
 
+for (const valuation_source of ['yahoo', 'mixed', 'broker_snapshot', 'bogus']) {
+  const cache = { ...validAccountTabCache, manualAccounts: [{ ...validAccountTabCache.manualAccounts[0], valuation_source }] };
+  const result = projectReplicaDataset({ ...envelope, accountTabCache: cache } as unknown as ReplicaEnvelope);
+  equal(result.accountTabCache, valuation_source === 'bogus' ? undefined : cache);
+}
 console.log('replica contract tests passed');

@@ -64,7 +64,7 @@ deepEqual(
 deepEqual(
   computePeriodStats([
     items[1],
-    { ...items[1], id: 4, currency: 'USD', amount: -12.34, cashflow_amount: 12.34 },
+    { ...items[1], id: 4, currency: 'USD', amount: -12.34, cashflow_amount: 12.34 } as Transaction,
   ]),
   { income: 0, expense: 100, net: -100, count: 1 },
   '沒有可信 FX rate 時，原幣交易不得混進 TWD period totals',

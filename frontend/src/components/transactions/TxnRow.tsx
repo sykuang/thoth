@@ -11,6 +11,7 @@ import { Pressable, Text, View } from 'react-native';
 import { BankBadge } from '@/components/BankBadge';
 import { renderAmount } from '@/lib/currency';
 import { maskCardNo } from '@/lib/mask';
+import { transactionDateForBasis } from '@/lib/transactionTimeline';
 import { getDisplayDescription, parseDateForMobileLayout } from '@/lib/txnDisplay';
 import {
   type CardDateBasis,
@@ -42,19 +43,9 @@ export const TxnRow = React.memo(
     selected = false,
     selectionMode = false,
   }: TxnRowProps) {
+    if (t.kind === 'loan_repayment') { selectionMode = false; onLongPress = undefined; }
     const render = renderAmount(t, fxMode);
-    // Backend already returns t.date according to cardDateBasis; keep this fallback
-    // for older API payloads that may not yet have migrated.
-    const isCardRow = t.kind === 'billed' || t.kind === 'pending';
-    const postDate = t.post_date?.trim();
-    const displayDate =
-      isCardRow && cardDateBasis === 'post' && postDate
-        ? postDate
-        : t.date;
-    const isPostDateFallback = isCardRow && cardDateBasis === 'post' && !postDate;
-    const displayDateText = isPostDateFallback && displayDate
-      ? `${displayDate}（消費日）`
-      : displayDate;
+    const displayDate = transactionDateForBasis(t, cardDateBasis);
     // Phase 6 (excluded): 該帳戶被標「不納入淨資產統計」→ 整列反灰 + 金額劃線
     // Phase 9.3 補 (2026-06-18): 該筆 auto_excluded (rule 自動排 / 使用者手動勾「忽略此筆」)
     // 也要反灰 — backend stats 用 (excluded OR auto_excluded) 兩個一起 skip,
@@ -122,9 +113,6 @@ export const TxnRow = React.memo(
             <Text className="text-ink-700 dark:text-ink-300 text-large font-semibold leading-tight">
               {dateParts.day}
             </Text>
-            {isPostDateFallback && (
-              <Text className="text-ink-400 dark:text-ink-500 text-micro">消費日</Text>
-            )}
           </View>
 
           {/* 中 + 右: 兩行 flex-1 */}
@@ -153,6 +141,7 @@ export const TxnRow = React.memo(
             <View className="flex-row items-center justify-between mt-1">
               <View className="flex-row items-center gap-2 flex-wrap flex-1 mr-2">
                 <BankBadge bank={t.bank as SupportedBank} size="xs" rectangular />
+                {t.kind === 'loan_repayment' && <Text className="text-ink-500 text-micro">{t.account_no} · 貸款</Text>}
                 {(t.tags ?? []).slice(0, 3).map((tag) => (
                   <Text
                     key={tag}
@@ -207,13 +196,13 @@ export const TxnRow = React.memo(
           </View>
         )}
         <Text className="w-28 px-3 py-2 text-small text-ink-700 dark:text-ink-300">
-          {displayDateText ?? '—'}
+          {displayDate || '—'}
         </Text>
         <Text className="w-20 px-3 py-2 text-small text-ink-700 dark:text-ink-300">
           {BANK_LABELS[t.bank as SupportedBank] ?? t.bank}
         </Text>
         <Text className="w-32 px-3 py-2 text-small text-ink-700 dark:text-ink-300 font-mono">
-          {maskCardNo(t.account_or_card)}
+          {t.kind === 'loan_repayment' ? t.account_no : maskCardNo(t.account_or_card)}
         </Text>
         <View className="flex-1 px-3 py-2">
           <Text className="text-small text-ink-700 dark:text-ink-300" numberOfLines={2}>
