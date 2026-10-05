@@ -433,7 +433,6 @@ export default function TransactionsScreen() {
       }
     >
       <View className="px-4 py-4 max-w-[800px] w-full mx-auto">
-        {datasetQ.data?.loanRepaymentsAvailable === false && <Text className="text-ink-500">伺服器未提供完整貸款還款資料，不能視為零筆。</Text>}
         {/* Header: 收支表 標題 + Phase 9.2 選取模式按鈕 */}
         <View className="flex-row items-center justify-between mb-3">
           <View className="w-16" />{/* spacer 對稱 */}
