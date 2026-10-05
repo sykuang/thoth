@@ -2331,6 +2331,18 @@ class BankStore:
             self.conn.commit()
         return updated
 
+    def record_auto_debit_payment(self, payment_date: str, amount: int, *,
+                                  commit: bool = True) -> int:
+        """Advance every card's last-payment pair to a newer auto-debit; never regress."""
+        cursor = self.conn.execute(
+            "UPDATE cards SET last_payment_amount = ?, last_payment_date = ?, updated_at = ? "
+            "WHERE user_id = ? AND (last_payment_date IS NULL OR last_payment_date < ?)",
+            (amount, payment_date, _now(), self.user_id, payment_date),
+        )
+        if commit:
+            self.conn.commit()
+        return cursor.rowcount
+
     # ---- 7. 每日數值快照：同日同 category 覆蓋 ----
     def put_daily_metric(self, category: str, payload, snapshot_date: str | None = None,
                          *, commit: bool = True) -> None:
