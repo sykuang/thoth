@@ -523,7 +523,7 @@ function EditableTxnDetailModal({
                 </>
               ) : (
                 <Text className="text-ink-700 dark:text-ink-300 text-small">
-                  ⏳ 本筆未出帳, 出帳後才會有銀行實際匯率 (本系統不推算)
+                  ⏳ 尚未出帳，出帳後才有銀行實際匯率
                 </Text>
               )}
             </View>
@@ -544,7 +544,7 @@ function EditableTxnDetailModal({
                 <DetailRow
                   label="認列方式"
                   value={cardDateBasis === 'post' && !postDate
-                    ? '未納入入帳日顯示與統計（尚未取得入帳日）'
+                    ? '尚無入帳日'
                     : cardDateBasis === 'post' ? '入帳日' : '消費日'}
                 />
               </>
@@ -581,7 +581,7 @@ function EditableTxnDetailModal({
               className="border border-ink-200 dark:border-ink-700 rounded-xl px-3 py-2.5 text-body bg-white dark:bg-ink-800 text-ink-900 dark:text-ink-50"
             />
             <Text className="text-ink-400 dark:text-ink-500 text-micro mt-1">
-              留空恢復原文 · 原始資料永遠保留
+              留空即恢復原本名稱
             </Text>
           </View>
 

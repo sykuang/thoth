@@ -160,7 +160,7 @@ export default function CategoriesScreen() {
 
   // 二次確認包 (web 用 confirm, native 用 Alert) — 防使用者手滑
   function confirmReset() {
-    const msg = '此動作會砍掉所有自訂規則重塞預設, 無法復原, 確定要繼續？';
+    const msg = '這會刪除所有自訂規則並恢復預設，無法復原，確定要繼續？';
     if (Platform.OS === 'web') {
        
       if (window.confirm(msg)) resetMut.mutate();
@@ -221,7 +221,7 @@ export default function CategoriesScreen() {
       .map((l) => l.trim())
       .filter((l) => l.length > 0);
     if (!form.pattern || lines.length === 0) {
-      setStatus({ kind: 'err', msg: '請填 pattern 並輸入至少一行範例文字' });
+      setStatus({ kind: 'err', msg: '請填寫比對文字並輸入至少一行範例' });
       return;
     }
     previewMut.mutate({ pattern: form.pattern, sample_texts: lines });
@@ -279,7 +279,7 @@ export default function CategoriesScreen() {
       </View>
       <View>
         <Text className="text-ink-700 dark:text-ink-300 text-small font-semibold mb-2">
-          子分類 (選填，留空 = 整主類 match)
+          子分類（選填）
         </Text>
         {editForm.category ? (
           <CategorySubChips
@@ -315,7 +315,7 @@ export default function CategoriesScreen() {
             🚫 不算收支
           </Text>
           <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-            命中此 rule 的交易自動排除 (還款/轉帳/退款/回饋等)
+            符合此規則的交易不納入統計（還款／轉帳／退款／回饋等）
           </Text>
         </View>
         <Switch
@@ -464,7 +464,7 @@ export default function CategoriesScreen() {
               )}
               <TextInput
                 className={inputBase}
-                placeholder="或輸入自訂子分類 (留空 = 整主類 match)"
+                placeholder="或輸入自訂子分類（選填）"
                 placeholderTextColor="#94a3b8"
                 value={form.subcategory}
                 onChangeText={(t) => setForm({ ...form, subcategory: t })}
@@ -488,7 +488,7 @@ export default function CategoriesScreen() {
                   🚫 不算收支
                 </Text>
                 <Text className="text-ink-500 dark:text-ink-400 text-micro mt-0.5">
-                  命中此 rule 的交易自動排除 (還款/轉帳/退款/回饋等)
+                  符合此規則的交易不納入統計（還款／轉帳／退款／回饋等）
                 </Text>
               </View>
               <Switch
@@ -636,7 +636,7 @@ export default function CategoriesScreen() {
         {showPreview ? (
         <View className="bg-white dark:bg-ink-900 rounded-2xl p-5 shadow-card mb-4">
           <Text className="text-ink-900 dark:text-ink-50 text-h2 mb-3">
-            預覽 match（一行一筆範例文字）
+            預覽比對（一行一筆範例）
           </Text>
           <RegexPatternInput
             testID="rules-preview-pattern"

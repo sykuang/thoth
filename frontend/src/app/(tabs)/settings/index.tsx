@@ -476,7 +476,7 @@ function RememberCredentialsToggle() {
       // 關閉 = 清掉 Keychain item
       Alert.alert(
         '關閉 Face ID 快速登入?',
-        '會清除裝置上儲存的帳密。下次 session 過期時你需要手動重新登入。',
+        '會清除裝置上儲存的帳密。之後登入過期需手動重新登入。',
         [
           { text: '取消', style: 'cancel' },
           {
@@ -540,7 +540,7 @@ function RememberCredentialsToggle() {
       )}
       {enabled === true && hardwareReady === true && (
         <Text className="text-accent-600 dark:text-accent-400 text-micro px-1 mt-1">
-          ✓ 已啟用 — session 過期時會自動 Face ID 重登
+          ✓ 已啟用 — 登入過期時會用 Face ID 自動重新登入
         </Text>
       )}
     </View>

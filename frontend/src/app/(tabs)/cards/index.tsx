@@ -722,7 +722,7 @@ export default function AccountsTabScreen() {
           </View>
         </View>
         <Text className="text-ink-500 dark:text-ink-400 text-small mb-6">
-          管理銀行帳戶、信用卡與已連結券商。銀行資料可從各銀行卡片同步，券商資料列於下方。
+          管理銀行帳戶、信用卡與券商。
         </Text>
 
         {triggerSync.isError && (
@@ -1230,7 +1230,7 @@ function PendingBankAccountRow({
       ? 'text-red-700 dark:text-red-300'
       : 'text-amber-700 dark:text-amber-400';
   const hint = completedAt
-    ? `已於 ${formatRelativeTime(completedAt)} 同步；等待銀行資料寫入後會自動變成帳戶列`
+    ? `已於 ${formatRelativeTime(completedAt)} 同步，帳戶資料稍後會出現`
     : failedAt
       ? `上次同步失敗${lastJob?.error_msg ? ` — ${lastJob.error_msg}` : ''}`
       : account.has_creds

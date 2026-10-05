@@ -120,7 +120,7 @@ export function BulkEditSheet({ visible, targets, onClose, onSuccess }: Props) {
 
   const tagsModeOptions = [
     { value: 'no_change' as const, label: '不修改' },
-    { value: 'add' as const, label: '加入 (append + dedup)' },
+    { value: 'add' as const, label: '加入' },
     { value: 'replace' as const, label: '覆寫 (整個換掉)' },
   ];
 
@@ -338,14 +338,14 @@ export function BulkEditSheet({ visible, targets, onClose, onSuccess }: Props) {
           <Text className="text-ink-400 dark:text-ink-500 text-micro mt-1">
             {tagsMode === 'replace'
               ? '所有選中交易的標籤都會被換成這組 (空 = 清空)'
-              : '把這些標籤加到所有選中交易 (已存在的會 skip)'}
+              : '把這些標籤加到所有選中交易'}
           </Text>
         </View>
       )}
 
       {/* 提示 */}
       <Text className="text-ink-400 dark:text-ink-500 text-micro mt-2">
-        儲存後會更新 {targets.length} 筆交易; 沒勾的欄位完全不動 (raw 永遠不改)。
+        儲存後會更新 {targets.length} 筆交易；未勾選的欄位不會變更。
       </Text>
 
       {/* nested TagPicker — visible 控制 */}

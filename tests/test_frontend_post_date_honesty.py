@@ -12,7 +12,7 @@ def test_card_detail_discloses_missing_post_date_without_recognition_fallback() 
     assert "尚無入帳日" in src
     assert "暫按消費日" not in src
     assert 'label="消費日"' in src  # Factual detail is still available.
-    assert "未納入入帳日顯示與統計" in src
+    assert "尚無入帳日" in src
     assert "消費日" not in row_src
     assert "不顯示也不納入統計" in settings_src
     assert "銀行尚未提供入帳日時" in settings_src

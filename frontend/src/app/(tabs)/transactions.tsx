@@ -668,7 +668,7 @@ export default function TransactionsScreen() {
               {brokerageUnavailable
                 ? '券商交易目前無法載入'
                 : sourceInventoryUnknown
-                  ? '此篩選沒有任何交易，交易來源尚未確認'
+                  ? '此篩選沒有任何交易'
                 : noKnownSources
                   ? showSnaptradeTransactions ? '還沒有任何交易來源' : '目前顯示範圍沒有交易來源'
                 : isUnsupportedAccountDrilldown
@@ -683,7 +683,7 @@ export default function TransactionsScreen() {
                     ? '到「帳戶」tab 新增銀行或券商帳戶，同步後這裡就會有資料'
                     : '可到「帳戶」新增銀行帳戶，或在「設定」開啟「顯示 SnapTrade 交易明細」'
                 : isUnsupportedAccountDrilldown
-                  ? '目前這家銀行只同步到帳戶餘額，尚未同步存款交易明細；清除篩選也不會出現此帳戶的明細。'
+                  ? '這家銀行目前只同步餘額，沒有交易明細。'
                   : '試試清除篩選或執行同步'}
             </Text>
           </View>
