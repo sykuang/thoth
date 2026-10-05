@@ -23,8 +23,8 @@ def test_frontend_expense_categories_use_life_first_order() -> None:
     src = (ROOT / "frontend/src/lib/category-color.ts").read_text()
     assert _string_literals_from_array(src, "EXPENSE_CATEGORIES") == [
         "飲食", "購物", "交通", "居住", "通訊",
-        "娛樂", "醫療", "教育", "旅遊", "金融",
-        "投資", "酒菸", "其他",
+        "娛樂", "醫療", "教育", "旅遊", "金融費用",
+        "保險", "稅費", "投資", "酒菸", "其他",
     ]
 
 
