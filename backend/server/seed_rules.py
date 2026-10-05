@@ -12,7 +12,8 @@ Phase 8 (2026-06-15) 擴充: 從 10 條 → 完整覆蓋 Phase 6 13 主類 + Pha
 + 一鍵恢復 (POST /rules/reset).
 
 主類分布:
-  飲食 / 酒菸 / 購物 / 居住 / 交通 / 通訊 / 娛樂 / 醫療 / 教育 / 旅遊 / 金融 / 投資 / 其他
+  飲食 / 酒菸 / 購物 / 居住 / 交通 / 通訊 / 娛樂 / 醫療 / 教育 / 旅遊 / 金融費用 / 保險 / 稅費 / 投資 / 其他
+  (2026-10-05: 金融 拆成 金融費用 / 保險 / 稅費；電子支付是付款通道不是用途，已移除)
   + 訂閱 (flag, 跨主類)
   + 5 收入: 薪資 / 獎金 / 利息股息 / 投資收益 / 其他
   + 轉帳 / 還款 (flow_type='transfer')
@@ -201,10 +202,10 @@ DEFAULT_RULES: list[dict] = [
     #   詳見 wiki [[frontend-cross-layer-display-vs-stats-consistency]].
     {"name": "信用卡年費減免",
      "pattern": r"年費減免|年費沖銷|年費退回|年費退款|手續費減免|手續費退回|手續費沖銷|利息減免|利息退回|利息沖銷",
-     "category": "金融", "subcategory": "年費減免", "priority": 100},
+     "category": "金融費用", "subcategory": "年費減免", "priority": 100},
     {"name": "信用卡年費",
      "pattern": r"年費|Annual Fee|ANNUAL MEMBERSHIP|Annual Membership|ANNUAL MEMBER|Annual Member|MEMBER FEE|Member Fee",
-     "category": "金融", "subcategory": "年費", "priority": 95},
+     "category": "金融費用", "subcategory": "年費", "priority": 95},
     # 2026-07-28: 「國外交易手續費」必須高於所有商家 rule。
     # recategorize migration dry-run 抓到: HSBC 的手續費 row description 是
     # 「國外交易手續費ＡＬＰ＊Ｔａｏｂａｏ」(手續費 + 原始商家名黏在一起),
@@ -214,13 +215,13 @@ DEFAULT_RULES: list[dict] = [
     # priority 300 高於所有商家 rule (最高 110) 與收入類 (最高 250)。
     {"name": "國外交易手續費",
      "pattern": r"國外交易手續費|海外交易手續費|國際交易手續費|Foreign Transaction Fee|FOREIGN TXN FEE",
-     "category": "金融", "subcategory": "手續費", "priority": 300},
+     "category": "金融費用", "subcategory": "手續費", "priority": 300},
     {"name": "手續費",
      "pattern": r"手續費|管理費|Fee|跨行費|匯費",
-     "category": "金融", "subcategory": "手續費", "priority": 80},
+     "category": "金融費用", "subcategory": "手續費", "priority": 80},
     {"name": "保險",
      "pattern": r"國泰人壽|富邦人壽|新光人壽|南山人壽|中國人壽|保險|保費|investlink",
-     "category": "金融", "subcategory": "保險", "priority": 100},
+     "category": "保險", "subcategory": None, "priority": 100},
 
     # 投資 (flow_type='investment' 用, 對 dashboard 不算消費) — 細項已在上方投資子分類區
     # ====== 跨類 flag ======
@@ -256,7 +257,7 @@ DEFAULT_RULES: list[dict] = [
      "category": "獎金", "priority": 200},
     {"name": "貸款利息支出",
      "pattern": r"放款利息|貸款利息|借款利息|循環息|循環利息",
-     "category": "金融", "subcategory": "貸款利息", "priority": 300},
+     "category": "金融費用", "subcategory": "貸款利息", "priority": 300},
     {"name": "利息股息",
      "pattern": r"利息|股息|債息|配息|股利|Interest|INTEREST|Dividend|DIVIDEND",
      "category": "利息股息", "priority": 200},
@@ -339,12 +340,6 @@ DEFAULT_RULES: list[dict] = [
      "category": "購物", "subcategory": "海外其他", "priority": 90},
 
     # ─── 玉山 APE pay-with-line 系列 (HSBC 大量未命中前綴) ───
-    {"name": "玉山APE付款",
-     "pattern": r"^ＡＰＥ|^APE\d|ＡＰＥ４９５９|ＡＰＥ４７２２",
-     "category": "金融", "subcategory": "電子支付", "priority": 95},
-    {"name": "街口支付",
-     "pattern": r"街口|ＴＷＱＲ|TWQR|跨機構購物|電子支付",
-     "category": "金融", "subcategory": "電子支付", "priority": 105},
 
     # ─── 旅遊 全形平台 / 全形航空 / 旅行社 ───
     # 注意: 2026-06-19 拔掉 `盛豐行` — 該店是威士忌/烈酒專賣 (買酒網品牌主體),
@@ -390,16 +385,16 @@ DEFAULT_RULES: list[dict] = [
     # ─── 稅 / 規費 (priority 200 強, 蓋過所有消費) ───
     {"name": "綜所稅",
      "pattern": r"綜所稅款|綜所稅|綜合所得稅|個人所得稅",
-     "category": "金融", "subcategory": "稅", "priority": 200},
+     "category": "稅費", "subcategory": "稅", "priority": 200},
     {"name": "牌照稅燃料費",
      "pattern": r"牌照稅|燃料費|燃料稅|汽燃費|路用稅",
-     "category": "金融", "subcategory": "稅", "priority": 200},
+     "category": "稅費", "subcategory": "稅", "priority": 200},
     {"name": "房屋稅地價稅",
      "pattern": r"房屋稅|地價稅|契稅|印花稅|遺贈稅",
-     "category": "金融", "subcategory": "稅", "priority": 200},
+     "category": "稅費", "subcategory": "稅", "priority": 200},
     {"name": "違規罰款",
      "pattern": r"違規|罰單|罰款|交通違規|超速|違停|違規Ａ|違規A",
-     "category": "金融", "subcategory": "罰款", "priority": 200},
+     "category": "稅費", "subcategory": "罰款", "priority": 200},
 
     # ─── 加油 / 計程車 / 汽車 / 海外叫車 ───
     {"name": "加油站",
@@ -447,13 +442,13 @@ DEFAULT_RULES: list[dict] = [
     {"name": "保險公司",
      "pattern": r"全球人壽|國泰人壽|富邦人壽|新光人壽|南山人壽|中國人壽|台灣人壽|"
                 r"三商美邦|宏泰人壽|明台產險|富邦產險|新光產險|國泰世紀產險|和泰產險",
-     "category": "金融", "subcategory": "保險", "priority": 110},
+     "category": "保險", "subcategory": None, "priority": 110},
     {"name": "卡費利息違約金",
      "pattern": r"循環息|循環利息|違約金|減少違約金|滯納金|遲繳|預借現金|預借手續費",
-     "category": "金融", "subcategory": "手續費", "priority": 120},
+     "category": "金融費用", "subcategory": "手續費", "priority": 120},
     {"name": "信用卡分期",
      "pattern": r"^分期|信用卡分期|每期攤付|分期－",
-     "category": "金融", "subcategory": "分期", "priority": 120},
+     "category": "金融費用", "subcategory": "分期", "priority": 120},
     {"name": "信用卡帳單", "auto_excluded": True,
      "pattern": r"上期帳單|上期應繳|本期應繳|帳單總額|本期帳單|信用卡帳單",
      "category": "還款", "subcategory": "信用卡", "priority": 95},

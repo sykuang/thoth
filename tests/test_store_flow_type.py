@@ -81,7 +81,7 @@ def test_twd_loan_interest_row_stays_expense(store):
         "SELECT category, subcategory, flow_type, income_category "
         "FROM twd_transactions",
     ).fetchone()
-    assert row["category"] == "金融"
+    assert row["category"] == "金融費用"
     assert row["subcategory"] == "貸款利息"
     assert row["flow_type"] == "expense"
     assert row["income_category"] is None
@@ -179,6 +179,6 @@ def test_foreign_txn_fee_beats_merchant_rule(store):
     row = store.conn.execute(
         "SELECT category, subcategory, flow_type FROM card_billed_txns",
     ).fetchone()
-    assert row["category"] == "金融"
+    assert row["category"] == "金融費用"
     assert row["subcategory"] == "手續費"
     assert row["flow_type"] == "expense"

@@ -30,7 +30,7 @@ def test_register_seeds_default_rules(client):
         # 13 主類
         "飲食", "酒菸", "購物", "居住", "交通",
         "通訊", "娛樂", "醫療", "教育", "旅遊",
-        "金融", "投資", "其他",
+        "金融費用", "保險", "稅費", "投資", "其他",
         # 收入 5 類 + transfer/payment
         "薪資", "獎金", "利息股息", "投資收益",
         "轉帳", "還款",
@@ -189,7 +189,7 @@ def test_default_rules_cover_13_main_categories(client):
     main_13 = {
         "飲食", "酒菸", "購物", "居住", "交通",
         "通訊", "娛樂", "醫療", "教育", "旅遊",
-        "金融", "投資", "其他",
+        "金融費用", "保險", "稅費", "投資", "其他",
     }
     covered = {r["category"] for r in DEFAULT_RULES if r["category"] in main_13}
     assert covered == main_13, \
