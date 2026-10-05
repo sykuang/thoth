@@ -128,3 +128,23 @@ def test_previous_month_same_day_clamps_month_end_and_rolls_year():
     assert cards_router._previous_month_same_day(date(2026, 3, 31)) == date(2026, 2, 28)
     assert cards_router._previous_month_same_day(date(2024, 3, 31)) == date(2024, 2, 29)
     assert cards_router._previous_month_same_day(date(2026, 1, 31)) == date(2025, 12, 31)
+
+
+class _AfterFubonOctDue(date):
+    @classmethod
+    def today(cls) -> "_AfterFubonOctDue":
+        return cls(2026, 10, 5)
+
+
+def test_full_current_cycle_payment_not_yet_posted_is_paid(monkeypatch):
+    monkeypatch.setattr(cards_router, "date", _AfterFubonOctDue)
+    card = dict(bank="fubon", card_no="****2099", bill_due_amount=25724.0,
+                statement_close_date="2026-09-16", payment_due_date="2026-10-02",
+                last_payment_amount=25724.0, last_payment_date="2026-10-05")
+
+    assert cards_router._compute_bill_status(CardSummary(**card)) == "paid"
+    # partial or previous-cycle payment still overdue
+    assert cards_router._compute_bill_status(
+        CardSummary(**{**card, "last_payment_amount": 25000.0})) == "overdue"
+    assert cards_router._compute_bill_status(
+        CardSummary(**{**card, "last_payment_date": "2026-09-10"})) == "overdue"

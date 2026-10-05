@@ -96,6 +96,13 @@ def _compute_bill_status(card: CardSummary) -> str:
             return "paid"
         return "no_payment_required"
 
+    # Banks (e.g. Fubon) keep the remaining due at the full bill until the payment
+    # posts. A current-cycle payment of exactly that amount settles it; a posted
+    # payment would already have reduced the remaining due (HSBC partial case).
+    if (last_pay and payment_boundary and last_pay >= payment_boundary
+            and card.last_payment_amount is not None
+            and abs(card.last_payment_amount - card.bill_due_amount) < 0.5):
+        return "paid"
     if due is None:
         return "unknown"
     if today <= due:
