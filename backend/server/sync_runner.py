@@ -750,6 +750,14 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
             delta = persist_collected(bank, data, store, rules=rules)
         except Exception as exc:
             raise _PersistenceError("persistence_failed") from exc
+        from backend.server.auto_debit_payments import apply_auto_debit_payments
+
+        try:
+            delta["auto_debit_payments_applied"] = apply_auto_debit_payments(
+                bank, user_id, store, data,
+            )
+        except Exception as exc:  # derived facts never fail an otherwise persisted sync
+            print(f"[sync][{bank}] auto-debit derivation skipped: {type(exc).__name__}", file=sys.stderr)
         stats = store.stats()
     except BaseException:
         try:

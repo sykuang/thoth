@@ -1,5 +1,6 @@
 """E.SUN SPA card presence and native IESC bill read, RAM-only and incomplete."""
 from collections.abc import Callable
+from datetime import date
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -25,6 +26,32 @@ BILL_URLS = {
     'detail': 'https://iesc.esunbank.com/GW/creditBill/getDetailResult',
 }
 BILL_TOTAL = 2 * LIMIT
+
+
+def _statement_cycle(body):
+    """Latest TWD statement (close date, due date, total). Never a remaining-due fact."""
+    info = body.get('billInfo') if type(body) is dict else None
+    if type(info) is not dict:
+        return None
+    totals = info.get('billTotalInfoList')
+    if type(totals) is not list or len(totals) != 1 or type(totals[0]) is not dict:
+        return None  # ponytail: TWD-only bills; foreign-currency statements stay unavailable
+    total = totals[0]
+    amount = total.get('billTotalAmount')
+    if total.get('billTotalCurrency') != 'TWD' or type(amount) is not int or not 0 <= amount <= 100_000_000:
+        return None
+    dates = []
+    for key in ('billDate', 'paymentDueDate'):
+        raw = info.get(key)
+        if type(raw) is not str or len(raw) != 8 or not raw.isdigit():
+            return None
+        try:
+            dates.append(date(int(raw[:4]), int(raw[4:6]), int(raw[6:])).isoformat())
+        except ValueError:
+            return None
+    if dates[0] > dates[1]:
+        return None
+    return {'statement_close_date': dates[0], 'payment_due_date': dates[1], 'statement_amount': amount}
 
 
 def _cleanup_all(actions):
@@ -138,6 +165,7 @@ def _open_bill(page, bound):
     if button.count() != 1 or not button.is_visible() or not button.is_enabled():
         raise ValueError('SPA bill button rejected')
     receipt: dict[str, object] = {'popup': False, 'summary': False, 'detail': False}
+    cycles: dict[str, object] = {}
     popup = None
     observers = {}
     admitted = 0
@@ -175,6 +203,8 @@ def _open_bill(page, bound):
             projection = _project_bill(kind, payload.get('body'))
             if projection is not None:
                 receipt[kind] = projection
+                if kind == 'summary':
+                    cycles['summary'] = _statement_cycle(payload.get('body'))
         except Exception:
             pass  # An unavailable bounded observation never becomes a fact.
 
@@ -206,6 +236,8 @@ def _open_bill(page, bound):
         if receipt['popup']:
             while monotonic() < deadline and not (receipt['summary'] and receipt['detail']):
                 native.wait_for_timeout(50)
+        # Amounts stay out of telemetry; the caller pops this private key.
+        receipt['_statement_cycle'] = cycles.get('summary')
         return receipt
     finally:
         actions: list[Callable[[], object]] = [
@@ -222,12 +254,15 @@ def collect_products(crawler, page, collector, login_baseline):
     """Read product presence and optional native bill; never certify sync success."""
     presence, bound = _overview(crawler, page, collector, login_baseline)
     evidence = {'card_presence': presence, 'popup': False, 'summary': False, 'detail': False}
+    cycle = None
     if presence:
         crawler._esun_spa_phase = 'native_bill'
         try:
             evidence.update(_open_bill(page, bound))
+            cycle = evidence.pop('_statement_cycle', None)
         except Exception:
             # A failed native handoff is an incomplete read, never a bill fact.
             evidence['native_bill_unavailable'] = True
+    evidence['statement_cycle'] = cycle is not None
     return BankCollectResult(bank='esun', error='spa_collection_incomplete', card_bill_facts_ok=False,
-                             telemetry={'esun_spa_products': evidence})
+                             card_statement_cycle=cycle, telemetry={'esun_spa_products': evidence})

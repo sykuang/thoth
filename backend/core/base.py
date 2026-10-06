@@ -1401,6 +1401,7 @@ class BankCollectResult:
     card_resources: Any = None
     card_statement_transactions: Any = None
     card_statements: Any = None
+    card_statement_cycle: Any = None
     card_submenu: Any = None
     card_summary: Any = None
     card_text: Any = None
