@@ -1,5 +1,6 @@
 import type { Transaction } from '@/types/api';
 import {
+  applyTxnFilters,
   computePeriodStats,
   filterCategoryViewItems,
   matchesCardDrilldown,
@@ -85,5 +86,16 @@ deepEqual(
   ],
   '單卡 drilldown 必須保留銀行無法歸卡的整戶信用卡交易，但不得帶入其他卡或存款交易',
 );
+
+{
+  const rows = [
+    { ...txn(1, '飲食', 'expense'), description: 'ＡＴＭ提款（跨行）', tags: [] },
+    { ...txn(2, '飲食', 'expense'), description: '全聯', tags: ['ＵＳ旅遊'] },
+  ];
+  const ids = (search: string) => applyTxnFilters(rows, { category: '', subcategory: '', direction: 'all', search }).map((t) => t.id);
+  deepEqual(ids('atm提款(跨行)'), [1], '半形搜尋必須命中全形描述');
+  deepEqual(ids('us'), [2], '半形搜尋必須命中全形標籤');
+  deepEqual(ids('ＡＴＭ'), [1], '全形搜尋仍可命中');
+}
 
 console.log('transaction category view filter tests passed');
