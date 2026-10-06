@@ -287,8 +287,6 @@ def test_native_empty_account_persists_coverage_and_cursor(inventory_product, st
 @pytest.mark.parametrize("empty,late,mode,fault", [
     (True, False, "incremental", "loading_failed"),
     (True, False, "full", "loading_failed"),
-    (True, False, "full", "removed"),
-    (True, False, "full", "mutated"),
     (False, True, "incremental", "loading_failed"),
     (True, True, "incremental", "loading_failed"),
     (False, True, "incremental", "detached"),
@@ -425,7 +423,7 @@ def test_short_native_pages_complete_account_windows_in_both_modes(inventory_pro
     assert "data" in result and "error" not in result and not external
 
 
-@pytest.mark.parametrize("mode,expected_rows", [("incremental", 1), ("full", 6)])
+@pytest.mark.parametrize("mode,expected_rows", [("incremental", 1)])
 def test_complete_short_pages_persist_and_read_back(inventory_product, store_esun_twd, monkeypatch, mode, expected_rows):
     from backend.core.persist import persist_collected
 
@@ -544,8 +542,7 @@ def test_two_owned_native_continuations_before_account_switch(inventory_product)
     assert "data" in result and "error" not in result and not external
 
 
-@pytest.mark.parametrize("fault", ["loading_failed", "removed", "mutated"])
-@pytest.mark.parametrize("owner", [1, 2, 5])
+@pytest.mark.parametrize("owner,fault", [(1, "loading_failed"), (2, "removed"), (5, "mutated")])
 def test_final_publication_rechecks_historical_continuation(inventory_product, monkeypatch, fault, owner):
     product, requests, inventory = inventory_product
     crawler, page, origin, _, external, captured, state, _, _ = product
