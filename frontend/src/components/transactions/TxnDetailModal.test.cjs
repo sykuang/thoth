@@ -332,6 +332,7 @@ for (const splits of [[],parent.splits]) test(`original parent editing (${splits
   assert.equal(body.category,'飲食');assert.equal(body.subcategory,'晚餐');
   assert.deepEqual(body.splits,splits);
   if (!splits.length) assert.equal(s.client.getQueryData(s.listKey).items[0].category,'飲食','original unsplit optimistic update remains');
+  if (!splits.length) assert.equal(s.client.getQueryData(s.replicaKey).transactions[0].category,'飲食','replica-backed tab shows the edit before pull returns');
   s.client.clear();
 });
 
