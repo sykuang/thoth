@@ -42,6 +42,7 @@ dev = [
     "pytest>=8.0.0",
     "httpx2>=0.0.1",
     "ruff>=0.15.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 # Optional extras — 開源 user 想啟用對應 push provider 才 install。
