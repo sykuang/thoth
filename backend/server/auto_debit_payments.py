@@ -37,13 +37,8 @@ def card_debits(store: BankStore, account_no: str, card_bank: str,
     if pattern is None:
         return []
     since = ((today or date.today()) - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    rows = store.conn.execute(
-        "SELECT txn_datetime, description, expend FROM twd_transactions "
-        "WHERE user_id = ? AND account_no = ? AND currency = 'TWD' AND expend > 0 "
-        "AND txn_datetime >= ? ORDER BY txn_datetime",
-        (store.user_id, account_no, since),
-    ).fetchall()
-    return [(r[0][:10], int(r[2])) for r in rows if pattern.search((r[1] or "").strip())]
+    return [(day, amount) for day, desc, amount in store.twd_debits_since(account_no, since)
+            if pattern.search(desc.strip())]
 
 
 def statement_fact(cycle: dict[str, Any], debits: list[tuple[str, int]]):

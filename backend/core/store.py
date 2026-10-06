@@ -2331,6 +2331,16 @@ class BankStore:
             self.conn.commit()
         return updated
 
+    def twd_debits_since(self, account_no: str, since: str) -> list[tuple[str, str, int]]:
+        """(date, description, expend) TWD debits of one account since `since`, oldest first."""
+        rows = self.conn.execute(
+            "SELECT txn_datetime, description, expend FROM twd_transactions "
+            "WHERE user_id = ? AND account_no = ? AND currency = 'TWD' AND expend > 0 "
+            "AND txn_datetime >= ? ORDER BY txn_datetime",
+            (self.user_id, account_no, since),
+        ).fetchall()
+        return [(r[0][:10], r[1] or "", int(r[2])) for r in rows]
+
     def record_auto_debit_payment(self, payment_date: str, amount: int, *,
                                   commit: bool = True) -> int:
         """Advance every card's last-payment pair to a newer auto-debit; never regress."""

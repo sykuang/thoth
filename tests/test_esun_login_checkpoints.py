@@ -776,6 +776,7 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         ast.dump(node, include_attributes=False) for node in crawler.body[start:]
     ).encode()
     assert hashlib.sha256(full).hexdigest() == (
-        # 2026-10-03 live: SPA path publishes accounts read from the 交易明細 overview.
-        "f37c76d19887649a90a70ecab00081ad0eed4932beb5c270155ac216f59798b0"
+        # 2026-10-05: SPA path also forwards the native statement cycle (date/due/total)
+        # so the auto-debit derivation can compute remaining due; no new browser action.
+        "63d3b81e066a2d025efc26e42ca83aa2b4b876730f93894eb21cb88a6361063a"
     )
