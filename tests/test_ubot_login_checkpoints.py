@@ -631,6 +631,21 @@ def test_ocr_reads_five_times_and_refreshes_at_most_four(monkeypatch, capsys) ->
     assert page.wait_for_timeout.call_args_list == [call(2000)] * 4
     assert "PRIVATE-OCR-MARKER" not in capsys.readouterr().err
     page.evaluate.assert_not_called()
+    page.locator.assert_called_with(ubot_module.REFRESH_CAPTCHA_SELECTOR)
+
+
+def test_refresh_selector_skips_wrapper_divs_sharing_the_link_text() -> None:
+    from patchright.sync_api import sync_playwright
+
+    html = """<div class=wrap><div class=row><div class=link>重新產生</div></div></div>"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.set_content(html)
+        assert ubot_module._unique_visible_enabled_exact(page, "div,a,span,button,i", "重新產生") is None
+        found = ubot_module._unique_visible_enabled_exact(page, ubot_module.REFRESH_CAPTCHA_SELECTOR, "重新產生")
+        assert found is not None and found.get_attribute("class") == "link"
+        browser.close()
 
 
 def test_ocr_refresh_ambiguity_stops_without_click_or_submit(monkeypatch) -> None:

@@ -51,7 +51,8 @@ SEL_SID = "#sid"           # 身分證字號 (text)
 SEL_NICK = "#nickname"     # 使用者代號 (password)
 SEL_PWD = "#password"      # 網路密碼 (password, maxlen=12)
 SEL_CAPTCHA = "#CAPTCHA"   # 圖形驗證碼 (tel)
-SEL_CAPTCHA_IMG = "img[alt='CAPTCHA']"  # base64 jpeg 170x50
+SEL_CAPTCHA_IMG = "img[alt='CAPTCHA']"
+REFRESH_CAPTCHA_SELECTOR = "div:not(:has(div,a,span,button,i)),a,span,button,i"  # base64 jpeg 170x50
 
 # W (2026-06-17): positive signal — 對齊 SCSB 鐵律, 取代「#sid 不在 = 已登入」
 # negative-only 訊號。內銀區頁面本來就沒 #sid（外網 modal 才有），單看它不在
@@ -1140,9 +1141,11 @@ class UbotCrawler(BankCrawler):
             _log(f"[cap] OCR attempt={attempt} status=invalid")
             if attempt == max_attempts:
                 break
+            # Leaf divs only: the link's wrapper divs share its exact text, and three
+            # matches made the unique gate refuse every refresh.
             refresh = _unique_visible_enabled_exact(
                 page,
-                "div,a,span,button,i",
+                REFRESH_CAPTCHA_SELECTOR,
                 "重新產生",
             )
             if refresh is None:
