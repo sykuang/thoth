@@ -40,6 +40,11 @@ export type TxnFilters = {
 export type TxnCashflowDirection = 'income' | 'expense' | 'zero';
 
 /** Keep provider-level card rows visible without attributing them to one card. */
+/** Search key: NFKC folds full-width letters/digits/punctuation (ＡＴＭ、（１）) to half-width. */
+export function searchFold(s: string | null | undefined): string {
+  return (s ?? '').normalize('NFKC').toLowerCase();
+}
+
 export function matchesCardDrilldown(t: Transaction, cardNo: string): boolean {
   return t.card_no === cardNo
     || ((t.kind === 'billed' || t.kind === 'pending') && !t.card_no);
@@ -88,7 +93,7 @@ export function txnCashflowAmount(t: Transaction): Money {
  * 點「未分類」chip → category='__null__' → 這裡比對 t.category=null/undefined/''.
  */
 export function applyTxnFilters(items: Transaction[], f: TxnFilters): Transaction[] {
-  const searchLower = f.search.trim().toLowerCase();
+  const searchLower = searchFold(f.search.trim());
   return items.filter((t) => {
     // 主類: '__null__' sentinel 代表未分類
     if (f.category) {
@@ -108,10 +113,11 @@ export function applyTxnFilters(items: Transaction[], f: TxnFilters): Transactio
     // 對齊 backend `q` filter 行為: server 端只 match desc, 此處是 client 補強 (期間內 row
     // 已全載到 rawItems, 多 match tag 不會增加 API call).
     if (searchLower) {
-      const desc = (t.kind === 'loan_repayment' ? [t.description, t.bank, t.account_no, t.currency, t.loan_repayment.sub_account].join(' ') : t.description ?? '').toLowerCase();
-      const hitDesc = desc.includes(searchLower);
+      const desc = (t.kind === 'loan_repayment' ? [t.description, t.bank, t.account_no, t.currency, t.loan_repayment.sub_account].join(' ') : t.description ?? '');
+      const descFold = searchFold(desc);
+      const hitDesc = descFold.includes(searchLower);
       const hitTag = (t.tags ?? []).some((tag) =>
-        tag.toLowerCase().includes(searchLower),
+        searchFold(tag).includes(searchLower),
       );
       if (!hitDesc && !hitTag) return false;
     }

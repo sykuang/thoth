@@ -32,6 +32,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { CategoryPicker } from '@/components/CategoryPicker';
 import { api, type ApiError, formatApiError } from '@/lib/api';
+import { applyBulkPatch } from '@/lib/bulkPatch';
+import type { Transaction } from '@/types/api';
 import { sortCategoryKeys } from '@/lib/category-color';
 import { Dropdown } from './Dropdown';
 import { TagPicker } from './TagPicker';
@@ -184,6 +186,16 @@ export function BulkEditSheet({ visible, targets, onClose, onSuccess }: Props) {
           failedTargets.push({ target: targets[idx], error: msg });
         }
       });
+      // The transactions tab renders the local replica; patch confirmed rows now so
+      // closing the sheet does not reveal pre-edit rows until the replica pull returns.
+      const ok = new Set(targets.filter((_, i) => results[i].status === 'fulfilled')
+        .map((t) => `${t.bank}|${t.kind}|${t.id}`));
+      for (const [key, data] of qc.getQueriesData<{ transactions?: Transaction[] }>({ queryKey: ['frontend-dataset'] })) {
+        if (!data?.transactions) continue;
+        qc.setQueryData(key, { ...data, transactions: data.transactions.map((t) => (
+          ok.has(`${t.bank}|${t.kind}|${t.id}`) ? applyBulkPatch(t, patch) : t
+        )) });
+      }
       return { updated, failed, failedTargets };
     },
     onSuccess: (res) => {

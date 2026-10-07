@@ -324,6 +324,32 @@ function EditableTxnDetailModal({
         qc.setQueryData(key, next);
       }
 
+      // 1b. Transactions tab reads the local replica, not the list cache; patch it
+      // too or the closed sheet reveals the pre-edit row until replica pull returns.
+      await qc.cancelQueries({ queryKey: ['frontend-dataset'] });
+      const replicaSnaps = qc.getQueriesData<{ transactions?: Transaction[] }>({
+        queryKey: ['frontend-dataset'],
+      });
+      for (const [key, data] of replicaSnaps) {
+        if (!data?.transactions) continue;
+        qc.setQueryData(key, {
+          ...data,
+          transactions: data.transactions.map((t) =>
+            t.bank === txn.bank && t.kind === txn.kind && t.id === txn.id
+              ? {
+                  ...t,
+                  category: newCat || null,
+                  subcategory: newSub || null,
+                  description_overwrite: vars.description_overwrite || null,
+                  tags: vars.tags,
+                  auto_excluded: vars.auto_excluded,
+                }
+              : t,
+          ),
+        });
+      }
+      const snaps: [readonly unknown[], unknown][] = [...listSnaps, ...replicaSnaps];
+
       // 2. Stats cache patch — cat 主類 delta (count + amount)
       const statsSnaps = qc.getQueriesData<TransactionsStatsResponse>({
         queryKey: ['transactions', 'stats'],
@@ -360,7 +386,7 @@ function EditableTxnDetailModal({
         }
       }
 
-      return { listSnaps, statsSnaps };
+      return { listSnaps: snaps, statsSnaps };
     },
     onError: (e, vars, ctx) => {
       // Rollback: snapshot 全部還原

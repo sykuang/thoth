@@ -27,6 +27,7 @@
  *     onClose={() => setTagPickerVisible(false)}
  *   />
  */
+import { searchFold } from '@/lib/txnFilter';
 import { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -78,9 +79,9 @@ export function TagPicker({ visible, value, onChange, onClose }: Props) {
   // 已選的 tag 也要列出 (帶 ✓), 讓 user 能直接取消
   const filtered = useMemo(() => {
     if (!trimmedQuery) return allPopular;
-    const needle = trimmedQuery.toLowerCase();
+    const needle = searchFold(trimmedQuery);
     return allPopular.filter((t) =>
-      t.name.toLowerCase().includes(needle),
+      searchFold(t.name).includes(needle),
     );
   }, [allPopular, trimmedQuery]);
 

@@ -54,6 +54,7 @@ import {
   matchesCardDrilldown,
   transactionSectionTitle,
   txnCashflowAmount,
+  searchFold,
 } from '@/lib/txnFilter';
 import {
   type SupportedBank,
@@ -295,7 +296,7 @@ export default function TransactionsScreen() {
 
   const visibleBrokerageActivities = useMemo(() => {
     if (!brokerageRelevant) return [];
-    const needle = search.trim().toLowerCase();
+    const needle = searchFold(search.trim());
     if (!needle) return brokeragePeriodActivities;
     const accounts = new Map((activeBrokeragePortfolio?.accounts ?? []).map((account) => [account.id, account]));
     return brokeragePeriodActivities.filter((activity) => {
@@ -306,7 +307,7 @@ export default function TransactionsScreen() {
         activity.description,
         account?.institution_name,
         account?.name,
-      ].some((value) => value?.toLowerCase().includes(needle));
+      ].some((value) => searchFold(value).includes(needle));
     });
   }, [brokeragePeriodActivities, activeBrokeragePortfolio, brokerageRelevant, search]);
 
