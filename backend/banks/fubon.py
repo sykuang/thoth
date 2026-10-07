@@ -44,6 +44,7 @@ from scrapling.fetchers import StealthySession
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    captcha_unreadable,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -819,9 +820,9 @@ class FubonCrawler(BankCrawler):
                 or captcha_field.get_attribute("maxlength") != "6"
             ):
                 raise FubonLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            captcha = self._ocr_captcha(frame, max_attempts=5)
+            captcha = self._ocr_captcha(frame, max_attempts=1)
             if not captcha or len(captcha) != 6 or not captcha.isdigit():
-                raise FubonLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+                raise captcha_unreadable(FubonLoginError("圖形驗證碼 OCR 失敗；未送出登入"))
             captcha_field.click()
             captcha_field.click(click_count=3)
             captcha_field.press("Backspace", timeout=5000)

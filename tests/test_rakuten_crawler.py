@@ -830,33 +830,18 @@ def test_real_patchright_multi_modal_post_submit_wait_is_secret_safe(caplog) -> 
             browser.close()
 
 
-def test_captcha_refreshes_image_at_most_once_before_one_submit(monkeypatch) -> None:
-    crawler, page, _, button, _, refresh = _submit_fixture(monkeypatch, captcha_visible=True)
-    solve = Mock(side_effect=[None, "1234"])
-    stable = Mock()
-    monkeypatch.setattr(rakuten_mod, "solve_captcha", solve)
-    monkeypatch.setattr(rakuten_mod, "wait_captcha_stable", stable)
-
-    crawler.submit_credentials_once(page)
-
-    refresh.click.assert_called_once_with()
-    assert solve.call_count == 2
-    assert all(call.kwargs["min_confidence"] == 0.95 for call in solve.call_args_list)
-    assert stable.call_count == 2
-    button.click.assert_called_once_with()
-
-
 def test_captcha_ocr_failure_never_submits(monkeypatch) -> None:
     crawler, page, _, button, _, refresh = _submit_fixture(monkeypatch, captcha_visible=True)
     solve = Mock(return_value=None)
     monkeypatch.setattr(rakuten_mod, "solve_captcha", solve)
     monkeypatch.setattr(rakuten_mod, "wait_captcha_stable", Mock())
 
-    with pytest.raises(RakutenLoginError, match="OCR 失敗"):
+    with pytest.raises(RakutenLoginError, match="OCR 失敗") as error:
         crawler.submit_credentials_once(page)
 
-    refresh.click.assert_called_once_with()
-    assert solve.call_count == 2
+    assert error.value.safe_code == "captcha_ocr_failed"  # shared login reloads the page
+    refresh.click.assert_not_called()
+    assert solve.call_count == 1
     button.click.assert_not_called()
 
 

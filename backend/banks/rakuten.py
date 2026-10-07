@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import contextlib
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 import os
@@ -19,6 +18,7 @@ from zoneinfo import ZoneInfo
 from scrapling.fetchers import StealthySession
 
 from backend.core.base import (
+    captcha_unreadable,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -804,27 +804,7 @@ class RakutenCrawler(BankCrawler):
                 tmp_path=self.captcha_tmp,
             ) or ""
             if not captcha:
-                with contextlib.suppress(Exception):
-                    old_src = page.locator(CAPTCHA_IMG).get_attribute("src") or ""
-                    captcha_group = page.locator("captcha-image").locator(
-                        "xpath=ancestor::div[contains(@class,'form-group')][1]",
-                    )
-                    captcha_group.locator("a:has(.icon-restart)").click()
-                    page.wait_for_function(
-                        "old => (document.querySelector('captcha-image img')?.getAttribute('src') || '') !== old",
-                        arg=old_src,
-                        timeout=5000,
-                    )
-                    wait_captcha_stable(page, CAPTCHA_IMG, tmp_path=self.captcha_tmp)
-                    captcha = solve_captcha(
-                        page,
-                        CAPTCHA_IMG,
-                        expected_len=4,
-                        min_confidence=0.95,
-                        tmp_path=self.captcha_tmp,
-                    ) or ""
-            if not captcha:
-                raise RakutenLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+                raise captcha_unreadable(RakutenLoginError("圖形驗證碼 OCR 失敗；未送出登入"))
 
         fields = (
             ("#custNo", self.creds.national_id),

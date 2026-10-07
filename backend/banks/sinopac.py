@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    captcha_unreadable,
     _HistoryBodyObserver,
     _OriginGuardProxy,
     BankCollectResult,
@@ -560,12 +561,12 @@ class SinopacCrawler(BankCrawler):
                 strict=True,
             ):
                 self._keyboard_fill(page, field, value)
-            captcha = self._ocr_captcha(page, max_attempts=5)
+            captcha = self._ocr_captcha(page, max_attempts=1)
             if captcha is None:
-                raise SinopacLoginError(
+                raise captcha_unreadable(SinopacLoginError(
                     self.CAPTCHA_INVALID,
                     "永豐驗證碼辨識失敗；未送出登入",
-                )
+                ))
             self._keyboard_fill(page, fields[3], captcha)
 
             candidates = page.locator("#MMA_Login")
