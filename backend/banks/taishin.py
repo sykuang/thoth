@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    captcha_unreadable,
     BankCollectResult,
     BankCrawler,
     ResponseCollector,
@@ -1829,9 +1830,9 @@ class TaishinCrawler(BankCrawler):
         except Exception:
             raise TaishinLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        captcha = self._ocr_captcha(frame, max_attempts=5)
+        captcha = self._ocr_captcha(frame, max_attempts=1)
         if not captcha or len(captcha) != 6 or not captcha.isdigit():
-            raise TaishinLoginError("圖形驗證碼 OCR 失敗；未送出登入")
+            raise captcha_unreadable(TaishinLoginError("圖形驗證碼 OCR 失敗；未送出登入"))
         try:
             candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS["captcha"]))
             if candidates.count() != 1:

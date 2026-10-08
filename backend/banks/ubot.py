@@ -1063,7 +1063,7 @@ class UbotCrawler(BankCrawler):
         except Exception:
             raise UbotLoginError("登入欄位無法安全填寫；未送出登入") from None
 
-        captcha = self._ocr_with_regen(page, max_attempts=5)
+        captcha = self._ocr_with_regen(page, max_attempts=1)
         if not captcha:
             raise UbotLoginError(
                 "圖形驗證碼 OCR 失敗；未送出登入",

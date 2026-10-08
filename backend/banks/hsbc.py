@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import (
+    captcha_unreadable,
     ApiHit,
     BankCollectResult,
     BankCrawler,
@@ -395,7 +396,7 @@ class HsbcCrawler(BankCrawler):
 
     def _solve_captcha(self, page) -> str | None:
         previous_digest = None
-        for attempt in range(8):
+        for attempt in range(1):  # unreadable → shared login reloads the page
             try:
                 stable = self._stable_captcha(page, previous_digest)
                 if stable is None:
@@ -413,7 +414,7 @@ class HsbcCrawler(BankCrawler):
             if isinstance(result, str) and re.fullmatch(r"[A-Za-z0-9]{5}", result):
                 return result
             try:
-                if attempt == 7 or not self._refresh_captcha(page):
+                if attempt == 0 or not self._refresh_captcha(page):
                     return None
             except Exception:
                 return None
@@ -451,7 +452,7 @@ class HsbcCrawler(BankCrawler):
             self._keyboard_fill(page, password, self.creds.password)
             captcha_text = self._solve_captcha(page)
             if captcha_text is None:
-                raise HsbcLoginError("無法安全辨識驗證碼；未送出登入")
+                raise captcha_unreadable(HsbcLoginError("無法安全辨識驗證碼；未送出登入"))
             captcha = self._visible_enabled(page, SEL_CAPTCHA)
             self._keyboard_fill(page, captcha, captcha_text)
             final = self._exact_button(

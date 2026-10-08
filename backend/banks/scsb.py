@@ -31,7 +31,7 @@ from typing import ClassVar
 from urllib.parse import parse_qsl, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
+from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector, captcha_unreadable
 from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScsbCreds
@@ -382,9 +382,9 @@ class ScsbCrawler(BankCrawler):
                 strict=True,
             ):
                 self._keyboard_fill(page, field, value)
-            captcha = self._ocr_captcha(page, max_attempts=5)
+            captcha = self._ocr_captcha(page, max_attempts=1)
             if not captcha:
-                raise ScsbLoginError("無法安全辨識驗證碼；未送出登入")
+                raise captcha_unreadable(ScsbLoginError("無法安全辨識驗證碼；未送出登入"))
             self._keyboard_fill(page, fields[3], captcha)
 
             candidates = page.locator(

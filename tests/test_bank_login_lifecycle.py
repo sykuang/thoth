@@ -2030,3 +2030,55 @@ def test_twelve_actions_still_leave_room_for_successful_login(monkeypatch, tmp_p
         CheckpointPhase.POST_SUBMIT_SETTLE,
     ]
     assert crawler.events[-2:] == ["collect", "logout"]
+
+
+def _captcha_crawler(fail_times: int):
+    from backend.core.base import captcha_unreadable
+
+    crawler = _StagedCrawler(name="staged")
+    crawler.reloads = 0
+
+    def submit(page) -> None:
+        crawler.submissions += 1
+        if crawler.submissions <= fail_times:
+            raise captcha_unreadable(RuntimeError("ocr"))
+
+    crawler.submit_credentials_once = submit
+    page = SimpleNamespace(reload=lambda: setattr(crawler, "reloads", crawler.reloads + 1))
+    return crawler, page
+
+
+@pytest.mark.parametrize("fail_times, ok", [(0, True), (4, True), (5, False)])
+def test_unreadable_captcha_reloads_page_up_to_five_attempts(fail_times, ok) -> None:
+    crawler, page = _captcha_crawler(fail_times)
+    if ok:
+        crawler._submit_with_captcha_reloads(page, page)
+    else:
+        with pytest.raises(RuntimeError) as error:
+            crawler._submit_with_captcha_reloads(page, page)
+        assert error.value.safe_code == "captcha_ocr_failed"
+    assert crawler.submissions == min(fail_times + 1, 5)
+    assert crawler.reloads == min(fail_times, 4)
+    assert crawler.events.count("prepare-login-page") == crawler.reloads
+
+
+def test_other_submit_errors_never_reload_or_resubmit() -> None:
+    crawler, page = _captcha_crawler(0)
+
+    def submit(_page) -> None:
+        crawler.submissions += 1
+        raise RuntimeError("login failed")
+
+    crawler.submit_credentials_once = submit
+    with pytest.raises(RuntimeError):
+        crawler._submit_with_captcha_reloads(page, page)
+    assert (crawler.submissions, crawler.reloads) == (1, 0)
+
+
+@pytest.mark.parametrize("bank", ["fubon", "hsbc", "rakuten", "scb", "scsb", "sinopac", "taishin", "ubot"])
+def test_every_captcha_bank_tags_unreadable_ocr_for_reload(bank) -> None:
+    import inspect
+    import importlib
+
+    source = inspect.getsource(importlib.import_module(f"backend.banks.{bank}"))
+    assert "captcha_unreadable(" in source or 'safe_code="captcha_ocr_failed"' in source

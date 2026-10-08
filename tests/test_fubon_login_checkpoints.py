@@ -550,7 +550,7 @@ def test_submit_uses_exact_dynamic_field_contract_and_true_keyboard() -> None:
         field.input_value.assert_called_once_with()
     page.keyboard.press.assert_not_called()
     page.keyboard.type.assert_not_called()
-    crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=5)
+    crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=1)
     submit.click.assert_called_once_with(timeout=8000)
     assert frame.locator.call_args_list.count(call("input[type='password']")) == 1
     page.evaluate.assert_not_called()

@@ -342,7 +342,7 @@ def test_submit_uses_keyboard_cardinality_fresh_ocr_and_one_native_click() -> No
         call("PASSWORD-PRIVATE", delay=80),
         call("123456", delay=80),
     ]
-    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=5)
+    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=1)
     button.click.assert_called_once_with(timeout=8000)
     page.fill.assert_not_called()
     page.evaluate.assert_not_called()
