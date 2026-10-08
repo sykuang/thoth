@@ -434,7 +434,7 @@ def _refresh():
     return refresh
 
 
-def test_captcha_reads_eight_stable_native_screenshots_and_refreshes_at_most_seven(
+def test_captcha_reads_one_stable_screenshot_and_leaves_retries_to_page_reload(
     monkeypatch,
 ) -> None:
     crawler = _crawler()
@@ -445,12 +445,12 @@ def test_captcha_reads_eight_stable_native_screenshots_and_refreshes_at_most_sev
     monkeypatch.setattr(hsbc_module, "ocr_bytes", ocr)
 
     assert crawler._solve_captcha(page) is None
-    assert ocr.call_count == 8
-    assert image.screenshot.call_count == 16
-    assert refresh.click.call_count == 7
+    assert ocr.call_count == 1
+    assert image.screenshot.call_count == 2
+    refresh.click.assert_not_called()
 
 
-def test_captcha_ocr_exceptions_are_failed_reads_with_the_same_eight_seven_budget(
+def test_captcha_ocr_exception_is_one_failed_read_without_in_page_refresh(
     monkeypatch,
 ) -> None:
     crawler = _crawler()
@@ -461,8 +461,8 @@ def test_captcha_ocr_exceptions_are_failed_reads_with_the_same_eight_seven_budge
     monkeypatch.setattr(hsbc_module, "ocr_bytes", ocr)
 
     assert crawler._solve_captcha(page) is None
-    assert ocr.call_count == 8
-    assert refresh.click.call_count == 7
+    assert ocr.call_count == 1
+    refresh.click.assert_not_called()
 
 
 def test_captcha_image_and_refresh_ambiguity_stop_before_submit(monkeypatch) -> None:

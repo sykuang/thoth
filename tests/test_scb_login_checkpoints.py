@@ -456,7 +456,7 @@ def test_stale_capt_dom_does_not_refresh_during_ordinary_submit() -> None:
     crawler.submit_credentials_once(page)
 
     refresh.click.assert_not_called()
-    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=5)
+    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=1)
     submit.click.assert_called_once_with(timeout=8000)
 
 

@@ -44,6 +44,16 @@ from backend.core.login_checkpoints import (
     validate_login_checkpoint_outcome,
 )
 
+# Unreadable CAPTCHA = raised before any credential submit, so a page reload is safe.
+CAPTCHA_UNREADABLE = "captcha_ocr_failed"
+CAPTCHA_PAGE_ATTEMPTS = 5
+
+
+def captcha_unreadable(error: BaseException) -> BaseException:
+    """Tag a pre-submit OCR failure so the shared login reloads instead of failing."""
+    error.safe_code = CAPTCHA_UNREADABLE
+    return error
+
 
 class _DuplicateJsonKey(ValueError):
     pass
@@ -1772,6 +1782,29 @@ class BankCrawler(ABC):
         """Allow a bank-specific, non-resubmitting auth recheck after a terminal."""
         return False
 
+    def _submit_with_captcha_reloads(self, page, submit_page) -> None:
+        """Submit once; an unreadable CAPTCHA (raised before any submit) reloads and retries."""
+        for attempt in range(1, CAPTCHA_PAGE_ATTEMPTS + 1):
+            try:
+                self.submit_credentials_once(submit_page)
+                return
+            except Exception as error:
+                if (getattr(error, "safe_code", None) != CAPTCHA_UNREADABLE
+                        or attempt == CAPTCHA_PAGE_ATTEMPTS):
+                    raise
+            import sys as _sys
+            print(f"[{self.name}][login] captcha unreadable; reload attempt={attempt + 1}",
+                  file=_sys.stderr)
+            page.reload()
+            self.prepare_login_page(page)
+            if (getattr(self, "_shared_dialog_blocked", False)
+                    or not self._credential_origin_allowed(page)):
+                reduce_login_checkpoint(
+                    CheckpointPhase.PRE_SUBMIT,
+                    LoginBudget(),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
+
     def _shared_login(self, page) -> bool:
         if not self._credential_origin_allowed(page):
             reduce_login_checkpoint(
@@ -1910,7 +1943,7 @@ class BankCrawler(ABC):
                                 CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
                             )
                     submit_page = _OriginGuardProxy(page, ensure_submission_origin)
-                self.submit_credentials_once(submit_page)
+                self._submit_with_captcha_reloads(page, submit_page)
             if next_budget.reloads == budget.reloads + 1:
                 page.reload()
                 self.prepare_login_page(page)
