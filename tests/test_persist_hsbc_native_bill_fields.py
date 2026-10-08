@@ -207,3 +207,22 @@ def test_hsbc_persist_upsert_preserves_existing_native_fields(store):
     assert row["bill_due_amount"] == 71032.0
     assert row["last_payment_amount"] == 622.0
     assert row["last_payment_date"] == "2026-06-11"
+
+
+def test_hsbc_collector_nets_cashback_from_bank_outstanding_balance():
+    """Statement 3,701, paid 1,529, cashback 2,172: balance equals unbilled → settled."""
+    out = _hsbc_card_payload()
+    out["cards"][0]["outstandingBalance"] = 534.0
+    detail = next(iter(out["card_detail"].values()))["detail"]
+    detail["details"] = [
+        {"key": "Last Statement Date", "value": "18 Sep 2026"},
+        {"key": "Last Statement Amount", "value": "3,701 TWD"},
+        {"key": "Last Payment Amount", "value": "1,529 TWD"},
+        {"key": "Last Payment Date", "value": "07 Oct 2026"},
+        {"key": "Unbilled Transactions", "value": "534 TWD"},
+    ]
+
+    assert _hsbc_card_bill_facts(out)[0]["remaining_due"] == 0.0
+
+    out["cards"][0]["outstandingBalance"] = 1534.0  # 1,000 of the statement still unpaid
+    assert _hsbc_card_bill_facts(out)[0]["remaining_due"] == 1000.0
