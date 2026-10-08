@@ -115,6 +115,12 @@ def _hsbc_card_bill_facts(out: dict):
         if (remaining is not None and payment_amount is not None and statement_date
                 and payment_date and payment_date >= statement_date):
             remaining = max(remaining - payment_amount, 0)
+        # The bank's own balance already nets cashback/statement credits that the
+        # payment subtraction above cannot see: billed remainder = balance - unbilled.
+        outstanding = card_bill_money(card.get("outstandingBalance"))
+        unbilled = card_bill_money(_hsbc_twd_integer(kv.get("Unbilled Transactions")))
+        if remaining is not None and outstanding is not None and unbilled is not None:
+            remaining = min(remaining, max(outstanding - unbilled, 0))
         facts.append(make_card_bill_fact(
             scope="card",
             card_no=entry.get("masked") or card.get("maskedCardNumber"),
