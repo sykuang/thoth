@@ -1171,3 +1171,13 @@ def test_scrape_twd_page_returns_only_normalized_fields() -> None:
     assert result["txDetails"][0]["txDesc"] == "跨行轉入"
     with pytest.raises(RuntimeError, match="rakuten-twd-history-dom"):
         RakutenCrawler._scrape_twd_page(FakePage(), "81234567890124")
+
+
+def test_modal_shape_keeps_title_and_buttons_but_masks_digits() -> None:
+    from backend.banks.rakuten import _modal_shape
+
+    page = Mock()
+    page.evaluate.return_value = [{"id": "m1", "title": "提醒 2026", "buttons": ["確定", "第3頁"]}]
+    assert _modal_shape(page) == [{"id": "m#", "title": "提醒 ####", "buttons": ["確定", "第#頁"]}]
+    page.evaluate.side_effect = RuntimeError("boom")
+    assert _modal_shape(page) == ["RuntimeError"]

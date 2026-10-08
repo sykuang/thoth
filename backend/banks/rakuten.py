@@ -9,6 +9,7 @@ from __future__ import annotations
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 import os
+import json
 import re
 import time
 from typing import ClassVar
@@ -156,6 +157,22 @@ def _semantic_modal_visible(page) -> bool:
         if any(controls.nth(item).is_visible() for item in range(control_count)):
             return True
     return False
+
+
+def _modal_shape(page) -> list:
+    """Title and visible button labels of open modals, digits masked; never body text."""
+    try:
+        shapes = page.evaluate("""() => [...document.querySelectorAll('.modal.show:not(.modal_loading)')]
+          .filter(m => m.offsetWidth || m.offsetHeight).slice(0, 5).map(m => ({
+            id: (m.id || '').slice(0, 40),
+            title: (m.querySelector('.modal-title,h1,h2,h3,h4,h5')?.innerText || '').trim().slice(0, 60),
+            buttons: [...m.querySelectorAll('button,a,[role=button]')]
+              .filter(b => b.offsetWidth || b.offsetHeight).slice(0, 8)
+              .map(b => (b.innerText || b.getAttribute('aria-label') || '').trim().slice(0, 20)),
+          }))""")
+        return json.loads(re.sub(r"\d", "#", json.dumps(shapes, ensure_ascii=False)))
+    except Exception as e:
+        return [type(e).__name__]
 
 
 def _click_visible_login(page) -> bool:
@@ -661,6 +678,8 @@ class RakutenCrawler(BankCrawler):
             or getattr(self, "_shared_dialog_blocked", False)
         ):
             return False
+        # Unknown post-submit modals fail closed; record their shape so the rule can be added.
+        print(f"[rakuten][login] unknown modal shape={_modal_shape(page)}", flush=True)
         authenticated_quiet_polls = 0
         deadline = time.monotonic() + 20.0
 
