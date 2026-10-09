@@ -1177,7 +1177,9 @@ class CathayCrawler(BankCrawler):
         amt = t.get("amount") if "amount" in t else None
         if amt is None:
             amt = t.get("transAmount")
-        desc = t.get("desc") or t.get("transDesc") or t.get("description") or ""
+        if amt is None:
+            amt = t.get("twdAmount")
+        desc = t.get("desc") or t.get("transDesc") or t.get("merchantName") or t.get("description") or ""
         return amt is None and not str(desc).strip()
 
     def _norm_card_txn(self, t: dict) -> dict:
@@ -1212,8 +1214,9 @@ class CathayCrawler(BankCrawler):
             # 入帳日：國泰用 beginValueDate(折算入帳日) / convertDate(折算日)；
             # 三個獨立來源欄位都沒有時保留 None，shared store 不得偽造。
             "post_date": t.get("beginValueDate") or t.get("convertDate") or t.get("postingDate"),
-            "desc": t.get("transDesc"),
-            "amount": t.get("amount"),                            # 台幣入帳金額
+            # Unbilled consume rows (live 2026-10-09) use merchantName/twdAmount.
+            "desc": t.get("transDesc") or t.get("merchantName"),
+            "amount": t.get("amount") if t.get("amount") is not None else t.get("twdAmount"),  # 台幣入帳金額
             "currency": t.get("currency"),
             "consume_country": consume_country,
             "consume_currency": consume_currency,
