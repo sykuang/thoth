@@ -870,6 +870,7 @@ class EsunCrawler(BankCrawler):
                 result.telemetry.update(card.telemetry)
                 result.card_statement_cycle = card.card_statement_cycle
                 result.card_transactions = card.card_transactions
+                result.card_transactions_ok = card.card_transactions_ok
             except Exception:
                 result.telemetry['esun_spa_products'] = {'status': 'unavailable'}
             self._esun_spa_phase = 'capture_publication'

@@ -779,5 +779,6 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         # 2026-10-05: SPA path also forwards the native statement cycle (date/due/total)
         # so the auto-debit derivation can compute remaining due; no new browser action.
         # 2026-10-09 live: SPA statement detail rows now flow into card_transactions.
-        "c296cad5764557946eaa8a5bd2d612e0fbc81d0ec4deabdbe308305212f8c081"
+        # 2026-10-09 live: SPA unposted (刷卡明細) popup forwards card_transactions_ok.
+        "ff7b737a833a3054228c6c15969983015535c6f36714fa193f9653a76a8c4cbd"
     )
