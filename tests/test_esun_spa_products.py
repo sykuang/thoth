@@ -151,3 +151,31 @@ def test_no_card_never_opens_popup(monkeypatch):
     assert result.card_bill_facts_ok is False
     assert result.telemetry["esun_spa_products"]["card_presence"] is False
     assert not called
+
+
+def test_unposted_detail_becomes_pending_and_marks_fetch_ok(monkeypatch):
+    from backend.banks.esun_spa import products
+    body = {"rtnCode": "0000", "transList": [{"year": "2026", "month": "10", "transDetailList": [
+        {"merchantName": " Shop ", "paymentCurrency": "TWD", "paymentAmount": 120, "transCurrency": "TWD",
+         "transAmount": 120, "cardNo": "0000-XXXX-XXXX-2869", "transMonthDay": "1005"}]}]}
+    rows = products._unposted_transactions(body)
+    assert rows == [{"card_last4": "2869", "consume_date": "2026-10-05", "post_date": None, "merchant": "Shop",
+                     "billed_amount": 120, "billed_currency": "TWD", "consume_currency": None,
+                     "consume_amount": None, "status": "未入帳"}]
+    assert products._unposted_transactions({"transList": [{"year": "2026", "transDetailList": [{"cardNo": "x"}]}]}) is None
+
+    monkeypatch.setattr(products, "_overview", lambda *a: (True, lambda: None))
+    def open_bill(page, bound, selector=products.BILL_BUTTON, urls=products.BILL_URLS):
+        return {"_detail": body} if urls is products.UNPOSTED_URLS else {"_statement_cycle": None}
+    monkeypatch.setattr(products, "_open_bill", open_bill)
+    result = collect_products(SimpleNamespace(_esun_spa_phase=None), None, None, None)
+    assert result.card_transactions_ok is True and result.card_transactions == rows
+    assert result.telemetry["esun_spa_products"]["unposted_txns"] == 1
+
+    def broken(page, bound, selector=products.BILL_BUTTON, urls=products.BILL_URLS):
+        if urls is products.UNPOSTED_URLS:
+            raise ValueError("popup missing")
+        return {}
+    monkeypatch.setattr(products, "_open_bill", broken)
+    result = collect_products(SimpleNamespace(_esun_spa_phase=None), None, None, None)
+    assert result.card_transactions_ok is False and result.card_transactions is None

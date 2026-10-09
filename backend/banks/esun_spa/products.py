@@ -25,6 +25,11 @@ BILL_URLS = {
     'summary': 'https://iesc.esunbank.com/GW/creditBill/getSummaryResult',
     'detail': 'https://iesc.esunbank.com/GW/creditBill/getDetailResult',
 }
+UNPOSTED_BUTTON = '#layout-content [mfe-service="esb/card"] .ccm01002 :text-is("刷卡明細")'
+UNPOSTED_URLS = {
+    'summary': 'https://iesc.esunbank.com/GW/creditUnposted/getSummaryResult',
+    'detail': 'https://iesc.esunbank.com/GW/creditUnposted/getDetailResult',
+}
 BILL_TOTAL = 2 * LIMIT
 
 
@@ -84,6 +89,36 @@ def _statement_transactions(body, bill_date):
                 'consume_amount': t.get('transAmount') if foreign else None,
                 'status': '已入帳',
                 'bill_month': bill_date[:7],
+            })
+    return rows
+
+
+def _unposted_transactions(body):
+    """Unposted (未出帳) detail rows → pending card_transactions. None when any row is malformed."""
+    groups = body.get('transList') if type(body) is dict else None
+    if type(groups) is not list or body.get('rtnCode') not in (None, '0000'):
+        return None
+    rows = []
+    for group in groups:
+        year = group.get('year') if type(group) is dict else None
+        if type(year) is not str or len(year) != 4 or not year.isdigit():
+            return None
+        for t in group.get('transDetailList') or []:
+            trans, card, amount = t.get('transMonthDay'), t.get('cardNo'), t.get('paymentAmount')
+            if (type(amount) is not int or type(card) is not str or not card[-4:].isdigit()
+                    or type(trans) is not str or len(trans) != 4 or not trans.isdigit()):
+                return None
+            foreign = t.get('transCurrency') not in (None, '', 'TWD')
+            rows.append({
+                'card_last4': card[-4:],
+                'consume_date': f'{year}-{trans[:2]}-{trans[2:]}',
+                'post_date': None,
+                'merchant': (t.get('merchantName') or '').strip(),
+                'billed_amount': amount,
+                'billed_currency': t.get('paymentCurrency') or 'TWD',
+                'consume_currency': t.get('transCurrency') if foreign else None,
+                'consume_amount': t.get('transAmount') if foreign else None,
+                'status': '未入帳',
             })
     return rows
 
@@ -190,12 +225,12 @@ def _overview(crawler, page, collector, login_baseline):
     return body['haveCreditCard'], bound
 
 
-def _open_bill(page, bound):
+def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     """One actual native click; observe only popup-owned official bill responses."""
     native = _OriginGuardProxy._unwrap(page)
     context = native.context
     bound()
-    button = page.locator(BILL_BUTTON)
+    button = page.locator(selector)
     if button.count() != 1 or not button.is_visible() or not button.is_enabled():
         raise ValueError('SPA bill button rejected')
     receipt: dict[str, object] = {'popup': False, 'summary': False, 'detail': False}
@@ -219,7 +254,7 @@ def _open_bill(page, bound):
             route.abort()
 
     def response_seen(response):
-        kind = next((kind for kind, url in BILL_URLS.items() if response.url == url), None)
+        kind = next((kind for kind, url in urls.items() if response.url == url), None)
         if popup is None or kind is None or response.status != 200 or kind not in observers:
             return
         try:
@@ -234,11 +269,11 @@ def _open_bill(page, bound):
             payload = _json(raw)
             if type(payload) is not dict or payload.get('status') != '200':
                 return
-            projection = _project_bill(kind, payload.get('body'))
+            projection = _project_bill(kind, payload.get('body')) if urls is BILL_URLS else {'shape': kind}
             if projection is not None:
                 receipt[kind] = projection
                 if kind == 'summary':
-                    cycles['summary'] = _statement_cycle(payload.get('body'))
+                    cycles['summary'] = _statement_cycle(payload.get('body')) if urls is BILL_URLS else None
                 else:
                     cycles['detail'] = payload.get('body')
         except Exception:
@@ -257,7 +292,7 @@ def _open_bill(page, bound):
         popup = opened.value
         if popup.opener() is not native or popup.context is not context:
             raise ValueError('SPA bill popup owner rejected')
-        for kind, url in BILL_URLS.items():
+        for kind, url in urls.items():
             observer = _HistoryBodyObserver(popup, url)
             observer.LIMIT, observer.TOTAL_LIMIT, observer.MAX_RECORDS = LIMIT, BILL_TOTAL, 16
             observer.WAIT_SECONDS = 1  # Optional diagnostics must not stall the main read.
@@ -291,7 +326,7 @@ def collect_products(crawler, page, collector, login_baseline):
     """Read product presence and optional native bill; never certify sync success."""
     presence, bound = _overview(crawler, page, collector, login_baseline)
     evidence = {'card_presence': presence, 'popup': False, 'summary': False, 'detail': False}
-    cycle = txns = None
+    cycle = txns = pending = None
     if presence:
         crawler._esun_spa_phase = 'native_bill'
         try:
@@ -303,7 +338,19 @@ def collect_products(crawler, page, collector, login_baseline):
         except Exception:
             # A failed native handoff is an incomplete read, never a bill fact.
             evidence['native_bill_unavailable'] = True
+        crawler._esun_spa_phase = 'native_unposted'
+        try:
+            receipt = _open_bill(page, bound, UNPOSTED_BUTTON, UNPOSTED_URLS)
+            pending = _unposted_transactions(receipt.get('_detail'))
+        except Exception:
+            evidence['native_unposted_unavailable'] = True
     evidence['statement_cycle'] = cycle is not None
     evidence['statement_txns'] = None if txns is None else len(txns)
+    evidence['unposted_txns'] = None if pending is None else len(pending)
+    # Unposted read is authoritative only when the full detail parsed; else keep DB pending untouched.
+    if pending is not None:
+        txns = (txns or []) + pending
     return BankCollectResult(bank='esun', error='spa_collection_incomplete', card_bill_facts_ok=False,
-                             card_statement_cycle=cycle, card_transactions=txns, telemetry={'esun_spa_products': evidence})
+                             card_statement_cycle=cycle, card_transactions=txns,
+                             card_transactions_ok=pending is not None,
+                             telemetry={'esun_spa_products': evidence})
