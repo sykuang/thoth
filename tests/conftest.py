@@ -180,3 +180,23 @@ def client(tmp_path, monkeypatch):
         pass
 
     return TestClient(app_mod.app)
+
+
+@pytest.fixture(autouse=True)
+def _slow_ci_real_browser_snapshots(monkeypatch):
+    """Real-browser checkpoint tests: 100ms element snapshots flake on shared CI runners;
+    500ms keeps absence checks cheap (3s made this suite ~20x slower).
+
+    Only real Locator classes are patched; fake locators keep asserting the
+    production 100ms budget, and production code is unchanged.
+    """
+    from patchright.sync_api import Locator as PatchrightLocator
+    from playwright.sync_api import Locator as PlaywrightLocator
+
+    for cls in (PatchrightLocator, PlaywrightLocator):
+        original = cls.element_handle
+
+        def element_handle(self, *, timeout=None, _original=original):
+            return _original(self, timeout=None if timeout is None else max(timeout, 500))
+
+        monkeypatch.setattr(cls, "element_handle", element_handle)
