@@ -54,6 +54,40 @@ def _statement_cycle(body):
     return {'statement_close_date': dates[0], 'payment_due_date': dates[1], 'statement_amount': amount}
 
 
+def _statement_transactions(body, bill_date):
+    """Statement detail rows → billed card_transactions. None when any row is malformed."""
+    groups = body.get('transList') if type(body) is dict else None
+    if type(groups) is not list or type(bill_date) is not str or len(bill_date) != 10:
+        return None
+    close_year, close_mmdd = int(bill_date[:4]), bill_date[5:7] + bill_date[8:]
+
+    def iso(mmdd):  # statement rows never post after the close date; later MMDD is last year
+        return f'{close_year - (mmdd > close_mmdd)}-{mmdd[:2]}-{mmdd[2:]}'
+
+    rows = []
+    for group in groups:
+        for t in (group.get('transDetailList') if type(group) is dict else None) or []:
+            trans, post, card = (t.get(k) for k in ('transMonthDay', 'postingMonthDay', 'cardNo'))
+            amount = t.get('paymentAmount')
+            if (type(amount) is not int or type(card) is not str or not card[-4:].isdigit()
+                    or not all(type(v) is str and len(v) == 4 and v.isdigit() for v in (trans, post))):
+                return None
+            foreign = t.get('transCurrency') not in (None, '', 'TWD')
+            rows.append({
+                'card_last4': card[-4:],
+                'consume_date': iso(trans),
+                'post_date': iso(post),
+                'merchant': (t.get('merchantName') or '').strip(),
+                'billed_amount': amount,
+                'billed_currency': t.get('paymentCurrency') or 'TWD',
+                'consume_currency': t.get('transCurrency') if foreign else None,
+                'consume_amount': t.get('transAmount') if foreign else None,
+                'status': '已入帳',
+                'bill_month': bill_date[:7],
+            })
+    return rows
+
+
 def _cleanup_all(actions):
     pending = list(actions)
     for _ in range(2):
@@ -205,6 +239,8 @@ def _open_bill(page, bound):
                 receipt[kind] = projection
                 if kind == 'summary':
                     cycles['summary'] = _statement_cycle(payload.get('body'))
+                else:
+                    cycles['detail'] = payload.get('body')
         except Exception:
             pass  # An unavailable bounded observation never becomes a fact.
 
@@ -238,6 +274,7 @@ def _open_bill(page, bound):
                 native.wait_for_timeout(50)
         # Amounts stay out of telemetry; the caller pops this private key.
         receipt['_statement_cycle'] = cycles.get('summary')
+        receipt['_detail'] = cycles.get('detail')
         return receipt
     finally:
         actions: list[Callable[[], object]] = [
@@ -254,15 +291,19 @@ def collect_products(crawler, page, collector, login_baseline):
     """Read product presence and optional native bill; never certify sync success."""
     presence, bound = _overview(crawler, page, collector, login_baseline)
     evidence = {'card_presence': presence, 'popup': False, 'summary': False, 'detail': False}
-    cycle = None
+    cycle = txns = None
     if presence:
         crawler._esun_spa_phase = 'native_bill'
         try:
             evidence.update(_open_bill(page, bound))
             cycle = evidence.pop('_statement_cycle', None)
+            detail = evidence.pop('_detail', None)
+            if cycle:
+                txns = _statement_transactions(detail, cycle['statement_close_date'])
         except Exception:
             # A failed native handoff is an incomplete read, never a bill fact.
             evidence['native_bill_unavailable'] = True
     evidence['statement_cycle'] = cycle is not None
+    evidence['statement_txns'] = None if txns is None else len(txns)
     return BankCollectResult(bank='esun', error='spa_collection_incomplete', card_bill_facts_ok=False,
-                             card_statement_cycle=cycle, telemetry={'esun_spa_products': evidence})
+                             card_statement_cycle=cycle, card_transactions=txns, telemetry={'esun_spa_products': evidence})
