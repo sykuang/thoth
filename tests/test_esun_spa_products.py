@@ -162,7 +162,7 @@ def test_no_card_never_opens_popup(monkeypatch):
 
 def test_unposted_detail_becomes_pending_and_marks_fetch_ok(monkeypatch):
     from backend.banks.esun_spa import products
-    body = {"rtnCode": "0000", "transList": [{"year": "2026", "month": "10", "transDetailList": [
+    body = {"rtnCode": "S", "rtnMsgs": [], "transList": [{"year": "2026", "month": "10", "transDetailList": [
         {"merchantName": " Shop ", "paymentCurrency": "TWD", "paymentAmount": 120, "transCurrency": "TWD",
          "transAmount": 120, "cardNo": "0000-XXXX-XXXX-2869", "transMonthDay": "1005"}]}]}
     rows = products._unposted_transactions(body)

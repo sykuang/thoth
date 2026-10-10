@@ -96,7 +96,8 @@ def _statement_transactions(body, bill_date):
 def _unposted_transactions(body):
     """Unposted (未出帳) detail rows → pending card_transactions. None when any row is malformed."""
     groups = body.get('transList') if type(body) is dict else None
-    if type(groups) is not list or body.get('rtnCode') not in (None, '0000'):
+    # Live 2026-10-10: rtnCode is a one-letter flag, not '0000'; the envelope status gate already passed.
+    if type(groups) is not list or body.get('rtnMsgs'):
         return None
     rows = []
     for group in groups:
