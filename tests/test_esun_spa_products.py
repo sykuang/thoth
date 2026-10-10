@@ -94,21 +94,28 @@ def test_native_popup_reads_only_owned_official_responses(monkeypatch):
     setattr(popup, 'context', context)
     native = SimpleNamespace(context=context)
     setattr(popup, 'opener', lambda: native)
-    forbidden = []
-    def no_native_body():
-        forbidden.append(True)
-        raise AssertionError('no native response body read')
+    reads = []
+    def native_body():
+        reads.append(True)
+        return b'{"status":"200","body":{"unexpected":1}}'
     response = SimpleNamespace(url='https://iesc.esunbank.com/GW/creditBill/getSummaryResult', status=200,
                                headers={'content-type': 'application/json'},
                                request=SimpleNamespace(frame=popup.main_frame, method='POST',
                                                        url='https://iesc.esunbank.com/GW/creditBill/getSummaryResult',
                                                        redirected_from=None, redirected_to=None),
-                               body=no_native_body, json=no_native_body)
+                               body=native_body, json=native_body)
     class Pending:
         def __enter__(self): return SimpleNamespace(value=popup)
         def __exit__(self, *args): pass
     native.expect_popup = lambda **kwargs: Pending()
-    native.wait_for_timeout = lambda ms: context.handlers['response'](response)
+    stranger = SimpleNamespace(**{**vars(response), 'request': SimpleNamespace(
+        **{**vars(response.request), 'frame': (f := SimpleNamespace())}),
+        'body': lambda: reads.append('stranger')})
+    f.page = SimpleNamespace(main_frame=f, opener=lambda: None)
+    def deliver(ms):
+        context.handlers['response'](stranger)
+        context.handlers['response'](response)
+    native.wait_for_timeout = deliver
     routing = []
     def click(**kwargs):
         handler = context.handlers['route']
@@ -120,13 +127,13 @@ def test_native_popup_reads_only_owned_official_responses(monkeypatch):
                              click=click)
     native.locator = lambda selector: button
     monkeypatch.setattr(products._OriginGuardProxy, '_unwrap', lambda page: page)
-    clock = iter([0, 0, 0, 7])
+    clock = iter(range(0, 1000))
     monkeypatch.setattr(products, 'monotonic', lambda: next(clock))
     receipt = products._open_bill(native, lambda: None)
     assert receipt['popup'] is True and receipt['summary'] is False
     assert receipt['detail'] is False and not context.handlers and routing == ['deny', 'allow']
-    assert not forbidden and all(s.detached for s in popup.sessions)
-    assert not any('Network.getResponseBody' in s.commands for s in popup.sessions)
+    # Owned popup response is read in-handler (live: XHRs beat late CDP attach); a stranger never is.
+    assert reads and set(reads) == {True}
 
 
 def test_native_failure_returns_closed_partial(monkeypatch):
@@ -155,7 +162,7 @@ def test_no_card_never_opens_popup(monkeypatch):
 
 def test_unposted_detail_becomes_pending_and_marks_fetch_ok(monkeypatch):
     from backend.banks.esun_spa import products
-    body = {"rtnCode": "0000", "transList": [{"year": "2026", "month": "10", "transDetailList": [
+    body = {"rtnCode": "S", "rtnMsgs": [], "transList": [{"year": "2026", "month": "10", "transDetailList": [
         {"merchantName": " Shop ", "paymentCurrency": "TWD", "paymentAmount": 120, "transCurrency": "TWD",
          "transAmount": 120, "cardNo": "0000-XXXX-XXXX-2869", "transMonthDay": "1005"}]}]}
     rows = products._unposted_transactions(body)
