@@ -4,7 +4,7 @@ from datetime import date
 from time import monotonic
 from urllib.parse import urlsplit
 
-from backend.core.base import BankCollectResult, _HistoryBodyObserver, _OriginGuardProxy
+from backend.core.base import BankCollectResult, _OriginGuardProxy
 from .capture import PATHS, LIMIT, _json, _json_type, require_current_success
 from .collection import navigation_guard
 from .navigation import build_menu_plan, navigate_twd, TIMEOUT
@@ -236,7 +236,6 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     receipt: dict[str, object] = {'popup': False, 'summary': False, 'detail': False}
     cycles: dict[str, object] = {}
     popup = None
-    observers = {}
     admitted = 0
 
     def reserve(size):
@@ -254,17 +253,20 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
             route.abort()
 
     def response_seen(response):
+        # Live 2026-10-10: the popup's XHRs can finish before expect_popup returns and
+        # before a CDP observer attaches, so accept by opener ownership and read the body here.
         kind = next((kind for kind, url in urls.items() if response.url == url), None)
-        if popup is None or kind is None or response.status != 200 or kind not in observers:
+        if kind is None or response.status != 200 or receipt[kind] is not False:
             return
+        cycles['seen'] = cycles.get('seen', 0) + 1  # diag: official URL observed at all
         try:
             req = response.request
-            if (req.frame is not popup.main_frame or req.frame.page is not popup
+            owner = req.frame.page
+            if (req.method != 'POST' or req.frame is not owner.main_frame or owner.opener() is not native
                     or not _json_type(response.headers.get('content-type', ''))):
                 return
-            raw = observers[kind].read(response, req.frame, req.frame.url,
-                                       lambda: BILL_TOTAL - admitted, 1, reserve)
-            if raw is None or len(raw) > LIMIT:
+            raw = response.body()
+            if len(raw) > LIMIT or not reserve(len(raw)):
                 return
             payload = _json(raw)
             if type(payload) is not dict or payload.get('status') != '200':
@@ -292,13 +294,7 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
         popup = opened.value
         if popup.opener() is not native or popup.context is not context:
             raise ValueError('SPA bill popup owner rejected')
-        for kind, url in urls.items():
-            observer = _HistoryBodyObserver(popup, url)
-            observer.LIMIT, observer.TOTAL_LIMIT, observer.MAX_RECORDS = LIMIT, BILL_TOTAL, 16
-            observer.WAIT_SECONDS = 1  # Optional diagnostics must not stall the main read.
-            observers[kind] = observer
-            observer.start()
-        deadline = monotonic() + 7
+        deadline = monotonic() + 15
         while monotonic() < deadline:
             if _official(popup.url) and urlsplit(popup.url).hostname == 'iesc.esunbank.com' and urlsplit(popup.url).path.startswith('/IESC/'):
                 receipt['popup'] = True
@@ -310,11 +306,10 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
         # Amounts stay out of telemetry; the caller pops this private key.
         receipt['_statement_cycle'] = cycles.get('summary')
         receipt['_detail'] = cycles.get('detail')
+        receipt['seen'] = cycles.get('seen', 0)
         return receipt
     finally:
-        actions: list[Callable[[], object]] = [
-            lambda observer=observer: observer.close() for observer in observers.values()
-        ]
+        actions: list[Callable[[], object]] = []
         if response_installed:
             actions.append(lambda: context.remove_listener('response', response_seen))
         if route_installed:
@@ -342,7 +337,7 @@ def collect_products(crawler, page, collector, login_baseline):
         try:
             receipt = _open_bill(page, bound, UNPOSTED_BUTTON, UNPOSTED_URLS)
             pending = _unposted_transactions(receipt.get('_detail'))
-            evidence['unposted'] = {k: receipt.get(k) is not False for k in ('popup', 'summary', 'detail')}
+            evidence['unposted'] = {k: receipt.get(k) if k == 'seen' else receipt.get(k) is not False for k in ('popup', 'seen', 'summary', 'detail')}
         except Exception as exc:
             evidence['native_unposted_unavailable'] = type(exc).__name__
     evidence['statement_cycle'] = cycle is not None
