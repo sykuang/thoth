@@ -15,6 +15,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
+import { useOwnerBoundApi } from '@/hooks/useOwnerBoundApi';
 import { api, type ApiError } from '@/lib/api';
 import {
   assertReplicaOwnerEpoch,
@@ -25,6 +26,7 @@ import {
 } from '@/lib/replica';
 import { replicaStore } from '@/lib/replicaStore';
 import { useAuthStore } from '@/stores/auth';
+import { type ReplicaTransactionDataset } from '@/lib/replica';
 import { type UserPreferences } from '@/types/api';
 
 /** Default 跟 backend preferences_router.DEFAULT_PREFERENCES 對齊。 */
@@ -42,6 +44,13 @@ type PreferencesMutationVariables = {
 
 export function usePreferences() {
   const qc = useQueryClient();
+  const { ownerKey, ownerEpoch } = useOwnerBoundApi();
+  // Passive cache read: the replica already carries server preferences, so a
+  // failed GET must fall back to it instead of DEFAULT (else UI shows the wrong mode).
+  const replicaPrefs = useQuery<ReplicaTransactionDataset>({
+    queryKey: ['frontend-dataset', 'replica', ownerKey, ownerEpoch],
+    enabled: false,
+  }).data?.preferences;
 
   const query = useQuery<UserPreferences, ApiError>({
     queryKey: ['user-preferences'],
@@ -85,7 +94,7 @@ export function usePreferences() {
 
   return {
     /** Loading 期間或第一次 fetch 失敗都會吐 default — UI 永遠拿得到值 */
-    data: query.data ?? DEFAULT_PREFERENCES,
+    data: query.data ?? replicaPrefs ?? DEFAULT_PREFERENCES,
     hasServerData: query.data !== undefined,
     isLoading: query.isLoading,
     error: query.error,
