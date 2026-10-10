@@ -342,14 +342,16 @@ def collect_products(crawler, page, collector, login_baseline):
         try:
             receipt = _open_bill(page, bound, UNPOSTED_BUTTON, UNPOSTED_URLS)
             pending = _unposted_transactions(receipt.get('_detail'))
-        except Exception:
-            evidence['native_unposted_unavailable'] = True
+            evidence['unposted'] = {k: receipt.get(k) is not False for k in ('popup', 'summary', 'detail')}
+        except Exception as exc:
+            evidence['native_unposted_unavailable'] = type(exc).__name__
     evidence['statement_cycle'] = cycle is not None
     evidence['statement_txns'] = None if txns is None else len(txns)
     evidence['unposted_txns'] = None if pending is None else len(pending)
     # Unposted read is authoritative only when the full detail parsed; else keep DB pending untouched.
     if pending is not None:
         txns = (txns or []) + pending
+    print(f"[esun][spa-products] {evidence}", flush=True)  # shapes/counts only, never amounts
     return BankCollectResult(bank='esun', error='spa_collection_incomplete', card_bill_facts_ok=False,
                              card_statement_cycle=cycle, card_transactions=txns,
                              card_transactions_ok=pending is not None,
