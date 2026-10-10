@@ -1668,7 +1668,7 @@ function CardRow({
             className={`text-h3 font-semibold font-mono ml-2 ${
               excluded
                 ? 'text-ink-400 dark:text-ink-500 line-through'
-                : billDue > 0
+                : billDue > 0 && card.bill_status !== 'paid'
                   ? 'text-red-600 dark:text-red-400'
                   : 'text-emerald-600 dark:text-emerald-400'
             }`}

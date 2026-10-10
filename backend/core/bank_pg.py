@@ -35,7 +35,7 @@ _PG_POOL_RECONNECT_TIMEOUT = float(os.environ.get("PG_POOL_RECONNECT_TIMEOUT", "
 # Phase C (2026-06-18): per-process cache of PG schemas already migrated for
 # user_id columns. SQLite side has _PHASE_C_MIGRATED in db.py; this is the PG
 # mirror. Keyed by schema name (one entry per bank per process).
-_PHASE_C_PG_MIGRATED: set[str] = set()
+_PHASE_C_PG_MIGRATED: dict[str, int] = {}
 
 # Tables that need user_id column + composite UNIQUE INDEX (mirrors
 # db.py:_PHASE_C_PK_INDEXES exactly so SQLite and PG converge on the same shape).
@@ -173,7 +173,16 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
     PG mirror of db.py:_ensure_phase_c_user_id. Revalidates each opened schema
     because a cached schema name can be dropped and recreated in-process.
     """
-    _PHASE_C_PG_MIGRATED.discard(schema)
+    # Schema oid changes when a schema is dropped and recreated, so it is a
+    # lock-free revalidation key. Re-running the ALTERs on every open took
+    # ACCESS EXCLUSIVE locks and deadlocked readers against sync writers.
+    oid_row = conn.execute(
+        "SELECT oid FROM pg_namespace WHERE nspname = %s", (schema,)
+    ).fetchone()
+    schema_oid = int(oid_row[0]) if oid_row else None
+    if schema_oid is not None and _PHASE_C_PG_MIGRATED.get(schema) == schema_oid:
+        return
+    _PHASE_C_PG_MIGRATED.pop(schema, None)
     try:
         # 1) Existing tables in this schema
         cur = conn.execute(
@@ -398,8 +407,8 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
         except Exception:
             pass
         raise
-    if complete_schema:
-        _PHASE_C_PG_MIGRATED.add(schema)
+    if complete_schema and schema_oid is not None:
+        _PHASE_C_PG_MIGRATED[schema] = schema_oid
 
 
 def _reset_phase_c_pg_cache() -> None:

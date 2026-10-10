@@ -2107,6 +2107,8 @@ def test_postgres_native_currency_migration_waits_for_tables_and_retries_failure
 
         def execute(self, sql, params=()):
             self.calls.append((sql, params))
+            if "FROM pg_namespace WHERE nspname" in sql:
+                return Cursor([(42,)])
             if "information_schema.tables" in sql:
                 return Cursor([(table,) for table in sorted(self.tables)])
             if "information_schema.columns" in sql:
@@ -2149,6 +2151,9 @@ def test_postgres_native_currency_migration_waits_for_tables_and_retries_failure
     bank_pg._ensure_phase_c_user_id_pg(conn, schema)
     assert schema in bank_pg._PHASE_C_PG_MIGRATED
     assert sum("ALTER COLUMN expend TYPE DOUBLE PRECISION" in sql for sql, _ in conn.calls) == 2
+    before = len(conn.calls)
+    bank_pg._ensure_phase_c_user_id_pg(conn, schema)
+    assert not any("ALTER" in sql or "UPDATE" in sql for sql, _ in conn.calls[before:])
 
     retry_schema = "bank_retryuserid"
     retry_conn = Conn()
