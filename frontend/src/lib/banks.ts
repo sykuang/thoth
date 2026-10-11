@@ -1,7 +1,7 @@
 /**
  * Bank brand metadata — color tokens + short labels for UI.
  *
- * 來源: 各銀行 2024-2026 官網品牌色 (從 .css 或 Logo 取色).
+ * 來源: 2026-10 各銀行官網 header logo 取主色 (SVG fill 或截圖去白/灰/黑後的最大色桶).
  * 用於: BankBadge + AccountCard 點綴色 + transactions chip border.
  *
  * 設計取捨:
@@ -25,19 +25,19 @@ export type BankMeta = {
 };
 
 export const BANK_META: Record<SupportedBank, BankMeta> = {
-  cathay:   { short: '國泰', color: '#00665e', fg: 'white', primary: 'mixed' },         // 國泰深綠
-  ctbc:     { short: '中信', color: '#003a8c', fg: 'white', primary: 'mixed' },         // 中信藍
-  dbs:      { short: '星展', color: '#e30613', fg: 'white', primary: 'mixed' },         // DBS red
-  esun:     { short: '玉山', color: '#1e7a3c', fg: 'white', primary: 'mixed' },         // 玉山綠
-  fubon:    { short: '富邦', color: '#00754a', fg: 'white', primary: 'mixed' },         // 富邦綠
-  hsbc:     { short: '滙豐', color: '#db0011', fg: 'white', primary: 'credit_card' },   // HSBC red
-  linebank: { short: 'LINE', color: '#06c755', fg: 'white', primary: 'deposit' },       // LINE green
-  rakuten:  { short: '樂天', color: '#bf0000', fg: 'white', primary: 'deposit' },       // Rakuten red
-  scb:      { short: '渣打', color: '#0473ea', fg: 'white', primary: 'mixed' },         // 渣打藍
-  scsb:     { short: '上海', color: '#a2231d', fg: 'white', primary: 'mixed' },         // 上海商銀 (百年實體綜合, 1915 創立, 非數位)
-  sinopac:  { short: '永豐', color: '#005bac', fg: 'white', primary: 'mixed' },         // 永豐藍
-  taishin:  { short: '台新', color: '#0e4e96', fg: 'white', primary: 'mixed' },         // 台新藍
-  ubot:     { short: '聯邦', color: '#c8161e', fg: 'white', primary: 'mixed' },         // 聯邦紅 (使用者有存款帳戶 + 信用卡)
+  cathay:   { short: '國泰', color: '#009043', fg: 'black', primary: 'mixed' },         // 國泰綠
+  ctbc:     { short: '中信', color: '#007979', fg: 'white', primary: 'mixed' },         // 中信綠
+  dbs:      { short: '星展', color: '#ff3333', fg: 'black', primary: 'mixed' },         // DBS red
+  esun:     { short: '玉山', color: '#009f99', fg: 'black', primary: 'mixed' },         // 玉山綠
+  fubon:    { short: '富邦', color: '#008ec6', fg: 'black', primary: 'mixed' },         // 富邦藍
+  hsbc:     { short: '滙豐', color: '#da0010', fg: 'white', primary: 'credit_card' },   // HSBC red
+  linebank: { short: 'LINE', color: '#0288e4', fg: 'black', primary: 'deposit' },       // LINE Bank blue
+  rakuten:  { short: '樂天', color: '#bd0100', fg: 'white', primary: 'deposit' },       // Rakuten red
+  scb:      { short: '渣打', color: '#006ce4', fg: 'white', primary: 'mixed' },         // 渣打藍
+  scsb:     { short: '上海', color: '#b7281f', fg: 'white', primary: 'mixed' },         // 上海商銀紅
+  sinopac:  { short: '永豐', color: '#e71a0f', fg: 'white', primary: 'mixed' },         // 永豐紅
+  taishin:  { short: '台新', color: '#6b060c', fg: 'white', primary: 'mixed' },         // 台新酒紅
+  ubot:     { short: '聯邦', color: '#00488e', fg: 'white', primary: 'mixed' },         // 聯邦藍
 };
 
 /** 安全 lookup — bank 不在 BANK_META 時 fallback 中性灰 badge. */
