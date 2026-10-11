@@ -44,3 +44,9 @@ def test_deploy_script_passes_network_bootstrap_flag() -> None:
     assert 'BOOTSTRAP_NETWORK_ONLY="${BOOTSTRAP_NETWORK_ONLY:-false}"' in text
     assert '"bootstrapNetworkOnly": {"value": os.environ["BOOTSTRAP_NETWORK_ONLY"] == "true"}' in text
     assert 'if [[ "$BOOTSTRAP_NETWORK_ONLY" == "false" ]]' in text
+
+
+def test_deploy_image_tag_is_unique_per_run() -> None:
+    text = (Path(__file__).resolve().parents[1] / "deploy" / "deploy.sh").read_text()
+    assert 'IMAGE_TAG="${IMAGE_TAG:-0.1.0}"' not in text
+    assert "git rev-parse --short HEAD" in text and "date -u" in text
