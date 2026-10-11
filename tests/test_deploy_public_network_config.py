@@ -41,6 +41,6 @@ def test_container_app_uses_direct_secrets_and_external_sync_workers() -> None:
 def test_deploy_script_passes_network_bootstrap_flag() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
 
-    assert 'BOOTSTRAP_NETWORK_ONLY="${BOOTSTRAP_NETWORK_ONLY:-true}"' in text
+    assert 'BOOTSTRAP_NETWORK_ONLY="${BOOTSTRAP_NETWORK_ONLY:-false}"' in text
     assert '"bootstrapNetworkOnly": {"value": os.environ["BOOTSTRAP_NETWORK_ONLY"] == "true"}' in text
     assert 'if [[ "$BOOTSTRAP_NETWORK_ONLY" == "false" ]]' in text
