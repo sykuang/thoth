@@ -4,7 +4,7 @@ from pathlib import Path
 BICEP = Path("deploy/main.bicep")
 
 
-def test_deployment_uses_external_jobs_and_scale_to_zero() -> None:
+def test_deployment_uses_external_jobs_and_keeps_one_warm_replica() -> None:
     text = BICEP.read_text()
 
     assert "var scheduledJobName = '${namePrefix}-sync-scheduled'" in text
@@ -31,6 +31,6 @@ def test_deployment_uses_external_jobs_and_scale_to_zero() -> None:
     assert text.count("cpu: json('1.0')") == 4
     assert text.count("memory: '2.0Gi'") == 4
     assert "{ name: 'SYNC_EXECUTION_MODE', value: 'external' }" in text
-    assert "minReplicas: 0" in text
+    assert "minReplicas: 1" in text
     assert "maxReplicas: 1" in text
     assert "THOTH_DISABLE_SCHEDULER" not in text
