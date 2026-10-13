@@ -159,7 +159,7 @@ def test_account_snapshot_does_not_report_unrelated_live_status_error():
         sections.index("function ActionButton")
     ]
 
-    assert "sync.error ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null)" in accounts_section
+    assert "(hasDisabledConnection ? null : sync.error) ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null)" in accounts_section
 
 
 def test_accounts_tab_uses_plain_scroll_view_without_keyboard_insets():

@@ -65,6 +65,13 @@ def _raise_http(error: Exception, *, sync_error_code: str | None = None) -> NoRe
         raise HTTPException(status_code=409, detail=str(error)) from error
     if isinstance(error, SnapTradeInvalidCallback):
         raise HTTPException(status_code=400, detail=str(error)) from error
+    if sync_error_code == "connection_disabled":
+        # User-fixable: point at the repair flow instead of blaming upstream.
+        raise HTTPException(
+            status_code=409,
+            detail="券商連線已停用，請至設定修復連線",
+            headers={"X-SnapTrade-Error-Code": sync_error_code},
+        ) from error
     headers = (
         {"X-SnapTrade-Error-Code": sync_error_code}
         if sync_error_code is not None

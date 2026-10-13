@@ -310,7 +310,9 @@ def test_disabled_connection_preserves_previous_snapshot(client, monkeypatch):
     fake.connection_disabled = True
     failed = client.post("/snaptrade/sync", headers=headers)
 
-    assert failed.status_code == 502
+    assert failed.status_code == 409
+    assert failed.headers["X-SnapTrade-Error-Code"] == "connection_disabled"
+    assert "修復" in failed.json()["detail"]
     assert client.get("/snaptrade/portfolio", headers=headers).json() == before
 
 

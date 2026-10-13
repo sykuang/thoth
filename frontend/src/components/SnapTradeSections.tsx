@@ -46,6 +46,8 @@ export function SnapTradeConnectionSettings() {
   });
   const sync = useMutation({
     mutationFn: () => ownerApi('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
+    // A failed sync may mean a disabled broker; refresh status to surface the repair CTA.
+    onError: () => queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
@@ -185,6 +187,8 @@ export function SnapTradeAccountsSection() {
   });
   const sync = useMutation({
     mutationFn: () => ownerApi('/snaptrade/sync', { method: 'POST', timeoutMs: 120_000 }),
+    // A failed sync may mean a disabled broker; refresh status to surface the repair CTA.
+    onError: () => queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['snaptrade', 'status'] }),
@@ -207,7 +211,7 @@ export function SnapTradeAccountsSection() {
     && !hasSnapshot
   ) return null;
 
-  const error = sync.error ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null);
+  const error = (hasDisabledConnection ? null : sync.error) ?? portfolioQuery.error ?? (!hasSnapshot ? statusQuery.error : null);
   return (
     <View className="mt-6" testID="snaptrade-accounts-section">
       <View className="flex-row items-center justify-between gap-3 mb-3">
