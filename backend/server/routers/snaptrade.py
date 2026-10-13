@@ -41,6 +41,7 @@ _SYNC_ERROR_MARKERS = (
 
 class ConnectRequest(BaseModel):
     redirect_uri: str = Field(min_length=8, max_length=2048)
+    reconnect: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 def get_service() -> SnapTradeService:
@@ -91,7 +92,9 @@ def connect(
 ) -> dict[str, str]:
     try:
         return {
-            "redirect_uri": get_service().connection_url(user["id"], body.redirect_uri),
+            "redirect_uri": get_service().connection_url(
+                user["id"], body.redirect_uri, body.reconnect,
+            ),
         }
     except Exception as error:
         _raise_http(error)

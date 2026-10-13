@@ -292,6 +292,7 @@ class SnapTradeSDKGateway:
         user_id: str,
         user_secret: str,
         redirect_uri: str,
+        reconnect: str | None = None,
     ) -> str:
         response = _response(self.client.authentication.login_snap_trade_user(
             user_id=user_id,
@@ -299,6 +300,7 @@ class SnapTradeSDKGateway:
             connection_type="read",
             show_close_button=True,
             custom_redirect=redirect_uri,
+            **({"reconnect": reconnect} if reconnect else {}),
         ))
         url = (
             response.get("redirectURI") or response.get("redirect_uri")
@@ -470,20 +472,39 @@ class SnapTradeService:
     def status(self, user_id: int) -> dict[str, Any]:
         configured = _configured()
         credentials = self._credentials(user_id) if configured else None
-        connection_count: int | None = None
+        connections: list[dict[str, Any]] | None = None
         if credentials:
-            connection_count = len(self._gateway().list_connections(*credentials))
+            connections = [
+                {
+                    "id": _text(connection.get("id")),
+                    "brokerage_name": _text(_nested(connection, "brokerage", "name")),
+                    "disabled": disabled if type(disabled := connection.get("disabled")) is bool else None,
+                }
+                for connection in self._gateway().list_connections(*credentials)
+            ]
         return {
             "configured": configured,
             "registered": credentials is not None,
-            "connection_count": connection_count,
+            "connection_count": None if connections is None else len(connections),
+            "connections": connections,
             "last_synced_at": db.snaptrade_snapshot(user_id)["last_synced_at"],
         }
 
-    def connection_url(self, user_id: int, redirect_uri: str) -> str:
+    def connection_url(
+        self, user_id: int, redirect_uri: str, reconnect: str | None = None,
+    ) -> str:
         redirect_uri = _validate_redirect_uri(redirect_uri)
         credentials = self._ensure_credentials(user_id)
-        return self._gateway().connection_url(*credentials, redirect_uri)
+        gateway = self._gateway()
+        if reconnect is None:
+            return gateway.connection_url(*credentials, redirect_uri)
+        # Only re-auth a connection this user owns.
+        if not any(
+            _text(connection.get("id")) == reconnect
+            for connection in gateway.list_connections(*credentials)
+        ):
+            raise SnapTradeInvalidCallback("SnapTrade connection 不存在")
+        return gateway.connection_url(*credentials, redirect_uri, reconnect)
 
     def sync(self, user_id: int) -> dict[str, Any]:
         with _operation_lock(user_id, "sync", 600) as lock_owner:

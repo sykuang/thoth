@@ -218,6 +218,7 @@ def test_connect_registers_user_encrypts_secret_and_returns_read_only_portal(cli
         "configured": True,
         "registered": True,
         "connection_count": 1,
+        "connections": [{"id": "auth-1", "brokerage_name": None, "disabled": False}],
         "last_synced_at": None,
     }
     assert "secret" not in json.dumps(status.json()).lower()
@@ -1125,3 +1126,24 @@ def test_missing_server_configuration_fails_closed(client, monkeypatch):
     assert status.json()["configured"] is False
     assert connect.status_code == 503
     assert "尚未設定" in connect.json()["detail"]
+
+
+def test_reconnect_reauths_only_the_owned_disabled_connection(client, monkeypatch):
+    fake = FakeSnapTradeGateway()
+    fake.connection_disabled = True
+    calls: list[str | None] = []
+    fake.connection_url = lambda user_id, secret, redirect_uri, reconnect=None: (
+        calls.append(reconnect) or "https://connect.snaptrade.example/portal"
+    )
+    _install_fake(monkeypatch, fake)
+    headers = _register(client, "snaptrade-reconnect@example.com")
+    assert client.post("/snaptrade/connect", json={"redirect_uri": REDIRECT_URI}, headers=headers).status_code == 200
+
+    status = client.get("/snaptrade/status", headers=headers).json()
+    assert status["connections"] == [{"id": "auth-1", "brokerage_name": None, "disabled": True}]
+
+    ok = client.post("/snaptrade/connect", json={"redirect_uri": REDIRECT_URI, "reconnect": "auth-1"}, headers=headers)
+    assert ok.status_code == 200
+    bad = client.post("/snaptrade/connect", json={"redirect_uri": REDIRECT_URI, "reconnect": "someone-else"}, headers=headers)
+    assert bad.status_code == 400
+    assert calls == [None, "auth-1"]
