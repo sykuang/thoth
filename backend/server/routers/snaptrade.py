@@ -1,6 +1,7 @@
 """Authenticated SnapTrade connection and read-only portfolio routes."""
 from __future__ import annotations
 
+import logging
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,6 +18,8 @@ from backend.server.snaptrade import (
 )
 
 router = APIRouter(prefix="/snaptrade", tags=["snaptrade"])
+
+logger = logging.getLogger("backend.snaptrade")
 
 _SYNC_ERROR_MARKERS = (
     ("connection 已停用", "connection_disabled"),
@@ -101,7 +104,10 @@ def sync(user: dict = Depends(current_user)) -> dict[str, Any]:
         clear_dashboard_cache(user_id=user["id"], namespace="portfolio.summary")
         return result
     except Exception as error:
-        _raise_http(error, sync_error_code=_sync_error_code(error))
+        code = _sync_error_code(error)
+        # Code + type only; upstream messages may carry account data.
+        logger.warning("snaptrade sync failed code=%s type=%s", code, type(error).__name__)
+        _raise_http(error, sync_error_code=code)
 
 
 @router.get("/portfolio")
