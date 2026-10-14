@@ -209,7 +209,7 @@ class ScsbCrawler(BankCrawler):
             action_selector="button.btn-gradient",
             action_texts=("我知道了",),
             required_body_pattern=re.compile(
-                r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}詐騙[\s\S]{0,300}$"
+                r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}(?:詐騙|維護)[\s\S]{0,300}$"
             ),
             max_actions=1,
             first_match_timeout_ms=5000,
