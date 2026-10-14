@@ -198,6 +198,18 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         assert page.locator("body").get_attribute("data-other") == "0"
 
         page.set_content(
+            '<div class="custom-modal show"><h5>網路銀行 10/14、10/15 維護公告</h5>'
+            '親愛的客戶 您好! 本行為提供更優質的服務，網路銀行將於下列時段進行系統維護作業'
+            '<button class="btn btn-outline-primary">本日不再顯示</button>'
+            '<button class="btn btn-gradient">我知道了</button></div>'
+            "<script>document.body.dataset.t='0';document.querySelector('.btn-gradient').onclick="
+            "()=>{document.body.dataset.t++;document.querySelector('div').hidden=true}</script>"
+        )
+        outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
+        assert outcome.rule_name == "scsb-fraud-notice"
+        assert page.locator("body").get_attribute("data-t") == "1"
+
+        page.set_content(
             '<div class="custom-modal show">親愛的客戶，一般通知<button>我知道了</button></div>'
             "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>document.body.dataset.clicks++</script>"
         )
