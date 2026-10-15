@@ -69,9 +69,7 @@ def test_shared_login_api_and_rule_inventory() -> None:
         "rakuten-startup-connect-error",
         "rakuten-duplicate-session",
         "rakuten-otp-required",
-        "rakuten-referral-promo",
-        "rakuten-ricb-promo",
-        "rakuten-time-deposit-promo",
+        "rakuten-promo",
         "rakuten-unknown-modal",
     ]
     assert all(rule.bank == "rakuten" for rule in rules)
@@ -79,8 +77,6 @@ def test_shared_login_api_and_rule_inventory() -> None:
         CheckpointKind.STARTUP_RECOVERY,
         CheckpointKind.DUPLICATE_SESSION,
         CheckpointKind.OTP_REQUIRED,
-        CheckpointKind.DISMISSIBLE_NOTICE,
-        CheckpointKind.DISMISSIBLE_NOTICE,
         CheckpointKind.DISMISSIBLE_NOTICE,
         CheckpointKind.UNKNOWN_BLOCKER,
     ]
@@ -90,8 +86,6 @@ def test_shared_login_api_and_rule_inventory() -> None:
         "input[name='otpCode']",
         ".modal.show",
         ".modal.show",
-        ".modal.show",
-        ".modal.show",
     ]
     assert [rule.phases for rule in rules] == [
         (CheckpointPhase.PRE_SUBMIT,),
@@ -99,21 +93,18 @@ def test_shared_login_api_and_rule_inventory() -> None:
         (CheckpointPhase.POST_SUBMIT, CheckpointPhase.POST_SUBMIT_SETTLE),
         tuple(CheckpointPhase),
         tuple(CheckpointPhase),
-        tuple(CheckpointPhase),
-        tuple(CheckpointPhase),
     ]
     assert [rule.action_texts for rule in rules] == [
         (),
         ("是，我要登入",),
         (),
-        ("稍後再看",),
-        ("略過",),
-        ("稍後再說", "稍後"),
+        ("稍後再說", "稍後再看", "稍後", "略過"),
         (),
     ]
     assert all(rule.max_actions == 1 for rule in rules)
 
-    duplicate, referral, ricb = rules[1], rules[3], rules[4]
+    duplicate, promo = rules[1], rules[3]
+    assert promo.required_body_pattern is None
     assert duplicate.required_body_pattern.fullmatch(RakutenCrawler.DUP_LOGIN_BODY)
     assert duplicate.required_body_pattern.fullmatch(
         RakutenCrawler.DUP_LOGIN_BODY.replace(" ", "\n")
@@ -123,49 +114,6 @@ def test_shared_login_api_and_rule_inventory() -> None:
     )
     assert not duplicate.required_body_pattern.fullmatch(
         f"{RakutenCrawler.DUP_LOGIN_BODY} 請洽客服"
-    )
-    assert referral.required_body_pattern.search(
-        f"{RakutenCrawler.REFERRAL_PROMO_PREFIX}\n活動期間"
-    )
-    assert not referral.required_body_pattern.search(
-        f"非官方{RakutenCrawler.REFERRAL_PROMO_PREFIX}"
-    )
-    assert referral.required_body_pattern.search(
-        "推薦獎金活動更新，新戶另享現金回饋\n稍後再看"
-    )
-    assert not referral.required_body_pattern.search("推薦獎金活動更新\n稍後再看")
-    assert not referral.required_body_pattern.search("新戶另享現金回饋\n稍後再看")
-    assert ricb.required_body_pattern.search(
-        f"{RakutenCrawler.INSURANCE_PROMO_PREFIX}\n活動期間"
-    )
-    assert not ricb.required_body_pattern.search(
-        f"非官方{RakutenCrawler.INSURANCE_PROMO_PREFIX}"
-    )
-
-
-def test_time_deposit_promo_rule_is_closed() -> None:
-    crawler = object.__new__(RakutenCrawler)
-    rule = next(
-        rule
-        for rule in crawler.login_checkpoint_rules()
-        if rule.name == "rakuten-time-deposit-promo"
-    )
-    body = (
-        "免解任務 ✕ 可開多筆 ✕ 萬元起存 "
-        "無需解任務！萬元即可開立： "
-        "🔒【限額 20 億】 6個月定期存款 2.0% "
-        "•鎖住收益，獻給追求穩健的你 "
-        "•讓明年出行、旅行的預算更充裕 "
-        "•期間：即日起～2026/12/31（額滿即止） "
-        "🔥限額高利，額滿即止👇立即開立定存👇 "
-        "稍後 立即開立定存"
-    )
-
-    assert rule.action_texts == ("稍後再說", "稍後")
-    assert rule.required_body_pattern is not None
-    assert rule.required_body_pattern.fullmatch(body)
-    assert not rule.required_body_pattern.fullmatch(
-        body.replace("稍後 立即開立定存", "稍後 立即解約")
     )
 
 
@@ -367,6 +315,27 @@ def test_late_auth_recovery_rechecks_named_unknown_loading_modal(monkeypatch) ->
     assert page.wait_for_timeout.call_args_list == [call(1000)] * 4
 
 
+def test_late_auth_recovery_waits_out_a_45s_loader(monkeypatch) -> None:
+    clock = [0.0]
+    page = Mock()
+    page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
+    monkeypatch.setattr(rakuten_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        rakuten_mod, "_any_visible", lambda _p, sel: sel == LOADER_SELECTOR and clock[0] < 45
+    )
+    monkeypatch.setattr(rakuten_mod, "_semantic_modal_visible", lambda _page: False)
+    crawler = object.__new__(RakutenCrawler)
+    crawler.name = "rakuten"
+    crawler._shared_dialog_blocked = False
+    crawler._credential_origin_allowed = Mock(return_value=True)
+    crawler._logged_in = Mock(return_value=True)
+    error = LoginCheckpointBlocked(
+        LoginBudget(credential_submissions=1), CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    )
+
+    assert crawler._recover_late_authentication(page, error)
+
+
 def test_late_auth_recovery_never_actions_a_new_modal_without_scope_provenance() -> None:
     modal_visible = True
 
@@ -487,19 +456,20 @@ def test_rakuten_rules_with_real_patchright_evaluator() -> None:
                 CheckpointPhase.POST_SUBMIT,
             )
             assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
-            assert outcome.rule_name == "rakuten-unknown-modal"
+            assert outcome.rule_name in {"rakuten-promo", "rakuten-unknown-modal"}
             assert page.locator("#unknown-confirm").get_attribute("data-clicked") is None
             assert secret not in repr(outcome)
 
-            for prefix, action, expected_rule in (
-                (RakutenCrawler.REFERRAL_PROMO_PREFIX, "稍後再看", "rakuten-referral-promo"),
-                (RakutenCrawler.INSURANCE_PROMO_PREFIX, "略過", "rakuten-ricb-promo"),
+            for title, action in (
+                ("無需解任務！萬元即可開啟財富旅程 全新文案", "稍後再說"),
+                ("推薦獎金 任意新活動", "稍後再看"),
+                ("投保抽大獎 任意新活動", "略過"),
             ):
                 outcome = evaluate(
                     f"""
                     <div class="modal show">
-                      <div>{prefix}<br>活動期間</div>
-                      <button id="other">立即參加</button>
+                      <div>{title}</div>
+                      <button id="other">立即開立定存</button>
                       <button id="dismiss" onclick="this.closest('.modal').classList.remove('show')">
                         {action}
                       </button>
@@ -508,24 +478,22 @@ def test_rakuten_rules_with_real_patchright_evaluator() -> None:
                     CheckpointPhase.POST_SUBMIT,
                 )
                 assert outcome.kind is CheckpointKind.DISMISSIBLE_NOTICE
-                assert outcome.rule_name == expected_rule
+                assert outcome.rule_name == "rakuten-promo"
                 assert outcome.action_label == action
                 assert page.locator("#other").get_attribute("data-clicked") is None
 
             outcome = evaluate(
-                f"""
+                """
                 <div class="modal show">
-                  <div>{RakutenCrawler.TIME_DEPOSIT_PROMO_PREFIX} 未驗證附加內容</div>
-                  <button id="time-deposit-dismiss" onclick="this.dataset.clicked='yes'; this.closest('.modal').classList.remove('show')">
-                    稍後
-                  </button>
+                  <div>未知公告</div>
+                  <button id="no-dismiss" onclick="this.dataset.clicked='yes'">立即開立定存</button>
                 </div>
                 """,
                 CheckpointPhase.POST_SUBMIT,
             )
             assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
-            assert outcome.rule_name == "rakuten-unknown-modal"
-            assert page.locator("#time-deposit-dismiss").get_attribute("data-clicked") is None
+            assert outcome.rule_name in {"rakuten-promo", "rakuten-unknown-modal"}
+            assert page.locator("#no-dismiss").get_attribute("data-clicked") is None
 
             outcome = evaluate(
                 """

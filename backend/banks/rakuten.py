@@ -239,9 +239,6 @@ class RakutenCrawler(BankCrawler):
         "帳號重複登入 您已在其他裝置登入，繼續登入將會 "
         "登出前一個裝置，是否以此裝置登入？"
     )
-    REFERRAL_PROMO_PREFIX = "推薦獎金NT$500無上限+抽沖繩來回機票，新戶也享NT$300現金~"
-    INSURANCE_PROMO_PREFIX = "輸入專案代碼【RICB】投保即可抽大獎"
-    TIME_DEPOSIT_PROMO_PREFIX = "夏末優存限定，高利 2.0% 限額開搶!"
     LOGOUT_BODY = "登出網路銀行 確認登出本系統？"
 
     def __init__(self) -> None:
@@ -674,14 +671,14 @@ class RakutenCrawler(BankCrawler):
             not isinstance(error, LoginCheckpointBlocked)
             or error.budget != LoginBudget(credential_submissions=1)
             or error.outcome.kind is not CheckpointKind.UNKNOWN_BLOCKER
-            or error.outcome.rule_name not in {None, "rakuten-unknown-modal"}
+            or error.outcome.rule_name not in {None, "rakuten-promo", "rakuten-unknown-modal"}
             or getattr(self, "_shared_dialog_blocked", False)
         ):
             return False
         # Unknown post-submit modals fail closed; record their shape so the rule can be added.
         print(f"[rakuten][login] unknown modal shape={_modal_shape(page)}", flush=True)
         authenticated_quiet_polls = 0
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 60.0  # matches the 60s loader wait in collect()
 
         while True:
             remaining = deadline - time.monotonic()
@@ -727,22 +724,6 @@ class RakutenCrawler(BankCrawler):
         def prefix(text: str) -> re.Pattern[str]:
             return re.compile(r"^\s*" + r"\s+".join(re.escape(part) for part in text.split()))
 
-        referral_body = re.compile(
-            r"\A\s*推薦獎金(?=[\s\S]{1,2048}\Z)(?=[\s\S]*新戶)"
-        )
-        time_deposit_body = re.compile(
-            r"\A\s*免解任務\s*✕\s*可開多筆\s*✕\s*萬元起存\s*"
-            r"無需解任務！萬元即可開立：\s*"
-            r"🔒【限額\s*[0-9０-９]{1,4}\s*億】\s*"
-            r"[0-9０-９]{1,2}個月定期存款\s*"
-            r"[0-9０-９]{1,2}(?:[.．][0-9０-９]{1,2})?%\s*"
-            r"•鎖住收益，獻給追求穩健的你\s*"
-            r"•讓明年出行、旅行的預算更充裕\s*"
-            r"•期間：即日起～[0-9０-９]{2,4}/[0-9０-９]{1,2}/[0-9０-９]{1,2}（額滿即止）\s*"
-            r"🔥限額高利，額滿即止👇立即開立定存👇\s*"
-            r"(?:稍後再說|稍後)\s*立即開立定存\s*\Z"
-        )
-
         return (
             LoginCheckpointRule(
                 name="rakuten-startup-connect-error",
@@ -767,32 +748,14 @@ class RakutenCrawler(BankCrawler):
                 kind=CheckpointKind.OTP_REQUIRED,
                 container_selector="input[name='otpCode']",
             ),
+            # Promo copy changes every campaign; match the dismiss button, never the body.
             LoginCheckpointRule(
-                name="rakuten-referral-promo",
+                name="rakuten-promo",
                 bank="rakuten",
                 phases=all_phases,
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
                 container_selector=".modal.show",
-                action_texts=("稍後再看",),
-                required_body_pattern=referral_body,
-            ),
-            LoginCheckpointRule(
-                name="rakuten-ricb-promo",
-                bank="rakuten",
-                phases=all_phases,
-                kind=CheckpointKind.DISMISSIBLE_NOTICE,
-                container_selector=".modal.show",
-                action_texts=("略過",),
-                required_body_pattern=prefix(self.INSURANCE_PROMO_PREFIX),
-            ),
-            LoginCheckpointRule(
-                name="rakuten-time-deposit-promo",
-                bank="rakuten",
-                phases=all_phases,
-                kind=CheckpointKind.DISMISSIBLE_NOTICE,
-                container_selector=".modal.show",
-                action_texts=("稍後再說", "稍後"),
-                required_body_pattern=time_deposit_body,
+                action_texts=("稍後再說", "稍後再看", "稍後", "略過"),
             ),
             LoginCheckpointRule(
                 name="rakuten-unknown-modal",
