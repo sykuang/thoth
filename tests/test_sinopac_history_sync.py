@@ -896,8 +896,9 @@ def test_sinopac_history_accepts_native_current_defaults_for_historical_window()
     assert result["status"] == "explicit_empty"
 
 
-def test_sinopac_history_accepts_native_fail_no_data_envelope() -> None:
-    hit = _history_hit(rows=[])
+@pytest.mark.parametrize("message", ["查無資料", "該區間查無明細資料！"])
+def test_sinopac_history_accepts_native_fail_no_data_envelope(message: str) -> None:
+    hit = _history_hit(rows=[], message=message)
     hit.resp_json[0]["Header"] = "FAIL"
     hit.resp_json[0]["HeadInfo"] = None
 

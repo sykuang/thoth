@@ -876,7 +876,8 @@ class SinopacCrawler(BankCrawler):
         if body["Header"] == "FAIL":
             if (
                 rows
-                or body.get("Message") != "查無資料"
+                # Bank wording for "no rows in this window"; seen both ways in production.
+                or body.get("Message") not in {"查無資料", "該區間查無明細資料！"}
                 or body.get("RecordCount") is not None
                 or head_info is not None
             ):
