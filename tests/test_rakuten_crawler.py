@@ -315,6 +315,27 @@ def test_late_auth_recovery_rechecks_named_unknown_loading_modal(monkeypatch) ->
     assert page.wait_for_timeout.call_args_list == [call(1000)] * 4
 
 
+def test_late_auth_recovery_waits_out_a_45s_loader(monkeypatch) -> None:
+    clock = [0.0]
+    page = Mock()
+    page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
+    monkeypatch.setattr(rakuten_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        rakuten_mod, "_any_visible", lambda _p, sel: sel == LOADER_SELECTOR and clock[0] < 45
+    )
+    monkeypatch.setattr(rakuten_mod, "_semantic_modal_visible", lambda _page: False)
+    crawler = object.__new__(RakutenCrawler)
+    crawler.name = "rakuten"
+    crawler._shared_dialog_blocked = False
+    crawler._credential_origin_allowed = Mock(return_value=True)
+    crawler._logged_in = Mock(return_value=True)
+    error = LoginCheckpointBlocked(
+        LoginBudget(credential_submissions=1), CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    )
+
+    assert crawler._recover_late_authentication(page, error)
+
+
 def test_late_auth_recovery_never_actions_a_new_modal_without_scope_provenance() -> None:
     modal_visible = True
 

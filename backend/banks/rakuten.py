@@ -678,7 +678,7 @@ class RakutenCrawler(BankCrawler):
         # Unknown post-submit modals fail closed; record their shape so the rule can be added.
         print(f"[rakuten][login] unknown modal shape={_modal_shape(page)}", flush=True)
         authenticated_quiet_polls = 0
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 60.0  # matches the 60s loader wait in collect()
 
         while True:
             remaining = deadline - time.monotonic()
