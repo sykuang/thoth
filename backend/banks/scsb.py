@@ -207,10 +207,8 @@ class ScsbCrawler(BankCrawler):
             kind=CheckpointKind.DISMISSIBLE_NOTICE,
             container_selector=".custom-modal.show",
             action_selector="button.btn-gradient",
+            # Notice copy changes (fraud, maintenance, FISC drills); match the dismiss button, never the body.
             action_texts=("我知道了",),
-            required_body_pattern=re.compile(
-                r"^[\s\S]{0,300}親愛的客戶[\s\S]{0,300}(?:詐騙|維護)[\s\S]{0,300}$"
-            ),
             max_actions=1,
             first_match_timeout_ms=5000,
         )
