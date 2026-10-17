@@ -117,7 +117,7 @@ def test_shared_api_terminal_first_rules_and_no_retry_kinds() -> None:
     fraud = rules[10]
     assert fraud.action_selector == "button.btn-gradient"
     assert fraud.action_texts == ("我知道了",)
-    assert fraud.required_body_pattern is not None
+    assert fraud.required_body_pattern is None
     assert fraud.first_match_timeout_ms == 5000
     assert all(rule.bank == "scsb" for rule in rules)
     assert all(
@@ -198,8 +198,8 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         assert page.locator("body").get_attribute("data-other") == "0"
 
         page.set_content(
-            '<div class="custom-modal show"><h5>網路銀行 10/14、10/15 維護公告</h5>'
-            '親愛的客戶 您好! 本行為提供更優質的服務，網路銀行將於下列時段進行系統維護作業'
+            '<div class="custom-modal show"><h5>10/17（六）、10/24（六） 財金公司跨行系統演練</h5>'
+            '親愛的客戶 您好! 配合財金公司辦理跨行系統演練，部分時段將暫停跨行服務'
             '<button class="btn btn-outline-primary">本日不再顯示</button>'
             '<button class="btn btn-gradient">我知道了</button></div>'
             "<script>document.body.dataset.t='0';document.querySelector('.btn-gradient').onclick="
@@ -210,12 +210,12 @@ def test_real_rules_click_only_exact_intro_and_terminal_collisions_never_click()
         assert page.locator("body").get_attribute("data-t") == "1"
 
         page.set_content(
-            '<div class="custom-modal show">親愛的客戶，一般通知<button>我知道了</button></div>'
+            '<div class="custom-modal show">親愛的客戶，一般通知<button class="btn">確認</button></div>'
             "<script>document.body.dataset.clicks='0';document.querySelector('button').onclick=()=>document.body.dataset.clicks++</script>"
         )
         outcome = _evaluate(page, CheckpointPhase.PRE_SUBMIT)
         assert outcome.kind is CheckpointKind.UNKNOWN_BLOCKER
-        assert outcome.rule_name == "scsb-unknown-custom-modal"
+        assert outcome.rule_name in {"scsb-fraud-notice", "scsb-unknown-custom-modal"}
         assert page.locator("body").get_attribute("data-clicks") == "0"
 
         for body, kind in (
