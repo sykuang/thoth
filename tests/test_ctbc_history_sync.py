@@ -579,3 +579,25 @@ def test_ctbc_attested_history_persists_and_advances_cursor(tmp_path, monkeypatc
         assert store.latest_twd_transaction_dates() == {"acct-a": date(2026, 8, 30)}
     finally:
         store.close()
+
+
+def _qu006_hit(code, desc, rs, status=200):
+    return ApiHit(
+        url=f"https://www.ctbcbank.com{_CTBC_EBMW_PATH}", method="POST", status=status,
+        req_body={"resource": "/twrbc-card/qu006/011", "rqData": {"curCode": "TWD"}},
+        resp_json={"code": code, "desc": desc, "rsData": rs},
+    )
+
+
+@pytest.mark.parametrize("hits, expected", [
+    ([_qu006_hit("8888", "您目前無此資料。", None)], True),
+    ([_qu006_hit("0000", "", {"allItems": []}), _qu006_hit("8888", "您目前無此資料。", None)], True),
+    ([_qu006_hit("8888", "您目前無此資料。", None), _qu006_hit("9999", "系統忙碌", None)], False),
+    ([_qu006_hit("8888", "系統忙碌", None)], False),
+    ([_qu006_hit("8888", "您目前無此資料。", None, status=500)], False),
+    ([], False),
+])
+def test_qu006_no_data_reply_counts_as_empty_unbilled(hits, expected):
+    collector = ResponseCollector()
+    collector.hits.extend(hits)
+    assert CtbcCrawler._qu006_is_empty(collector) is expected

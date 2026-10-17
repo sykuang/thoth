@@ -709,6 +709,8 @@ class CtbcCrawler(BankCrawler):
             data = self._latest_rsdata(collector, r)
             if data is not None:
                 card_api_dump[r] = data
+        if "/twrbc-card/qu006/011" not in card_api_dump and self._qu006_is_empty(collector):
+            card_api_dump["/twrbc-card/qu006/011"] = {"allItems": []}
         out["card_api_dump"] = card_api_dump
 
         # 最終 url + 截圖（信用卡頁）
@@ -752,6 +754,18 @@ class CtbcCrawler(BankCrawler):
         if hits:
             return hits[-1].resp_json.get("rsData")
         return None
+
+    @staticmethod
+    def _qu006_is_empty(collector: ResponseCollector) -> bool:
+        """Live 2026-10-17: no unbilled rows answers code 8888, rsData null, exact desc below."""
+        hits = [h for h in collector.hits
+                if "ebmwResource" in h.url and isinstance(h.req_body, dict)
+                and h.req_body.get("resource") == "/twrbc-card/qu006/011"]
+        if not hits or hits[-1].status != 200 or not isinstance(hits[-1].resp_json, dict):
+            return False
+        resp = hits[-1].resp_json
+        return (resp.get("code") == "8888" and resp.get("rsData") is None
+                and resp.get("desc") == "您目前無此資料。")
 
     def _collect_twd_deposit_history(
         self,
