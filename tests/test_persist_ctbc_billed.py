@@ -363,3 +363,16 @@ def test_ctbc_same_last4_pk_collision_resolved(store):
     assert "附卡" in name_map["****7036_2"]
     # 單張不加正/附卡 suffix（沒衝突不需區分）
     assert "正卡" not in name_map["****7051"]
+
+
+def test_ctbc_empty_unbilled_clears_stale_pending(store):
+    """Once every unbilled row posts, the emptied qu006 snapshot must sweep old pending rows."""
+    row = {"purchaseDt": "20261011", "postingDt": "20261015", "cardNoSuffixFour": "3443_0",
+           "description": "道町燒肉                 TAIPEI       TW", "purchaseAmt": 2068,
+           "origCurDesc": "TWD", "origCurAmt": 2068, "txCode": "40"}
+    base = {"summary": {}, "twd_deposit": {}}
+    persist_ctbc({**base, "card_api_dump": {"/twrbc-card/qu006/011": {"allItems": [row]}}}, store)
+    persist_ctbc({**base, "card_api_dump": {}}, store)
+    assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1
+    persist_ctbc({**base, "card_api_dump": {"/twrbc-card/qu006/011": {"allItems": []}}}, store)
+    assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
