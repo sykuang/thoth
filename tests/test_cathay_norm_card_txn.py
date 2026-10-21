@@ -142,6 +142,8 @@ class _LatestBillCollector:
     ("Paid", "paid"),
     ("Payed", "paid"),
     ("UnPaid", "unpaid"),
+    # Live bill overview shows an outstanding statement and「我要繳費」for Payment.
+    ("Payment", "unpaid"),
 ])
 def test_latest_bill_status_is_canonical_enum_value(crawler, raw, canonical):
     result = crawler._parse(_LatestBillCollector(raw))
@@ -152,6 +154,15 @@ def test_latest_bill_status_is_canonical_enum_value(crawler, raw, canonical):
         "status": canonical,
         "remaining_due": 0.0 if canonical == "paid" else 4321.0,
     }]
+
+
+@pytest.mark.parametrize(("raw", "remaining"), [("Payment", 4321), ("Payed", 0)])
+def test_legacy_latest_bill_liability_uses_shared_status(raw, remaining):
+    from backend.server.routers.portfolio import _liab_cathay
+
+    assert _liab_cathay({
+        "latest_bill": {"twd": {"billAmount": 4321, "payBillStatus": raw}},
+    }) == remaining
 
 
 def test_latest_bill_rejects_unknown_status(crawler):

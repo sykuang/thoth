@@ -15,7 +15,8 @@ def cathay_bill_status(value: Any, *, strict: bool = False) -> CathayBillStatus 
     token = str(value or "").strip().casefold()
     if token in {"paid", "payed"}:
         return CathayBillStatus.PAID
-    if token == "unpaid":
+    # Cathay's bill overview renders「我要繳費」for the live Payment status.
+    if token in {"unpaid", "payment"}:
         return CathayBillStatus.UNPAID
     if strict:
         raise ValueError(f"unsupported Cathay bill status: {value!r}")
