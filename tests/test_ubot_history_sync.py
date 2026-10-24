@@ -1199,7 +1199,7 @@ def test_ubot_delayed_pending_transition_preserves_user_overlay(
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     card_no = "****2302"
     pending = {
-        "cardNo": card_no, "effectiveDate": "20260715", "postingDate": "20260716",
+        "cardNo": card_no, "effectiveDate": "20260715", "postingDate": "00000000",
         "txCode": "40", "txAmt": "100", "Currency": "TWD", "oriAmt": "100",
         "txDesc": "TEST", "typeName": "聯邦卡",
     }

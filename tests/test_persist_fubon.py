@@ -178,7 +178,8 @@ def test_fubon_pending_preserves_posting_date_column(fubon_data, fubon_store):
     persist_fubon(fubon_data, fubon_store)
 
     row = fubon_store.conn.execute(
-        "SELECT consume_date, post_date, description FROM card_pending_txns"
+        "SELECT consume_date, post_date, description FROM card_billed_txns "
+        "WHERE description = '測試商店'"
     ).fetchone()
     assert dict(row) == {
         "consume_date": "2026-05-05",

@@ -234,6 +234,7 @@ def get_card_detail(
     回 shape:
       {
         ...card 主檔所有欄 (含 bill_due_amount/last_payment_date/bill_status)
+        posted_txns:  全部已入帳資料（含尚未分配帳單或沒有入帳日期的資料）
         billed_txns:  list[{date, post_date, amount, description, currency,
                             category, subcategory, txn_type, flow_type}]
                        (本期帳單：上一個結帳日後、截至本次結帳日的入帳資料)
@@ -278,8 +279,9 @@ def get_card_detail(
             status_code=404, detail=f"card not found: {bank}/{card_no}",
         )
 
-    # CardDetail.card → response shape, 再 append 3 個 list
+    # Statement membership and booking state are independent collections.
     body = _card_to_response(detail.card)
+    body["posted_txns"] = [t.model_dump() for t in detail.posted_txns]
     body["billed_txns"] = [t.model_dump() for t in detail.billed_txns]
     body["pending_txns"] = [t.model_dump() for t in detail.pending_txns]
     body["payments"] = [p.model_dump() for p in detail.payments]

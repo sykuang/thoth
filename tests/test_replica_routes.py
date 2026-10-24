@@ -1074,14 +1074,14 @@ def test_loan_metric_is_ignored_without_a_loan_account(monkeypatch) -> None:
     assert replica_facts._loan_fact("cathay", 1) is None
 
 
-def test_replica_esun_pending_posts_on_consume_date_only_for_esun() -> None:
+def test_replica_never_fabricates_pending_post_date_from_consume_date() -> None:
     from backend.server.replica_facts import _transaction_fact
 
     row = SimpleNamespace(
         id=1, kind="pending", amount=100, consume_date="2026-10-05",
         post_date=None, card_no="2869", currency="TWD",
     )
-    assert _transaction_fact("esun", row, set(), set())["post_date"] == "2026-10-05"
+    assert _transaction_fact("esun", row, set(), set())["post_date"] is None
     assert _transaction_fact("cathay", row, set(), set())["post_date"] is None
     row.kind = "billed"
     assert _transaction_fact("esun", row, set(), set())["post_date"] is None

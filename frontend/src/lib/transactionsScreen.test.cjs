@@ -100,7 +100,7 @@ const has = (html, id) => html.includes(`data-testid="${id}"`);
 test('consume → post → consume keeps posted pending and recomputes rows, categories, counts and totals', () => {
   preferences.show_snaptrade_transactions = false;
   const posted = {...transaction, id: 2, kind: 'pending', post_date: transaction.date, consume_date: transaction.date, description: 'posted-pending'};
-  const unposted = {...transaction, id: 3, kind: 'pending', post_date: ' ', description: 'unposted', category: '未入帳分類'};
+  const unposted = {...transaction, id: 3, kind: 'pending', consume_date: transaction.date, post_date: ' ', description: 'unposted', category: '未入帳分類'};
   const unpostedBilled = {...unposted, id: 4, kind: 'billed', post_date: null};
   client.setQueryData(datasetKey, {transactions: [transaction, posted, unposted, unpostedBilled], preferences});
   const check = (tree, count, expense, category) => {
@@ -126,7 +126,7 @@ test('consume → post → consume keeps posted pending and recomputes rows, cat
 
 test('post basis excludes previously selected unposted cards from bulk targets and income chips', () => {
   preferences.show_snaptrade_transactions = false;
-  const unposted = {...transaction, id: 3, kind: 'pending', post_date: null, amount: 50,
+  const unposted = {...transaction, id: 3, kind: 'pending', consume_date: transaction.date, post_date: null, amount: 50,
     cashflow_direction: 'income', cashflow_amount: 50, category: '未入帳收入'};
   client.setQueryData(datasetKey, {transactions: [transaction, unposted], preferences});
   render([
@@ -143,6 +143,125 @@ test('post basis excludes previously selected unposted cards from bulk targets a
       press('txn-filter-open')(tree);
     },
     tree => {assert.ok(!tree.some(node => node.props.accessibilityRole === 'button' && text(node) === '未入帳收入'));},
+  ]);
+});
+
+test('post-only replica rows keep unknown consume dates through screen basis switches, categories and selection', () => {
+  const {projectReplicaDataset} = require('./replica');
+  const {TxnRow} = require('../components/transactions/TxnRow');
+  preferences.show_snaptrade_transactions = false;
+  for (const kind of ['billed', 'pending']) for (const consume_date of [null, undefined, '', '   ']) {
+    for (const splits of [[], [
+      {amount:150, category:'僅入帳分類', subcategory:null},
+      {amount:250, category:'僅入帳分類', subcategory:null},
+    ]]) {
+      const dataset = projectReplicaDataset(JSON.parse(JSON.stringify({
+        partitions:{'bank:cathay':{transactions:[
+          {...transaction, bank:'manual', date:'2026-06-10'},
+          {...transaction, id:2, kind, date:'2026-06-24', consume_date, post_date:'2026-06-24',
+            description:'post-only-purchase', category:'僅入帳分類', amount:-400, cashflow_amount:400, splits},
+        ]}}, generations:{}, syncedAt:'2026-06-24',
+      })));
+      client.setQueryData(datasetKey, {...dataset, preferences});
+      preferences = {...preferences, card_date_basis:'consume'};
+      const check = (tree, count, expense, present) => {
+        assert.ok(tree.some(node => text(node) === `共 ${count} 筆`));
+        assert.ok(text(tree.find(node => node.props.testID === 'expense-card-toggle')).includes(`NT$ ${expense}`));
+        assert.equal(tree.some(node => node.props.t?.description === 'post-only-purchase'), present);
+      };
+      render([
+        tree => tree.find(node => node.props.onPeriodChange).props.onPeriodChange('2026-06'),
+        tree => {check(tree, 1, 100, false); preferences = {...preferences, card_date_basis:'post'};},
+        tree => {check(tree, 1 + (splits.length || 1), 500, true); press('txn-selection-enter')(tree);},
+        tree => tree.find(node => node.props.t?.description === 'post-only-purchase').props.onPress(),
+        tree => {assert.equal(tree.find(node => node.props.targets).props.targets.length, 1); preferences = {...preferences, card_date_basis:'consume'};},
+        tree => {
+          check(tree, 1, 100, false);
+          assert.deepEqual(tree.find(node => node.props.targets).props.targets, []);
+          press('txn-view-category')(tree);
+        },
+        tree => {
+          assert.ok(!tree.some(node => node.props.testID === 'txn-cat-row-僅入帳分類'));
+          preferences = {...preferences, card_date_basis:'post'};
+        },
+        tree => assert.ok(tree.some(node => node.props.testID === 'txn-cat-row-僅入帳分類' && text(node).includes('-NT$ 400'))),
+      ]);
+      // Direct row rendering must not turn the replica's display fallback into a
+      // consume-date label, even when a caller renders outside period filtering.
+      const cardRows = dataset.transactions.filter(row => row.kind === kind);
+      for (const t of cardRows) for (const wide of [false, true]) {
+        const html = renderToStaticMarkup(React.createElement(TxnRow, {t, wide, cardDateBasis:'consume', fxMode:'original'}));
+        assert.ok(!html.includes('2026-06-24'));
+        assert.ok(html.includes('—'));
+        assert.equal(t.consume_date?.trim() || '', '');
+        assert.equal(t.post_date, '2026-06-24');
+      }
+      assert.deepEqual(client.getQueryData(datasetKey).transactions, dataset.transactions, 'filtering must not mutate date facts or split identities');
+    }
+  }
+});
+
+test('HTTP replica → projection → local stats → actual screen agrees on all buckets',
+  {skip: !process.env.CARD_BOOKING_HTTP_FIXTURE}, () => {
+    const snapshots = JSON.parse(require('node:fs').readFileSync(process.env.CARD_BOOKING_HTTP_FIXTURE, 'utf8'));
+    const {applyReplicaResponse, projectReplicaDataset} = require('./replica');
+    const {computeLocalDashboardStats} = require('./localStats');
+    const {isTransactionInPeriod, mergeTransactionTimeline} = require('./transactionTimeline');
+    const {aggregateByCategory} = require('./txnFilter');
+    assert.equal(snapshots.length, 4, 'both physical kinds, split/unsplit');
+    for (const snapshot of snapshots) {
+      const envelope = applyReplicaResponse(undefined, snapshot.replica, 'synthetic-http-owner');
+      assert.ok(envelope);
+      const dataset = projectReplicaDataset(envelope);
+      for (const scenario of snapshot.scenarios) {
+        const rows = dataset.transactions.filter(t => isTransactionInPeriod(t, scenario.basis, scenario.bounds.since, scenario.bounds.until));
+        const local = computeLocalDashboardStats(rows, scenario.basis);
+        for (const [key, value] of Object.entries(local)) assert.deepEqual(value, scenario.stats[key], `HTTP/local ${key}`);
+        assert.equal(mergeTransactionTimeline(rows, [], [], scenario.basis).length, scenario.list.total);
+        assert.deepEqual(aggregateByCategory(rows), scenario.stats.by_category);
+      }
+      preferences = {...preferences, card_date_basis:'consume', show_snaptrade_transactions:false};
+      client.setQueryData(datasetKey, {...dataset, preferences});
+      const post = snapshot.scenarios.find(s => s.basis === 'post').stats;
+      render([
+        tree => tree.find(n => n.props.onPeriodChange).props.onPeriodChange('2026-06'),
+        tree => {
+          assert.equal(tree.filter(n => n.props.t).length, 0);
+          assert.ok(tree.some(n => n.props.testID === 'txn-empty'));
+          assert.ok(!tree.some(n => n.props.accessibilityRole === 'button' && ['food','transport'].includes(text(n))));
+          preferences = {...preferences, card_date_basis:'post'};
+        },
+        tree => {
+          assert.equal(tree.filter(n => n.props.t).length, post.total);
+          assert.ok(tree.some(n => text(n) === `共 ${post.total} 筆`));
+          assert.ok(text(tree.find(n => n.props.testID === 'expense-card-toggle')).includes('NT$ 1,200'));
+          press('txn-view-category')(tree);
+        },
+        tree => {
+          for (const [category, amount] of Object.entries(post.amount_by_category)) {
+            const row = tree.find(n => n.props.testID === `txn-cat-row-${category}`);
+            assert.ok(row);
+            assert.ok(text(row).includes(`-NT$ ${amount.toLocaleString()}`));
+          }
+          preferences = {...preferences, card_date_basis:'consume'};
+        },
+        tree => assert.ok(!tree.some(n => n.props.testID?.startsWith('txn-cat-row-'))),
+      ]);
+    }
+  });
+
+test('direct old-server legacy card dates remain visible, explicit unknown facts do not', () => {
+  const legacy = {...transaction, kind:'billed', post_date:'2026-07-02', date:'2026-06-24', description:'legacy-date-only'};
+  delete legacy.consume_date;
+  preferences = {...preferences, show_snaptrade_transactions:false};
+  client.setQueryData(datasetKey, {transactions:[legacy, {...legacy,id:2,consume_date:null,description:'explicit-unknown'}], preferences});
+  render([
+    tree => tree.find(n => n.props.onPeriodChange).props.onPeriodChange('2026-06'),
+    tree => {
+      assert.ok(tree.some(n => n.props.t?.description === 'legacy-date-only'));
+      assert.ok(!tree.some(n => n.props.t?.description === 'explicit-unknown'));
+      assert.ok(tree.some(n => text(n) === '共 1 筆'));
+    },
   ]);
 });
 

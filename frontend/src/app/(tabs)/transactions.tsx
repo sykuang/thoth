@@ -44,7 +44,7 @@ import {
 import { formatApiError } from '@/lib/api';
 import { categorySortRank, sortCategoryKeys } from '@/lib/category-color';
 import { formatCurrency, formatSignedCurrency } from '@/lib/currency';
-import { isTransactionVisibleForBasis, mergeTransactionTimeline, transactionDateForBasis } from '@/lib/transactionTimeline';
+import { isTransactionInPeriod, isTransactionVisibleForBasis, mergeTransactionTimeline } from '@/lib/transactionTimeline';
 import {
   applyTxnFilters,
   aggregateByCategory,
@@ -247,11 +247,7 @@ export default function TransactionsScreen() {
     if (effectiveAccountNo) items = items.filter((t) => t.account_no === effectiveAccountNo);
     if (effectiveAccountCurrency) items = items.filter((t) => t.currency === effectiveAccountCurrency);
     if (effectiveCardNo) items = items.filter((t) => matchesCardDrilldown(t, effectiveCardNo));
-    items = items.filter((t) => {
-      const d = transactionDateForBasis(t, cardDateBasis);
-      return d >= since && d <= until;
-    });
-    return items;
+    return items.filter(t => isTransactionInPeriod(t, cardDateBasis, since, until));
   }, [datasetQ.data, selectedBanks, effectiveAccountNo, effectiveAccountCurrency, effectiveCardNo, granularity, selectedPeriod, cardDateBasis]);
 
   const transactionRefreshing = (

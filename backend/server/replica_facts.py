@@ -100,12 +100,7 @@ def _transaction_fact(
         "datetime": _value(row, "txn_datetime") if kind == "twd" else None,
         "account_date": _date(_value(row, "account_date")),
         "consume_date": _date(_value(row, "consume_date")),
-        # E.SUN only assigns post_date at statement close; show pending rows on
-        # the consume date so post-date mode does not hide them. Read-time only.
-        "post_date": _date(_value(row, "post_date")) or (
-            _date(_value(row, "consume_date"))
-            if bank == "esun" and kind == "pending" else None
-        ),
+        "post_date": _date(_value(row, "post_date")),
         "bill_date": _date(_value(row, "bill_date")),
         "description": _value(row, "description"),
         "description_overwrite": _value(row, "description_overwrite"),

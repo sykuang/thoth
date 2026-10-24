@@ -690,7 +690,8 @@ def test_ubot_unbilled_preserves_posting_date_for_installment_month(store):
     persist_ubot(data, store, rules=None)
 
     row = store.conn.execute(
-        "SELECT consume_date, post_date, description, amount FROM card_pending_txns"
+        "SELECT consume_date, post_date, description, amount FROM card_billed_txns "
+        "WHERE amount = 45756"
     ).fetchone()
     assert dict(row) == {
         "consume_date": "2026-05-05",

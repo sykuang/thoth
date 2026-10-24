@@ -134,12 +134,56 @@ def _latest_cursor_dates(
     return result
 
 
+def _card_identity_conflicts(left, right) -> bool:
+    """Known immutable card evidence vetoes every weaker content-based match."""
+    left, right = dict(left), dict(right)
+    for field in ("currency", "consume_currency", "consume_amount", "native_identity", "txn_type", "post_date"):
+        a, b = left.get(field), right.get(field)
+        if a is None or b is None:
+            continue
+        if field.endswith("currency"):
+            a, b = str(a).strip().upper(), str(b).strip().upper()
+        elif field == "consume_amount":
+            a, b = Decimal(str(a)), Decimal(str(b))
+        if a != b:
+            return True
+    return False
+
+
 def _pending_billed_identity(row) -> tuple | None:
-    """pending/billed 配對 identity：外幣優先原幣，台幣才看入帳金額。
+    """pending/billed identity: native reference first, then original FX/local amount.
 
     外幣 pending 的 TWD amount 常只是授權/估算值，正式入帳後會因結匯改變；
     真正不變的是 card_no + consume_currency + consume_amount。
     """
+    row = dict(row)
+    if row.get("native_identity"):
+        if any(not isinstance(row.get(field), str) or not row[field].strip()
+               for field in ("native_identity", "card_no", "txn_type")):
+            return None
+        dates = [row.get("consume_date") or row.get("date")]
+        if row.get("post_date") is not None:
+            dates.append(row["post_date"])
+        for value in dates:
+            parsed = _cursor_date(value)
+            if parsed is None or not isinstance(value, str) or parsed.isoformat() != value:
+                return None
+        # Use the writer's monetary rules before building any occurrence proof.
+        try:
+            currency = str(row.get("currency") or "TWD").strip().upper()
+            row["amount"] = native_money(row.get("amount"), currency)
+            if row.get("consume_amount") is not None:
+                row["consume_currency"] = str(row.get("consume_currency") or currency).strip().upper()
+                row["consume_amount"] = native_money(row["consume_amount"], row["consume_currency"])
+        except ValueError:
+            return None
+        # Native references still need occurrence evidence. Only exact original FX
+        # money permits a mutable settlement amount; local amounts stay guarded.
+        evidence = _pending_billed_identity({**row, "native_identity": None})
+        if evidence is None:
+            return None
+        return ("native", row["native_identity"], evidence, row.get("txn_type"),
+                Decimal(str(row["amount"])).compare(0))
     card_no = row.get("card_no") if isinstance(row, dict) else row["card_no"]
     currency = row.get("consume_currency") if isinstance(row, dict) else row["consume_currency"]
     main_currency = row.get("currency") if isinstance(row, dict) else row["currency"]
@@ -155,11 +199,12 @@ def _pending_billed_identity(row) -> tuple | None:
         try:
             # Decimal(str(...)).normalize() 讓 100.20 與 100.2 視為同額，避免 float 表示差。
             original = Decimal(str(consume_amount)).normalize()
-            if not original.is_finite():
+            if not original.is_finite() or original == 0:
                 return None
         except (InvalidOperation, ValueError):
             return None
-        return ("fx", card_no, consume_date, currency, original)
+        return ("fx", card_no, consume_date, currency, original, row.get("txn_type"),
+                None if amount is None else Decimal(str(amount)).compare(0))
     # 只有明確 TWD／未標幣別的 row 才可退回 local amount。若主幣別已顯示外幣，
     # 卻缺 consume_*，代表資料不足，不可把外幣 amount 當 TWD identity 誤配。
     if main_currency and main_currency != "TWD":
@@ -167,6 +212,23 @@ def _pending_billed_identity(row) -> tuple | None:
     if amount is None or consume_date is None:
         return None
     return ("local", card_no, consume_date, amount)
+
+
+def _card_occurrence_matches(left, right) -> bool:
+    """Exact money/card/date evidence, with known references and dates as vetoes."""
+    left, right = dict(left), dict(right)
+    identity = _pending_billed_identity({**left, "native_identity": None})
+    return (identity is not None
+            and identity == _pending_billed_identity({**right, "native_identity": None})
+            and left.get("txn_type") == right.get("txn_type")
+            and left.get("amount") is not None and right.get("amount") is not None
+            and Decimal(str(left["amount"])).compare(0) == Decimal(str(right["amount"])).compare(0)
+            and not _card_identity_conflicts(left, right))
+
+
+def _native_occurrence_matches(left, right) -> bool:
+    return (bool(dict(left).get("native_identity") and dict(right).get("native_identity"))
+            and _card_occurrence_matches(left, right))
 
 
 def _pending_raw_key(row) -> tuple:
@@ -427,6 +489,7 @@ CREATE TABLE IF NOT EXISTS card_billed_txns (
     consume_country  TEXT,
     consume_currency TEXT,
     consume_amount   REAL,
+    native_identity  TEXT,
     first_seen       TEXT NOT NULL,
     dedup_key        TEXT NOT NULL
 );
@@ -481,6 +544,7 @@ CREATE TABLE IF NOT EXISTS card_pending_txns (
     consume_country  TEXT,            -- 2026-06-14: 消費國家
     consume_currency TEXT,            -- 2026-06-14: 原始消費幣別（如 EUR）
     consume_amount   REAL,            -- 2026-06-14: 原始外幣金額（保留小數）
+    native_identity  TEXT,
     refreshed_at     TEXT NOT NULL
 );
 
@@ -854,6 +918,8 @@ class BankStore:
         for tbl in ("card_billed_txns", "card_pending_txns"):
             tbl_cols = {r["name"] for r in self.conn.execute(
                 f"PRAGMA table_info({tbl})").fetchall()}
+            if "native_identity" not in tbl_cols:
+                self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN native_identity TEXT")
             if "txn_type" not in tbl_cols:
                 self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN txn_type TEXT")
         # Phase 6 (loan): balance_history 加 loan_balance 欄
@@ -1221,14 +1287,13 @@ class BankStore:
         return snapshots
 
     def _pending_user_metadata_by_identity(self, scope: str) -> dict[tuple, list[tuple]]:
-        """外幣 pending overlay fallback：以原幣 identity 跨估算金額/desc 變動保留。
+        """Preserve renamed overlays only with exact native/original-FX identity.
 
-        只收真正外幣 (consume_currency != TWD + consume_amount 有值)。台幣仍走四欄
-        exact key，避免同卡同額交易誤搬。list + pop(0) 保留 occurrence 語意。
+        Local purchases without references still require the four-field exact key.
         """
         out: dict[tuple, list[tuple]] = {}
         rows = self.conn.execute(
-            "SELECT id, card_no, consume_date, amount, currency, consume_currency, consume_amount, "
+            "SELECT id, card_no, consume_date, amount, currency, consume_currency, consume_amount, native_identity, txn_type, "
             "category, subcategory, "
             "description_overwrite, tags_overwrite, auto_excluded, splits_overwrite "
             "FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id",
@@ -1236,7 +1301,7 @@ class BankStore:
         ).fetchall()
         for r in rows:
             identity = _pending_billed_identity(r)
-            if not identity or identity[0] != "fx":
+            if not identity or identity[0] not in ("fx", "native"):
                 continue
             out.setdefault(identity, []).append((
                 r["category"], r["subcategory"], r["description_overwrite"],
@@ -1331,11 +1396,14 @@ class BankStore:
         self.conn.commit()
 
     def card_dedup_rows(self, user_columns: tuple[str, ...]) -> list[dict]:
-        """Card billed rows needed by the one-off cross-sync duplicate repair."""
+        """Legacy card billed rows needed by the one-off cross-sync repair.
+
+        Content-only repair cannot disambiguate native occurrences; exclude them.
+        """
         cols = ", ".join(("id", "card_no", "consume_date", "post_date", "description", "amount",
                           "consume_amount", "first_seen") + user_columns)
         return [dict(r) for r in self.conn.execute(
-            f"SELECT {cols} FROM card_billed_txns WHERE user_id = ?", (self.user_id,)
+            f"SELECT {cols} FROM card_billed_txns WHERE user_id = ? AND native_identity IS NULL", (self.user_id,)
         ).fetchall()]
 
     def apply_card_dedup(self, actions: list[dict]) -> None:
@@ -1352,8 +1420,31 @@ class BankStore:
         self.conn.commit()
 
     # ---- 2. 信用卡已出帳明細：append-only ----
-    def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None) -> int:
+    def _validate_native_card_occurrences(self, txns: list[dict]) -> None:
+        # Missing proof is not new-purchase permission. Quarantine this user's card
+        # writes if pre-validation native rows exist, including pending disappearance.
+        def validate(rows, *, incoming=False):
+            if any(row.get("native_identity") and (
+                _pending_billed_identity(row) is None
+                # Incoming writers persist `date`; a conflicting stored-row alias
+                # must not steer either validation or later occurrence matching.
+                or (incoming and row.get("consume_date", row.get("date")) != row.get("date"))
+            ) for row in rows):
+                raise ValueError("incomplete native card occurrence")
+
+        validate(txns, incoming=True)
+        # ponytail: scan native rows; index/quarantine at migration if history grows.
+        for table in ("card_billed_txns", "card_pending_txns"):
+            validate(dict(row) for row in self.conn.execute(
+                f"SELECT card_no, consume_date, post_date, currency, consume_currency, consume_amount, "
+                f"amount, native_identity, txn_type FROM {table} "
+                "WHERE user_id = ? AND native_identity IS NOT NULL", (self.user_id,),
+            ).fetchall())
+
+    def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None,
+                           *, suppress_history_cursor: bool = False) -> int:
         from backend.server.categorizer import categorize_with_excluded
+        self._validate_native_card_occurrences(txns)
         txns = [dict(txn) for txn in txns]
         for txn in txns:
             currency = str(txn.get("currency") or "TWD").strip().upper()
@@ -1376,7 +1467,7 @@ class BankStore:
                 and t.get("amount") is not None and t.get("desc")
             ):
                 candidates = self.conn.execute(
-                    """SELECT card_no FROM card_billed_txns
+                    """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
                          AND consume_date = ? AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
@@ -1384,6 +1475,7 @@ class BankStore:
                     (self.user_id, t.get("date"), t.get("amount"), t.get("desc"),
                      t.get("consume_amount")),
                 ).fetchall()
+                candidates = [row for row in candidates if not _card_identity_conflicts(row, t)]
                 if len(candidates) == 1:
                     t["card_no"] = candidates[0]["card_no"]
                 elif len(candidates) > 1:
@@ -1395,16 +1487,112 @@ class BankStore:
         # dedup_key 同時納入 consume_date(消費日) 與 post_date(入帳日)：
         # 同消費日但不同入帳日（如分期、跨月折算）算不同筆，不可去重誤殺。
         content_keys = [
-            _dedup_key(t.get("card_no"), t.get("bill_date"), t.get("date"),
+            (_dedup_key("native", t["native_identity"], t.get("card_no"), t.get("date"),
+                        t.get("post_date") or t.get("bill_date"),
+                        _pending_billed_identity(t) or (t.get("amount"), t.get("consume_currency"), t.get("consume_amount")),
+                        t.get("currency"), t.get("txn_type")) if t.get("native_identity") else
+             _dedup_key(t.get("card_no"), t.get("bill_date"), t.get("date"),
                        t.get("post_date"), t.get("desc"), t.get("amount"),
-                       t.get("consume_amount"))
+                       t.get("consume_amount")))
             for t in txns
         ]
         dedup_keys = _with_occurrence(content_keys)
         claimed_ids: set[int] = set()
         for t, key in zip(txns, dedup_keys, strict=True):
             post_date = t.get("post_date") or None
-            if post_date and t.get("date") and t.get("amount") is not None and t.get("desc"):
+            native = t.get("native_identity")
+            keyed = self.conn.execute(
+                "SELECT * FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                (self.user_id, key),
+            ).fetchone()
+            if keyed is not None and _card_identity_conflicts(keyed, t):
+                raise ValueError("conflicting billed card dedup identity currency")
+            if "native_identity" in t and t.get("bill_date"):
+                # Legacy promoted rows have no cross-source identity. Same dates/
+                # amount are only an ambiguity alarm, never permission to merge.
+                legacy = self.conn.execute(
+                    "SELECT * FROM card_billed_txns WHERE user_id = ? "
+                    "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                    "AND bill_date IS NULL",
+                    (self.user_id, t.get("card_no"), t.get("date")),
+                ).fetchall()
+                if any((native is None or row["native_identity"] is None)
+                       and _pending_raw_key(row) != _pending_raw_key(t)
+                       and _card_occurrence_matches(row, t) for row in legacy):
+                    raise ValueError("ambiguous native card identity for legacy promoted row")
+            if native:
+                candidates = self.conn.execute(
+                    "SELECT * FROM card_billed_txns WHERE user_id = ? "
+                    "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                    "AND (post_date IS NOT DISTINCT FROM ? OR post_date IS NULL OR CAST(? AS TEXT) IS NULL) "
+                    "AND txn_type IS NOT DISTINCT FROM ? "
+                    "AND (native_identity = ? OR (native_identity IS NULL AND description = ? "
+                    "AND amount IS NOT DISTINCT FROM ?)) "
+                    "ORDER BY CASE WHEN post_date IS NULL THEN 1 ELSE 0 END, id",
+                    (self.user_id, t.get("card_no"), t.get("date"), post_date, post_date,
+                     t.get("txn_type"), native, t.get("desc"), t.get("amount")),
+                ).fetchall()
+                if any(row["native_identity"] == native and _card_identity_conflicts(row, t)
+                       for row in candidates):
+                    raise ValueError("conflicting native card occurrence currency")
+                available = [row for row in candidates if row["id"] not in claimed_ids
+                             and (post_date or not t.get("bill_date") or row["bill_date"] is None
+                                  or row["bill_date"] == t.get("bill_date"))]
+                same = [row for row in available if not _card_identity_conflicts(row, t)
+                        and (not row["native_identity"] or _native_occurrence_matches(row, t))]
+                if not same and any(row["native_identity"] == native for row in available):
+                    raise ValueError("ambiguous native card occurrence evidence")
+                if same:
+                    target = same[0]
+                    splits = target["splits_overwrite"]
+                    amount = target["amount"]
+                    if amount != t.get("amount"):
+                        # Exact original FX allows settlement, not arbitrary rewrites.
+                        # Only snapshot -> statement provides authoritative ordering.
+                        incoming_count = sum(_native_occurrence_matches(target, other) for other in txns)
+                        if len(same) != 1 or incoming_count != 1:
+                            raise ValueError("ambiguous native FX settlement occurrences")
+                        if suppress_history_cursor or target["bill_date"] or not t.get("bill_date"):
+                            raise ValueError("ambiguous native FX settlement ordering")
+                        amount = t["amount"]
+                        splits = _rescale_splits(target["splits_overwrite"], amount)
+                        if target["splits_overwrite"] and splits is None:
+                            raise ValueError("cannot preserve native billed splits")
+                    if target["post_date"] is None and post_date:
+                        fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                                  "auto_excluded", "splits_overwrite")
+                        incoming_dates = {other.get("post_date") for other in txns
+                                          if _pending_billed_identity(other) == _pending_billed_identity(t)}
+                        if ((len(same) > 1 or len(incoming_dates) > 1)
+                                and any(row[field] for row in same for field in fields)):
+                            raise ValueError("ambiguous native undated occurrence overlays")
+                    if target["native_identity"] is None:
+                        fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                                  "auto_excluded", "splits_overwrite")
+                        incoming_count = sum(
+                            (other.get("card_no"), other.get("date"), other.get("post_date"),
+                             other.get("amount"), other.get("desc")) ==
+                            (t.get("card_no"), t.get("date"), post_date, t.get("amount"), t.get("desc"))
+                            for other in txns
+                        )
+                        if ((len(same) > 1 or incoming_count > 1)
+                                and any(row[field] for row in same for field in fields)):
+                            raise ValueError("ambiguous legacy native card occurrence overlays")
+                    self.conn.execute(
+                        "UPDATE card_billed_txns SET native_identity = ?, "
+                        "post_date = COALESCE(post_date, ?), "
+                        "bill_date = COALESCE(bill_date, ?), amount = ?, splits_overwrite = ? "
+                        "WHERE user_id = ? AND id = ?",
+                        (native, post_date, t.get("bill_date"), amount, splits, self.user_id, target["id"]),
+                    )
+                    claimed_ids.add(target["id"])
+                    self._current_billed_ids.append(target["id"])
+                    if not suppress_history_cursor:
+                        self._record_transaction_cursor(
+                            "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
+                        )
+                    continue
+            if not native and post_date and t.get("date") and t.get("amount") is not None and t.get("desc"):
                 # The same posted row can reach us with a different dedup_key: float vs int
                 # money, a statement row without the card number, or a later statement
                 # (new bill_date) relisting it. Reuse one unclaimed equivalent row instead
@@ -1414,7 +1602,7 @@ class BankStore:
                     (self.user_id, key),
                 ).fetchone() is None:
                     same = [r["id"] for r in self.conn.execute(
-                        """SELECT id FROM card_billed_txns
+                        """SELECT * FROM card_billed_txns
                            WHERE user_id = ? AND consume_date = ? AND post_date = ?
                              AND amount = ? AND TRIM(description) = TRIM(?)
                              AND consume_amount IS NOT DISTINCT FROM ?
@@ -1423,10 +1611,19 @@ class BankStore:
                            ORDER BY id""",
                         (self.user_id, t.get("date"), post_date, t.get("amount"), t.get("desc"),
                          t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
-                    ).fetchall() if r["id"] not in claimed_ids]
+                    ).fetchall() if r["id"] not in claimed_ids and not _card_identity_conflicts(r, t)]
                     if same:
                         claimed_ids.add(same[0])
                         self._current_billed_ids.append(same[0])
+                        self.conn.execute(
+                            "UPDATE card_billed_txns SET bill_date = COALESCE(bill_date, ?) "
+                            "WHERE user_id = ? AND id = ?",
+                            (t.get("bill_date"), self.user_id, same[0]),
+                        )
+                        if not suppress_history_cursor:
+                            self._record_transaction_cursor(
+                                "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
+                            )
                         if t.get("card_no"):
                             self.conn.execute(
                                 "UPDATE card_billed_txns SET card_no = ? WHERE user_id = ? AND id = ?"
@@ -1435,11 +1632,11 @@ class BankStore:
                             )
                         continue
             if (
-                post_date and t.get("card_no") and t.get("date")
+                not native and post_date and t.get("card_no") and t.get("date")
                 and t.get("amount") is not None and t.get("desc")
             ):
                 blank_candidates = self.conn.execute(
-                    """SELECT id FROM card_billed_txns
+                    """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND (card_no IS NULL OR card_no = '')
                          AND consume_date = ? AND post_date = ?
                          AND amount = ? AND description = ?
@@ -1448,6 +1645,8 @@ class BankStore:
                     (self.user_id, t.get("date"), post_date, t.get("amount"),
                      t.get("desc"), t.get("consume_amount")),
                 ).fetchall()
+                blank_candidates = [row for row in blank_candidates
+                                    if row["id"] not in claimed_ids and not _card_identity_conflicts(row, t)]
                 if len(blank_candidates) > 1:
                     continue
                 key_exists = self.conn.execute(
@@ -1462,11 +1661,11 @@ class BankStore:
                          blank_candidates[0]["id"]),
                     )
             if (
-                post_date and t.get("date") and t.get("amount") is not None
+                not native and (post_date or t.get("bill_date")) and t.get("date") and t.get("amount") is not None
                 and t.get("desc")
             ):
                 candidates = self.conn.execute(
-                    """SELECT id FROM card_billed_txns
+                    """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
                          AND card_no IS NOT DISTINCT FROM ?
                          AND consume_date = ? AND amount = ? AND description = ?
@@ -1475,13 +1674,20 @@ class BankStore:
                     (self.user_id, t.get("card_no"), t.get("date"), t.get("amount"),
                      t.get("desc"), t.get("consume_amount")),
                 ).fetchall()
+                candidates = [row for row in candidates if row["id"] not in claimed_ids
+                              and not _card_identity_conflicts(row, t)
+                              and (post_date or row["bill_date"] is None
+                                   or row["bill_date"] == t.get("bill_date"))]
                 existing_key = self.conn.execute(
                     "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
                     (self.user_id, key),
                 ).fetchone()
                 if len(candidates) > 1:
-                    continue
-                if len(candidates) == 1 and existing_key is None:
+                    fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                              "auto_excluded", "splits_overwrite")
+                    if any(row[field] for row in candidates for field in fields):
+                        continue  # No evidence pairs edited repeated purchases with new dates.
+                if candidates and existing_key is None:
                     # 同一 canonical row 從「尚無入帳日」升級為銀行真值；原地更新可保留
                     # 使用者分類／備註／拆帳，且避免新 dedup key 造成雙列。
                     self.conn.execute(
@@ -1502,8 +1708,8 @@ class BankStore:
                     amount, consume_country, consume_currency, consume_amount, first_seen,
                     dedup_key, category, subcategory, txn_type, auto_excluded,
                     description_overwrite, tags_overwrite, flow_type, income_category,
-                    is_subscription, splits_overwrite)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    is_subscription, splits_overwrite, native_identity)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING
                    RETURNING id""",
                 (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
@@ -1511,7 +1717,7 @@ class BankStore:
                  t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
                  t.get("txn_type"), 1 if auto_ex else 0,
                  description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0, splits_overwrite),
+                 1 if _is_subscription(sub) else 0, splits_overwrite, native),
             ).fetchone()
             existing = None
             if inserted:
@@ -1528,20 +1734,21 @@ class BankStore:
                 if existing:
                     claimed_ids.add(existing["id"])
                     self._current_billed_ids.append(existing["id"])
-                    if post_date is None and existing["post_date"]:
+                    if not native and post_date is None and existing["post_date"]:
                         # 舊 store 寫入 consume_date fallback，但 dedup_key 是用來源的
                         # post_date=None 生成；同 key 再同步即是可證明的 legacy 假值。
                         self.conn.execute(
                             "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
                             (existing["id"],),
                         )
-            self._record_transaction_cursor(
-                "card_billed_transactions",
-                t.get("card_no"),
-                post_date,
-                t.get("date"),
-                t.get("bill_date"),
-            )
+            if not suppress_history_cursor:
+                self._record_transaction_cursor(
+                    "card_billed_transactions",
+                    t.get("card_no"),
+                    post_date,
+                    t.get("date"),
+                    t.get("bill_date"),
+                )
         # 不在此 commit：billed INSERT、overlay adoption、pending refresh 必須同一 transaction。
         # 各 persist 最後由 refresh_card_pending／log_sync commit；中途 crash 會整批 rollback，
         # 避免下一輪 ON CONFLICT 後失去「本次新增 billed」candidate。
@@ -1579,6 +1786,7 @@ class BankStore:
         """
         # 資訊量打分：consume_currency NOT NULL 加 1，consume_amount NOT NULL 加 1
         # 對 5 欄群組找最高分（分數同則最舊 first_seen）→ 留下，DELETE 其他
+        # Native occurrences are outside this legacy content-only repair's proof.
         # 用 ROW_NUMBER 視窗函數 (SQLite 3.25+, macOS 自帶 3.43+)
         # Phase C (2026-06-17): 只 dedup 本 user 的 row, partition 多加 user_id 也安全。
         cur = self.conn.execute(
@@ -1596,6 +1804,7 @@ class BankStore:
                               ) AS rn
                        FROM card_billed_txns
                        WHERE user_id = ?
+                         AND native_identity IS NULL
                          AND card_no IS NOT NULL
                          AND consume_date IS NOT NULL
                          AND amount IS NOT NULL
@@ -1633,33 +1842,21 @@ class BankStore:
 
     # ---- 3. 未出帳/即時：refresh-by-scope ----
     def _adopt_vanished_pending_overlay(self, scope: str, txns: list[dict]) -> None:
-        """把「本次從未入帳清單消失」的 pending overlay 搬到同次新寫入的 billed。
+        """Adopt vanished overlays using exact native or original-FX evidence.
 
-        台幣只由 refresh_card_pending 的四欄 exact gate 處理；這裡只處理
-        有原幣金額證據的外幣 identity，且候選限本次新 INSERT billed。
-
-        配對 identity: card_no + consume_date + consume_currency + consume_amount。
-        候選只限本次 BankStore sync 新 INSERT 的 billed，絕不掃歷史交易。
-
-        三道守門 (寧可漏搬, 不可錯搬 —— 錯搬會把分類蓋到別筆交易上):
-          1. caller 僅在 fetch_ok=True 時進入。
-          2. 只接受外幣 card_no + consume_currency + consume_amount 全等；台幣
-             改名後沒有穩定 transaction id，不做 fuzzy overlay adoption。
-          3. 同一 identity 上若消失的 pending 或本次 payload billed 超過一筆
-             (多對多) → 該組整組放棄, 無法判定誰對誰。
-
-        新 INSERT billed 可能已被規則自動分類，因此 pending 人工 overlay 可以覆蓋；
-        touched existing billed 只接受 outcome-equivalent overlay，衝突時跳過。
-
+        FX fallback remains limited to newly inserted billed rows. Native references
+        also authorize currently observed existing rows, never an unrestricted history
+        scan. Still-observed unknowns retain pending membership. Ambiguous native
+        occurrences, conflicting edits/currencies and invalid splits fail closed.
         """
         rows = self.conn.execute(
-            "SELECT id, scope, card_no, consume_date, amount, currency, description, "
+            "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
             "consume_currency, consume_amount, category, subcategory, description_overwrite, "
             "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
             "WHERE user_id = ? AND scope = ?",
             (self.user_id, scope),
         ).fetchall()
-        candidate_billed_ids = self._new_billed_ids
+        candidate_billed_ids = [*self._new_billed_ids, *self._current_billed_ids]
         candidate_billed_ids = list(dict.fromkeys(candidate_billed_ids))
         if not rows or not candidate_billed_ids:
             return
@@ -1673,28 +1870,39 @@ class BankStore:
         candidate_identities: set[tuple] = set()
         for r in rows:
             identity = _pending_billed_identity(r)
-            if identity is None or identity[0] != "fx":
+            if identity is None or identity[0] not in ("fx", "native"):
                 continue
             candidate_identities.add(identity)
 
         placeholders = ",".join("?" for _ in candidate_billed_ids)
         billed_rows = self.conn.execute(
-            f"SELECT id, card_no, consume_date, amount, currency, consume_currency, consume_amount, "
+            f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, "
             f"category, subcategory, txn_type, description_overwrite, tags_overwrite, "
             f"auto_excluded, splits_overwrite FROM card_billed_txns "
             f"WHERE user_id = ? AND id IN ({placeholders})",
             (self.user_id, *candidate_billed_ids),
         ).fetchall()
+        fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                  "auto_excluded", "splits_overwrite")
+        for pending_row in rows:
+            native = pending_row["native_identity"]
+            if not native or not any(pending_row[field] for field in fields):
+                continue
+            if any(_native_occurrence_matches(pending_row, txn) for txn in txns):
+                continue  # A still-observed unknown keeps its overlay in pending.
+            native_targets = [row for row in billed_rows if row["native_identity"] == native]
+            if native_targets and not any(_native_occurrence_matches(pending_row, row) for row in native_targets):
+                raise ValueError("conflicting native vanished pending occurrence")
         billed_by_identity: dict[tuple, list] = {}
         for b in billed_rows:
             identity = _pending_billed_identity(b)
-            if identity is not None:
+            if identity is not None and (identity[0] == "native" or b["id"] in self._new_billed_ids):
                 billed_by_identity.setdefault(identity, []).append(b)
 
         # 同交易可能同時出現在 unbilled/current/realtime；跨 scope 一起判定
         # overlay 是否一致，但每次 refresh 只刪自己 scope，避免回傳 count 失真。
         all_pending = self.conn.execute(
-            "SELECT id, scope, card_no, consume_date, amount, currency, description, "
+            "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
             "consume_currency, consume_amount, category, subcategory, description_overwrite, "
             "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
             "WHERE user_id = ? AND scope IN ('unbilled', 'current', 'realtime')",
@@ -1714,6 +1922,9 @@ class BankStore:
             siblings = pending_by_identity.get(identity, [])
             targets = billed_by_identity.get(identity, [])
             incoming = incoming_by_identity.get(identity, [])
+            if any("booking_status" in txn for txn in incoming):
+                # Explicitly observed non-promoted rows still belong to pending.
+                continue
             if identity[0] == "fx" and len(incoming) > 1:
                 self._unsafe_pending_overlay_identities.add(identity)
                 continue
@@ -1735,12 +1946,20 @@ class BankStore:
             ) for p in overlay_rows}
             if (any(n > 1 for n in scope_counts.values()) or len(raw_keys) != 1
                     or len(overlay_signatures) != 1 or len(targets) != 1):
+                if identity[0] == "native":
+                    raise ValueError("ambiguous native pending overlays")
                 self._unsafe_pending_overlay_identities.add(identity)
                 continue
 
             p = overlay_rows[0]
             target = targets[0]
+            if _card_identity_conflicts(p, target):
+                if identity[0] == "native":
+                    raise ValueError("conflicting native pending occurrence")
+                continue
             splits = _rescale_splits(p["splits_overwrite"], target["amount"])
+            if identity[0] == "native" and p["splits_overwrite"] and splits is None:
+                raise ValueError("cannot preserve native pending splits")
             pending_signature = (
                 p["category"], p["subcategory"], p["description_overwrite"],
                 p["tags_overwrite"], p["auto_excluded"], splits,
@@ -1751,6 +1970,8 @@ class BankStore:
             )
             if (target["id"] not in new_billed_ids and any(target_signature)
                     and target_signature != pending_signature):
+                if identity[0] == "native":
+                    raise ValueError("conflicting native billed overlays")
                 # Existing billed 只有 outcome-equivalent overlay 才可重用；衝突時不猜。
                 self._unsafe_pending_overlay_identities.add(identity)
                 continue
@@ -1800,7 +2021,237 @@ class BankStore:
     def rollback(self) -> None:
         self.conn.rollback()
 
+    def _promote_card_pending_overlays(self, scope: str, booked: list[dict], pending: list[dict],
+                                       target_ids: list[int], new_ids: set[int]) -> None:
+        """Only explicit source occurrences authorize reuse of historical billed targets.
+
+        Legacy card rows lack credential provenance. The refresh boundary rejects
+        proven foreign native namespaces; it never backfills ownership on legacy rows.
+        """
+        if len(target_ids) != len(booked) or len(set(target_ids)) != len(target_ids):
+            raise ValueError("ambiguous booked occurrence targets")
+        fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                  "auto_excluded", "splits_overwrite")
+        donors = self.conn.execute(
+            "SELECT * FROM card_pending_txns WHERE user_id = ? ORDER BY id", (self.user_id,),
+        ).fetchall()
+        targets = []
+        for txn, target_id in zip(booked, target_ids, strict=True):
+            target = self.conn.execute(
+                "SELECT * FROM card_billed_txns WHERE user_id = ? AND id = ?", (self.user_id, target_id),
+            ).fetchone()
+            if target is None:
+                raise ValueError("missing booked occurrence target")
+            if _card_identity_conflicts(target, txn):
+                raise ValueError("conflicting booked occurrence target currency")
+            targets.append(dict(target))
+            if not txn.get("card_no"):
+                cards = self.conn.execute(
+                    "SELECT card_no FROM card_billed_txns WHERE user_id = ? AND consume_date = ? "
+                    "AND amount = ? AND description = ? AND consume_amount IS NOT DISTINCT FROM ? "
+                    "AND (post_date = ? OR post_date IS NULL)",
+                    (self.user_id, target["consume_date"], target["amount"], target["description"],
+                     target["consume_amount"], target["post_date"]),
+                ).fetchall()
+                if len({row["card_no"] or "" for row in cards}) > 1:
+                    raise ValueError("ambiguous blank-card booking identity")
+
+        def exact(row):
+            row = dict(row)
+            currency = str(row.get("currency") or "TWD").strip().upper()
+            consume_date, amount, description = _pending_raw_key(row)
+            return (row.get("card_no") or "", consume_date,
+                    native_money(amount, currency, optional=True), description, currency)
+
+        def matches_source(row, source):
+            if _card_identity_conflicts(row, source):
+                return False
+            row, source = dict(row), dict(source)
+            if row.get("native_identity") and source.get("native_identity"):
+                return _native_occurrence_matches(row, source)
+            identity = _pending_billed_identity(source)
+            return exact(row) == exact(source) or (
+                identity is not None and identity[0] == "fx" and identity == _pending_billed_identity(row)
+            )
+
+        # Keep the source's blank identity even if billed upsert safely enriched it.
+        sources = [{**target, **{field: txn[field] for field in
+                    ("currency", "consume_currency", "consume_amount", "native_identity") if txn.get(field) is not None},
+                    "card_no": txn.get("card_no")}
+                   for txn, target in zip(booked, targets, strict=True)]
+        matches = [[p for p in donors if matches_source(p, source)] for source in sources]
+        # ponytail: card snapshots are small; index identities if import sizes grow.
+        for donor in donors:
+            if not any(donor[field] for field in fields):
+                continue
+            if donor["scope"] != scope and not any(donor in group for group in matches):
+                continue
+            match_count = sum(matches_source(donor, source) for source in (*sources, *pending))
+            if (match_count == 0 and donor["native_identity"]
+                    and all(source.get("native_identity") and source["native_identity"] != donor["native_identity"]
+                            for source in (*sources, *pending))):
+                continue  # Different known references prove these are other purchases.
+            if match_count != 1:
+                # A promotion must not silently erase an unmatchable edited row,
+                # or choose which identical booked/unknown occurrence owned its edits.
+                raise ValueError("ambiguous pending booking overlay identity")
+        for target, siblings in zip(targets, matches, strict=True):
+            edited = [p for p in siblings if any(p[field] for field in fields)]
+            if edited:
+                signatures = {tuple(p[field] for field in fields) for p in edited}
+                scope_counts = Counter(p["scope"] for p in siblings)
+                if (len(signatures) != 1 or any(n > 1 for n in scope_counts.values())
+                        or any(sum(p in group for group in matches) != 1 for p in edited)):
+                    raise ValueError("ambiguous pending booking overlays")
+                donor = edited[0]
+                splits = _rescale_splits(donor["splits_overwrite"], target["amount"])
+                if donor["splits_overwrite"] and splits is None:
+                    raise ValueError("cannot preserve booked splits")
+                signature = (*(donor[field] for field in fields[:-1]), splits)
+                existing = tuple(target[field] for field in fields)
+                if target["id"] not in new_ids and any(existing) and existing != signature:
+                    raise ValueError("conflicting billed booking overlays")
+                flow, income_cat = _flow_fields(donor["category"], donor["subcategory"], None, target["txn_type"])
+                self.conn.execute(
+                    "UPDATE card_billed_txns SET category=?, subcategory=?, description_overwrite=?, "
+                    "tags_overwrite=?, auto_excluded=?, splits_overwrite=?, flow_type=?, "
+                    "income_category=?, is_subscription=? WHERE user_id=? AND id=?",
+                    (*signature, flow, income_cat, 1 if _is_subscription(donor["subcategory"]) else 0,
+                     self.user_id, target["id"]),
+                )
+            for donor in siblings:
+                if donor["scope"] == scope:
+                    self.conn.execute(
+                        "DELETE FROM card_pending_txns WHERE user_id = ? AND id = ?",
+                        (self.user_id, donor["id"]),
+                    )
+
+    def persist_card_batch(self, billed: list[dict], pending: list[dict], *, scope: str,
+                           fetch_ok: bool, rules: list[dict] | None = None,
+                           commit: bool = True) -> tuple[int, int]:
+        """Own SQL and occurrence ledgers together, even behind a write barrier."""
+        from copy import deepcopy
+
+        self._validate_native_card_occurrences([*billed, *pending])
+        names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
+                 "_unsafe_pending_overlay_identities")
+        before = {name: deepcopy(getattr(self, name)) for name in names}
+        self.begin_transaction()
+        try:
+            with self.savepoint("card_batch"):
+                self._new_billed_ids = []
+                self._current_billed_ids = []
+                self._adopted_pending_raw_keys = {}
+                self._unsafe_pending_overlay_identities = set()
+                billed_n = self.upsert_card_billed(billed, rules=rules) if billed else 0
+                if fetch_ok:
+                    # Native-aware producers explicitly attest a missing reference too.
+                    # Keep legacy callers' membership contract; never infer ownership.
+                    incoming = {(t.get("card_no"), *_pending_raw_key(t)) for t in pending}
+                    donors = self.conn.execute(
+                        "SELECT * FROM card_pending_txns WHERE user_id=? AND scope=?",
+                        (self.user_id, scope),
+                    ).fetchall()
+                    fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                              "auto_excluded", "splits_overwrite")
+                    if any("native_identity" in txn and not txn.get("native_identity")
+                           and not donor["native_identity"] and any(donor[field] for field in fields)
+                           and (donor["card_no"], *_pending_raw_key(donor)) not in incoming
+                           and _pending_raw_key(donor) != _pending_raw_key(txn)
+                           and _card_occurrence_matches(donor, txn)
+                           for donor in donors for txn in billed):
+                        raise ValueError("ambiguous native pending overlay identity")
+                pending_n = self.refresh_card_pending(
+                    scope, pending, rules=rules, fetch_ok=fetch_ok, commit=False,
+                )
+        except Exception:
+            for name, value in before.items():
+                setattr(self, name, value)
+            raise
+        if commit:
+            self.commit()
+        return billed_n, pending_n
+
     def refresh_card_pending(self, scope: str, txns: list[dict],
+                             rules: list[dict] | None = None,
+                             fetch_ok: bool | None = None,
+                             commit: bool = True) -> int:
+        if fetch_ok is not False:
+            self._validate_native_card_occurrences(txns)
+            # Only the native producer's exact namespace proves credential ownership.
+            # Legacy rows remain unowned; do not invent a backfill from current login.
+            native_rows = self.conn.execute(
+                "SELECT native_identity FROM card_pending_txns WHERE user_id = ? "
+                "AND native_identity IS NOT NULL", (self.user_id,),
+            ).fetchall()
+            for row in native_rows:
+                try:
+                    namespace = json.loads(row["native_identity"])
+                except (TypeError, ValueError):
+                    continue
+                if (isinstance(namespace, list) and len(namespace) == 5
+                        and namespace[0] == self.bank and namespace[1] == self.user_id
+                        and type(namespace[2]) is int and namespace[2] > 0
+                        and all(isinstance(value, str) and value for value in namespace[3:])
+                        and namespace[2] != self.source_account_id):
+                    raise ValueError("foreign credential source owns native pending rows")
+        if fetch_ok is not True:
+            return self._refresh_card_pending(scope, txns, rules, fetch_ok, commit)
+        txns = [dict(txn) for txn in txns]
+        booked, pending = [], []
+        for txn in txns:
+            # Missing attestation is unknown too, including unchanged providers.
+            txn.setdefault("booking_status", None)
+            post_date = txn.get("post_date")
+            # Producers attest booking provenance; this boundary accepts only their
+            # canonical calendar date (or explicit booked-without-date), never sentinels.
+            valid_date = post_date is None or (
+                isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
+                and (parsed_date := _cursor_date(post_date)) is not None
+                and parsed_date <= date.today()
+            )
+            if not valid_date:
+                txn["post_date"] = None
+            (booked if txn.get("booking_status") == "booked" and valid_date else pending).append(txn)
+        if not booked:
+            return self._refresh_card_pending(scope, txns, rules, fetch_ok, commit)
+        from copy import deepcopy
+
+        ledger_names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
+                        "_unsafe_pending_overlay_identities")
+        before = {name: deepcopy(getattr(self, name)) for name in ledger_names}
+        # SQLite RELEASE of an outermost savepoint commits even with commit=False.
+        if isinstance(self.conn, sqlite3.Connection) and not self.conn.in_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            with self.savepoint("card_booking_promotion"):
+                start = len(self._current_billed_ids)
+                new_before = set(self._new_billed_ids)
+                self.upsert_card_billed(booked, rules, suppress_history_cursor=True)
+                target_ids = self._current_billed_ids[start:]
+                self._promote_card_pending_overlays(
+                    scope, booked, pending, target_ids, set(self._new_billed_ids) - new_before,
+                )
+                # Explicit promotion must not turn an unknown sibling occurrence
+                # into an implicit historical transition in the legacy reconciler.
+                current_ids, new_ids = self._current_billed_ids, self._new_billed_ids
+                promoted = set(target_ids)
+                self._current_billed_ids = [i for i in current_ids if i not in promoted]
+                self._new_billed_ids = [i for i in new_ids if i not in promoted]
+                count = self._refresh_card_pending(scope, pending, rules, fetch_ok, commit=False)
+                # Snapshot observations are not historical-adoption evidence for
+                # later scopes either; their explicit transitions are handled above.
+                self._current_billed_ids = before["_current_billed_ids"]
+                self._new_billed_ids = before["_new_billed_ids"]
+        except Exception:
+            for name, value in before.items():
+                setattr(self, name, value)
+            raise
+        if commit:
+            self.conn.commit()
+        return count
+
+    def _refresh_card_pending(self, scope: str, txns: list[dict],
                              rules: list[dict] | None = None,
                              fetch_ok: bool | None = None,
                              commit: bool = True) -> int:
@@ -1833,7 +2284,47 @@ class BankStore:
                     txn.get("consume_amount"), consume_currency,
                 )
         now = _now()
+        for txn in txns:
+            if not txn.get("native_identity") or "booking_status" not in txn:
+                continue
+            authoritative = self.conn.execute(
+                "SELECT * FROM card_billed_txns WHERE user_id=? AND native_identity=? "
+                "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                "AND bill_date IS NOT NULL",
+                (self.user_id, txn["native_identity"], txn.get("card_no"), txn.get("date")),
+            ).fetchall()
+            if any(_native_occurrence_matches(row, txn) and row["amount"] != txn.get("amount")
+                   for row in authoritative):
+                # Historical equality can veto stale snapshots, never promote an unknown.
+                raise ValueError("ambiguous native FX snapshot settlement ordering")
         pending_metadata = self._pending_user_metadata(scope)
+        native_pending = {row["id"]: dict(row) for row in self.conn.execute(
+            "SELECT * FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+            (self.user_id, scope),
+        ).fetchall()}
+        incoming_native = {txn.get("native_identity") for txn in txns}
+        for txn in txns:
+            if txn.get("native_identity"):
+                for old in native_pending.values():
+                    if (old.get("native_identity") == txn["native_identity"]
+                            and _pending_raw_key(old)[0] == _pending_raw_key(txn)[0]
+                            and _card_identity_conflicts(old, txn)):
+                        raise ValueError("conflicting native pending occurrence currency")
+            exact_key = (txn.get("card_no"), *_pending_raw_key(txn))
+            for metadata in pending_metadata.get(exact_key, []):
+                old_native = native_pending[metadata[-1]].get("native_identity")
+                if (old_native and txn.get("native_identity") and old_native != txn["native_identity"]
+                        and old_native not in incoming_native):
+                    if any(metadata[:-1]):
+                        raise ValueError("conflicting native pending overlay identity")
+        fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                  "auto_excluded", "splits_overwrite")
+        for old in native_pending.values():
+            if not old.get("native_identity") or not any(old[field] for field in fields):
+                continue
+            incoming = [txn for txn in txns if txn.get("native_identity") == old["native_identity"]]
+            if incoming and not any(_native_occurrence_matches(old, txn) for txn in incoming):
+                raise ValueError("conflicting native pending overlay occurrence")
         pending_refreshed_at: dict[tuple, list[str]] = {}
         for row in self.conn.execute(
             "SELECT card_no, consume_date, amount, description, refreshed_at "
@@ -1850,12 +2341,17 @@ class BankStore:
         pending_fx_metadata = self._pending_user_metadata_by_identity(scope)
         consumed_pending_ids: set[int] = set()
 
-        def take_metadata(rows):
-            while rows:
-                metadata = rows.pop(0)
+        def take_metadata(rows, txn=None):
+            for metadata in list(rows or []):
                 pending_id = metadata[-1]
                 if pending_id in consumed_pending_ids:
                     continue
+                old = native_pending[pending_id]
+                if txn and (_card_identity_conflicts(old, txn)
+                            or (old.get("native_identity") and txn.get("native_identity")
+                                and not _native_occurrence_matches(old, txn))):
+                    continue
+                rows.remove(metadata)
                 consumed_pending_ids.add(pending_id)
                 return metadata
             return None
@@ -1885,24 +2381,39 @@ class BankStore:
             (t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"))
             for t in txns
         )
+        observed_pending_keys = {
+            (t.get("card_no"), *_pending_raw_key(t)) for t in txns if "booking_status" in t
+        }
         all_pending_metadata = self._pending_user_metadata()
+        exact_evidence: dict[tuple, list] = {}
+        for row in self.conn.execute(
+            "SELECT * FROM card_pending_txns WHERE user_id = ?", (self.user_id,),
+        ).fetchall():
+            exact_evidence.setdefault((row["card_no"], *_pending_raw_key(row)), []).append(row)
+        for txn in txns:
+            exact_evidence.setdefault((txn.get("card_no"), *_pending_raw_key(txn)), []).append(txn)
         current_targets: dict[tuple, list] = {}
+        observed_billed = []
         transition_targets: dict[tuple, list] = {}
         new_billed_ids = set(self._new_billed_ids)
         current_billed_ids = list(dict.fromkeys(self._current_billed_ids))
         if current_billed_ids:
             placeholders = ",".join("?" for _ in current_billed_ids)
             rows = self.conn.execute(
-                f"SELECT id, card_no, consume_date, amount, description, txn_type, first_seen, "
+                f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, description, txn_type, first_seen, "
                 f"category, subcategory, description_overwrite, tags_overwrite, auto_excluded, "
                 f"splits_overwrite FROM card_billed_txns "
                 f"WHERE user_id = ? AND id IN ({placeholders})",
                 (self.user_id, *current_billed_ids),
             ).fetchall()
+            observed_billed = [dict(row) for row in rows] if fetch_ok is True else []
             for row in rows:
                 exact_key = (
                     row["card_no"], row["consume_date"], row["amount"], row["description"],
                 )
+                if any(_card_identity_conflicts(row, evidence)
+                       for evidence in exact_evidence.get(exact_key, [])):
+                    continue
                 current_targets.setdefault(exact_key, []).append(row)
                 pending_seen = pending_refreshed_at.get(exact_key, [])
                 if (
@@ -1936,6 +2447,7 @@ class BankStore:
                 self._unsafe_pending_overlay_identities.add(unsafe_marker)
             merge_allowed = (
                 fetch_ok is True and complete and incoming_count <= 1
+                and exact_key not in observed_pending_keys
                 and previous_count <= 1 and len(current_targets.get(exact_key, [])) == 1
                 and len(transition_targets.get(exact_key, [])) == 1
                 and unsafe_marker not in self._unsafe_pending_overlay_identities
@@ -1945,7 +2457,10 @@ class BankStore:
                 planned_transfer_keys.add(exact_key)
         for exact_key in planned_transfer_keys:
             metadata_rows = pending_metadata.get(exact_key, [])
-            if not metadata_rows or not any(metadata_rows[0][:-1]):
+            if not metadata_rows:
+                continue
+            if not any(metadata_rows[0][:-1]):
+                consumed_pending_ids.add(metadata_rows[0][-1])
                 continue
             (cat, sub, description_overwrite, tags_overwrite, auto_ex,
              splits_overwrite, _pending_id) = metadata_rows[0]
@@ -1977,6 +2492,8 @@ class BankStore:
                  splits_overwrite, flow, income_cat,
                  1 if _is_subscription(sub) else 0, self.user_id, target["id"]),
             )
+            # Reserve the vanished exact donor before any renamed FX fallback.
+            consumed_pending_ids.add(_pending_id)
         unsafe_exact_keys: set[tuple] = set()
         for exact_key, rows in pending_metadata.items():
             retained_count = (
@@ -2004,10 +2521,10 @@ class BankStore:
                 remaining_exact_prunes[exact_key] -= 1
                 # Overlay 已搬到 billed，但舊 pending occurrence 仍須標記 consumed，
                 # 否則同 identity 的 renamed FX fallback 會重複取用。
-                take_metadata(pending_metadata.get(exact_key))
+                take_metadata(pending_metadata.get(exact_key), t)
                 pruned_indices.add(index)
                 continue
-            metadata = take_metadata(pending_metadata.get(exact_key))
+            metadata = take_metadata(pending_metadata.get(exact_key), t)
             if metadata is not None:
                 exact_metadata_by_index[index] = metadata
         fx_fallback_counts: Counter = Counter()
@@ -2015,8 +2532,41 @@ class BankStore:
             if index in pruned_indices or index in exact_metadata_by_index:
                 continue
             identity = _pending_billed_identity(t)
-            if identity and identity[0] == "fx":
+            if identity and identity[0] in ("fx", "native"):
                 fx_fallback_counts[identity] += 1
+
+        for identity, count in fx_fallback_counts.items():
+            if identity[0] != "native":
+                continue
+            remaining = [metadata for metadata in pending_fx_metadata.get(identity, [])
+                         if metadata[-1] not in consumed_pending_ids]
+            if ((count != 1 or len(remaining) != 1)
+                    and any(any(metadata[:-1]) for metadata in remaining)):
+                raise ValueError("ambiguous native pending occurrence overlays")
+
+        # Resolve every pending donor before replacing the scope, not just exact keys.
+        # A missing reference is not proof that a renamed edited purchase disappeared.
+        for index, txn in enumerate(txns):
+            if index in pruned_indices or index in exact_metadata_by_index:
+                continue
+            identity = _pending_billed_identity(txn)
+            candidates = pending_fx_metadata.get(identity, []) if identity else []
+            remaining = [m for m in candidates if m[-1] not in consumed_pending_ids]
+            if fx_fallback_counts.get(identity, 0) == 1 and len(remaining) == 1:
+                metadata = take_metadata(candidates, txn)
+                if metadata is not None:
+                    exact_metadata_by_index[index] = metadata
+        for old in native_pending.values():
+            if old["id"] in consumed_pending_ids or not any(old[field] for field in fields):
+                continue
+            ambiguous_pending = any((old.get("native_identity") or "native_identity" in txn)
+                                    and not (old.get("native_identity") and txn.get("native_identity"))
+                                    and _card_occurrence_matches(old, txn) for txn in txns)
+            ambiguous_billed = any((old.get("native_identity") or txn.get("native_identity"))
+                                   and not (old.get("native_identity") and txn.get("native_identity"))
+                                   and _card_occurrence_matches(old, txn) for txn in observed_billed)
+            if ambiguous_pending or ambiguous_billed:
+                raise ValueError("ambiguous orphan pending overlay identity")
 
         # 外幣原幣 identity 的唯一 1:1 overlay adoption；台幣只走上方 exact gate。
         # 找不到唯一安全對象時不搬 overlay，但可信 snapshot 仍決定 membership。
@@ -2037,20 +2587,13 @@ class BankStore:
                              if identity else None)
             adopted_raw_keys = scope_ledgers.get(scope) if scope_ledgers else None
             raw_key = _pending_raw_key(t)
-            if adopted_raw_keys and adopted_raw_keys[raw_key] > 0:
+            if "booking_status" not in t and adopted_raw_keys and adopted_raw_keys[raw_key] > 0:
                 adopted_raw_keys[raw_key] -= 1
                 # Counter 只扣已接手 occurrence 數；額外同 raw row 必須保留。
                 continue
             cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
                                   if rules else (None, None, False))
             metadata = exact_metadata_by_index.get(index)
-            if metadata is None:
-                identity = _pending_billed_identity(t)
-                fx_rows = pending_fx_metadata.get(identity) if identity else None
-                unconsumed = ([m for m in fx_rows if m[-1] not in consumed_pending_ids]
-                              if fx_rows else [])
-                if fx_fallback_counts.get(identity, 0) == 1 and len(unconsumed) == 1:
-                    metadata = take_metadata(fx_rows)
             description_overwrite = tags_overwrite = splits_overwrite = None
             if metadata:
                 (cat, sub, description_overwrite, tags_overwrite, auto_ex,
@@ -2072,8 +2615,8 @@ class BankStore:
                     consume_country, consume_currency, consume_amount,
                     refreshed_at, category, subcategory, txn_type, auto_excluded,
                     description_overwrite, tags_overwrite, flow_type, income_category,
-                    is_subscription, splits_overwrite)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    is_subscription, splits_overwrite, native_identity)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.user_id, scope, t.get("card_no"), t.get("date"),
                  t.get("post_date") or None, t.get("desc"),
                  t.get("amount"), t.get("currency"),
@@ -2081,7 +2624,7 @@ class BankStore:
                  t.get("consume_amount"),
                  now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
                  description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0, splits_overwrite),
+                 1 if _is_subscription(sub) else 0, splits_overwrite, t.get("native_identity")),
             )
 
         self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")

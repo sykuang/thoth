@@ -184,15 +184,18 @@ def test_ctbc_unbilled_qu006_writes_real_unbilled_rows(store):
         "summary": {}, "twd_deposit": {},
     }
     delta = persist_ctbc(fixture_pending, store)
-    assert delta["card_unbilled"] == 2
+    assert delta["card_unbilled"] == 1
     conn = store.conn
     rows = list(conn.execute(
         "SELECT scope, card_no, consume_date, description, amount, currency, "
         "consume_currency, consume_amount, txn_type, post_date "
-        "FROM card_pending_txns ORDER BY amount"
+        "FROM card_pending_txns UNION ALL "
+        "SELECT 'booked', card_no, consume_date, description, amount, currency, "
+        "consume_currency, consume_amount, txn_type, post_date "
+        "FROM card_billed_txns ORDER BY amount"
     ))
-    assert len(rows) == 2, f"qu006 unbilled rows should be persisted, got: {rows}"
-    assert [r[0] for r in rows] == ["unbilled", "unbilled"]
+    assert len(rows) == 2, f"both qu006 transactions must be persisted, got: {rows}"
+    assert [r[0] for r in rows] == ["booked", "unbilled"]
     assert [r[1] for r in rows] == ["****7036", "****7036"]
     assert [r[2] for r in rows] == ["2026-06-18", "2026-06-18"]
     assert [r[3] for r in rows] == ["９１ＡＰＰ＊ＩＳＰＯ＋   TAIPEI CITY  TW"] * 2
@@ -226,11 +229,11 @@ def test_ctbc_missing_unbilled_endpoint_preserves_existing_pending_rows(store):
     assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 3
 
 
-def test_ctbc_renamed_pending_is_deleted_without_unsafe_overlay_guess(tmp_path, monkeypatch):
-    """仍在清單時保留雙列；可信消失後刪 pending，但改名 TWD overlay 不猜。"""
+def test_ctbc_legacy_renamed_pending_fails_closed_without_losing_overlay(tmp_path, monkeypatch):
+    """No reference means no renamed match; disappearance must not erase edits."""
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     pending_item = {
-        "purchaseDt": "20260910", "postingDt": "20260912",
+        "purchaseDt": "20260910", "postingDt": "00000000",
         "cardNoSuffixFour": "1234_0",
         "description": "御膳食堂 TAIPEI CITY TW", "purchaseAmt": 500,
         "origCurCode": "901", "origCurDesc": "TWD", "origCurAmt": 500,
@@ -271,24 +274,56 @@ def test_ctbc_renamed_pending_is_deleted_without_unsafe_overlay_guess(tmp_path, 
     overlap.close()
 
     settled = BankStore("ctbc_lifecycle")
-    persist_ctbc({
-        "card_api_dump": {
-            "/twrbc-card/qu002/010": {
-                "cardDataList": [],
-                "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
+    with pytest.raises(ValueError, match="ambiguous.*native"):
+        persist_ctbc({
+            "card_api_dump": {
+                "/twrbc-card/qu002/010": {
+                    "cardDataList": [],
+                    "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
+                },
+                "/twrbc-card/qu006/011": {"allItems": []},
             },
-            "/twrbc-card/qu006/011": {"allItems": []},
-        },
-        "summary": {}, "twd_deposit": {},
-    }, settled, rules=[])
+            "summary": {}, "twd_deposit": {},
+        }, settled, rules=[])
     row = settled.conn.execute(
         "SELECT description, category, description_overwrite FROM card_billed_txns"
     ).fetchone()
     assert row is not None
     assert tuple(row) == ("御膳食堂", None, None)
     pending_count = settled.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
-    assert pending_count is not None and pending_count[0] == 0
+    assert pending_count is not None and pending_count[0] == 1
+    overlay = settled.conn.execute("SELECT category, description_overwrite FROM card_pending_txns").fetchone()
+    assert tuple(overlay) == ("餐飲", "家庭聚餐")
     settled.close()
+
+
+def test_ctbc_native_reference_reconciles_genuinely_posted_renamed_purchase(tmp_path, monkeypatch):
+    """Synthetic native shapes; equal reference is evidence, merchant similarity is not."""
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    pending = {"purchaseDt": "20260910", "postingDt": "20260912", "cardNoSuffixFour": "1234_0",
+               "description": "御膳食堂 TAIPEI CITY TW", "purchaseAmt": 500,
+               "origCurDesc": "TWD", "origCurAmt": 500, "txCode": "40",
+               "acwRefNbr": "synthetic-purchase-a", "pkIdx": "synthetic-qu006-index", "authCode": "123456"}
+    statement = {"purchaseDt": "091026", "postingDt": "091226", "cardNo": "1234_0",
+                 "merchantChiName": "御膳食堂", "ntAmt": 500, "txCode": "40",
+                 "acwRefNbr": "synthetic-purchase-a", "pkIdx": "synthetic-qu002-index", "authCode": "123456"}
+    with_store = BankStore("ctbc_native", user_id=1, source_account_id=101)
+    persist_ctbc({"card_api_dump": {"/twrbc-card/qu006/011": {"allItems": [pending]}}}, with_store)
+    assert with_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
+    original_id = with_store.conn.execute("SELECT id FROM card_billed_txns").fetchone()[0]
+    with_store.conn.execute("UPDATE card_billed_txns SET description_overwrite='family dinner'")
+    with_store.conn.commit()
+    with_store.close()
+    reopened = BankStore("ctbc_native", user_id=1, source_account_id=101)
+    payload = {"card_api_dump": {"/twrbc-card/qu002/010": {"billData": {"TWD": {
+        "2026/09": {"bills": [statement]}}}}, "/twrbc-card/qu006/011": {"allItems": [pending]}}}
+    persist_ctbc(payload, reopened)
+    actual = reopened.conn.execute("SELECT id, amount, bill_date, description_overwrite FROM card_billed_txns").fetchall()
+    assert [tuple(row) for row in actual] == [(original_id, 500, "2026-09-01", "family dinner")]
+    assert reopened.conn.execute("SELECT SUM(amount) FROM card_billed_txns").fetchone()[0] == 500
+    persist_ctbc(payload, reopened)
+    assert reopened.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
+    reopened.close()
 
 
 def test_ctbc_successful_empty_unbilled_endpoint_sweeps_existing_pending_rows(store):
@@ -367,7 +402,7 @@ def test_ctbc_same_last4_pk_collision_resolved(store):
 
 def test_ctbc_empty_unbilled_clears_stale_pending(store):
     """Once every unbilled row posts, the emptied qu006 snapshot must sweep old pending rows."""
-    row = {"purchaseDt": "20261011", "postingDt": "20261015", "cardNoSuffixFour": "3443_0",
+    row = {"purchaseDt": "20261011", "postingDt": "00000000", "cardNoSuffixFour": "3443_0",
            "description": "道町燒肉                 TAIPEI       TW", "purchaseAmt": 2068,
            "origCurDesc": "TWD", "origCurAmt": 2068, "txCode": "40"}
     base = {"summary": {}, "twd_deposit": {}}

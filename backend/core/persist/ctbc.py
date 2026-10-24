@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 
 from backend.core import account_classify, classify
 from backend.core.store import BankStore
@@ -87,6 +88,23 @@ def _ctbc_yyyymmdd_to_iso(value: str | None) -> str | None:
         return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
     except ValueError:
         return None
+
+
+def _ctbc_native_identity(row: dict, card: str, store: BankStore) -> str | None:
+    """Exact acquisition reference only; pkIdx/authCode are not cross-source IDs.
+
+    Live cross-period stability is unverified: reuse requires an equal reference
+    plus the store's occurrence guards, never merchant similarity.
+    """
+    ref = row.get("acwRefNbr")
+    if ref is None or (isinstance(ref, str) and not ref.strip()):
+        return None
+    if not isinstance(ref, str) or ref != ref.strip():
+        raise ValueError("invalid CTBC native reference")
+    if not card:
+        raise ValueError("missing CTBC native card identity")
+    return json.dumps([store.bank, store.user_id, store.source_account_id or 0, card, ref],
+                      ensure_ascii=False, separators=(",", ":"))
 
 
 def _parse_ctbc_twd_history(twd_history: list) -> list[dict]:
@@ -388,6 +406,7 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
                     desc = (t.get("merchantChiName") or "").strip()
                     amt_signed = _to_num(t.get("ntAmt"))
                     billed_rows.append({
+                        "native_identity": _ctbc_native_identity(t, (t.get("cardNo") or "").strip(), store),
                         "card_no": f"****{last4}" if last4 else None,
                         "bill_date": bill_date,
                         "date": consume_date,
@@ -428,10 +447,13 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         orig_amt = _num_to_float(t.get("origCurAmt"))
         consume_currency = orig_desc if orig_desc and orig_desc != "TWD" else None
         consume_amount = orig_amt if consume_currency else None
+        post_date = _ctbc_yyyymmdd_to_iso(t.get("postingDt"))
         pending_rows.append({
+            "native_identity": _ctbc_native_identity(t, suffix_raw, store),
             "card_no": f"****{last4}",
             "date": consume_date,
-            "post_date": _ctbc_yyyymmdd_to_iso(t.get("postingDt")),
+            "post_date": post_date,
+            "booking_status": "booked" if post_date else None,
             "desc": desc,
             "amount": amt,
             "currency": "TWD",
@@ -471,20 +493,12 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         store.upsert_cards(list(seen_cards.values()))
         cards_n = len(seen_cards)
 
-    billed_n = 0
-    if billed_rows:
-        billed_n = store.upsert_card_billed(billed_rows, rules=rules) or 0
-
-    # 永遠 call refresh_card_pending 即使 pending_rows=[]:
-    # 用 DELETE+INSERT semantics 來 sweep 升級前殘留的 pending row (本次 INSERT 0 筆).
-    # fetch_ok: qu006/011 必須明示 allItems list；任意 error dict 不算成功，
-    # pending_rows 空也不可拿來做消失比對。
     qu006_ok = (isinstance(qu006_raw, dict)
                 and not any(qu006_raw.get(key) for key in ("error", "Error", "errorMessage"))
                 and isinstance(qu006_raw.get("allItems"), list))
-    pending_n = store.refresh_card_pending(
-        "unbilled", pending_rows, rules=rules,
-        fetch_ok=qu006_ok)
+    billed_n, pending_n = store.persist_card_batch(
+        billed_rows, pending_rows, scope="unbilled", fetch_ok=qu006_ok, rules=rules,
+    )
 
     if months_summary:
         store.put_daily_metric("ctbc_bill_months_summary", months_summary, today)

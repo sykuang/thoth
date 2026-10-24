@@ -14,6 +14,29 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.mark.parametrize("canonical", ["omitted", None, "", " ", "2026-06-13"])
+@pytest.mark.parametrize("basis", ["consume", "post"])
+@pytest.mark.parametrize("kind", ["billed", "pending"])
+@pytest.mark.parametrize("as_object", [False, True])
+def test_stat_date_legacy_fallback_is_consume_only_and_omitted_only(
+    canonical, basis, kind, as_object,
+):
+    from types import SimpleNamespace
+    from backend.server.routers import transactions as tx
+
+    values = {"kind": kind, "date": "2026-06-12"}
+    if canonical != "omitted":
+        values[f"{basis}_date"] = canonical
+    row = SimpleNamespace(**values) if as_object else values
+    result = tx._apply_stat_filters(
+        [row], since=None, until=None, q=None, card_date_basis=basis,
+    )
+    expected = "2026-06-13" if canonical == "2026-06-13" else (
+        "2026-06-12" if canonical == "omitted" and basis == "consume" else None
+    )
+    assert [tx._item_get(item, "date") for item in result] == ([expected] if expected else [])
+
+
 def test_pg_fast_excluded_prefetch_returns_empty_without_falling_back(monkeypatch):
     """PG fast path should return {} for no excluded rows instead of falling back per bank."""
     import backend.server.db_facade.accounts as accounts_mod

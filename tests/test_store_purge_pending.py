@@ -1,8 +1,8 @@
-"""驗證 billed transition 在可信 pending refresh 後清對應 stale row。
+"""可信 snapshot 決定 pending membership，歷史 billed 不替來源證明入帳。
 
-銀行 billed 出帳後，pending 通常仍短暫出現在未出帳清單；只有本輪安全且唯一的
-exact transition 可在 `fetch_ok=True` refresh 時合併。抓取失敗時 membership 不動，
-多 occurrence 不猜。底層 exact helper 仍維持四欄全等與缺欄 fail-closed contract。
+仍被抓到且沒有 affirmative booking_status 的 row 必須保留；只有來源消失或
+明確 booked 才可移除。抓取失敗時 membership 不動，多 occurrence 不猜。
+消失後 overlay 搬移仍須四欄全等、完整且唯一的 transition evidence。
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _seed_pending(store: BankStore, scope: str, txns: list[dict]) -> None:
     store.refresh_card_pending(scope, txns, rules=None)
 
 
-# === 1. 正常 case：4 欄全等 → 清掉 pending ===
+# === 1. 四欄全等也須等來源消失才清 pending ===
 def test_billed_purges_matching_pending(tmp_store: BankStore) -> None:
     txn = {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
            "amount": 1727, "currency": "TWD"}
@@ -38,11 +38,13 @@ def test_billed_purges_matching_pending(tmp_store: BankStore) -> None:
     tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
 
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
+    assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 1
+    tmp_store.refresh_card_pending("unbilled", [], fetch_ok=True)
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0, \
-        "可信 pending refresh 後 exact transition 應只留 billed"
+        "可信 snapshot 已無 pending 時才只留 billed"
 
 
-# === 2. 兩筆 pending 但只一筆出帳 → 只清出帳那筆 ===
+# === 2. 兩筆 pending 只有一筆從來源消失 → 只清消失那筆 ===
 def test_billed_purges_only_matching_pending(tmp_store: BankStore) -> None:
     pending = [
         {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
@@ -57,6 +59,8 @@ def test_billed_purges_only_matching_pending(tmp_store: BankStore) -> None:
     ])
     tmp_store.refresh_card_pending("unbilled", pending, fetch_ok=True)
 
+    assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 2
+    tmp_store.refresh_card_pending("unbilled", [pending[1]], fetch_ok=True)
     rows = tmp_store.conn.execute(
         "SELECT description FROM card_pending_txns").fetchall()
     descs = sorted(r["description"] for r in rows)
@@ -143,7 +147,7 @@ def test_billed_with_none_card_does_not_purge(tmp_store: BankStore) -> None:
         "card_no=None 視為資料不齊不敢清（保守策略）"
 
 
-# === 7. 跨 scope (unbilled + current) 都會被清 ===
+# === 7. 跨 scope (unbilled + current) 各自消失才會被清 ===
 def test_billed_purges_across_scopes(tmp_store: BankStore) -> None:
     _seed_pending(tmp_store, "unbilled", [
         {"card_no": "****7032", "date": "2026-06-08", "desc": "中油",
@@ -161,15 +165,20 @@ def test_billed_purges_across_scopes(tmp_store: BankStore) -> None:
     tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
     tmp_store.refresh_card_pending("current", [txn], fetch_ok=True)
 
+    assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 2
+    tmp_store.refresh_card_pending("unbilled", [], fetch_ok=True)
+    rows = tmp_store.conn.execute("SELECT scope FROM card_pending_txns").fetchall()
+    assert [row["scope"] for row in rows] == ["current"]
+    tmp_store.refresh_card_pending("current", [], fetch_ok=True)
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0, \
-        "各 scope 經可信 refresh 後都只留 billed"
+        "各 scope 都確認來源消失後才只留 billed"
 
 
-# === 8. 新 billed transition 只在可信 refresh 中做 exact merge ===
+# === 8. 可信 snapshot 明確 booked 才能合併仍被抓到的 row ===
 
 
 def test_refresh_pending_dedups_against_new_billed_transition(tmp_store: BankStore) -> None:
-    """同一 sync 新 billed 與可信 pending 1:1 exact 時只留 billed。"""
+    """來源明確 booked 的 exact row 合併 billed；未證實的另一筆仍保留。"""
     # 1. billed 先存在
     tmp_store.upsert_card_billed([
         {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ　台北市政",
@@ -177,15 +186,15 @@ def test_refresh_pending_dedups_against_new_billed_transition(tmp_store: BankSto
     ])
     assert tmp_store.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
 
-    # 2. refresh pending 一次寫兩筆: 一筆同 key billed, 一筆全新
+    # 2. snapshot 一次回兩筆: 一筆明確 booked 且同 key billed，一筆未知
     n = tmp_store.refresh_card_pending("unbilled", [
         {"card_no": "****7036", "date": "2026-05-20", "desc": "ＳＵＫＩＹＡ　台北市政",
-         "amount": -268, "currency": "TWD"},   # ← 跟 billed 同 key, 應被 prune
+         "amount": -268, "currency": "TWD", "booking_status": "booked"},  # 明確入帳
         {"card_no": "****7036", "date": "2026-06-10", "desc": "健身房",
          "amount": -1288, "currency": "TWD"},  # ← 未在 billed, 保留
     ], fetch_ok=True)
 
-    # 回傳數應為 1 (傳 2 筆, prune 1, 留 1)
+    # 回傳數應為 1 (傳 2 筆，明確 booked 合併 1，未知保留 1)
     assert n == 1, f"refresh 應回傳實際保留數 1, 實際 {n}"
 
     # DB 內只剩 1 筆 pending
@@ -282,6 +291,21 @@ def test_billed_inherits_matching_pending_user_metadata(tmp_store: BankStore) ->
         rules=[{"pattern": "晚餐", "category": "其他", "subcategory": "待確認"}],
     )
     tmp_store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
+
+    fields = "category, subcategory, description_overwrite, tags_overwrite, auto_excluded"
+    pending = tmp_store.conn.execute(f"SELECT {fields} FROM card_pending_txns").fetchone()
+    assert pending is not None
+    assert dict(pending) == {
+        "category": "飲食", "subcategory": "聚餐", "description_overwrite": "慶生晚餐",
+        "tags_overwrite": '["家人", "生日"]', "auto_excluded": 1,
+    }
+    billed = tmp_store.conn.execute(f"SELECT {fields} FROM card_billed_txns").fetchone()
+    assert billed is not None
+    assert dict(billed) == {
+        "category": "其他", "subcategory": "待確認", "description_overwrite": None,
+        "tags_overwrite": None, "auto_excluded": 0,
+    }
+    tmp_store.refresh_card_pending("unbilled", [], fetch_ok=True)
 
     row = tmp_store.conn.execute(
         """SELECT category, subcategory, description_overwrite,

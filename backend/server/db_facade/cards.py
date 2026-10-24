@@ -5,7 +5,7 @@ Pydantic models:
   BilledTxnRow          single billed txn (card detail page)
   PendingTxnRow         single pending txn (card detail page)
   PaymentRow            single payment txn (card detail page)
-  CardDetail            full card detail (CardSummary + 3 lists)
+  CardDetail            full card detail (statement + posted + pending + payments)
   SetCardExcludedResult write return value
   SetCardNicknameResult write return value
 
@@ -75,7 +75,7 @@ class CardSummary(BaseModel):
     payment_due_date: str | None = None
     updated_at: str | None = None
     bill_due_amount: float | None = None
-    unbilled_amount: float = 0.0
+    unbilled_amount: float | None = 0.0
     last_payment_date: str | None = None
     last_payment_amount: float | None = None
 
@@ -117,6 +117,8 @@ class CardDetail(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     card: CardSummary
+    # Complete booked history, independent of statement assignment/date availability.
+    posted_txns: list[BilledTxnRow] = []
     billed_txns: list[BilledTxnRow] = []
     pending_txns: list[PendingTxnRow] = []
     payments: list[PaymentRow] = []
@@ -180,6 +182,8 @@ def _bill_summary_for_cards(
     """產出每張卡的 bill_due_amount / unbilled_amount / last_payment_* summary.
 
     `bill_due_amount` 只讀 crawler canonical fact；交易加總不是剩餘應繳。
+    `unbilled_amount` 保留舊 pending 正數合計；若有已入帳但未分配帳單的
+    消費，或 bank-level pending 無法歸屬單卡，該合計已不完整，回 NULL。
     """
     summary: dict[str, dict[str, Any]] = {
         no: {
@@ -256,6 +260,7 @@ def _bill_summary_for_cards(
     if helpers._has_table(con, "card_pending_txns"):
         cols = helpers._columns(con, "card_pending_txns")
         if {"card_no", "amount"}.issubset(cols):
+            ambiguous_pending = False
             for r in con.execute(
                 """SELECT COALESCE(NULLIF(card_no, ''), '__bank__') AS card_key,
                           SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS amount_sum
@@ -266,14 +271,39 @@ def _bill_summary_for_cards(
             ):
                 card_key = r["card_key"]
                 if card_key == "__bank__":
-                    if len(card_nos) != 1:
+                    # Requested cards can be a detail subset or hide inactive
+                    # cards. Only the user's complete bank inventory can infer ownership.
+                    bank_card_nos = [
+                        row["card_no"] for row in con.execute(
+                            "SELECT card_no FROM cards WHERE user_id = ? AND card_no IS NOT NULL AND card_no != ''",
+                            (user_id,),
+                        )
+                    ] if helpers._has_table(con, "cards") else []
+                    if len(bank_card_nos) != 1:
+                        ambiguous_pending = True
                         continue
-                    target = card_nos[0]
+                    target = bank_card_nos[0]
                 else:
-                    if card_key not in summary:
-                        continue
                     target = card_key
-                summary[target]["unbilled_amount"] = float(r["amount_sum"] or 0)
+                if target in summary:
+                    summary[target]["unbilled_amount"] += float(r["amount_sum"] or 0)
+            if ambiguous_pending:
+                for values in summary.values():
+                    values["unbilled_amount"] = None
+
+    if helpers._has_table(con, "card_billed_txns"):
+        cols = helpers._columns(con, "card_billed_txns")
+        unassigned = "NULLIF(TRIM(bill_date), '') IS NULL" if "bill_date" in cols else "1 = 1"
+        for row in con.execute(
+            f"""SELECT DISTINCT COALESCE(NULLIF(card_no, ''), '__bank__') AS card_key
+                FROM card_billed_txns
+                WHERE user_id = ? AND amount > 0 AND {unassigned}""",
+            (user_id,),
+        ):
+            keys = card_nos if row["card_key"] == "__bank__" else [row["card_key"]]
+            for key in keys:
+                if key in summary:
+                    summary[key]["unbilled_amount"] = None
 
     # Canonical overlay: unknown stays NULL; never infer debt from purchases.
     for card_no, native in native_by_card.items():
@@ -397,7 +427,7 @@ class CardsReadMixin(_BaseHelpers):
         cycle_start: str,
         cycle_end: str | None = None,
     ) -> CardDetail | None:
-        """單張卡 detail (含本期 billed/pending + 最近 12 筆 payments).
+        """單張卡 detail (本期 billed、全部 posted/pending、最近 12 筆 payments).
 
         cycle_start / cycle_end 由 caller 算 (純 datetime, UI policy).
         有 cycle_end 時使用 (cycle_start, cycle_end] 的入帳日範圍。
@@ -435,6 +465,7 @@ class CardsReadMixin(_BaseHelpers):
             card_summary = CardSummary(**base, **bs)
 
             billed_txns: list[BilledTxnRow] = []
+            posted_txns: list[BilledTxnRow] = []
             if self._has_table(con, "card_billed_txns"):
                 cb_cols = self._columns(con, "card_billed_txns")
                 txn_col = ", txn_type" if "txn_type" in cb_cols else ", NULL AS txn_type"
@@ -454,19 +485,21 @@ class CardsReadMixin(_BaseHelpers):
                     cycle_where = "SUBSTR(consume_date, 1, 10) >= ?"
                 else:
                     cycle_where = f"{date_expr} > ? AND {date_expr} <= ?"
-                cycle_params: tuple[Any, ...] = (user_id, card_no, cycle_start)
+                cycle_params: tuple[Any, ...] = (cycle_start,)
                 if cycle_end is not None:
                     cycle_params += (cycle_end,)
+                cycle_params += (user_id, card_no)
                 for r in con.execute(
                     f"""SELECT consume_date, post_date, amount, description, currency
-                              {txn_col}{flow_col}{category_col}{subcategory_col}
+                              {txn_col}{flow_col}{category_col}{subcategory_col},
+                              ({cycle_where}) AS in_cycle
                        FROM card_billed_txns
-                       WHERE user_id = ? AND card_no = ? AND {cycle_where}
+                       WHERE user_id = ? AND card_no = ?
                        ORDER BY {date_expr} DESC, id DESC""",
                     cycle_params,
                 ):
                     r_keys = set(r.keys())
-                    billed_txns.append(BilledTxnRow(
+                    txn = BilledTxnRow(
                         date=r["consume_date"],
                         post_date=r["post_date"] if "post_date" in r_keys else None,
                         amount=float(r["amount"]) if r["amount"] is not None else 0.0,
@@ -476,7 +509,10 @@ class CardsReadMixin(_BaseHelpers):
                         subcategory=r["subcategory"],
                         txn_type=r["txn_type"],
                         flow_type=r["flow_type"],
-                    ))
+                    )
+                    posted_txns.append(txn)
+                    if r["in_cycle"]:
+                        billed_txns.append(txn)
 
             pending_txns: list[PendingTxnRow] = []
             if self._has_table(con, "card_pending_txns"):
@@ -546,6 +582,7 @@ class CardsReadMixin(_BaseHelpers):
 
             return CardDetail(
                 card=card_summary,
+                posted_txns=posted_txns,
                 billed_txns=billed_txns,
                 pending_txns=pending_txns,
                 payments=payments,

@@ -214,6 +214,13 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                 "ALTER COLUMN user_id SET NOT NULL"
             )
 
+        for tbl in ("card_billed_txns", "card_pending_txns"):
+            if tbl in existing:
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."{tbl}" '
+                    'ADD COLUMN IF NOT EXISTS native_identity TEXT'
+                )
+
         if "accounts" in existing:
             conn.execute(
                 f'ALTER TABLE "{schema}"."accounts" '

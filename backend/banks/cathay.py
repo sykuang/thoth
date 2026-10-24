@@ -46,7 +46,8 @@ _TWD_HISTORY_PATH = (
 )
 _TWD_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
-    r"(?:Z|[+-]\d{2}:?\d{2})?$",
+    # fromisoformat normalizes overflowing offset minutes instead of rejecting them.
+    r"(?:Z|[+-]\d{2}:?[0-5]\d)?$",
 )
 _TWD_AMOUNT_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.0+)?$")
 _PG_INTEGER_MAX = 2_147_483_647
@@ -1208,12 +1209,15 @@ class CathayCrawler(BankCrawler):
         raw_country = t.get("consumeCountry")
         consume_country = raw_country if (raw_country and str(raw_country).strip()) else None
 
+        posting = self._twd_response_date(t.get("postingDate"))
+        post_date = posting.isoformat() if posting is not None and posting <= date.today() else None
+
         return {
             "card_no": self.mask_card(t.get("cardNo") or t.get("mobileCardNo")),
             "date": t.get("consumeDate") or t.get("transDate"),   # 消費日
-            # 入帳日：國泰用 beginValueDate(折算入帳日) / convertDate(折算日)；
-            # 三個獨立來源欄位都沒有時保留 None，shared store 不得偽造。
-            "post_date": t.get("beginValueDate") or t.get("convertDate") or t.get("postingDate"),
+            # Conversion/value dates must not masquerade as posting dates in readers either.
+            "post_date": post_date,
+            "booking_status": "booked" if post_date else None,
             # Unbilled consume rows (live 2026-10-09) use merchantName/twdAmount.
             "desc": t.get("transDesc") or t.get("merchantName"),
             "amount": t.get("amount") if t.get("amount") is not None else t.get("twdAmount"),  # 台幣入帳金額

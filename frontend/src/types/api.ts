@@ -369,6 +369,7 @@ export type Card = {
   payment_due_date?: string | null;
   /** MoneyBook-style normalized bill summary from /cards. */
   bill_due_amount?: number | null;
+  /** Legacy pending-positive subtotal; unknown when booked purchases lack statement assignment. Not unbooked balance. */
   unbilled_amount?: number | null;
   bill_status?: 'due' | 'paid' | 'no_payment_required' | 'overdue' | 'unknown';
   /**
@@ -382,8 +383,11 @@ export type Card = {
 
 /** Card detail page (GET /cards/{bank}/{card_no}) — Phase 9.4. */
 export type CardDetail = Card & {
+  /** Complete booked history; dates/statement assignment may be unknown. */
+  posted_txns: CardDetail['billed_txns'];
+  /** Closed statement cycle, not all booked purchases. */
   billed_txns: {
-    date: string;
+    date: string | null;
     post_date: string | null;
     amount: number;
     description: string;

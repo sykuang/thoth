@@ -120,6 +120,31 @@ def test_country_empty_string_normalized_to_none(crawler):
     assert out["consume_country"] is None
 
 
+@pytest.mark.parametrize(("fields", "expected", "post_date"), [
+    ({"postingDate": "2026-05-08"}, "booked", "2026-05-08"),
+    ({"convertDate": "2026-05-07", "postingDate": "2026-05-08"}, "booked", "2026-05-08"),
+    ({"convertDate": "2026-05-07"}, None, None),
+    ({"beginValueDate": "2026-05-07"}, None, None),
+    ({"postingDate": "2026-05-08T00:00:00"}, "booked", "2026-05-08"),
+    *[({"postingDate": f"2026-06-23T00:30:45.123456{offset}"}, "booked", "2026-06-23")
+      for offset in ("Z", "+08:00", "+0800", "-08:00", "-0800", "+23:59", "-2359")],
+    ({"postingDate": "2026-06-23T00:00:00+08:60", "convertDate": "2026-06-23",
+      "beginValueDate": "2026-06-23"}, None, None),
+    *[({"postingDate": value}, None, None) for value in (
+        "2026-02-30", "0000-00-00", "2026-05-08junk", "2099-01-01", True, 20260508,
+        "2026-06-23T00:00:00+08:60", "2026-06-23T00:00:00+0860",
+        "2026-06-23T00:00:00-08:60", "2026-06-23T00:00:00-0860",
+    )],
+])
+def test_booking_evidence_keeps_posting_separate_from_conversion(crawler, fields, expected, post_date):
+    row = crawler._norm_card_txn({
+        "cardNo": "9000000000367037", "consumeDate": "2026-05-05",
+        "transDesc": "Synthetic purchase", "amount": 100, **fields,
+    })
+    assert row.get("booking_status") == expected
+    assert row["post_date"] == post_date
+
+
 class _LatestBillCollector:
     hits = []
 

@@ -38,16 +38,27 @@ export function transactionDateForBasis(
     if (basis === 'post') {
       return transaction.post_date?.trim() || '';
     }
-    return transaction.consume_date?.trim() || transaction.date?.trim()
-      || transaction.post_date?.trim() || '';
+    return ('consume_date' in transaction ? transaction.consume_date : transaction.date)?.trim() || '';
   }
   return transaction.date ?? '';
 }
 
-/** Posting is a date fact, not billed/pending status. Keep undated non-card rows. */
+/** A card needs the chosen date fact; undated non-card rows retain their contract. */
 export function isTransactionVisibleForBasis(transaction: Transaction, basis: CardDateBasis): boolean {
-  return basis !== 'post' || (transaction.kind !== 'billed' && transaction.kind !== 'pending')
+  return (transaction.kind !== 'billed' && transaction.kind !== 'pending')
     || transactionDateForBasis(transaction, basis) !== '';
+}
+
+export function isTransactionInPeriod(
+  transaction: Transaction,
+  basis: CardDateBasis,
+  since?: string,
+  until?: string,
+): boolean {
+  if (!isTransactionVisibleForBasis(transaction, basis)) return false;
+  const date = transactionDateForBasis(transaction, basis);
+  if ((since || until) && !date) return false;
+  return (!since || date >= since) && (!until || date <= until);
 }
 
 export function mergeTransactionTimeline(
