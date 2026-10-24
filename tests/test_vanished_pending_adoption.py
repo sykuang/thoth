@@ -227,8 +227,9 @@ def test_pending_fx_exact_mapping_is_reserved_before_renamed_fallback(store):
     ]
 
 
-def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store):
-    """被 exact billed 吞掉的 FX pending metadata 不可再參與 renamed fallback。"""
+@pytest.mark.parametrize("edited_exact", [False, True])
+def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store, edited_exact):
+    """Exact 來源消失搬 billed；其 metadata 不可再參與仍存在的 renamed FX fallback。"""
     base = {**PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2}
     store.refresh_card_pending(
         "unbilled", [{**base, "desc": "EXACT"}, {**base, "desc": "OLD"}], rules=[])
@@ -236,8 +237,9 @@ def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store):
         "SELECT id, description FROM card_pending_txns"
     ).fetchall()
     by_desc = {row["description"]: row["id"] for row in rows}
-    store.conn.execute(
-        "UPDATE card_pending_txns SET category='餐飲' WHERE id=?", (by_desc["EXACT"],))
+    if edited_exact:
+        store.conn.execute(
+            "UPDATE card_pending_txns SET category='餐飲' WHERE id=?", (by_desc["EXACT"],))
     store.conn.execute(
         "UPDATE card_pending_txns SET category='旅遊' WHERE id=?", (by_desc["OLD"],))
     store.conn.commit()
@@ -246,10 +248,10 @@ def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store):
     ], rules=[])
 
     store.refresh_card_pending(
-        "unbilled", [{**base, "desc": "EXACT"}, {**base, "desc": "RENAMED"}],
+        "unbilled", [{**base, "desc": "RENAMED"}],
         rules=[], fetch_ok=True)
 
-    assert _billed(store)[0]["category"] == "餐飲"
+    assert _billed(store)[0]["category"] == ("餐飲" if edited_exact else None)
     pending = store.conn.execute(
         "SELECT description, category FROM card_pending_txns"
     ).fetchone()
@@ -662,7 +664,7 @@ def test_different_desc_cross_scope_conflict_cannot_overwrite_exact_merge(store)
     store.upsert_card_billed([{**PEND, "bill_date": "2026-07-20"}], rules=[])
 
     assert store.refresh_card_pending(
-        "unbilled", [PEND], rules=[], fetch_ok=True, commit=False
+        "unbilled", [], rules=[], fetch_ok=True, commit=False
     ) == 0
     assert store.refresh_card_pending(
         "current", [], rules=[], fetch_ok=True
@@ -670,8 +672,8 @@ def test_different_desc_cross_scope_conflict_cannot_overwrite_exact_merge(store)
     assert _billed(store)[0]["category"] == "旅遊"
 
 
-def test_fx_adoption_uses_incoming_raw_key_and_does_not_reinsert_renamed_row(store):
-    """FX overlap merge 後 ledger 必須 suppress trusted incoming renamed row。"""
+def test_fx_renamed_unknown_keeps_overlay_until_disappearance(store):
+    """FX renamed incoming 是仍存在的 pending；消失後才接手，空清單重播不插回。"""
     old = {**PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2}
     store.refresh_card_pending("unbilled", [old], rules=[])
     store.conn.execute("UPDATE card_pending_txns SET category='旅遊'")
@@ -683,9 +685,18 @@ def test_fx_adoption_uses_incoming_raw_key_and_does_not_reinsert_renamed_row(sto
 
     assert store.refresh_card_pending(
         "unbilled", [incoming], rules=[], fetch_ok=True
-    ) == 0
+    ) == 1
+    assert _billed(store)[0]["category"] is None
+    row = store.conn.execute(
+        "SELECT description, category FROM card_pending_txns"
+    ).fetchone()
+    assert (row["description"], row["category"]) == ("RENAMED PENDING", "旅遊")
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True) == 0
     assert _pending_count(store) == 0
     assert _billed(store)[0]["category"] == "旅遊"
+    before = _billed(store)
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True) == 0
+    assert _billed(store) == before
 
 
 def test_fx_multi_incoming_identity_does_not_adopt_to_one_billed(store):
@@ -709,7 +720,7 @@ def test_fx_multi_incoming_identity_does_not_adopt_to_one_billed(store):
 
 
 def test_later_scope_extra_identical_occurrence_is_preserved(store):
-    """接手 1 筆後，較晚 scope 回 2 筆完全相同 raw rows，只能扣 1 筆。"""
+    """來源消失接手 1 筆後，較晚 scope 的 2 筆 unknown raw occurrences 都保留。"""
     txn = {**PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2}
     store.refresh_card_pending("unbilled", [txn], rules=[])
     store.conn.execute("UPDATE card_pending_txns SET category='旅遊'")
@@ -717,8 +728,9 @@ def test_later_scope_extra_identical_occurrence_is_preserved(store):
     store.upsert_card_billed([{
         **txn, "amount": 3267, "desc": "正式商戶", "bill_date": "2026-07-20",
     }], rules=[])
-    store.refresh_card_pending("unbilled", [txn], rules=[], fetch_ok=True, commit=False)
-    store.refresh_card_pending("current", [txn, txn], rules=[], fetch_ok=True)
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True, commit=False) == 0
+    assert _billed(store)[0]["category"] == "旅遊"
+    assert store.refresh_card_pending("current", [txn, txn], rules=[], fetch_ok=True) == 2
 
     rows = store.conn.execute(
         "SELECT scope, description FROM card_pending_txns"
@@ -739,8 +751,8 @@ def test_later_scope_distinct_occurrence_with_same_identity_is_preserved(store):
     store.upsert_card_billed([{
         **a, "amount": 3267, "desc": "正式商戶", "bill_date": "2026-07-20",
     }], rules=[])
-    store.refresh_card_pending("unbilled", [a], rules=[], fetch_ok=True, commit=False)
-    store.refresh_card_pending("current", [b], rules=[], fetch_ok=True)
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True, commit=False) == 0
+    assert store.refresh_card_pending("current", [b], rules=[], fetch_ok=True) == 1
 
     rows = store.conn.execute(
         "SELECT scope, description FROM card_pending_txns ORDER BY scope"
@@ -752,7 +764,7 @@ def test_later_scope_distinct_occurrence_with_same_identity_is_preserved(store):
 
 
 def test_cross_scope_duplicate_is_adopted_once_without_pending_reinsert(store):
-    """同一交易同時在 unbilled/current：接手一次並刪兩 scope，後續 refresh 不插回。"""
+    """同交易跨 scope 仍存在就保留各自 overlay；各自消失後接手，重播不插回。"""
     pending = {**PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2}
     store.refresh_card_pending("unbilled", [pending], rules=[])
     store.refresh_card_pending("current", [pending], rules=[])
@@ -765,10 +777,35 @@ def test_cross_scope_duplicate_is_adopted_once_without_pending_reinsert(store):
     }], rules=[])
     assert store.refresh_card_pending(
         "unbilled", [pending], rules=[], fetch_ok=True, commit=False
-    ) == 0
+    ) == 1
     assert store.refresh_card_pending(
         "current", [pending], rules=[], fetch_ok=True
+    ) == 1
+
+    assert _billed(store)[0]["category"] is None
+    rows = store.conn.execute(
+        "SELECT scope, category, description_overwrite FROM card_pending_txns ORDER BY scope"
+    ).fetchall()
+    assert [(r["scope"], r["category"], r["description_overwrite"]) for r in rows] == [
+        ("current", "旅遊", "KEEP"), ("unbilled", "旅遊", "KEEP"),
+    ]
+    assert store.refresh_card_pending(
+        "unbilled", [], rules=[], fetch_ok=True, commit=False
     ) == 0
+    remaining = store.conn.execute(
+        "SELECT scope, category, description_overwrite FROM card_pending_txns"
+    ).fetchall()
+    assert [(r["scope"], r["category"], r["description_overwrite"]) for r in remaining] == [
+        ("current", "旅遊", "KEEP"),
+    ]
+    adopted = _billed(store)
+    assert adopted[0]["category"] == "旅遊"
+    assert adopted[0]["description_overwrite"] == "KEEP"
+    assert store.refresh_card_pending("current", [], rules=[], fetch_ok=True) == 0
+    assert _billed(store) == adopted
+    for scope in ("unbilled", "current"):
+        assert store.refresh_card_pending(scope, [], rules=[], fetch_ok=True) == 0
+    assert _billed(store) == adopted
 
     assert _billed(store)[0]["category"] == "旅遊"
     assert _pending_count(store) == 0
@@ -812,10 +849,10 @@ def test_billed_insert_rolls_back_if_transition_crashes_before_refresh(tmp_path,
 
 
 def test_unchanged_desc_path_still_works(store):
-    """回歸：description 不變時原四欄搬遷路徑仍正常。"""
+    """回歸：description 不變且來源消失時原四欄搬遷路徑仍正常。"""
     _seed_edited_pending(store)
     store.upsert_card_billed([{**PEND, "bill_date": "2026-07-20"}], rules=[])
-    store.refresh_card_pending("unbilled", [PEND], rules=[], fetch_ok=True)
+    store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True)
 
     b = _billed(store)
     assert b[0]["category"] == "購物"
@@ -916,8 +953,8 @@ def test_foreign_pending_refresh_keeps_overlay_when_twd_estimate_changes(store):
     assert sum(s["amount"] for s in moved) == 3267
 
 
-def test_billed_adopts_even_while_bank_still_returns_pending(store):
-    """銀行 pending/billed 重疊 1–3 天：新 billed 立即接手，pending 不可插回雙顯。"""
+def test_billed_waits_while_bank_still_returns_unknown_pending(store):
+    """銀行仍回未知授權時 overlay 留 pending；真正消失才接手一次。"""
     pending = {
         **PEND, "amount": 3200, "consume_currency": "USD", "consume_amount": 100.2,
     }
@@ -928,10 +965,20 @@ def test_billed_adopts_even_while_bank_still_returns_pending(store):
         **pending, "desc": "正式商戶", "amount": 3267, "bill_date": "2026-07-20",
     }], rules=[])
     # 同次 pending API 還回舊授權資料。
-    store.refresh_card_pending("unbilled", [pending], rules=[], fetch_ok=True)
+    assert store.refresh_card_pending("unbilled", [pending], rules=[], fetch_ok=True) == 1
+
+    assert _billed(store)[0]["category"] is None
+    row = store.conn.execute(
+        "SELECT description, amount, category FROM card_pending_txns"
+    ).fetchone()
+    assert (row["description"], row["amount"], row["category"]) == (PEND["desc"], 3200, "旅遊")
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True) == 0
 
     assert _billed(store)[0]["category"] == "旅遊"
     assert _pending_count(store) == 0
+    adopted = _billed(store)
+    assert store.refresh_card_pending("unbilled", [], rules=[], fetch_ok=True) == 0
+    assert _billed(store) == adopted
 
 
 def test_foreign_same_original_amount_on_different_date_never_matches(store):

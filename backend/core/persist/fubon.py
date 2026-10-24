@@ -837,6 +837,7 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
             "card_no": default_card_no,
             "date": p.get("date"),
             "post_date": p.get("post_date"),
+            "booking_status": "booked" if p.get("post_date") else None,
             "desc": desc,
             "amount": amt,
             "currency": p.get("currency") or "TWD",

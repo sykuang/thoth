@@ -386,7 +386,9 @@ class TransactionsReadMixin(_BaseHelpers):
                     card_expr = "card_no" if "card_no" in cols else "NULL"
                     consume_date_expr = "consume_date" if "consume_date" in cols else "NULL"
                     post_date_expr = "post_date" if "post_date" in cols else "NULL"
-                if kind == "pending":
+                if kind in ("billed", "pending"):
+                    # The router selects consume/post basis. A NULL consume date
+                    # cannot exclude a card row carrying a real posting date.
                     date_filter = ""
                 else:
                     date_filter = f" AND {date_col} IS NOT NULL"

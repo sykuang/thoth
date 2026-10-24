@@ -49,6 +49,21 @@ SEL_PWD = "#pppd"
 SEL_CAP = "#verified"
 SEL_CAP_IMG = ".ved_img"
 
+# The positional row parser needs column headers, not keywords in a summary cell.
+_TWD_TABLE_HEADERS_JS = r"""table => {
+    const rendered = element => element?.checkVisibility({
+        visibilityProperty: true, opacityProperty: true,
+    });
+    const row = [...table.rows].find(rendered);
+    return [
+        /時間|Time/i, /摘要|Summary/i, /支出|Expense/i,
+        /存入|Deposit/i, /結餘|Balance/i,
+    ].every((pattern, index) => {
+        const cell = row?.cells[index];
+        return rendered(cell) && pattern.test(cell.innerText || '');
+    });
+}"""
+
 _CAPTCHA_BACKGROUND = re.compile(
     r"^url\((?P<quote>[\"']?)data:image/(?:png|jpe?g|gif|webp);base64,"
     r"(?P<payload>[A-Za-z0-9+/]+={0,2})(?P=quote)\)$",
@@ -901,7 +916,7 @@ class ScsbCrawler(BankCrawler):
 
     @staticmethod
     def _twd_inquiry_prepare_result_wait_script() -> str:
-        """JS: 清除 binding，並記住同條件舊結果以拒絕 stale same-query DOM。"""
+        """Inventory existing DOM independently of rendered-header admission."""
         return r"""(expected) => {
             const visible = (el) => el && el.offsetParent !== null;
             const normalize = (value) => String(value || '').replace(/[-.]/g, '/');
@@ -909,13 +924,12 @@ class ScsbCrawler(BankCrawler):
                 const escaped = normalize(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 return new RegExp(`(^|\\D)${escaped}(?=$|\\D)`).test(normalize(text));
             };
-            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
             window.__thothScsbTwdResultScope = null;
             window.__thothScsbTwdResultElement = null;
             window.__thothScsbTwdOldScopes = new WeakMap();
             window.__thothScsbTwdOldTables = new WeakMap();
             for (const table of document.querySelectorAll('table')) {
-                if (visible(table) && tablePattern.test(table.innerText || '')) {
+                if (visible(table)) {
                     window.__thothScsbTwdOldTables.set(table, table.innerText || '');
                 }
             }
@@ -927,8 +941,10 @@ class ScsbCrawler(BankCrawler):
                     window.__thothScsbTwdOldEmpty.set(empty, empty.innerText || '');
                 }
             }
+            // Preserve the legacy scope inventory; this is not header admission.
+            const oldTablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
             for (const table of document.querySelectorAll('table')) {
-                if (!visible(table) || !tablePattern.test(table.innerText || '')) continue;
+                if (!visible(table) || !oldTablePattern.test(table.innerText || '')) continue;
                 for (let scope = table.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
                     if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                     const criteria = [...scope.querySelectorAll('*')].filter(el => {
@@ -999,10 +1015,10 @@ class ScsbCrawler(BankCrawler):
                 }
                 return null;
             };
-            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
+            const tableMatches = __TWD_TABLE_HEADERS__;
             const tables = [...document.querySelectorAll('table')].filter(el =>
                 visible(el)
-                && tablePattern.test(el.innerText || '')
+                && tableMatches(el)
                 && (!oldTables.has(el)
                     || oldTables.get(el) !== (el.innerText || ''))
                 && boundScope(el)
@@ -1026,7 +1042,7 @@ class ScsbCrawler(BankCrawler):
             window.__thothScsbTwdResultScope = unique ? scopes[0] : null;
             window.__thothScsbTwdResultElement = unique ? elements[0] : null;
             return unique;
-        }"""
+        }""".replace("__TWD_TABLE_HEADERS__", _TWD_TABLE_HEADERS_JS)
 
     @staticmethod
     def _twd_inquiry_extract_result_script() -> str:
@@ -1057,15 +1073,15 @@ class ScsbCrawler(BankCrawler):
                     && ![...el.children].some(child => /查詢條件|Query Criteria/i.test(child.innerText || ''));
             });
             if (!criteria) return {ok: false, empty: false, row_count: 0, text: ''};
-            const tablePattern = /(?:時間|Time)[\s\S]*(?:摘要|Summary)[\s\S]*(?:支出|Expense)[\s\S]*(?:存入|Deposit)[\s\S]*(?:結餘|Balance)/i;
+            const tableMatches = __TWD_TABLE_HEADERS__;
             const table = result.tagName === 'TABLE'
-                && tablePattern.test(result.innerText || '') ? result : null;
+                && tableMatches(result) ? result : null;
             if (table) {
                 const rowCount = [...table.rows].filter(row => row.querySelectorAll('td').length).length;
                 return {ok: true, empty: false, row_count: rowCount, text: table.innerText || ''};
             }
             return {ok: false, empty: false, row_count: 0, text: ''};
-        }"""
+        }""".replace("__TWD_TABLE_HEADERS__", _TWD_TABLE_HEADERS_JS)
 
     @staticmethod
     def _twd_empty_result_close_script() -> str:

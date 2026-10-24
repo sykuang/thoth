@@ -159,6 +159,12 @@ def _normalize_date(s: str | None) -> str | None:
     return head if head else None
 
 
+def _public_raw(r: Any) -> dict[str, Any]:
+    """Keep native bank identities and internal credential references server-only."""
+    return {key: value for key, value in dict(r).items()
+            if key not in {"native_identity", "source_account_id", "dedup_key"}}
+
+
 def _parse_tags_overwrite(raw: Any) -> list[str]:
     """tags_overwrite 欄 (TEXT JSON array) → list[str].
 
@@ -418,11 +424,11 @@ def _apply_card_date_basis(t: dict[str, Any], card_date_basis: str) -> dict[str,
     """
     if t.get("kind") not in {"billed", "pending"}:
         return t
-    consume_date = _normalize_date(t.get("consume_date") or t.get("date"))
+    consume_date = _normalize_date(t.get("consume_date", t.get("date")))
     post_date = _normalize_date(t.get("post_date"))
     t["consume_date"] = consume_date
     t["post_date"] = post_date
-    t["date"] = (post_date or consume_date) if card_date_basis == "post" else consume_date
+    t["date"] = post_date if card_date_basis == "post" else consume_date
     return t
 
 
@@ -490,7 +496,7 @@ def _twd_to_transaction(
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
         # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
         "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
-        "raw": dict(r),
+        "raw": _public_raw(r),
     }
 
 
@@ -571,7 +577,7 @@ def _billed_to_transaction(
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
         # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
         "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
-        "raw": dict(r),
+        "raw": _public_raw(r),
     }
 
 
@@ -666,7 +672,7 @@ def _pending_to_transaction(
         "tags": _parse_tags_overwrite(_row_get(r, "tags_overwrite")),
         # Phase 10 (2026-07-29): 分類拆帳子項 ([] = 未拆帳)
         "splits": _parse_splits_overwrite(_row_get(r, "splits_overwrite")),
-        "raw": dict(r),
+        "raw": _public_raw(r),
     }
 
 
@@ -717,14 +723,19 @@ def _apply_stat_filters(
     q: str | None,
     card_date_basis: Literal["consume", "post"] = "consume",
 ) -> list[Any]:
-    out = rows
-    if card_date_basis == "post":
-        for t in out:
-            if _item_get(t, "kind") in ("billed", "pending"):
-                post_date = _normalize_date(_item_get(t, "post_date"))
-                consume_date = _normalize_date(_item_get(t, "consume_date") or _item_get(t, "date"))
-                if hasattr(t, "date"):
-                    t.date = post_date or consume_date
+    # Membership precedes splitting and every aggregate, even without bounds.
+    out = []
+    for t in rows:
+        if _item_get(t, "kind") in ("billed", "pending"):
+            legacy_consume_date = _item_get(t, "date") if card_date_basis == "consume" else None
+            date = _normalize_date(_item_get(t, f"{card_date_basis}_date", legacy_consume_date))
+            if not date:
+                continue
+            if isinstance(t, dict):
+                t["date"] = date
+            else:
+                t.date = date
+        out.append(t)
     if since:
         out = [t for t in out if (_normalize_date(_item_get(t, "date")) or "") >= since]
     if until:
@@ -847,10 +858,10 @@ def _collect_transaction_stat_rows(
             excluded_cards_by_bank=excluded_cards_by_bank,
         ):
             rows.append(row)
-    return _apply_stat_filters(
-        _expand_stat_split_rows(rows),
+    return _expand_stat_split_rows(_apply_stat_filters(
+        rows,
         since=since, until=until, q=q, card_date_basis=card_date_basis,
-    )
+    ))
 
 
 def _collect_transactions(
@@ -897,6 +908,9 @@ def _collect_transactions(
                 items.append(_pending_to_transaction(bank, txn_row, bank_excluded_cards))
 
     items = [_apply_card_date_basis(t, card_date_basis) for t in items]
+    items = _apply_stat_filters(
+        items, since=None, until=None, q=None, card_date_basis=card_date_basis,
+    )
 
     # Phase 10 (2026-07-29) 分類拆帳: 已拆帳的母筆展開成 N 筆子項取代之。
     # 放在 filter 之前 — 子項各有自己的 category, 必須讓 category filter 看得到;

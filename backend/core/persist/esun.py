@@ -567,7 +567,8 @@ def persist_esun(
             "consume_amount": t.get("consume_amount") if is_foreign else None,
             "txn_type": classify.classify_by_desc_and_sign(desc or "", amt),
         }
-        if t.get("status") == "未入帳":
+        # 入帳中 and missing/unknown states are not affirmative booked evidence.
+        if t.get("status") != "已入帳":
             pending_txns.append(row)
         else:
             # 已入帳 → 帳單月份待 card_bills 對齊

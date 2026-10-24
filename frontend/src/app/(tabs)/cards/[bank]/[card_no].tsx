@@ -58,8 +58,9 @@ export default function CardDetailPage() {
   }
 
   const card = detailQ.data;
+  const postedTxns = card.posted_txns ?? card.billed_txns;
   const displayName = (card.nickname_overwrite || card.name || '(未命名)').trim();
-  const billDue = card.bill_due_amount ?? 0;
+  const billDue = card.bill_due_amount;
   const status = card.bill_status ?? 'unknown';
 
   return (
@@ -87,14 +88,16 @@ export default function CardDetailPage() {
         </Text>
         <Text
           className={`text-display font-mono font-semibold ${
-            billDue > 0
+            billDue == null
+              ? 'text-ink-500 dark:text-ink-400'
+              : billDue > 0
               ? status === 'overdue'
                 ? 'text-red-600 dark:text-red-400'
                 : 'text-ink-900 dark:text-ink-50'
               : 'text-emerald-600 dark:text-emerald-400'
           }`}
         >
-          {formatCurrency(billDue, 'TWD')}
+          {billDue == null ? '—' : formatCurrency(billDue, 'TWD')}
         </Text>
         <View className="flex-row items-center gap-2 mt-2 flex-wrap">
           <StatusBadge status={status} />
@@ -124,29 +127,29 @@ export default function CardDetailPage() {
         ))}
       </Section>
 
-      {/* 本期已出帳明細 */}
+      {/* 已入帳交易，不受帳單結帳週期限制 */}
       <Section
-        title="本期已出帳明細"
-        subtitle={card.billed_txns.length > 0 ? `${card.billed_txns.length} 筆` : undefined}
-        empty={card.billed_txns.length === 0 ? '本期沒有明細' : undefined}
+        title="已入帳明細"
+        subtitle={postedTxns.length > 0 ? `${postedTxns.length} 筆` : undefined}
+        empty={postedTxns.length === 0 ? '沒有已入帳明細' : undefined}
       >
-        {card.billed_txns.map((t, i) => (
+        {postedTxns.map((t, i) => (
           <TxnRow
             key={`b-${i}`}
             date={t.date?.slice(0, 10) ?? ''}
             description={t.description}
             amount={t.amount}
-            isLast={i === card.billed_txns.length - 1}
+            isLast={i === postedTxns.length - 1}
             meta={categoryMeta(t.category, t.subcategory)}
           />
         ))}
       </Section>
 
-      {/* 未出帳消費 */}
+      {/* 未入帳或來源尚未提供入帳證據 */}
       <Section
-        title="未出帳消費"
+        title="未入帳／待確認"
         subtitle={card.pending_txns.length > 0 ? `${card.pending_txns.length} 筆` : undefined}
-        empty={card.pending_txns.length === 0 ? '沒有未出帳消費' : undefined}
+        empty={card.pending_txns.length === 0 ? '沒有未入帳或待確認交易' : undefined}
       >
         {card.pending_txns.map((t, i) => (
           <TxnRow

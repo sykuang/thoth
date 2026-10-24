@@ -510,6 +510,7 @@ def _persist_hsbc(
             # 不要把 r["consume_currency"] (EUR) 塞進 currency 欄，會害 UI 以為「沒台幣金額」
             unbilled_rows_all.append({
                 "card_no": masked, "date": r["date"], "post_date": r.get("post_date"),
+                "booking_status": "booked" if r.get("post_date") else None,
                 "desc": r["desc"],
                 "amount": r["amount"], "currency": r["currency"],     # 主金額 = TWD
                 "consume_country": r.get("consume_country"),

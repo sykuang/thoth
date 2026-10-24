@@ -1413,7 +1413,8 @@ def test_hsbc_unbilled_accepts_bank_posted_date(store) -> None:
     persist_collected("hsbc", payload, store)
 
     row = store.conn.execute(
-        "SELECT post_date FROM card_pending_txns WHERE card_no = ?",
+        "SELECT post_date FROM card_billed_txns WHERE card_no = ? "
+        "AND description = 'unbilled-posted-purchase'",
         (identity,),
     ).fetchone()
     assert row["post_date"] == "2026-08-30"
@@ -1429,7 +1430,8 @@ def test_hsbc_unbilled_accepts_posted_date_without_transaction_date(store) -> No
     persist_collected("hsbc", payload, store)
 
     saved = store.conn.execute(
-        "SELECT consume_date, post_date FROM card_pending_txns WHERE card_no = ?",
+        "SELECT consume_date, post_date FROM card_billed_txns WHERE card_no = ? "
+        "AND post_date = '2026-08-30'",
         (identity,),
     ).fetchone()
     assert saved is not None and tuple(saved) == ("2026-08-30", "2026-08-30")

@@ -90,9 +90,17 @@ const unposted = (['billed', 'pending'] as const).flatMap(kind =>
   [null, undefined, '', '  '].flatMap(post_date => [
     { ...transactions[1], kind, post_date },
     { ...transactions[0], kind, post_date, consume_date: transactions[0].date },
-    { ...transactions[0], kind, post_date, income_category: null },
+    { ...transactions[0], kind, post_date, consume_date: transactions[0].date, income_category: null },
   ]));
 deepEqual(computeLocalDashboardStats([...visible, ...unposted], 'post'), computeLocalDashboardStats(visible, 'post'));
 deepEqual(computeLocalDashboardStats([...visible, ...unposted], 'consume').total, visible.length + unposted.length);
+
+const legacyCard = { ...transactions[1] };
+delete legacyCard.consume_date;
+deepEqual(computeLocalDashboardStats([legacyCard], 'consume'), computeLocalDashboardStats([transactions[1]], 'consume'));
+const unknownConsume = (['billed', 'pending'] as const).flatMap(kind =>
+  [null, undefined, '', '  '].map(consume_date => ({...transactions[1], kind, consume_date})));
+deepEqual(computeLocalDashboardStats([...transactions.filter(t => t.kind === 'twd'), ...unknownConsume], 'consume'),
+  computeLocalDashboardStats(transactions.filter(t => t.kind === 'twd'), 'consume'));
 
 console.log('local dashboard stats parity tests passed');
