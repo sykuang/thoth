@@ -142,6 +142,18 @@ def test_hsbc_persist_extracts_last_statement_amount(store):
     assert row["payment_due_date"] == "2026-06-05"
 
 
+def test_hsbc_persist_preserves_valid_early_card_dates(store):
+    payload = _hsbc_card_payload()
+    payload["cards"][0]["paymentDueDate"] = "01-01-0001"
+    payload["cards"][0]["statementDate"] = "31-12-9999"
+    payload["card_detail"]["4029-****-****-7034"]["detail"] = {"details": []}
+
+    persist_hsbc(payload, store)
+
+    row = store.conn.execute("SELECT payment_due_date, statement_close_date FROM cards").fetchone()
+    assert tuple(row) == ("0001-01-01", "9999-12-31")
+
+
 def test_hsbc_persist_handles_missing_last_payment(store):
     """case B: details 沒給 Last Payment → last_payment_amount/date 都 NULL.
 

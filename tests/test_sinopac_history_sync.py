@@ -1009,7 +1009,7 @@ def test_sinopac_history_response_fails_closed(mutation) -> None:
     elif mutation == "row_keys":
         hit.resp_json[0]["SubInfo"][0].pop("DataText11")
     elif mutation == "row_date":
-        hit.resp_json[0]["SubInfo"][0]["DataText1"] = "2026/09/01<br />12:34"
+        hit.resp_json[0]["SubInfo"][0]["DataText1"] = "2026/02/30<br />12:34"
     elif mutation == "row_money":
         hit.resp_json[0]["SubInfo"][0]["DataText4"] = "NaN"
     elif mutation == "row_overflow":
@@ -1475,7 +1475,7 @@ def test_sinopac_persistence_preserves_foreign_currency_and_decimals(tmp_path, m
     row["DataText5"] = "1,234.56"
 
     try:
-        delta = persist_sinopac(payload, store)
+        delta = persist_collected("sinopac", payload, store)
         saved = store.conn.execute(
             "SELECT currency, expend, income, balance FROM twd_transactions"
         ).fetchone()

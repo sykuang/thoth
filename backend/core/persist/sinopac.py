@@ -301,14 +301,12 @@ def _validate_sinopac_history(data: dict, store: BankStore) -> date:
                 or not re.fullmatch(r"\d{4}/\d{2}/\d{2}", row["DataText2"])
             ):
                 raise ValueError(error)
-            transacted = _strict_date(
+            _strict_date(
                 re.sub(r"<br\s*/?>", " ", row["DataText1"], flags=re.IGNORECASE),
                 "%Y/%m/%d %H:%M",
                 error,
             )
-            account_date = _strict_date(row["DataText2"], "%Y/%m/%d", error)
-            if not start <= transacted <= end or not start <= account_date <= end:
-                raise ValueError(error)
+            _strict_date(row["DataText2"], "%Y/%m/%d", error)
             description = _sinopac_strip_html(row["DataText3"])
             if not description or len(description) > 500:
                 raise ValueError(error)
@@ -394,9 +392,7 @@ def _parse_sinopac_repayment(account: str, repayment: dict) -> list[dict]:
         for key, field in (("due_date", 1), ("paid_on", 2)):
             value = raw[f"DataValue{field}"]
             parsed = _strict_date(value, "%Y/%m/%d", error)
-            if parsed.strftime("%Y/%m/%d") != value or (
-                key == "paid_on" and not start <= parsed <= end
-            ):
+            if parsed.strftime("%Y/%m/%d") != value:
                 raise ValueError(error)
             row[key] = parsed.isoformat()
         amounts = {}
@@ -774,7 +770,10 @@ def _persist_sinopac(
                 "counterparty_acct": _sinopac_strip_html(t.get("DataText8"))[:30] or None,
                 "memo": _sinopac_strip_html(t.get("DataText8")) or None,
             })
-        twd_new += store.upsert_twd_txns(rows, rules=rules, commit=False)
+        twd_new += store.upsert_twd_txns(
+            rows, rules=rules, commit=False,
+            suppress_history_cursor=data.get("history_coverage") is not None,
+        )
     delta["twd_txn_new"] = twd_new
 
     # 預留位（dropdown 破完再補）

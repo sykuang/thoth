@@ -1127,7 +1127,7 @@ class BankStore:
         self, account_no: str, sub_account: str, currency: str,
         start: str, end: str, rows: list[dict],
     ) -> int:
-        """Replace only a validated bank window; caller owns the sync transaction."""
+        """Replace the queried window and idempotently retain bank rows beyond it."""
         from hashlib import sha256
 
         # Zero is reserved for standalone CLI data, never a server credential ID.
@@ -1153,7 +1153,9 @@ class BankStore:
                    (user_id, source_account_id, account_no, sub_account, currency,
                     row_key, occurrence, due_date, paid_on, principal, interest, penalty,
                     paid_total, principal_balance, status, query_start, query_end, raw_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, source_account_id, account_no, sub_account, currency, row_key, occurrence)
+                   DO UPDATE SET query_start = excluded.query_start, query_end = excluded.query_end""",
                 (*scope, key, occurrences[key], row["due_date"], row["paid_on"],
                  row["principal"], row["interest"], row["penalty"], row["paid_total"],
                  row["principal_balance"], row["status"], start, end, row["raw_json"]),
@@ -1312,7 +1314,7 @@ class BankStore:
 
     # ---- 1. 台幣已過帳交易：append-only ----
     def upsert_twd_txns(self, txns: list[dict], rules: list[dict] | None = None,
-                        commit: bool = True) -> int:
+                        commit: bool = True, *, suppress_history_cursor: bool = False) -> int:
         """寫入台幣交易。若 `rules` 提供，每筆 desc 跑 categorize → 寫 category + subcategory + auto_excluded 欄。"""
         from backend.server.categorizer import categorize_with_excluded  # 延遲 import 避免 cli 依賴
         txns = [dict(txn) for txn in txns]
@@ -1362,11 +1364,12 @@ class BankStore:
                  1 if _is_subscription(sub) else 0),
             )
             inserted_count += self.conn.total_changes - before_insert
-            self._record_transaction_cursor(
-                t.get("history_domain") or "twd_transactions",
-                t.get("history_identity") or t.get("account_no"),
-                t.get("datetime"),
-            )
+            if not suppress_history_cursor:
+                self._record_transaction_cursor(
+                    t.get("history_domain") or "twd_transactions",
+                    t.get("history_identity") or t.get("account_no"),
+                    t.get("datetime"),
+                )
         if commit:
             self.conn.commit()
         return inserted_count
@@ -2207,8 +2210,7 @@ class BankStore:
             # canonical calendar date (or explicit booked-without-date), never sentinels.
             valid_date = post_date is None or (
                 isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
-                and (parsed_date := _cursor_date(post_date)) is not None
-                and parsed_date <= date.today()
+                and _cursor_date(post_date) is not None
             )
             if not valid_date:
                 txn["post_date"] = None

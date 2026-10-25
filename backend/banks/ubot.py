@@ -596,10 +596,8 @@ class UbotCrawler(BankCrawler):
                 raise RuntimeError(error)
             if any(not isinstance(row[key], str) for key in row_keys):
                 raise RuntimeError(error)
-            transacted = cls._strict_slash_date(row["TraDate"], error)
+            cls._strict_slash_date(row["TraDate"], error)
             cls._strict_slash_date(row["AccountDate"], error)
-            if not start <= transacted <= end:
-                raise RuntimeError(error)
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", row["TraTime"]) is None:
                 raise RuntimeError(error)
             try:

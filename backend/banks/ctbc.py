@@ -264,21 +264,17 @@ def _validated_ctbc_detail(row: dict, *, start: date, end: date) -> dict:
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?", raw_datetime):
         raise ValueError("invalid row")
     try:
-        txn_date = datetime.strptime(raw_datetime[:19], "%Y-%m-%d-%H.%M.%S").date()
+        datetime.strptime(raw_datetime[:19], "%Y-%m-%d-%H.%M.%S")
     except ValueError:
         raise ValueError("invalid row") from None
-    if not start <= txn_date <= end:
-        raise ValueError("invalid row")
     raw_account_date = row.get("trnDtRaw")
     if raw_account_date is not None:
         if not isinstance(raw_account_date, str) or not re.fullmatch(r"\d{8}", raw_account_date):
             raise ValueError("invalid row")
         try:
-            account_date = datetime.strptime(raw_account_date, "%Y%m%d").date()
+            datetime.strptime(raw_account_date, "%Y%m%d")
         except ValueError:
             raise ValueError("invalid row") from None
-        if not start <= account_date <= end:
-            raise ValueError("invalid row")
     if row.get("dbAmt") is None and row.get("crAmt") is None:
         raise ValueError("invalid row")
     normalized = dict(row)

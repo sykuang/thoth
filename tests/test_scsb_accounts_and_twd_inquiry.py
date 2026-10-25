@@ -919,6 +919,44 @@ def _mock_twd_query_page(*, full_text: str = "", result_state: dict | None = Non
     return page
 
 
+@pytest.mark.parametrize("dates", [
+    ("2026/02/22", "2026/02/23", "2026/03/01", "2026/08/22", "2026/08/23"),
+    ("2026/02/22", "2026/08/23"),
+])
+def test_scsb_preserves_bank_dates_outside_query_window(tmp_path, monkeypatch, dates):
+    page = _mock_twd_query_page(full_text="\n".join(
+        f"{value}\t合成交易{i}\t1\t\t9\t" for i, value in enumerate(dates)
+    ))
+    inquiry = object.__new__(ScsbCrawler)._collect_twd_inquiry(page, {"90000000123456"})
+
+    assert [row["date"] for row in inquiry["records"]] == list(dates)
+    assert inquiry["accounts"][0]["record_count"] == len(dates)
+    assert inquiry["accounts"][0]["windows"] == [{
+        "identity": "90000000123456", "start": "2026-02-23", "end": "2026-08-22",
+        "status": "complete", "pages": 1,
+    }]
+    page.expect_request.assert_called_once()
+    assert page._confirm_buttons.first.click.call_count == 1
+
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    store = BankStore("scsb")
+    try:
+        delta = persist_scsb({
+            "accounts": [{
+                "account_no": "90000000123456", "currency": "TWD",
+                "balance": "9", "type_header": "活儲存款",
+            }],
+            "twd_inquiry": inquiry,
+        }, store)
+        assert delta["twd_txn_new"] == len(dates)
+        stored = store.conn.execute(
+            "SELECT txn_datetime, account_date FROM twd_transactions ORDER BY id"
+        ).fetchall()
+        assert [(row[0], row[1]) for row in stored] == [(value, value) for value in dates]
+    finally:
+        store.close()
+
+
 def test_scsb_twd_response_is_read_from_request_started_by_current_click():
     page = _mock_twd_query_page()
     current_request = Mock()

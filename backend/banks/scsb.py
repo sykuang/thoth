@@ -1573,12 +1573,8 @@ class ScsbCrawler(BankCrawler):
             or (not records and not extracted.get("empty"))
         ):
             raise RuntimeError("partial-transaction-table")
-        start_date = date.fromisoformat(period["start"].replace("/", "-"))
-        end_date = date.fromisoformat(period["end"].replace("/", "-"))
+        # Query bounds do not override the dates reported by the bank.
         for record in records:
-            record_date = date.fromisoformat(record["date"].replace("/", "-"))
-            if not start_date <= record_date <= end_date:
-                raise RuntimeError("transaction-outside-query-period")
             record["account_no"] = account_no
         return records
 

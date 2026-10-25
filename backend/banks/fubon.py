@@ -444,7 +444,6 @@ class FubonCrawler(BankCrawler):
         ):
             raise RuntimeError("fubon-twd-history-result")
         if status == "complete":
-            dates = []
             try:
                 for cells in rows:
                     if not isinstance(cells, list):
@@ -457,7 +456,7 @@ class FubonCrawler(BankCrawler):
                     ]
                     if len(matched) != 1:
                         raise ValueError
-                    dates.append(date.fromisoformat(matched[0].replace("/", "-")))
+                    date.fromisoformat(matched[0].replace("/", "-"))
             except (TypeError, ValueError):
                 raise RuntimeError("fubon-twd-history-result") from None
             if (
@@ -469,8 +468,6 @@ class FubonCrawler(BankCrawler):
                 or grid_count != 1
                 or row_count <= 0
                 or snapshot.get("emptyMarker") is not None
-                # Live 2026-10-02: native rdoDay180_365 also returns the first rdoDay180 day; persistence drops it.
-                or any(day < start_day or day > end_day + timedelta(days=preset == "rdoDay180_365") for day in dates)
             ):
                 raise RuntimeError("fubon-twd-history-result")
         elif (

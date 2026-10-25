@@ -99,17 +99,7 @@ def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> 
         or not isinstance(description, str)
         or not 0 < len(description.strip()) <= 512
         or (start is None and transaction is None and posted is None)
-        or (
-            start is None
-            and transaction is None
-            and posted is not None
-            and posted < _hsbc_history_floor(end)
-        )
-        or (start is not None and transaction is None)
-        or (transaction is not None and transaction > end)
-        or (posted is not None and posted > end)
-        or (transaction is not None and posted is not None and transaction > posted)
-        or (start is not None and (posted is None or not start <= posted <= end))
+        or (start is not None and (transaction is None or posted is None))
     ):
         raise ValueError("invalid HSBC history transaction")
     if is_foreign and (
@@ -389,8 +379,7 @@ def _dmy_to_iso(s: str | None) -> str | None:
         if len(parts) != 3:
             return None
         d, mo, y = int(parts[0]), int(parts[1]), int(parts[2])
-        # 防呆: y 如果只 2 位 → 拒
-        if y < 1000:
+        if re.fullmatch(r"\d{4}", parts[2]) is None:
             return None
         return date(y, mo, d).isoformat()
     except Exception:
@@ -502,7 +491,9 @@ def _persist_hsbc(
             r = _hsbc_card_txn(t)
             r["card_no"] = masked
             rows.append(r)
-        billed_new += store.upsert_card_billed(rows, rules=rules)
+        billed_new += store.upsert_card_billed(
+            rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+        )
         # 未出帳（refresh-by-scope，彙整所有卡一起 refresh）
         for t in (entry.get("unposted") or []):
             r = _hsbc_card_txn(t)

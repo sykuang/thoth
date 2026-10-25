@@ -1,7 +1,7 @@
 """CTW01002 row normalization; posting date remains explicitly unknown.
 
 Caller must establish selected-account/inventory and fresh request/response binding.
-Window checks here concern transaction date only, not server window semantics.
+Query windows are context, not constraints on bank-reported transaction dates.
 Source: 9413 share timestamp; 7187 Chinese DB/CR help; schema_summary profiles.
 Only observed nonnegative integer money is accepted, bounded by current PG model.
 """
@@ -47,8 +47,6 @@ def normalize_row(row: dict, *, account_no: str, currency: str, start: date, end
         stamp = datetime.strptime(day + " " + time, "%Y/%m/%d %H:%M:%S")
     except ValueError:
         raise ValueError("invalid CTW01002 transaction timestamp") from None
-    if not start <= stamp.date() <= end:
-        raise ValueError("CTW01002 transaction outside candidate window")
     title, direction = (row.get("detailTitle"), row.get("debitCredit"))
     if type(title) is not str or not title.strip() or direction not in ("DB", "CR"):
         raise ValueError("invalid CTW01002 description or direction")

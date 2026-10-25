@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from collections import Counter
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from backend.core import classify
@@ -379,6 +380,7 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
         result_by_key[key] = result
     window_keys = []
     parsed = []
+    seen = Counter()
     from backend.banks.fubon import FubonCrawler, _fubon_history_windows
 
     for window in windows:
@@ -398,24 +400,16 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
         rows = _parse_fubon_deposit_txn_results([result])
         if len(rows) != result["snapshot"]["gridRowCount"]:
             raise ValueError("incomplete Fubon TWD history result")
-        start = date.fromisoformat(window["start"])
-        end = date.fromisoformat(window["end"])
-        if result.get("preset") == "rdoDay180_365":
-            # Native preset overlaps rdoDay180 (required alongside below) by one day; keep rdoDay180's copy.
-            overlap = (end + timedelta(days=1)).isoformat()
-            rows = [row for row in rows if not (row.get("account_date") == overlap and str(row.get("datetime", ""))[:10] == overlap)]
-        try:
-            valid_rows = all(
-                row.get("account_no") == window["identity"]
-                and start <= date.fromisoformat(row["datetime"][:10]) <= end
-                and start <= date.fromisoformat(row["account_date"]) <= end
-                for row in rows
-            )
-        except (TypeError, ValueError):
-            valid_rows = False
-        if not valid_rows:
+        if any(row.get("account_no") != window["identity"] for row in rows):
             raise ValueError("invalid Fubon TWD history row provenance")
-        parsed.extend(rows)
+        # Native query results can overlap; retain maximum observed multiplicity, not their sum.
+        observed = Counter()
+        for row in rows:
+            identity = tuple(sorted(row.items()))
+            observed[identity] += 1
+            if observed[identity] > seen[identity]:
+                parsed.append(row)
+                seen[identity] = observed[identity]
     if len(window_keys) != len(set(window_keys)) or set(window_keys) != set(result_by_key):
         raise ValueError("mismatched Fubon TWD history windows")
     mode = coverage.get("mode")
@@ -856,7 +850,9 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         if validated_twd_rows is not None
         else _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])
     )
-    twd_new = store.upsert_twd_txns(twd_txn_rows, rules=rules) if twd_txn_rows else 0
+    twd_new = store.upsert_twd_txns(
+        twd_txn_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+    ) if twd_txn_rows else 0
 
     # daily_metrics 多段
     limits = parsed.get("limits") or {}

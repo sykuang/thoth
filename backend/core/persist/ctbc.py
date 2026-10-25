@@ -206,7 +206,9 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # 2026-06-20: 補上 known TODO. collect() 抓近 6 個月 detailList 進 twd_history.
     # _parse_ctbc_twd_history 拍平成 store schema dict, upsert_twd_txns 用 dedup_key 去重.
     twd_history_rows = _parse_ctbc_twd_history(data.get("twd_history") or [])
-    twd_new = store.upsert_twd_txns(twd_history_rows, rules=rules) if twd_history_rows else 0
+    twd_new = store.upsert_twd_txns(
+        twd_history_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+    ) if twd_history_rows else 0
     delta["twd_txn_new"] = twd_new
 
     # 餘額快照（每日 metric）——含各帳號餘額（accounts 表不存餘額）

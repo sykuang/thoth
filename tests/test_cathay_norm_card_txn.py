@@ -126,12 +126,13 @@ def test_country_empty_string_normalized_to_none(crawler):
     ({"convertDate": "2026-05-07"}, None, None),
     ({"beginValueDate": "2026-05-07"}, None, None),
     ({"postingDate": "2026-05-08T00:00:00"}, "booked", "2026-05-08"),
+    ({"postingDate": "2099-01-01"}, "booked", "2099-01-01"),
     *[({"postingDate": f"2026-06-23T00:30:45.123456{offset}"}, "booked", "2026-06-23")
       for offset in ("Z", "+08:00", "+0800", "-08:00", "-0800", "+23:59", "-2359")],
     ({"postingDate": "2026-06-23T00:00:00+08:60", "convertDate": "2026-06-23",
       "beginValueDate": "2026-06-23"}, None, None),
     *[({"postingDate": value}, None, None) for value in (
-        "2026-02-30", "0000-00-00", "2026-05-08junk", "2099-01-01", True, 20260508,
+        "2026-02-30", "0000-00-00", "2026-05-08junk", True, 20260508,
         "2026-06-23T00:00:00+08:60", "2026-06-23T00:00:00+0860",
         "2026-06-23T00:00:00-08:60", "2026-06-23T00:00:00-0860",
     )],
@@ -143,6 +144,24 @@ def test_booking_evidence_keeps_posting_separate_from_conversion(crawler, fields
     })
     assert row.get("booking_status") == expected
     assert row["post_date"] == post_date
+
+
+@pytest.mark.parametrize("parser,container", [
+    ("_parse_bill_detail", "twdBillDetailInfo"),
+    ("_parse_consume", "consumeList"),
+])
+@pytest.mark.parametrize("posting_date", ["1999-01-01", "2099-01-01"])
+def test_card_parsers_preserve_bank_posting_dates(crawler, parser, container, posting_date):
+    raw = {
+        "consumeDate": "2026-05-05", "postingDate": posting_date,
+        "amount": 100, "transDesc": "Synthetic purchase",
+    }
+    parsed = getattr(crawler, parser)({container: [{"tradeData": [raw]}]})
+    row = next(iter(parsed.values()))[0]
+
+    assert row["date"] == "2026-05-05"
+    assert row["post_date"] == posting_date
+    assert row["booking_status"] == "booked"
 
 
 class _LatestBillCollector:

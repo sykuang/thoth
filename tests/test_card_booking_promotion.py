@@ -271,12 +271,13 @@ def test_cross_scope_equal_overlays_are_preserved_without_deleting_sibling_scope
     assert signature(rows(store, "card_billed_txns")[0]) == OVERLAY
 
 
-def test_future_snapshot_date_is_not_booking_evidence(store):
+def test_bank_attested_future_date_is_preserved_without_claiming_history(store):
     from datetime import timedelta
 
     future = (date.today() + timedelta(days=1)).isoformat()
-    assert store.refresh_card_pending("unbilled", [{**ROW, "post_date": future}], fetch_ok=True) == 1
-    assert rows(store, "card_billed_txns") == []
+    assert store.refresh_card_pending("unbilled", [{**ROW, "post_date": future}], fetch_ok=True) == 0
+    assert rows(store, "card_billed_txns")[0]["post_date"] == future
+    assert store.latest_card_transaction_dates() == {}
 
 
 def test_commit_false_leaves_promotions_rollbackable(store):

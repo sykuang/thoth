@@ -589,23 +589,23 @@ def test_esun_persistence_rechecks_pagination_before_cursor(tmp_path, monkeypatc
             store.close()
 
 
-def test_esun_persistence_rejects_rows_outside_attested_window(tmp_path, monkeypatch):
+def test_esun_persistence_preserves_rows_outside_attested_window(tmp_path, monkeypatch):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
-    for row in (
+    for count, row in enumerate((
         ["2024/01/01", "12:00:00", "利息", "", "2", "84"],
         ["2026/08/20", "2024/01/01", "利息", "", "2", "84"],
-    ):
+    ), 1):
         result = _bound_result()
         result["snapshot"]["gridRows"] = [row]
         store = BankStore("esun", user_id=7, source_account_id=93)
         try:
-            with pytest.raises(ValueError):
-                persist_collected(
-                    "esun",
-                    {"twd_txn_results": [result], "history_coverage": _bound_coverage()},
-                    store,
-                )
-            assert all(count == 0 for count in store.stats().values())
+            delta = persist_collected(
+                "esun",
+                {"twd_txn_results": [result], "history_coverage": _bound_coverage()},
+                store,
+            )
+            assert delta["twd_txn_new"] == 1
+            assert store.conn.execute("SELECT COUNT(*) FROM twd_transactions").fetchone()[0] == count
         finally:
             store.close()
 
@@ -697,7 +697,8 @@ def test_persist_collected_validates_coverage_before_any_write(tmp_path, monkeyp
             store.close()
 
 
-def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeypatch):
+@pytest.mark.parametrize("row_date", ["2026/08/20", "2024/01/01", "2099/01/01"])
+def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeypatch, row_date):
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
     collector = ResponseCollector()
@@ -772,7 +773,7 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
                     "gridCandidateCount": 1,
                     "gridRowCount": 1,
                     "gridRows": [
-                        ["2026/08/20", "12:00:00", "利息", "", "2", "84", "活存利息"],
+                        [row_date, "12:00:00", "利息", "", "2", "84", "活存利息"],
                     ],
                     "totalCount": 1,
                     "pager": {"present": False, "actionableNext": 0},
@@ -857,3 +858,10 @@ def test_esun_collect_wires_authoritative_twd_flow_to_coverage(tmp_path, monkeyp
         "status": "complete",
         "pages": 1,
     }]
+    store = BankStore("esun", user_id=7, source_account_id=98)
+    try:
+        assert persist_collected("esun", result, store)["twd_txn_new"] == 1
+        saved = store.conn.execute("SELECT txn_datetime FROM twd_transactions").fetchone()
+        assert saved[0] == row_date.replace("/", "-") + " 12:00:00"
+    finally:
+        store.close()

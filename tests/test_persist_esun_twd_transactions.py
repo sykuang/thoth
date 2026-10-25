@@ -230,7 +230,7 @@ def test_attested_spa_rows_preserve_null_posting_date_and_duplicate_occurrences(
     {"twd_txns": [_spa_row()]},
     {"twd_txns": [_spa_row()], "history_coverage": _spa_coverage(status="explicit_empty")},
     {"twd_txns": [_spa_row(account_no="9999999999998")], "history_coverage": _spa_coverage()},
-    {"twd_txns": [_spa_row(datetime="2026-09-01 01:02:03")], "history_coverage": _spa_coverage()},
+    {"twd_txns": [_spa_row(datetime="2026-02-30 01:02:03")], "history_coverage": _spa_coverage()},
     {"twd_txns": [_spa_row(account_date="2026-08-20")], "history_coverage": _spa_coverage()},
     {"twd_txns": [_spa_row()], "twd_txn_results": [], "history_coverage": _spa_coverage()},
 ])

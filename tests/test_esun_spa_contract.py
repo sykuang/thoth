@@ -69,7 +69,6 @@ def test_row_direction_and_unknown_posting_date():
         {"balance": None},
         {"balance": -1},
         {"txDate": "2026/02/30"},
-        {"txDate": "2026/08/31"},
         {"txDate": "2026/9/01"},
         {"txTime": "24:00:00"},
         {"detailTitle": ""},

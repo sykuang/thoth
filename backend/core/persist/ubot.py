@@ -151,10 +151,8 @@ def _validate_ubot_history(data: dict, store: BankStore) -> date:
             if not isinstance(row, dict) or set(row) != row_keys:
                 raise ValueError(error)
             try:
-                transacted = UbotCrawler._strict_slash_date(row["TraDate"], error)
+                UbotCrawler._strict_slash_date(row["TraDate"], error)
                 UbotCrawler._strict_slash_date(row["AccountDate"], error)
-                if not start <= transacted <= end:
-                    raise RuntimeError(error)
                 if re.fullmatch(r"\d{2}:\d{2}:\d{2}", row["TraTime"]) is None:
                     raise RuntimeError(error)
                 datetime.strptime(row["TraTime"], "%H:%M:%S")
@@ -291,7 +289,10 @@ def _persist_ubot(
                 "counterparty_acct": None,
                 "memo": (t.get("TraSum") or "").strip() or (t.get("PS") or "").strip() or None,
             })
-        twd_new += store.upsert_twd_txns(rows, rules=rules, commit=False)
+        twd_new += store.upsert_twd_txns(
+            rows, rules=rules, commit=False,
+            suppress_history_cursor=data.get("history_coverage") is not None,
+        )
     delta["twd_txn_new"] = twd_new
 
     # --- 信用卡已出帳明細（append-only）---

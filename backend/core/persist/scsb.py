@@ -509,7 +509,10 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
                     "memo": r.get("remarks") or None,
                 })
             if rows:
-                twd_new = store.upsert_twd_txns(rows, rules=rules, commit=False)
+                twd_new = store.upsert_twd_txns(
+                    rows, rules=rules, commit=False,
+                    suppress_history_cursor=data.get("history_coverage") is not None,
+                )
         delta["twd_txn_new"] = twd_new
 
 
