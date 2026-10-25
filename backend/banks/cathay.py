@@ -542,23 +542,16 @@ class CathayCrawler(BankCrawler):
         if start is not None and end is not None:
             for row in details:
                 try:
-                    normalized_datetime = cls._normalize_twd_datetime(
+                    cls._normalize_twd_datetime(
                         row.get("txnDateTime"),
                     )
                 except ValueError:
                     raise RuntimeError("cathay-twd-history-transaction-date")
-                transaction_date = datetime.fromisoformat(
-                    normalized_datetime.replace("Z", "+00:00"),
-                ).date()
-                if not start <= transaction_date <= end:
-                    raise RuntimeError("cathay-twd-history-transaction-range")
                 account_date = row.get("accountDate")
                 if account_date is not None:
                     parsed_account_date = cls._twd_response_date(account_date)
                     if parsed_account_date is None:
                         raise RuntimeError("cathay-twd-history-transaction-date")
-                    if not start <= parsed_account_date <= end:
-                        raise RuntimeError("cathay-twd-history-transaction-range")
                 if any(
                     value is not None and not isinstance(value, str)
                     for value in (
@@ -1210,7 +1203,7 @@ class CathayCrawler(BankCrawler):
         consume_country = raw_country if (raw_country and str(raw_country).strip()) else None
 
         posting = self._twd_response_date(t.get("postingDate"))
-        post_date = posting.isoformat() if posting is not None and posting <= date.today() else None
+        post_date = posting.isoformat() if posting is not None else None
 
         return {
             "card_no": self.mask_card(t.get("cardNo") or t.get("mobileCardNo")),

@@ -1277,34 +1277,26 @@ def test_taishin_result_snapshot_rejects_malformed_grouped_money() -> None:
         )
 
 
-def test_taishin_result_snapshot_rejects_unrelated_account_date() -> None:
+def test_taishin_result_snapshot_preserves_distant_account_date() -> None:
     snapshot = _result_snapshot()
     snapshot["rows"][0][1] = "2035/01/01"
 
-    with pytest.raises(RuntimeError, match="taishin-twd-history-dom"):
-        TaishinCrawler._validate_history_snapshot(
-            snapshot,
-            identity=ACCOUNT,
-            period="12_months",
-            start=date(2025, 9, 2),
-            end=date(2026, 9, 2),
-            api_row_count=1,
-        )
+    result = TaishinCrawler._validate_history_snapshot(
+        snapshot, identity=ACCOUNT, period="12_months",
+        start=date(2025, 9, 2), end=date(2026, 9, 2), api_row_count=1,
+    )
+    assert result["rows"][0]["account_date"] == "2035-01-01"
 
 
-def test_taishin_result_snapshot_rejects_account_date_outside_query_window() -> None:
+def test_taishin_result_snapshot_preserves_account_date_outside_query_window() -> None:
     snapshot = _result_snapshot()
     snapshot["rows"][0][1] = "2026/09/03"
 
-    with pytest.raises(RuntimeError, match="taishin-twd-history-dom"):
-        TaishinCrawler._validate_history_snapshot(
-            snapshot,
-            identity=ACCOUNT,
-            period="12_months",
-            start=date(2025, 9, 2),
-            end=date(2026, 9, 2),
-            api_row_count=1,
-        )
+    result = TaishinCrawler._validate_history_snapshot(
+        snapshot, identity=ACCOUNT, period="12_months",
+        start=date(2025, 9, 2), end=date(2026, 9, 2), api_row_count=1,
+    )
+    assert result["rows"][0]["account_date"] == "2026-09-03"
 
 
 def test_taishin_result_snapshot_rejects_same_count_stale_dom() -> None:

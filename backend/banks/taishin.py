@@ -523,12 +523,6 @@ class TaishinCrawler(BankCrawler):
             account_day = datetime.strptime(row[1], "%Y/%m/%d").date()
         except ValueError:
             raise RuntimeError(error) from None
-        if (
-            not start <= txn_at.date() <= end
-            or not start <= account_day <= end
-            or abs((account_day - txn_at.date()).days) > 7
-        ):
-            raise RuntimeError(error)
         description, memo = row[2], row[5]
         if not description:
             raise RuntimeError(error)

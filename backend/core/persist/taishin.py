@@ -406,7 +406,10 @@ def _persist_taishin(
     delta.setdefault("balance_days", 0)
     twd_rows = attested_twd_rows
     twd_new = (
-        store.upsert_twd_txns(twd_rows, rules=rules, commit=commit)
+        store.upsert_twd_txns(
+            twd_rows, rules=rules, commit=commit,
+            suppress_history_cursor=data.get("history_coverage") is not None,
+        )
         if twd_rows else 0
     )
     delta["twd_txn_new"] = twd_new

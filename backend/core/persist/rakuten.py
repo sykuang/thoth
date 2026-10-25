@@ -206,7 +206,10 @@ def _persist_rakuten(
             "loanBalance": None,
         }], commit=False)
         balance_days = 1
-    twd_new = store.upsert_twd_txns(txns, rules=rules, commit=False) if txns else 0
+    twd_new = store.upsert_twd_txns(
+        txns, rules=rules, commit=False,
+        suppress_history_cursor=data.get("history_coverage") is not None,
+    ) if txns else 0
     delta = {
         "bank": "rakuten",
         "scope": "structured",

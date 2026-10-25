@@ -453,14 +453,13 @@ class RakutenCrawler(BankCrawler):
             if not isinstance(row, dict) or set(row) != row_keys:
                 raise RuntimeError(error)
             try:
-                transacted = datetime.strptime(
+                datetime.strptime(
                     f"{row['sysDate']} {row['sysTime']}", "%Y/%m/%d %H:%M:%S",
-                ).date()
+                )
             except (KeyError, TypeError, ValueError):
                 raise RuntimeError(error) from None
             if (
-                not start <= transacted <= end
-                or not isinstance(row["txDesc"], str)
+                not isinstance(row["txDesc"], str)
                 or not row["txDesc"].strip()
                 or len(row["txDesc"]) > 2_000
                 or row["nickNameOrAcct"] is not None

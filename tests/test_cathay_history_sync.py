@@ -115,6 +115,28 @@ def test_cathay_twd_response_fails_closed_on_wrong_account_or_truncation():
             )
 
 
+@pytest.mark.parametrize("field", ["txnDateTime", "accountDate"])
+@pytest.mark.parametrize("bank_date", ["1999-01-01", "2099-01-01"])
+def test_cathay_twd_preserves_dates_outside_requested_window(field, bank_date):
+    detail = {
+        "txnDateTime": "2026-08-20T10:00:00", "accountDate": "2026-08-20",
+        "expendAmt": "1", "incomeAmt": None,
+    }
+    detail[field] = bank_date + ("T10:00:00" if field == "txnDateTime" else "")
+    response = {"success": True, "returnCode": "0000", "content": {"datas": [{
+        "queryStatus": "SUCCESS", "accountNumber": "00001234", "count": 1,
+        "startDate": "2026-08-01", "endDate": "2026-08-30", "details": [detail],
+    }]}}
+
+    account = CathayCrawler._validated_twd_account(
+        response, "00001234", start=date(2026, 8, 1), end=date(2026, 8, 30),
+    )
+    transaction = object.__new__(CathayCrawler)._normalize_twd_transactions(account["details"])[0]
+
+    assert transaction["datetime"] == detail["txnDateTime"]
+    assert transaction["account_date"] == detail["accountDate"]
+
+
 def test_cathay_twd_response_accepts_exact_iso_datetime_range():
     response = {
         "success": "true",
@@ -210,7 +232,7 @@ def test_cathay_history_template_requires_exact_owned_endpoint(mutation):
         "query_status", "account_normalized", "start", "start_suffix", "end",
         "end_slash", "fractional_count", "invalid_amount", "missing_datetime",
         "bad_time", "bad_account_date", "bad_description", "oversized_amount",
-        "precision_loss_amount", "account_date_out_of_range", "negative_expend",
+        "precision_loss_amount", "negative_expend",
         "negative_income", "missing_flow_amounts",
     ],
 )
@@ -256,8 +278,6 @@ def test_cathay_twd_response_binds_status_range_count_and_persistable_rows(mutat
         account["details"][0]["expendAmt"] = "1e30"
     elif mutation == "precision_loss_amount":
         account["details"][0]["expendAmt"] = "9007199254740993"
-    elif mutation == "account_date_out_of_range":
-        account["details"][0]["accountDate"] = "1999-01-01"
     elif mutation == "negative_expend":
         account["details"][0]["expendAmt"] = "-1"
     elif mutation == "negative_income":

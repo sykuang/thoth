@@ -700,7 +700,7 @@ def test_hsbc_posted_history_rechecks_deadline_after_fetch(monkeypatch) -> None:
     assert len(page.args) == 1
 
 
-def test_hsbc_incremental_history_filters_after_complete_bank_pagination() -> None:
+def test_hsbc_incremental_history_preserves_all_rows_after_complete_bank_pagination() -> None:
     card_id = "card-id-7034"
     identity = "4029-****-****-7034"
     end = date(2026, 8, 31)
@@ -709,6 +709,8 @@ def test_hsbc_incremental_history_filters_after_complete_bank_pagination() -> No
     second = [_posted_row(end - timedelta(days=offset)) for offset in range(10, 20)]
     third = [_posted_row(end - timedelta(days=offset)) for offset in range(20, 30)]
     fourth = [_posted_row(end - timedelta(days=30))]
+    first[0]["postedDate"] = "9999-12-30T00:00"
+    first[0]["transactionDate"] = "9999-12-31T00:00"
     page = _Page([
         _page_response(card_id, 0, 4, first),
         _page_response(card_id, 1, 4, second),
@@ -725,14 +727,14 @@ def test_hsbc_incremental_history_filters_after_complete_bank_pagination() -> No
         end=end,
     )
 
-    assert len(result["rows"]) == 19
+    assert result["rows"] == first + second + third + fourth
     assert result["receipt"] == {
         "identity": identity,
         "start": "2026-08-13",
         "end": "2026-08-31",
         "status": "complete",
         "pages": 4,
-        "rows": 19,
+        "rows": 31,
     }
     assert [args["url"].rsplit("=", 1)[-1] for args in page.args] == [
         "0", "1", "2", "3", "0", "1", "2", "3",
@@ -929,6 +931,7 @@ def test_hsbc_history_does_not_assume_unproven_page_sort_order() -> None:
 
     assert [row["postedDate"] for row in result["rows"]] == [
         "2026-08-31T00:00",
+        "2026-08-29T00:00",
         "2026-08-30T00:00",
     ]
 
@@ -997,7 +1000,7 @@ def test_hsbc_posted_history_accepts_exact_empty_first_page() -> None:
         "short-nonfinal-page",
         "empty-before-last-page",
 
-        "future-row",
+        "invalid-posted-date",
         "invalid-transaction-date",
         "invalid-transaction-time",
         "invalid-amount",
@@ -1008,7 +1011,8 @@ def test_hsbc_posted_history_accepts_exact_empty_first_page() -> None:
         "invalid-foreign-flag",
         "invalid-foreign-amount",
         "foreign-flag-with-twd",
-        "future-transaction-date",
+        "missing-transaction-date",
+        "missing-posted-date",
         "empty-description",
         "oversized-description",
     ),
@@ -1055,8 +1059,8 @@ def test_hsbc_posted_history_fails_closed_on_transport_or_pagination_drift(
     elif mutation == "empty-before-last-page":
         responses[0]["body"]["payload"]["content"] = []
 
-    elif mutation == "future-row":
-        responses[0]["body"]["payload"]["content"][0]["postedDate"] = "2026-09-01T00:00"
+    elif mutation == "invalid-posted-date":
+        responses[0]["body"]["payload"]["content"][0]["postedDate"] = "2026-02-30T00:00"
     elif mutation == "invalid-transaction-date":
         responses[0]["body"]["payload"]["content"][0]["transactionDate"] = "2026-02-30T00:00"
     elif mutation == "invalid-transaction-time":
@@ -1081,10 +1085,10 @@ def test_hsbc_posted_history_fails_closed_on_transport_or_pagination_drift(
         row = responses[0]["body"]["payload"]["content"][0]
         row["isForeign"] = True
         row["foreignAmount"] = "100 TWD"
-    elif mutation == "future-transaction-date":
-        responses[0]["body"]["payload"]["content"][0]["transactionDate"] = (
-            "9999-12-31T00:00"
-        )
+    elif mutation == "missing-transaction-date":
+        responses[0]["body"]["payload"]["content"][0].pop("transactionDate")
+    elif mutation == "missing-posted-date":
+        responses[0]["body"]["payload"]["content"][0].pop("postedDate")
     elif mutation == "empty-description":
         responses[0]["body"]["payload"]["content"][0]["description"] = " "
     elif mutation == "oversized-description":
@@ -1274,6 +1278,69 @@ def _persist_payload() -> dict:
     }
 
 
+def test_hsbc_posted_history_rejects_exact_known_null_before_attesting(store) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    detail = payload["card_detail"][identity]
+    detail["posted"][0]["postedDate"] = "0002-11-30T00:00"
+    page = _Page([_page_response(detail["card_id"], 0, 1, detail["posted"])])
+
+    # Persistence already treats this exact native value as no posting date.
+    with pytest.raises(ValueError, match="invalid HSBC history transaction"):
+        persist_collected("hsbc", payload, store)
+    with pytest.raises(RuntimeError, match="^hsbc-posted-history$"):
+        HsbcCrawler._fetch_posted_history(
+            page,
+            card_id=detail["card_id"],
+            identity=identity,
+            token="Bearer synthetic-token",
+            start=date(2025, 9, 1),
+            end=date(2026, 8, 31),
+        )
+
+    assert len(page.args) == 1  # Reject before replay/completeness attestation.
+    assert store.conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+    assert store.latest_card_transaction_dates() == {}
+
+
+@pytest.mark.parametrize("posted_date", [
+    "0003-11-30T00:00",
+    "0002-11-30T00:00:00",
+    "0002-11-30T00:00Z",
+])
+def test_hsbc_posted_history_preserves_non_null_ancient_dates_end_to_end(
+    store, posted_date,
+) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    detail = payload["card_detail"][identity]
+    detail["posted"][0]["postedDate"] = posted_date
+    expected_rows = deepcopy(detail["posted"])
+
+    result = HsbcCrawler._fetch_posted_history(
+        _Page([_page_response(detail["card_id"], 0, 1, expected_rows)]),
+        card_id=detail["card_id"],
+        identity=identity,
+        token="Bearer synthetic-token",
+        start=date(2025, 9, 1),
+        end=date(2026, 8, 31),
+    )
+    assert result["rows"] == expected_rows
+    assert result["receipt"]["status"] == "complete"
+    detail["posted"] = result["rows"]
+    detail["posted_receipt"] = result["receipt"]
+    payload["history_coverage"]["domains"][0]["windows"] = [result["receipt"]]
+
+    delta = persist_collected("hsbc", payload, store)
+
+    assert delta["card_billed_new"] == 1
+    saved = store.conn.execute(
+        "SELECT consume_date, post_date FROM card_billed_txns",
+    ).fetchone()
+    assert tuple(saved) == ("2026-08-31", posted_date.split("T")[0])
+    assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
+
+
 def test_hsbc_persistence_revalidates_history_before_writing(store) -> None:
     payload = _persist_payload()
 
@@ -1285,6 +1352,59 @@ def test_hsbc_persistence_revalidates_history_before_writing(store) -> None:
     assert store.latest_card_transaction_dates() == {
         "4029-****-****-7034": date(2026, 8, 31),
     }
+
+
+@pytest.mark.parametrize(
+    ("posted_date", "transaction_date", "unposted"),
+    (
+        ("2025-08-31T00:00", "2026-08-31T00:00", False),
+        ("9999-12-30T00:00", "9999-12-31T00:00", False),
+        ("0001-01-01T00:00", "0001-01-02T00:00", False),
+        ("2025-08-31T00:00", None, True),
+        ("9999-12-30T00:00", "9999-12-31T00:00", True),
+        ("0001-01-01T00:00", "2026-08-31T00:00", True),
+        ("0002-11-30T00:00", "9999-12-31T00:00", True),
+        (None, "0001-01-01T00:00", True),
+    ),
+)
+def test_hsbc_persistence_preserves_bank_dates_without_plausibility_limits(
+    store, monkeypatch, posted_date, transaction_date, unposted,
+) -> None:
+    payload = _persist_payload()
+    identity = payload["cards"][0]["maskedCardNumber"]
+    entry = payload["card_detail"][identity]
+    row = _posted_row(date(2026, 8, 31))
+    row.update({
+        "description": "native-bank-date",
+        "postedDate": posted_date,
+        "transactionDate": transaction_date,
+        "isPositive": False,
+        "isForeign": True,
+        "foreignAmount": "-12.34 USD",
+    })
+    entry["unposted" if unposted else "posted"] = [row]
+
+    persist_collected("hsbc", payload, store)
+
+    is_pending = posted_date in (None, "0002-11-30T00:00")
+    table = "card_pending_txns" if is_pending else "card_billed_txns"
+    saved = store.conn.execute(
+        f"SELECT consume_date, post_date, amount, consume_currency, consume_amount FROM {table} "
+        "WHERE description = 'native-bank-date'",
+    ).fetchone()
+    expected_posted = None if is_pending else posted_date.split("T")[0]
+    expected_transaction = transaction_date.split("T")[0] if transaction_date else expected_posted
+    assert saved is not None
+    assert tuple(saved) == (expected_transaction, expected_posted, -100, "USD", 12.34)
+    assert store.latest_card_transaction_dates() == {identity: date(2026, 8, 31)}
+    crawler = _crawler()
+    crawler.configure_transaction_cursor(
+        "card_billed_transactions", store.latest_card_transaction_dates(),
+    )
+    monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "incremental")
+    assert crawler._card_history_range(identity, end=date(2026, 8, 31)) == (
+        date(2026, 8, 24), date(2026, 8, 31),
+    )
 
 
 def test_hsbc_persistence_accepts_native_signed_domestic_metadata(store) -> None:
@@ -1438,7 +1558,7 @@ def test_hsbc_unbilled_accepts_posted_date_without_transaction_date(store) -> No
 
 
 @pytest.mark.parametrize("sentinel", ["0002-11-30T00:00:00", "0002-11-30T00:00Z"])
-def test_hsbc_unbilled_rejects_alternate_ancient_sentinel_without_transaction_date(
+def test_hsbc_unbilled_preserves_valid_ancient_dates_without_transaction_date(
     store, sentinel,
 ) -> None:
     payload = _persist_payload()
@@ -1448,8 +1568,11 @@ def test_hsbc_unbilled_rejects_alternate_ancient_sentinel_without_transaction_da
     pending["postedDate"] = sentinel
     payload["card_detail"][identity]["unposted"] = [pending]
 
-    with pytest.raises(ValueError, match="invalid HSBC history transaction"):
-        persist_collected("hsbc", payload, store)
+    persist_collected("hsbc", payload, store)
+    saved = store.conn.execute(
+        "SELECT consume_date, post_date FROM card_billed_txns WHERE post_date = '0002-11-30'",
+    ).fetchone()
+    assert saved is not None and tuple(saved) == ("0002-11-30", "0002-11-30")
     assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
 
 
@@ -1595,7 +1718,7 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "receipt-mismatch",
         "row-count",
         "status",
-        "row-outside-window",
+        "missing-posted-date",
         "invalid-posted-date",
         "invalid-transaction-date",
         "invalid-transaction-time",
@@ -1604,7 +1727,7 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "scientific-amount",
         "fractional-twd",
         "invalid-direction",
-        "future-transaction-date",
+        "missing-transaction-date",
         "invalid-foreign-amount",
         "foreign-flag-with-twd",
         "invalid-unposted",
@@ -1620,7 +1743,7 @@ def test_hsbc_empty_inventory_rejects_short_full_window_before_write(store) -> N
         "invalid-card-date",
         "duplicate-detail-key",
         "garbage-unposted-placeholder",
-        "alternate-unposted-placeholder",
+        "dateless-unposted-placeholder",
         "missing-card-status",
         "future-coverage-end",
     ),
@@ -1682,8 +1805,8 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
     elif mutation == "status":
         detail["posted_receipt"]["status"] = "explicit_empty"
         domain["windows"][0]["status"] = "explicit_empty"
-    elif mutation == "row-outside-window":
-        detail["posted"][0]["postedDate"] = "2025-08-31T00:00"
+    elif mutation == "missing-posted-date":
+        detail["posted"][0].pop("postedDate")
     elif mutation == "invalid-posted-date":
         detail["posted"][0]["postedDate"] = "2026-02-30T00:00"
     elif mutation == "invalid-transaction-date":
@@ -1698,8 +1821,8 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
         detail["posted"][0]["ntdAmount"] = "1e3 TWD"
     elif mutation == "fractional-twd":
         detail["posted"][0]["ntdAmount"] = "0.1 TWD"
-    elif mutation == "future-transaction-date":
-        detail["posted"][0]["transactionDate"] = "9999-12-31T00:00"
+    elif mutation == "missing-transaction-date":
+        detail["posted"][0].pop("transactionDate")
     elif mutation == "invalid-foreign-amount":
         detail["posted"][0]["isForeign"] = True
         detail["posted"][0]["foreignAmount"] = "Infinity USD"
@@ -1749,9 +1872,10 @@ def test_hsbc_persistence_rejects_unbound_or_malformed_history_before_write(
         row = _posted_row(date(2026, 8, 30))
         row["postedDate"] = "0002-garbage"
         detail["unposted"] = [row]
-    elif mutation == "alternate-unposted-placeholder":
+    elif mutation == "dateless-unposted-placeholder":
         row = _posted_row(date(2026, 8, 30))
-        row["postedDate"] = "0001-01-01T00:00"
+        row["postedDate"] = "0002-11-30T00:00"
+        row.pop("transactionDate")
         detail["unposted"] = [row]
     elif mutation == "missing-card-status":
         payload["cards"][0].pop("cardStatusDisplay")

@@ -900,8 +900,11 @@ class HsbcCrawler(BankCrawler):
     def _validate_posted_row(cls, row: object, *, end: date) -> date:
         if not isinstance(row, dict):
             raise RuntimeError("hsbc-posted-history")
+        # This exact native sentinel means unposted, not an ancient posting date.
+        if row.get("postedDate") == "0002-11-30T00:00":
+            raise RuntimeError("hsbc-posted-history")
         posted = cls._api_date(row.get("postedDate"))
-        transaction = cls._api_date(row.get("transactionDate"))
+        cls._api_date(row.get("transactionDate"))
         amount = row.get("ntdAmount") or row.get("amount")
         match = re.fullmatch(
             r"([+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?) TWD",
@@ -924,8 +927,6 @@ class HsbcCrawler(BankCrawler):
             or type(is_foreign) is not bool
             or not isinstance(description, str)
             or not 0 < len(description.strip()) <= 512
-            or transaction > posted
-            or transaction > end
         ):
             raise RuntimeError("hsbc-posted-history")
         if is_foreign:
@@ -1059,12 +1060,11 @@ class HsbcCrawler(BankCrawler):
                 raise RuntimeError("hsbc-posted-history")
             snapshots.append(snapshot)
 
+            # The endpoint is unfiltered and has no proven date sort order:
+            # retain every row and stop only at totalPages (within existing budgets).
             for row in rows:
-                row_date = cls._validate_posted_row(row, end=end)
-                if row_date > end:
-                    raise RuntimeError("hsbc-posted-history")
-                if row_date >= start:
-                    selected_rows.append(row)
+                cls._validate_posted_row(row, end=end)
+                selected_rows.append(row)
             pages += 1
             if page_number + 1 == total_pages:
                 break

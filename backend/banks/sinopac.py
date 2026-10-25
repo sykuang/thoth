@@ -801,12 +801,10 @@ class SinopacCrawler(BankCrawler):
             r"<br\s*/?>", " ", row["DataText1"], flags=re.IGNORECASE,
         ).strip()
         try:
-            transacted = datetime.strptime(raw_datetime, "%Y/%m/%d %H:%M")
-            account_date = datetime.strptime(row["DataText2"].strip(), "%Y/%m/%d").date()
+            datetime.strptime(raw_datetime, "%Y/%m/%d %H:%M")
+            datetime.strptime(row["DataText2"].strip(), "%Y/%m/%d")
         except ValueError:
             raise RuntimeError(error) from None
-        if not start <= transacted.date() <= end or not start <= account_date <= end:
-            raise RuntimeError(error)
         description = _plain_text(row["DataText3"])
         if not description or len(description) > 500:
             raise RuntimeError(error)

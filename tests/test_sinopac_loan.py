@@ -242,7 +242,7 @@ def test_cli_repayments_use_isolated_unscoped_source(tmp_path, monkeypatch):
         store.close()
 
 
-def test_repayment_window_bounds_payment_date_not_original_due_date():
+def test_repayment_preserves_payment_and_due_dates_outside_query_window():
     from backend.core.persist.sinopac import _parse_sinopac_repayment
     repayment = _repayment()
     repayment["records"][0]["DataValue1"] = "2026/07/06"
@@ -250,8 +250,7 @@ def test_repayment_window_bounds_payment_date_not_original_due_date():
     assert rows[0]["due_date"] == "2026-07-06"
     assert rows[0]["paid_on"] == "2026-08-06"
     repayment["records"][0]["DataValue2"] = "2026/07/06"
-    with pytest.raises(ValueError, match="SinoPac repayment"):
-        _parse_sinopac_repayment("0123456789012", repayment)
+    assert _parse_sinopac_repayment("0123456789012", repayment)[0]["paid_on"] == "2026-07-06"
 
 
 @pytest.mark.parametrize("mutation", [
@@ -264,7 +263,7 @@ def test_repayment_window_bounds_payment_date_not_original_due_date():
     lambda p: p["receipt"].update(currency="USD"),
     lambda p: p["receipt"].update(start="2026-8-01"),
     lambda p: p["receipt"].update(end="2026-02-30"),
-    lambda p: p["records"][0].update(DataValue2="2026/07/06"),
+    lambda p: p["records"][0].update(DataValue2="2026/02/30"),
     lambda p: p["records"][0].update(DataValue1="2026/02/30"),
     lambda p: p["records"][0].update(DataValue11="NaN"),
     lambda p: p["records"][0].update(DataValue3="10,301"),

@@ -240,7 +240,9 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
                 continue
             t.setdefault("account_no", acct_no)
             txns.append(t)
-        twd_new += store.upsert_twd_txns(txns, rules=rules)
+        twd_new += store.upsert_twd_txns(
+            txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+        )
     delta["twd_txn_new"] = twd_new
     if twd_skipped_invalid_amount:
         delta["twd_txn_skipped_invalid_amount"] = twd_skipped_invalid_amount
@@ -272,7 +274,9 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
                 continue
             t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
             real_txns.append(t)
-        billed_new += store.upsert_card_billed(real_txns, rules=rules)
+        billed_new += store.upsert_card_billed(
+            real_txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+        )
     delta["card_billed_new"] = billed_new
     if billed_skipped_summary:
         delta["card_billed_skipped_summary"] = billed_skipped_summary

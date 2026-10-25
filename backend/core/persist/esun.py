@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import re
@@ -233,8 +234,8 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
         ):
             raise ValueError("invalid E.SUN TWD history pagination")
         status = window.get("status")
-        window_start = date.fromisoformat(window["start"])
-        window_end = date.fromisoformat(window["end"])
+        date.fromisoformat(window["start"])
+        date.fromisoformat(window["end"])
         if status == "complete":
             rows = _parse_esun_twd_txn_results([result])
             row_count = snapshot.get("gridRowCount")
@@ -252,13 +253,6 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
                 or not isinstance(grid_rows, list)
                 or len(grid_rows) != row_count
                 or len(rows) != row_count
-                or any(
-                    not (
-                        window_start <= date.fromisoformat(row["datetime"][:10]) <= window_end
-                        and window_start <= date.fromisoformat(row["account_date"]) <= window_end
-                    )
-                    for row in rows
-                )
             ):
                 raise ValueError("invalid E.SUN TWD complete result coverage")
             parsed.extend(rows)
@@ -310,23 +304,20 @@ def _validated_esun_spa_rows(data: dict) -> list[dict]:
     if any(re.fullmatch(r"\d{13}", identity) is None for identity in identities):
         raise ValueError("invalid E.SUN SPA TWD identity")
     validated = []
-    seen = [0] * len(windows)
+    complete_accounts = Counter(window["identity"] for window in windows if window["status"] == "complete")
+    seen = Counter()
     for original in rows:
         if not isinstance(original, dict) or "account_date" not in original:
             raise ValueError("invalid E.SUN SPA TWD row")
         row = _validated_esun_twd_row(dict(original), unknown_account_date=True)
         if row["balance"] is None or row["account_no"] not in identities:
             raise ValueError("invalid E.SUN SPA TWD row")
-        day = date.fromisoformat(row["datetime"][:10])
-        matching = [i for i, window in enumerate(windows) if
-                    window["identity"] == row["account_no"]
-                    and window["start"] <= day.isoformat() <= window["end"]
-                    and window["status"] == "complete"]
-        if len(matching) != 1:
-            raise ValueError("E.SUN SPA TWD row outside complete window")
-        seen[matching[0]] += 1
+        # Rows are flattened across queries; dates cannot recover window provenance.
+        if row["account_no"] not in complete_accounts:
+            raise ValueError("E.SUN SPA TWD row lacks complete account coverage")
+        seen[row["account_no"]] += 1
         validated.append(row)
-    if any(window["status"] == "complete" and not seen[i] for i, window in enumerate(windows)):
+    if any(seen[identity] < count for identity, count in complete_accounts.items()):
         raise ValueError("E.SUN SPA TWD complete window lacks rows")
     return validated
 
@@ -401,7 +392,10 @@ def persist_esun(
 
     # --- TWD deposit transactions (FAO01002 存款交易明細查詢) ---
     if twd_rows:
-        delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules, commit=commit)
+        delta["twd_txn_new"] = store.upsert_twd_txns(
+            twd_rows, rules=rules, commit=commit,
+            suppress_history_cursor=data.get("history_coverage") is not None,
+        )
 
     # --- card_summary（信用卡額度/點數/截止日）---
     # Step 2 (2026-06-14): card_summary 是整戶層, 套到 card_transactions 出現的所有卡 (ESun 通常 1 張卡).

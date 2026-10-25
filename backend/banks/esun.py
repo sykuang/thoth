@@ -746,24 +746,13 @@ class EsunCrawler(BankCrawler):
             grid_rows = snapshot.get("gridRows")
             if not isinstance(grid_rows, list):
                 raise RuntimeError("esun-twd-history-result")
-            try:
-                dates = [
-                    date.fromisoformat(match.group(1).replace("/", "-"))
-                    for cells in grid_rows
-                    for cell in cells
-                    if (match := re.fullmatch(r"\*?(20\d{2}/\d{2}/\d{2})", cell))
-                ]
-            except (TypeError, ValueError):
-                raise RuntimeError("esun-twd-history-result") from None
             row_count = snapshot.get("gridRowCount")
             if (
                 type(row_count) is not int
                 or row_count <= 0
                 or total_count is not None and total_count != row_count
                 or not grid_text.strip()
-                or len(dates) != row_count
                 or snapshot.get("emptyMarker") is not None
-                or any(day < start or day > end for day in dates)
             ):
                 raise RuntimeError("esun-twd-history-result")
             from backend.core.persist.esun import _parse_esun_twd_txn_results
@@ -776,15 +765,13 @@ class EsunCrawler(BankCrawler):
                 raise RuntimeError("esun-twd-history-result")
             for row in rows:
                 try:
-                    txn_day = date.fromisoformat(str(row["datetime"])[:10])
-                    account_day = date.fromisoformat(row["account_date"])
+                    date.fromisoformat(str(row["datetime"])[:10])
+                    date.fromisoformat(row["account_date"])
                 except (KeyError, TypeError, ValueError):
                     raise RuntimeError("esun-twd-history-result") from None
                 money = (row.get("expend"), row.get("income"))
                 if (
                     row.get("account_no") != identity
-                    or not start <= txn_day <= end
-                    or not start <= account_day <= end
                     or not isinstance(row.get("desc"), str)
                     or not row["desc"].strip()
                     or not any(value is not None for value in money)

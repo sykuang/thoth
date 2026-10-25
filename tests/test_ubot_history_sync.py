@@ -234,7 +234,7 @@ def test_ubot_history_response_fails_closed(mutation: str) -> None:
     elif mutation == "row_keys":
         hit.resp_json["RespBody"]["NTDetailList"][0].pop("PS")
     elif mutation == "tra_date":
-        hit.resp_json["RespBody"]["NTDetailList"][0]["TraDate"] = "2026/08/01"
+        hit.resp_json["RespBody"]["NTDetailList"][0]["TraDate"] = "2026/02/30"
     elif mutation == "account_date":
         hit.resp_json["RespBody"]["NTDetailList"][0]["AccountDate"] = "2026/02/30"
     elif mutation == "time":
