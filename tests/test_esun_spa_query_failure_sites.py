@@ -24,12 +24,16 @@ def synthetic_credentials_only(monkeypatch):
     monkeypatch.setattr("backend.core.creds._ENV_LOADED", True)
 
 
-def form_diagnostic(result, error, error_id):
-    """Keep exact site assertions independent of shared runtime metadata additions."""
+def form_diagnostic(result, error, error_id, *, source_attributed=True):
+    """Distinguish a producer ID from a sink-only generic fallback prefix."""
     diagnostic = dict(result["collect_diagnostics"])
-    assert diagnostic.pop("error_id") == error_id
-    prefix = format_error_id(error_id, bank="esun")
-    assert prefix is not None
+    if source_attributed:
+        assert diagnostic.pop("error_id") == error_id
+    else:
+        assert "error_id" not in diagnostic
+    registered = format_error_id(error_id, bank="esun")
+    assert registered is not None
+    prefix = registered + " | "
     suffix = ""
     for key, allowed in (
         ("stage", {"collect", "collect_transactions", "collect_navigation", "collect_validation"}),
@@ -39,11 +43,11 @@ def form_diagnostic(result, error, error_id):
             value = diagnostic.pop(key)
             assert type(value) is str and value in allowed
             suffix += f": {key}={value}"
-    assert error == result["error"]
+    assert error == (result["error"] if source_attributed else prefix + result["error"])
     assert error.endswith(suffix)
     core = error.removesuffix(suffix)
-    assert core.startswith(prefix + " | ")
-    return diagnostic, core.removeprefix(prefix + " | ")
+    assert core.startswith(prefix)
+    return diagnostic, core.removeprefix(prefix)
 
 
 @pytest.fixture
@@ -382,8 +386,42 @@ def test_gate_metadata_is_allowlisted_at_producer_and_stored_sink(product, store
         expected += ": gate=calendar_readiness"
     else:
         assert "gate" not in result["collect_diagnostics"]
-    assert form_diagnostic(result, error, "ESUN-07-960-001")[1] == expected
+    assert form_diagnostic(result, error, "ESUN-07-960-001", source_attributed=False)[1] == expected
     assert "SYNTHETIC" not in error + capsys.readouterr().err
+
+
+@pytest.mark.parametrize("marker", [
+    "calendar_readiness", "calendar_readiness\nSYNTHETIC-DOM", ["calendar_readiness"],
+    {"gate": "calendar_readiness"}, HostileValue(), HostileString("calendar_readiness"),
+], ids=["closed", "unknown", "list", "dict", "hostile-object", "hostile-string"])
+def test_offline_unattributed_failure_keeps_gate_allowlist_without_source_id(monkeypatch, capsys, marker):
+    from tests.test_esun_terminal_joined_proofs import spa_surface, actual_run
+
+    crawler, page, collector, _ = spa_surface(monkeypatch)
+
+    def fail(*_args):
+        crawler._esun_spa_phase, crawler._esun_spa_gate = "transaction_form", marker
+        raise ValueError("SYNTHETIC-PRIVATE-ERROR")
+
+    monkeypatch.setattr(crawler, "collect", fail)
+    result = actual_run(crawler, page, collector)
+    failures, store = _sink(monkeypatch, crawler)
+    monkeypatch.setattr(crawler, "run", lambda **_kwargs: result)
+    assert runner._exec_sync(17) is True
+    diagnostic, legacy = form_diagnostic(result, failures[0][1], "ESUN-07-960-001", source_attributed=False)
+    expected = dict(exception="ValueError", code="collect_contract", phase="transaction_form")
+    if type(marker) is str and marker == "calendar_readiness":
+        expected["gate"] = marker
+    assert diagnostic == expected
+    forged = dict(result, collect_diagnostics=dict(result["collect_diagnostics"], error_id="ESUN-07-960-001"))
+    with pytest.raises(AssertionError):
+        form_diagnostic(forged, failures[0][1], "ESUN-07-960-001", source_attributed=False)
+    assert legacy == "collect_failed: ValueError: code=collect_contract: phase=transaction_form" + (
+        ": gate=calendar_readiness" if "gate" in expected else "")
+    assert failures == [(17, "[ESUN-07-960-001] 銀行資料收集：尚未分類的收集動作失敗 | " + result["error"])]
+    assert "data" not in result and not page.submissions
+    store.close.assert_called_once()
+    assert "SYNTHETIC" not in result["error"] + capsys.readouterr().err
 
 
 @pytest.mark.parametrize("selector,error_id,phase,gate", [
