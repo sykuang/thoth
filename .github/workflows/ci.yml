@@ -77,7 +77,7 @@ jobs:
         # so no global env setup is needed.
         # pyproject 已設定自動排除 e2e；conftest 用 tmp_path 完全隔離 DB/secret。
         # xdist: tests are tmp_path/monkeypatch isolated (conftest), so they run in parallel.
-        run: uv run pytest -p tests.parent_offline_gate -q --tb=short -n auto --dist worksteal --durations=20
+        run: uv run python -m pytest -p tests.parent_offline_gate -q --tb=short -n auto --dist worksteal --durations=20
 
       - name: Produce synthetic checkpoint REST and WebSocket fixtures
         env:
@@ -85,7 +85,7 @@ jobs:
         run: |
           umask 077
           test ! -e "$SYNC_ERROR_HTTP_FIXTURE"
-          uv run pytest tests/test_sync_error_id_survival.py::test_producer_to_worker_db_rest_ws_push_and_cli tests/test_checkpoint_rule_provenance.py::test_natural_checkpoint_reaches_worker_rest_ws_and_push -n 0 -q --tb=short
+          uv run python -m pytest tests/test_sync_error_id_survival.py::test_producer_to_worker_db_rest_ws_push_and_cli tests/test_checkpoint_rule_provenance.py::test_natural_checkpoint_reaches_worker_rest_ws_and_push -n 0 -q --tb=short
           test -s "$SYNC_ERROR_HTTP_FIXTURE"
 
       - name: Upload synthetic checkpoint contract
