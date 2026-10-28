@@ -248,7 +248,9 @@ def test_reentrant_callback_during_collection_cannot_publish(monkeypatch, tmp_pa
 def test_post_collect_origin_or_dialog_change_blocks_proof(monkeypatch, tmp_path, shift):
     crawler = Crawler(name="esun", move_after_collect=shift == "origin", dialog_after_collect=shift == "dialog")
     result, page = run_offline(monkeypatch, tmp_path, crawler)
-    assert result["error"].startswith("collect_failed:")
+    error_id, label = ("ESUN-07-970-002", "憑證來源檢查未通過") if shift == "origin" else ("ESUN-07-970-001", "原生JavaScript對話框阻擋")
+    assert result["error"] == f"[{error_id}] 收集來源驗證：{label} | collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+    assert result["collect_diagnostics"] == {"exception": "LoginCheckpointBlocked", "code": "collect_checkpoint", "error_id": error_id}
     assert "data" not in result
     assert "proof" not in crawler.events
     assert "logout" in crawler.events if shift == "dialog" else "logout" not in crawler.events

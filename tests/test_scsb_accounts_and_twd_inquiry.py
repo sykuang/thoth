@@ -446,7 +446,7 @@ def test_scsb_twd_period_verification_detects_controlled_input_reversion():
                 ScsbCrawler._twd_inquiry_period_verification_script(), period,
             )
 
-            assert verified == {"ok": False}
+            assert verified == {"ok": False, "_diagnostic": "SCSB-05-611-002"}
         finally:
             browser.close()
 

@@ -575,7 +575,7 @@ def test_missing_form_interstitial_fails_closed_without_global_overview_click(mo
             password="PASSWORD-PRIVATE",
         )
         monkeypatch.setattr(crawler, "prepare_login_page", lambda _page: None)
-        monkeypatch.setattr(crawler, "_logged_in", lambda _page: False)
+        monkeypatch.setattr(crawler, "_logged_in", lambda _page, *, _auth_probe_ids=None: False)
 
         with pytest.raises(CtbcLoginError, match="欄位無法安全填寫.*未送出登入") as error:
             crawler._shared_login(PageProxy())
@@ -596,7 +596,7 @@ def test_unknown_modal_blocks_shared_login_without_submission(monkeypatch) -> No
         crawler = _crawler()
         submissions = Mock()
         monkeypatch.setattr(crawler, "prepare_login_page", lambda _page: None)
-        monkeypatch.setattr(crawler, "_logged_in", lambda _page: False)
+        monkeypatch.setattr(crawler, "_logged_in", lambda _page, *, _auth_probe_ids=None: False)
         monkeypatch.setattr(crawler, "submit_credentials_once", submissions)
 
         with pytest.raises(LoginCheckpointBlocked) as error:
@@ -608,6 +608,40 @@ def test_unknown_modal_blocks_shared_login_without_submission(monkeypatch) -> No
     finally:
         browser.close()
         manager.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("unknown_modal", [False, True])
+def test_shared_login_synthetic_auth_probe_keeps_original_terminal(unknown_modal, monkeypatch):
+    """The auth stub must accept the diagnostic-only callback keyword."""
+    crawler, page, _candidates, button, _modals = _submit_fixture()
+    page.frames = []
+    empty = Mock()
+    empty.count.return_value = 0
+    empty.nth.return_value.element_handle.return_value = None
+    modal = Mock()
+    modal.is_visible.return_value = True
+    modal.element_handle.return_value = object() if unknown_modal else None
+    modal.inner_text.return_value = "PRIVATE UNKNOWN"
+    modal.locator.return_value = empty
+    modals = Mock()
+    modals.count.return_value = int(unknown_modal)
+    modals.nth.return_value = modal
+    page.locator.side_effect = lambda selector: modals if selector == ".modal.show" else empty
+    page.wait_for_selector.side_effect = RuntimeError("PRIVATE-INTERSTITIAL-DOM")
+    monkeypatch.setattr(crawler, "prepare_login_page", lambda _: None)
+    monkeypatch.setattr(crawler, "_logged_in", lambda _page, *, _auth_probe_ids=None: False)
+    if unknown_modal:
+        with pytest.raises(LoginCheckpointBlocked) as caught:
+            crawler._shared_login(page)
+        assert caught.value.outcome.rule_name == "ctbc-unknown-modal"
+        assert caught.value.outcome.error_id == "CTBC-03-055-001"
+        assert caught.value.phase is CheckpointPhase.PRE_SUBMIT
+    else:
+        with pytest.raises(CtbcLoginError, match="欄位無法安全填寫.*未送出登入") as caught:
+            crawler._shared_login(page)
+    assert "PRIVATE" not in str(caught.value)
+    button.click.assert_not_called()
+    page.click.assert_not_called()
 
 
 def test_authentication_requires_exact_https_ctbc_origin() -> None:

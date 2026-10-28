@@ -885,8 +885,14 @@ def native_safe_role(target):
         # Match source expressions, not metadata strings or a current error table.
         lines=Path(query.__file__).read_text().splitlines()
         line=next(line for name,line,path in frames if name=='query_twd' and path==query.__file__)
-        expression=lines[line-1]
-        role='radio-before' if 'if not one(radio' in expression else 'radio-after' if line<400 else 'radio-final' if line<490 else 'radio-submit'
+        tree = ast.parse('\n'.join(lines))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'query_twd')
+        calls = sorted(n.lineno for statement in function.body if not isinstance(statement, ast.FunctionDef)
+                       for n in ast.walk(statement) if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Name) and n.func.id == 'one'
+                       and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == 'radio')
+        assert len(calls) == 4
+        role = ('radio-before', 'radio-after', 'radio-final', 'radio-submit')[calls.index(line)]
         return ('query_twd',role)
     if 'submit' in s:return ('query_twd','submit')
     return ('query_twd',field+('-input' if 'input.combo-input' in s and '.calendar-base' not in s

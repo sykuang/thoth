@@ -146,8 +146,23 @@ def _plain_bank_cases():
     return cases
 
 
+@pytest.fixture
+def taishin_history_clock(bank, monkeypatch):
+    """Keep public history preflight on the synthetic receipts' attested day."""
+    if bank == "taishin":
+        from datetime import datetime
+        from backend.core.persist import taishin
+
+        class ReceiptDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 28, 12, tzinfo=tz)
+
+        monkeypatch.setattr(taishin, "datetime", ReceiptDatetime)
+
+
 @pytest.mark.parametrize("bank,number,data,cards", _plain_bank_cases())
-def test_plain_json_bank_persister_source_roles(bank, number, data, cards, record_property):
+def test_plain_json_bank_persister_source_roles(bank, number, data, cards, record_property, taishin_history_clock):
     from copy import deepcopy
     from backend.core import persist
     store = PersisterStore(bank, cards)
@@ -228,7 +243,7 @@ def test_natural_text_parsers_configured_context(bank, number, record_property):
 
 
 @pytest.mark.parametrize("bank,shadow,first", [("dbs", 836, 834), ("linebank", 831, 830), ("sinopac", 835, 834), ("sinopac", 843, 842), ("sinopac", 846, 839), ("ubot", 849, 833), ("taishin", 839, 833)])
-def test_plain_json_duplicate_operand_first_failure_control(bank, shadow, first, record_property):
+def test_plain_json_duplicate_operand_first_failure_control(bank, shadow, first, record_property, taishin_history_clock):
     import sys
     from copy import deepcopy
     from datetime import date

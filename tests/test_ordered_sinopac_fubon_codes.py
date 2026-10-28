@@ -1406,7 +1406,17 @@ def test_catalog_is_literal_registered_bank_owned_and_chinese(bank):
     from pathlib import Path
     import re
     catalog = import_module(f"backend.core.error_catalog.{bank}")
-    codes = ast.literal_eval(ast.parse(Path(catalog.__file__).read_text()).body[1].value)
+    tree = ast.parse(Path(catalog.__file__).read_text())
+    codes = ast.literal_eval(tree.body[1].value)
+    # Catalogs append literal source-owned checkpoint allocations via update.
+    for node in tree.body[2:]:
+        assert isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        call = node.value
+        assert ast.unparse(call.func) == "CODES.update"
+        assert len(call.args) == 1 and not call.keywords
+        additions = ast.literal_eval(call.args[0])
+        assert not codes.keys() & additions.keys(), "catalog allocation reused"
+        codes.update(additions)
     assert codes == catalog.CODES
     assert len(codes) < 4096
     for code, (action, reason) in codes.items():

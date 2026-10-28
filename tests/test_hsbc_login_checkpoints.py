@@ -648,7 +648,10 @@ def test_first_stage_dialog_blocks_final_submit_and_collect(monkeypatch, tmp_pat
 
         result = crawler.run("https://example.invalid", headless=True)
 
-        assert result["error"] == "RuntimeError: login failed"
+        assert result["error"] == (
+            "[HSBC-02-326-001] 登入送出：帳號階段出現未分類提示；未送出登入 (RuntimeError)"
+            " | RuntimeError: login failed"
+        )
         assert "PRIVATE" not in result["error"]
         assert page.locator("body").get_attribute("data-challenge") == "1"
         assert page.locator("body").get_attribute("data-final") == "0"
