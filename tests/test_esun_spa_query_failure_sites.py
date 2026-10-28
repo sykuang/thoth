@@ -12,6 +12,7 @@ import pytest
 from patchright.sync_api import JSHandle, Locator, TimeoutError
 
 from backend.banks.esun_spa import query
+from backend.core.error_codes import format_error_id
 from backend.server import sync_jobs_repo, sync_runner as runner
 from tests.test_esun_spa_product import PATHS, browser as browser, product as product
 from tests.test_esun_spa_completion import inventory_product as inventory_product
@@ -23,9 +24,16 @@ def synthetic_credentials_only(monkeypatch):
     monkeypatch.setattr("backend.core.creds._ENV_LOADED", True)
 
 
-def form_diagnostic(result, error):
-    """Keep exact site assertions independent of shared runtime metadata additions."""
+def form_diagnostic(result, error, error_id, *, source_attributed=True):
+    """Distinguish a producer ID from a sink-only generic fallback prefix."""
     diagnostic = dict(result["collect_diagnostics"])
+    if source_attributed:
+        assert diagnostic.pop("error_id") == error_id
+    else:
+        assert "error_id" not in diagnostic
+    registered = format_error_id(error_id, bank="esun")
+    assert registered is not None
+    prefix = registered + " | "
     suffix = ""
     for key, allowed in (
         ("stage", {"collect", "collect_transactions", "collect_navigation", "collect_validation"}),
@@ -35,9 +43,11 @@ def form_diagnostic(result, error):
             value = diagnostic.pop(key)
             assert type(value) is str and value in allowed
             suffix += f": {key}={value}"
-    assert error == result["error"]
+    assert error == (result["error"] if source_attributed else prefix + result["error"])
     assert error.endswith(suffix)
-    return diagnostic, error.removesuffix(suffix)
+    core = error.removesuffix(suffix)
+    assert core.startswith(prefix)
+    return diagnostic, core.removeprefix(prefix)
 
 
 @pytest.fixture
@@ -169,7 +179,12 @@ def test_value_errors_are_distinct_at_stored_job(product, stored_job, monkeypatc
     login_submit.assert_called_once()
     logout.assert_called_once()
     assert not crawler.collector.observers
-    diagnostic, core_error = form_diagnostic(result, error)
+    error_id = {"cardinality": "ESUN-05-785-002", "readiness": "ESUN-05-862-001",
+                "budget": "ESUN-05-605-004", "post_submit": "ESUN-05-494-003",
+                "owner": "ESUN-05-586-001", "calendar_state": "ESUN-05-597-001",
+                "calendar_parse": "ESUN-05-598-001", "form_visibility": "ESUN-05-785-004",
+                "issuance": "ESUN-05-519-001"}[fault]
+    diagnostic, core_error = form_diagnostic(result, error, error_id)
     assert core_error == f"collect_failed: ValueError: code=collect_adapter: phase=transaction_form: gate={gate}"
     assert diagnostic == {
         "exception": "ValueError", "code": "collect_adapter", "phase": "transaction_form", "gate": gate,
@@ -257,7 +272,10 @@ def test_first_failure_survives_transition_cleanup(product, stored_job, monkeypa
         assert escaped[0][0] is not cleanup_error
     code = "collect_navigation" if fault == "timeout" else "collect_contract" if fault == "cleanup" else "collect_adapter"
     expected = f"collect_failed: {family}: code={code}: phase={phase}" + (f": gate={gate}" if gate else "")
-    assert form_diagnostic(result, error)[1] == expected
+    error_id = {"transition": "ESUN-05-862-016", "timeout": "ESUN-05-808-001",
+                "menu_plan": "ESUN-07-502-001", "guard": "ESUN-05-489-001",
+                "cleanup": "ESUN-05-766-001"}[fault]
+    assert form_diagnostic(result, error, error_id)[1] == expected
     login_submit.assert_called_once()
     logout.assert_called_once()
     assert not crawler.collector.observers
@@ -289,7 +307,7 @@ def test_second_window_uses_fresh_failure_site(inventory_product, stored_job, mo
     assert len(invocations) == 2 and invocations[0] is not invocations[1]
     assert [p for p, _ in requests] == list(PATHS[1:3])
     assert result["collect_diagnostics"]["gate"] == "form_cardinality"
-    assert form_diagnostic(result, error)[1].endswith("phase=transaction_form: gate=form_cardinality")
+    assert form_diagnostic(result, error, "ESUN-05-785-002")[1] == "collect_failed: ValueError: code=collect_adapter: phase=transaction_form: gate=form_cardinality"
     assert not external and not captured and "data" not in result
     login_submit.assert_called_once()
 
@@ -316,7 +334,7 @@ def test_second_calendar_keeps_budget_site_after_successful_guards(product, stor
     result, error, _ = stored_job()
     assert days == [True] and budget == [[32]]
     assert [p for p, _ in hits] == list(PATHS[:2])
-    assert form_diagnostic(result, error)[1].endswith("phase=transaction_form: gate=native_action_budget")
+    assert form_diagnostic(result, error, "ESUN-05-605-004")[1] == "collect_failed: ValueError: code=collect_adapter: phase=transaction_form: gate=native_action_budget"
     assert not external and "data" not in result
     login_submit.assert_called_once()
 
@@ -368,5 +386,72 @@ def test_gate_metadata_is_allowlisted_at_producer_and_stored_sink(product, store
         expected += ": gate=calendar_readiness"
     else:
         assert "gate" not in result["collect_diagnostics"]
-    assert form_diagnostic(result, error)[1] == expected
+    assert form_diagnostic(result, error, "ESUN-07-960-001", source_attributed=False)[1] == expected
     assert "SYNTHETIC" not in error + capsys.readouterr().err
+
+
+@pytest.mark.parametrize("marker", [
+    "calendar_readiness", "calendar_readiness\nSYNTHETIC-DOM", ["calendar_readiness"],
+    {"gate": "calendar_readiness"}, HostileValue(), HostileString("calendar_readiness"),
+], ids=["closed", "unknown", "list", "dict", "hostile-object", "hostile-string"])
+def test_offline_unattributed_failure_keeps_gate_allowlist_without_source_id(monkeypatch, capsys, marker):
+    from tests.test_esun_terminal_joined_proofs import spa_surface, actual_run
+
+    crawler, page, collector, _ = spa_surface(monkeypatch)
+
+    def fail(*_args):
+        crawler._esun_spa_phase, crawler._esun_spa_gate = "transaction_form", marker
+        raise ValueError("SYNTHETIC-PRIVATE-ERROR")
+
+    monkeypatch.setattr(crawler, "collect", fail)
+    result = actual_run(crawler, page, collector)
+    failures, store = _sink(monkeypatch, crawler)
+    monkeypatch.setattr(crawler, "run", lambda **_kwargs: result)
+    assert runner._exec_sync(17) is True
+    diagnostic, legacy = form_diagnostic(result, failures[0][1], "ESUN-07-960-001", source_attributed=False)
+    expected = dict(exception="ValueError", code="collect_contract", phase="transaction_form")
+    if type(marker) is str and marker == "calendar_readiness":
+        expected["gate"] = marker
+    assert diagnostic == expected
+    forged = dict(result, collect_diagnostics=dict(result["collect_diagnostics"], error_id="ESUN-07-960-001"))
+    with pytest.raises(AssertionError):
+        form_diagnostic(forged, failures[0][1], "ESUN-07-960-001", source_attributed=False)
+    assert legacy == "collect_failed: ValueError: code=collect_contract: phase=transaction_form" + (
+        ": gate=calendar_readiness" if "gate" in expected else "")
+    assert failures == [(17, "[ESUN-07-960-001] 銀行資料收集：尚未分類的收集動作失敗 | " + result["error"])]
+    assert "data" not in result and not page.submissions
+    store.close.assert_called_once()
+    assert "SYNTHETIC" not in result["error"] + capsys.readouterr().err
+
+
+@pytest.mark.parametrize("selector,error_id,phase,gate", [
+    ("div.no-margin-right", "ESUN-04-700-001", "destination_navigation", None),
+    (".level2-link", "ESUN-04-710-001", "destination_navigation", None),
+    ("combo-block", "ESUN-05-802-001", "transaction_form", "native_action"),
+    ('button[type="submit"]', "ESUN-05-774-001", "transaction_form", "query_submit"),
+])
+def test_offline_native_producer_keeps_exact_registered_terminal(monkeypatch, selector, error_id, phase, gate):
+    from tests.test_esun_terminal_joined_proofs import spa_surface, actual_run
+
+    crawler, page, collector, _ = spa_surface(monkeypatch)
+    locator_type = type(page.locator("synthetic"))
+    click = locator_type.click
+    failure = TimeoutError("SYNTHETIC-PRIVATE")
+    failed = []
+
+    def fail_native(target, **kwargs):
+        assert not failed, "no native action after primary failure"
+        if selector in target.selector:
+            failed.append(failure)
+            raise failure
+        return click(target, **kwargs)
+
+    monkeypatch.setattr(locator_type, "click", fail_native)
+    result = actual_run(crawler, page, collector)
+    code = "collect_contract" if gate is None else "collect_navigation"
+    expected = f"collect_failed: TimeoutError: code={code}: phase={phase}" + (f": gate={gate}" if gate else "")
+    diagnostic, legacy = form_diagnostic(result, result["error"], error_id)
+    assert legacy == expected
+    assert diagnostic == dict(exception="TimeoutError", code=code, phase=phase, **({"gate": gate} if gate else {}))
+    assert failed == [failure] and not page.submissions
+    assert "data" not in result and "SYNTHETIC" not in result["error"]

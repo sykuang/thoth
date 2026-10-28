@@ -209,7 +209,12 @@ def test_sync_runner_records_error_on_failure(isolated, monkeypatch):
     job_id = sr.run_sync_job(user_id=1, bank="sinopac", headless=True)
     row = _wait_for_status(job_id, {"done", "failed"})
     assert row["status"] == "failed", f"unexpected: {row}"
-    assert row["error_msg"] == "sync_failed:RuntimeError"
+    assert row["error_msg"] == (
+        "[SINOPAC-09-900-001] 同步工作：尚未分類的工作失敗 | sync_failed:RuntimeError"
+    )
+    assert "simulated login failure" not in row["error_msg"]
+    assert row["finished_at"]
+    assert row["result_summary"] is None
 
 
 def test_unknown_bank_raises(isolated):

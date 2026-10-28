@@ -1,6 +1,7 @@
 """Canonical credit-card status values shared by collectors and readers."""
 from __future__ import annotations
 
+from backend.core.error_codes import with_error_code
 from enum import StrEnum
 from typing import Any
 
@@ -19,5 +20,5 @@ def cathay_bill_status(value: Any, *, strict: bool = False) -> CathayBillStatus 
     if token in {"unpaid", "payment"}:
         return CathayBillStatus.UNPAID
     if strict:
-        raise ValueError(f"unsupported Cathay bill status: {value!r}")
+        raise with_error_code(ValueError(f"unsupported Cathay bill status: {value!r}"), 'CATHAY-08-200-001')
     return None

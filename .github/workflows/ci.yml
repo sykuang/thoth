@@ -35,11 +35,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Diagnostic parity tests read the pinned, pre-change source commit.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node for embedded-JS diagnostics tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
 
       - name: Install uv (fast Python package manager)
         uses: astral-sh/setup-uv@v3
@@ -50,7 +58,7 @@ jobs:
       - name: Install dependencies
         # `uv sync` reads pyproject.toml and creates .venv with prod + dev deps.
         # `uv sync` 讀 pyproject.toml 建 .venv，含 prod + dev 依賴。
-        run: uv sync --all-extras --dev
+        run: uv sync --frozen --all-extras --dev
 
       - name: Install Chromium for offline browser contract tests
         run: uv run patchright install --with-deps chromium
@@ -69,13 +77,31 @@ jobs:
         # so no global env setup is needed.
         # pyproject 已設定自動排除 e2e；conftest 用 tmp_path 完全隔離 DB/secret。
         # xdist: tests are tmp_path/monkeypatch isolated (conftest), so they run in parallel.
-        run: uv run pytest -q --tb=short -n auto --dist worksteal --durations=20
+        run: uv run python -m pytest -p tests.parent_offline_gate -q --tb=short -n auto --dist worksteal --durations=20
+
+      - name: Produce synthetic checkpoint REST and WebSocket fixtures
+        env:
+          SYNC_ERROR_HTTP_FIXTURE: ${{ runner.temp }}/checkpoint-http.json
+        run: |
+          umask 077
+          test ! -e "$SYNC_ERROR_HTTP_FIXTURE"
+          uv run python -m pytest tests/test_sync_error_id_survival.py::test_producer_to_worker_db_rest_ws_push_and_cli tests/test_checkpoint_rule_provenance.py::test_natural_checkpoint_reaches_worker_rest_ws_and_push -n 0 -q --tb=short
+          test -s "$SYNC_ERROR_HTTP_FIXTURE"
+
+      - name: Upload synthetic checkpoint contract
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-http
+          path: ${{ runner.temp }}/checkpoint-http.json
+          if-no-files-found: error
+          retention-days: 1
 
   # ============================================================
   # Job 2: Frontend (TypeScript / Expo) — typecheck + lint
   # ============================================================
   frontend:
     name: Frontend (Node ${{ matrix.node-version }})
+    needs: backend
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -128,6 +154,20 @@ jobs:
 
       - name: Route parent contract
         run: pnpm test:routes
+
+      - name: Download synthetic checkpoint contract
+        uses: actions/download-artifact@v4
+        with:
+          name: checkpoint-http
+          path: ${{ runner.temp }}/checkpoint-contract
+
+      - name: Checkpoint API decoder and error presentation
+        env:
+          SYNC_ERROR_HTTP_FIXTURE: ${{ runner.temp }}/checkpoint-contract/checkpoint-http.json
+          EXPO_NO_DOTENV: "1"
+        run: |
+          node -e 'const fs=require("node:fs"),a=JSON.parse(fs.readFileSync(process.env.SYNC_ERROR_HTTP_FIXTURE,"utf8")); if(a.length!==7 || !["ESUN-03-900-001","ESUN-07-960-001","ESUN-01-910-001","ESUN-08-900-001","ESUN-08-800-002","UBOT-03-065-001","UBOT-03-070-001"].every(c=>a.filter(r=>r.prefix.startsWith("["+c+"]")).length===1)) throw Error("Missing checkpoint producer cases");'
+          node --import tsx --test src/lib/syncErrorPresentation.test.cjs
 
       - name: ESLint (informational — does not block CI)
         # `expo lint` runs ESLint with expo-config. Currently surfaces some React

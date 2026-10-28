@@ -70,6 +70,8 @@ exclude = ["backend.data*", "frontend*"]
 extend-exclude = [
     ".venv/",
     "backend/data/",
+    # Immutable pre-change source text, checked by SHA-256 rather than rewritten.
+    "tests/fixtures/auth_bridge_originals/",
 ]
 line-length = 120
 target-version = "py312"

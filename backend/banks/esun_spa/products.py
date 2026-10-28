@@ -1,4 +1,5 @@
 """E.SUN SPA card presence and native IESC bill read, RAM-only and incomplete."""
+from backend.core.error_codes import error_step, with_error_code
 from collections.abc import Callable
 from datetime import date
 from time import monotonic
@@ -125,18 +126,22 @@ def _unposted_transactions(body):
 
 
 def _cleanup_all(actions):
+    from backend.core.error_codes import exception_error_id
     pending = list(actions)
     for _ in range(2):
         retry = []
+        failure_id = None
         for action in pending:
             try:
                 action()
-            except Exception:
+            except Exception as error:
+                if failure_id is None:
+                    failure_id = exception_error_id(error, bank='esun')
                 retry.append(action)
         pending = retry
         if not pending:
             return
-    raise RuntimeError('E.SUN native bill cleanup incomplete') from None
+    raise with_error_code(RuntimeError('E.SUN native bill cleanup incomplete'), failure_id or 'ESUN-06-412-001') from None
 
 
 def _official(url):
@@ -170,25 +175,25 @@ def _project_bill(kind, body):
 
 
 def _overview(crawler, page, collector, login_baseline):
-    def require(ok):
+    def require(ok, *, error_id):
         if not ok:
-            raise ValueError('SPA card overview rejected')
+            raise with_error_code(ValueError('SPA card overview rejected'), error_id)
 
     crawler._esun_spa_phase = 'card_navigation'
-    require(collector.page is _OriginGuardProxy._unwrap(page))
+    require(collector.page is _OriginGuardProxy._unwrap(page), error_id='ESUN-06-400-001')
     guard = navigation_guard(crawler, page)
 
     def current_plan():
         guard()
         body, envelope = require_current_success(collector, login_baseline, PATHS[0])
         request = envelope.get('requestBody')
-        require(type(request) is dict)
+        require(type(request) is dict, error_id='ESUN-06-401-001')
         return build_menu_plan(body.get('menuList'), request.get('locale'), target='CCM01002')
 
     plan = current_plan()
 
     def revalidate():
-        require(current_plan() == plan)
+        require(current_plan() == plan, error_id='ESUN-06-402-001')
         return plan
 
     baseline = collector.snapshot()
@@ -200,27 +205,32 @@ def _overview(crawler, page, collector, login_baseline):
         try:
             body, request = require_current_success(collector, baseline, PATHS[4])
         except ValueError:
-            page.wait_for_timeout(20)
+            with error_step('ESUN-06-426-001'):
+                page.wait_for_timeout(20)
             continue
         # The child only mounts after native init succeeds; its own owned
         # overview response plus destination is the read proof. Init's response
         # body need not satisfy our separate generic SPA JSON-body contract.
-        require(collector.issued_count(PATHS[3]) == baseline['counts'][PATHS[3]] + 1)
-        require(request.get('requestBody') == {})
-        require(collector._latest_spa[PATHS[3]][0] < collector._latest_spa[PATHS[4]][0])
-        require(type(body.get('haveCreditCard')) is bool)
-        if page.evaluate(DESTINATION) is True:
-            break
-        page.wait_for_timeout(20)
+        require(collector.issued_count(PATHS[3]) == baseline['counts'][PATHS[3]] + 1, error_id='ESUN-06-403-001')
+        require(request.get('requestBody') == {}, error_id='ESUN-06-404-001')
+        require(collector._latest_spa[PATHS[3]][0] < collector._latest_spa[PATHS[4]][0], error_id='ESUN-06-405-001')
+        require(type(body.get('haveCreditCard')) is bool, error_id='ESUN-06-406-001')
+        with error_step('ESUN-06-427-001'):
+            if page.evaluate(DESTINATION) is True:
+                break
+        with error_step('ESUN-06-428-001'):
+            page.wait_for_timeout(20)
     else:
-        raise ValueError('SPA card overview timeout')
+        raise with_error_code(ValueError('SPA card overview timeout'), 'ESUN-06-413-001')
 
     def bound():
         revalidate()
-        require(collector.issued_count(PATHS[3]) == baseline['counts'][PATHS[3]] + 1)
-        require(collector._latest_spa[PATHS[3]][0] < collector._latest_spa[PATHS[4]][0])
+        require(collector.issued_count(PATHS[3]) == baseline['counts'][PATHS[3]] + 1, error_id='ESUN-06-407-001')
+        require(collector._latest_spa[PATHS[3]][0] < collector._latest_spa[PATHS[4]][0], error_id='ESUN-06-408-001')
         current, _ = require_current_success(collector, baseline, PATHS[4])
-        require(current is body and page.evaluate(DESTINATION) is True)
+        require(current is body, error_id='ESUN-06-409-001')
+        with error_step('ESUN-06-429-001'):
+            require(page.evaluate(DESTINATION) is True, error_id='ESUN-06-409-002')
 
     bound()
     return body['haveCreditCard'], bound
@@ -231,9 +241,17 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     native = _OriginGuardProxy._unwrap(page)
     context = native.context
     bound()
-    button = page.locator(selector)
-    if button.count() != 1 or not button.is_visible() or not button.is_enabled():
-        raise ValueError('SPA bill button rejected')
+    with error_step(('ESUN-06-430-001' if urls is BILL_URLS else 'ESUN-06-430-501')):
+        button = page.locator(selector)
+    with error_step(('ESUN-06-431-001' if urls is BILL_URLS else 'ESUN-06-431-501')):
+        if button.count() != 1:
+            raise with_error_code(ValueError('SPA bill button rejected'), ('ESUN-06-410-001' if urls is BILL_URLS else 'ESUN-06-410-501'))
+    with error_step(('ESUN-06-432-001' if urls is BILL_URLS else 'ESUN-06-432-501')):
+        if not button.is_visible():
+            raise with_error_code(ValueError('SPA bill button rejected'), ('ESUN-06-410-002' if urls is BILL_URLS else 'ESUN-06-410-502'))
+    with error_step(('ESUN-06-433-001' if urls is BILL_URLS else 'ESUN-06-433-501')):
+        if not button.is_enabled():
+            raise with_error_code(ValueError('SPA bill button rejected'), ('ESUN-06-410-003' if urls is BILL_URLS else 'ESUN-06-410-503'))
     receipt: dict[str, object] = {'popup': False, 'summary': False, 'detail': False}
     cycles: dict[str, object] = {}
     popup = None
@@ -249,9 +267,11 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     def route_request(route):
         # Context routing covers popup redirects too; never follow foreign hosts.
         if _official(route.request.url):
-            route.continue_()
+            with error_step(('ESUN-06-441-001' if urls is BILL_URLS else 'ESUN-06-441-501')):
+                route.continue_()
         else:
-            route.abort()
+            with error_step(('ESUN-06-442-001' if urls is BILL_URLS else 'ESUN-06-442-501')):
+                route.abort()
 
     def response_seen(response):
         # Live 2026-10-10: the popup's XHRs can finish before expect_popup returns and
@@ -263,10 +283,12 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
         try:
             req = response.request
             owner = req.frame.page
-            if (req.method != 'POST' or req.frame is not owner.main_frame or owner.opener() is not native
-                    or not _json_type(response.headers.get('content-type', ''))):
-                return
-            raw = response.body()
+            with error_step((('ESUN-06-443-001' if kind == "summary" else 'ESUN-06-443-101') if urls is BILL_URLS else ('ESUN-06-443-501' if kind == "summary" else 'ESUN-06-443-601'))):
+                if (req.method != 'POST' or req.frame is not owner.main_frame or owner.opener() is not native
+                        or not _json_type(response.headers.get('content-type', ''))):
+                    return
+            with error_step((('ESUN-06-434-001' if kind == "summary" else 'ESUN-06-434-101') if urls is BILL_URLS else ('ESUN-06-434-501' if kind == "summary" else 'ESUN-06-434-601'))):
+                raw = response.body()
             if len(raw) > LIMIT or not reserve(len(raw)):
                 return
             payload = _json(raw)
@@ -285,25 +307,35 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     route_installed = False
     response_installed = False
     try:
-        context.route('**/*', route_request)
+        with error_step(('ESUN-06-435-001' if urls is BILL_URLS else 'ESUN-06-435-501')):
+            context.route('**/*', route_request)
         route_installed = True
-        context.on('response', response_seen)
+        with error_step(('ESUN-06-436-001' if urls is BILL_URLS else 'ESUN-06-436-501')):
+            context.on('response', response_seen)
         response_installed = True
         bound()
-        with native.expect_popup(timeout=5000) as opened:
-            button.click(timeout=TIMEOUT, no_wait_after=True)
+        with (
+            error_step(('ESUN-06-437-001' if urls is BILL_URLS else 'ESUN-06-437-501')),
+            native.expect_popup(timeout=5000) as opened,
+        ):
+            error_step(('ESUN-06-438-001' if urls is BILL_URLS else 'ESUN-06-438-501'))(lambda: button.click(timeout=TIMEOUT, no_wait_after=True))()
         popup = opened.value
-        if popup.opener() is not native or popup.context is not context:
-            raise ValueError('SPA bill popup owner rejected')
+        with error_step(('ESUN-06-444-001' if urls is BILL_URLS else 'ESUN-06-444-501')):
+            if popup.opener() is not native:
+                raise with_error_code(ValueError('SPA bill popup owner rejected'), ('ESUN-06-411-001' if urls is BILL_URLS else 'ESUN-06-411-501'))
+        if popup.context is not context:
+            raise with_error_code(ValueError('SPA bill popup owner rejected'), ('ESUN-06-411-002' if urls is BILL_URLS else 'ESUN-06-411-502'))
         deadline = monotonic() + 15
         while monotonic() < deadline:
             if _official(popup.url) and urlsplit(popup.url).hostname == 'iesc.esunbank.com' and urlsplit(popup.url).path.startswith('/IESC/'):
                 receipt['popup'] = True
                 break
-            native.wait_for_timeout(50)
+            with error_step(('ESUN-06-439-001' if urls is BILL_URLS else 'ESUN-06-439-501')):
+                native.wait_for_timeout(50)
         if receipt['popup']:
             while monotonic() < deadline and not (receipt['summary'] and receipt['detail']):
-                native.wait_for_timeout(50)
+                with error_step(('ESUN-06-440-001' if urls is BILL_URLS else 'ESUN-06-440-501')):
+                    native.wait_for_timeout(50)
         # Amounts stay out of telemetry; the caller pops this private key.
         receipt['_statement_cycle'] = cycles.get('summary')
         receipt['_detail'] = cycles.get('detail')
@@ -312,9 +344,9 @@ def _open_bill(page, bound, selector=BILL_BUTTON, urls=BILL_URLS):
     finally:
         actions: list[Callable[[], object]] = []
         if response_installed:
-            actions.append(lambda: context.remove_listener('response', response_seen))
+            actions.append(error_step(('ESUN-06-425-001' if urls is BILL_URLS else 'ESUN-06-425-501'))(lambda: context.remove_listener('response', response_seen)))
         if route_installed:
-            actions.append(lambda: context.unroute('**/*', route_request))
+            actions.append(error_step(('ESUN-06-424-001' if urls is BILL_URLS else 'ESUN-06-424-501'))(lambda: context.unroute('**/*', route_request)))
         _cleanup_all(actions)
 
 

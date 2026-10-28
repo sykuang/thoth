@@ -113,7 +113,10 @@ def test_delayed_mount_run_attaches_before_login_and_repeated_callback_never_sub
 
     monkeypatch.setattr(crawler, "_execute_browser_flow", execute)
     result = crawler.run(page.url, headless=True)
-    assert result == {"error": "browser_callback_repeated"}
+    assert result == {
+        "error": "browser_callback_repeated",
+        "failure_diagnostics": {"error_id": "ESUN-07-930-001", "exception": "RuntimeError"},
+    }
     assert isinstance(crawler._spa_login_baseline, dict)
     assert crawler._spa_login_baseline["collector"] is crawler.collector
     submit.assert_called_once_with(page)

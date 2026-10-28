@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 import hashlib
@@ -41,6 +42,7 @@ from backend.core.card_bills import (
     make_card_bill_fact,
     publish_card_bill_facts,
 )
+from backend.core.error_codes import error_step, with_error_code, exception_error_id, format_error_id
 from backend.core.creds import TaishinCreds
 from backend.core.captcha import ocr_bytes
 from backend.core.login_checkpoints import (
@@ -88,20 +90,25 @@ def _taishin_card_bill_fact(parsed: dict):
             continue
         try:
             amount = float(raw_amount)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-015-001', bank="taishin"))
             continue
-        payment_date = card_bill_date(row.get("post_date") or row.get("txn_date"))
-        payment_amount = card_bill_money(abs(amount))
+        with error_step('TAISHIN-07-002-001'):
+            payment_date = card_bill_date(row.get("post_date") or row.get("txn_date"))
+        with error_step('TAISHIN-07-003-001'):
+            payment_amount = card_bill_money(abs(amount))
         if amount < 0 and payment_date and payment_amount is not None:
             payment_candidates.append((payment_date, payment_amount))
     payment_date, payment_amount = max(payment_candidates, default=(None, None))
-    return make_card_bill_fact(
-        remaining_due=summary.get("remaining") if isinstance(summary, dict) else None,
-        statement_close_date=period.get("statement_date") if isinstance(period, dict) else None,
-        payment_due_date=period.get("pay_due_date") if isinstance(period, dict) else None,
-        last_payment_amount=payment_amount,
-        last_payment_date=payment_date,
-    )
+    with error_step('TAISHIN-07-004-001'):
+        return make_card_bill_fact(
+            remaining_due=summary.get("remaining") if isinstance(summary, dict) else None,
+            statement_close_date=period.get("statement_date") if isinstance(period, dict) else None,
+            payment_due_date=period.get("pay_due_date") if isinstance(period, dict) else None,
+            last_payment_amount=payment_amount,
+            last_payment_date=payment_date,
+        )
 
 
 class TaishinCrawler(BankCrawler):
@@ -145,8 +152,8 @@ class TaishinCrawler(BankCrawler):
 
     def _history_window(self, identity: str, as_of: date) -> dict:
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
-        if mode not in {"full", "incremental"}:
-            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        if mode not in {'full', 'incremental'}:
+            raise with_error_code(ValueError(f'invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}'), 'TAISHIN-05-048-001')
         cursor = self.transaction_start_for(identity, domain="twd_transactions")
         if mode == "full":
             return {
@@ -155,7 +162,7 @@ class TaishinCrawler(BankCrawler):
                 "end": as_of,
             }
         if cursor is not None and cursor > as_of:
-            raise RuntimeError("taishin-twd-history-cursor")
+            raise with_error_code(RuntimeError('taishin-twd-history-cursor'), 'TAISHIN-05-049-001')
         if cursor is not None:
             target = max(self._subtract_months(as_of, 12), cursor - timedelta(days=7))
             periods = (
@@ -178,16 +185,17 @@ class TaishinCrawler(BankCrawler):
     @staticmethod
     def _validate_history_form(snapshot: dict) -> dict:
         error = "taishin-twd-history-form"
-        if (
-            not isinstance(snapshot, dict)
-            or snapshot.get("query_buttons") != 1
-            or type(snapshot.get("query_button")) is not int
-            or snapshot["query_button"] < 0
-        ):
-            raise RuntimeError(error)
+        if not isinstance(snapshot, dict):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-042-001')
+        elif snapshot.get('query_buttons') != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-042-002')
+        elif type(snapshot.get('query_button')) is not int:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-042-003')
+        elif snapshot['query_button'] < 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-042-004')
         selects = snapshot.get("selects")
         if not isinstance(selects, list):
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-043-001')
         expected_periods = [
             ("-- 請選擇查詢期間 --", ""),
             ("7天", "7_days"), ("14天", "14_days"),
@@ -200,23 +208,27 @@ class TaishinCrawler(BankCrawler):
         period_selects, sort_selects, account_selects = [], [], []
         last_index = -1
         for select in selects:
-            if (
-                not isinstance(select, dict)
-                or type(select.get("index")) is not int
-                or select["index"] <= last_index
-            ):
-                raise RuntimeError(error)
+            if not isinstance(select, dict):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-044-001')
+            elif type(select.get('index')) is not int:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-044-002')
+            elif select['index'] <= last_index:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-044-003')
             last_index = select["index"]
             options = select.get("options")
-            if not isinstance(options, list) or any(
-                not isinstance(option, dict)
-                or type(option.get("index")) is not int
-                or option["index"] != index
-                or not isinstance(option.get("text"), str)
-                or not isinstance(option.get("value"), str)
-                for index, option in enumerate(options)
-            ):
-                raise RuntimeError(error)
+            if not isinstance(options, list):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-001')
+            for (index, option) in enumerate(options):
+                if not isinstance(option, dict):
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-003')
+                if type(option.get('index')) is not int:
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-004')
+                if option['index'] != index:
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-005')
+                if not isinstance(option.get('text'), str):
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-006')
+                if not isinstance(option.get('value'), str):
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-045-007')
             matched = False
             for expected, matches in ((expected_periods, period_selects), (expected_sort, sort_selects)):
                 if len(options) == len(expected) and all(
@@ -265,8 +277,12 @@ class TaishinCrawler(BankCrawler):
                 and "請選擇" in str(first.get("text") or "")
             ):
                 account_selects.append((select["index"], accounts))
-        if len(period_selects) != 1 or len(sort_selects) != 1 or len(account_selects) != 1:
-            raise RuntimeError(error)
+        if len(period_selects) != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-046-001')
+        elif len(sort_selects) != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-046-002')
+        elif len(account_selects) != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-046-003')
         account_select, accounts = account_selects[0]
         return {
             "account_select": account_select,
@@ -286,7 +302,7 @@ class TaishinCrawler(BankCrawler):
     ) -> dict:
         form = cls._validate_history_form(snapshot)
         if form != expected:
-            raise RuntimeError("taishin-twd-history-inventory")
+            raise with_error_code(RuntimeError('taishin-twd-history-inventory'), 'TAISHIN-05-047-001')
         return form
 
     @staticmethod
@@ -314,15 +330,14 @@ class TaishinCrawler(BankCrawler):
         ):
             option = next((item for item in form[options] if item["identity"] == value), None)
             if option is None:
-                raise RuntimeError("taishin-twd-history-selection")
+                raise with_error_code(RuntimeError('taishin-twd-history-selection'), 'TAISHIN-05-050-001')
             # Native object-valued options share .value; only the validated index is unique.
-            frame.locator("select").nth(form[f"{name}_select"]).select_option(index=option["index"])
+            with error_step('TAISHIN-05-051-001'):
+                error_step({'account': 'TAISHIN-05-700-002', 'period': 'TAISHIN-05-700-003', 'sort': 'TAISHIN-05-700-004'}.get(name, 'TAISHIN-05-700-001'))(lambda: error_step({'account': 'TAISHIN-05-701-002', 'period': 'TAISHIN-05-701-003', 'sort': 'TAISHIN-05-701-004'}.get(name, 'TAISHIN-05-701-001'))(lambda: error_step({'account': 'TAISHIN-05-702-002', 'period': 'TAISHIN-05-702-003', 'sort': 'TAISHIN-05-702-004'}.get(name, 'TAISHIN-05-702-001'))(lambda: frame.locator("select"))().nth(form[f"{name}_select"]))().select_option(index=option["index"]))()
         snapshot = cls._history_form_snapshot(frame)
         cls._require_history_inventory(snapshot, form)
-        if cls._history_selected_options(snapshot, form) != {
-            "selected_identity": identity, "selected_period": period, "selected_sort": "forward",
-        }:
-            raise RuntimeError("taishin-twd-history-selection")
+        if cls._history_selected_options(snapshot, form) != {'selected_identity': identity, 'selected_period': period, 'selected_sort': 'forward'}:
+            raise with_error_code(RuntimeError('taishin-twd-history-selection'), 'TAISHIN-05-052-001')
 
     def _require_history_network_quiescence(
         self,
@@ -336,47 +351,49 @@ class TaishinCrawler(BankCrawler):
     ):
         matching = []
         for _ in range(10):
-            page.wait_for_timeout(500)
+            with error_step('TAISHIN-05-053-001'):
+                page.wait_for_timeout(500)
             if self._history_frame(page) is not submitted_frame:
-                raise RuntimeError("taishin-twd-history-frame")
+                raise with_error_code(RuntimeError('taishin-twd-history-frame'), 'TAISHIN-05-054-001')
             matching = [
                 hit for hit in collector.hits
                 if hit.request_sequence > boundary
                 and urlparse(hit.raw_url or hit.url).path
                 == "/TIBNetBank/svc/web1/rb0102/query"
             ]
-            if (
-                collector.request_sequence != request_sequence
-                or collector.issued_count("query") != issued_count
-                or len(matching) != 1
-            ):
-                raise RuntimeError("taishin-twd-history-response")
+            if collector.request_sequence != request_sequence:
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-055-001')
+            elif collector.issued_count('query') != issued_count:
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-055-002')
+            elif len(matching) != 1:
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-055-003')
         return matching[0]
 
     @staticmethod
     def _history_money(value: object, *, allow_dash: bool = False) -> int | None:
         if allow_dash and value == "-":
             return None
-        if not isinstance(value, str) or not re.fullmatch(
-            r"-?(?:0|[1-9]\d{0,9}|[1-9]\d{0,2}(?:,\d{3}){1,3})",
-            value,
-        ):
-            raise RuntimeError("taishin-twd-history-dom")
+        if not isinstance(value, str):
+            raise with_error_code(RuntimeError('taishin-twd-history-dom'), 'TAISHIN-05-075-001')
+        elif not re.fullmatch('-?(?:0|[1-9]\\d{0,9}|[1-9]\\d{0,2}(?:,\\d{3}){1,3})', value):
+            raise with_error_code(RuntimeError('taishin-twd-history-dom'), 'TAISHIN-05-075-002')
         parsed = int(value.replace(",", ""))
-        if abs(parsed) > 2_147_483_647:
-            raise RuntimeError("taishin-twd-history-dom")
+        if abs(parsed) > 2147483647:
+            raise with_error_code(RuntimeError('taishin-twd-history-dom'), 'TAISHIN-05-076-001')
         return parsed
 
     @staticmethod
     def _add_history_response_bytes(total: int, body_size: int) -> int:
-        if (
-            type(total) is not int
-            or type(body_size) is not int
-            or total < 0
-            or body_size <= 0
-            or total + body_size > 5_000_000
-        ):
-            raise RuntimeError("taishin-twd-history-response-budget")
+        if type(total) is not int:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-077-001')
+        elif type(body_size) is not int:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-077-002')
+        elif total < 0:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-077-003')
+        elif body_size <= 0:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-077-004')
+        elif total + body_size > 5000000:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-077-005')
         return total + body_size
 
     @staticmethod
@@ -388,9 +405,9 @@ class TaishinCrawler(BankCrawler):
             )
             encoded = ("[" + ",".join(serialized_rows) + "]").encode("utf-8")
         except (TypeError, ValueError):
-            raise RuntimeError("taishin-twd-history-binding") from None
-        if len(encoded) > 5_000_000:
-            raise RuntimeError("taishin-twd-history-response-budget")
+            raise with_error_code(RuntimeError('taishin-twd-history-binding'), 'TAISHIN-05-078-001') from None
+        if len(encoded) > 5000000:
+            raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-079-001')
         return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
@@ -404,21 +421,28 @@ class TaishinCrawler(BankCrawler):
         }
 
         def money(value: object) -> int:
-            if isinstance(value, bool) or not isinstance(value, (str, int)):
-                raise RuntimeError("taishin-api-projection")
+            if isinstance(value, bool):
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-015-001')
+            elif not isinstance(value, (str, int)):
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-015-002')
             raw = str(value).strip()
-            if re.fullmatch(r"-?(?:\d{1,12}|[1-9]\d{0,2}(?:,\d{3}){1,3})", raw) is None:
-                raise RuntimeError("taishin-api-projection")
+            if re.fullmatch('-?(?:\\d{1,12}|[1-9]\\d{0,2}(?:,\\d{3}){1,3})', raw) is None:
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-016-001')
             parsed = int(raw.replace(",", ""))
-            if abs(parsed) > 2_147_483_647:
-                raise RuntimeError("taishin-api-projection")
+            if abs(parsed) > 2147483647:
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-017-001')
             return parsed
 
         def text(value: object, limit: int, *, empty: bool = False) -> str:
-            if not isinstance(value, str) or len(value) > limit or (not empty and not value):
-                raise RuntimeError("taishin-api-projection")
-            if any(ord(char) < 32 and char not in "\t\n\r" for char in value):
-                raise RuntimeError("taishin-api-projection")
+            if not isinstance(value, str):
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-018-001')
+            elif len(value) > limit:
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-018-002')
+            elif not empty and (not value):
+                raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-018-003')
+            for char in value:
+                if ord(char) < 32 and char not in '\t\n\r':
+                    raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-019-001')
             return value
 
         for hit in hits:
@@ -454,10 +478,12 @@ class TaishinCrawler(BankCrawler):
                     identities = set()
                     for account in savings:
                         if not isinstance(account, dict):
-                            raise RuntimeError("taishin-api-projection")
+                            raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-005-001')
                         account_no = text(account.get("accountNo"), 14)
-                        if not re.fullmatch(r"\d{12,14}", account_no) or account_no in identities:
-                            raise RuntimeError("taishin-api-projection")
+                        if not re.fullmatch('\\d{12,14}', account_no):
+                            raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-006-001')
+                        elif account_no in identities:
+                            raise with_error_code(RuntimeError('taishin-api-projection'), 'TAISHIN-07-006-002')
                         identities.add(account_no)
                         projected_accounts.append({
                             "accountNo": account_no,
@@ -491,7 +517,9 @@ class TaishinCrawler(BankCrawler):
                         name: money(card.get(name))
                         for name in ("OUT-CRLIMIT-PERM", "OUT-AVAIL-CREDIT")
                     }}}
-            except RuntimeError:
+            except RuntimeError as _action_error:
+                with contextlib.suppress(Exception):
+                    _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-007-001', bank="taishin"))
                 continue
             responses.setdefault(endpoint, projected)
         return responses
@@ -507,25 +535,27 @@ class TaishinCrawler(BankCrawler):
     ) -> dict:
         error = "taishin-twd-history-dom"
         limits = (100, 100, 500, 100, 100, 1000, 100)
-        if (
-            len(row) != 7
-            or not all(isinstance(value, str) for value in row)
-            or any(len(value) > limit for value, limit in zip(row, limits, strict=True))
-            or any(
-                ord(char) < 32 and char not in "\t\n\r"
-                for value in row for char in value
-            )
-        ):
-            raise RuntimeError(error)
+        if len(row) != 7:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-072-001')
+        for value in row:
+            if not isinstance(value, str):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-072-002')
+        for (value, limit) in zip(row, limits, strict=True):
+            if len(value) > limit:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-072-003')
+        for value in row:
+            for char in value:
+                if ord(char) < 32 and char not in '\t\n\r':
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-072-004')
         row = [re.sub(r"\s+", " ", value).strip() for value in row]
         try:
             txn_at = datetime.strptime(row[0], "%Y/%m/%d %H:%M:%S")
             account_day = datetime.strptime(row[1], "%Y/%m/%d").date()
         except ValueError:
-            raise RuntimeError(error) from None
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-073-001') from None
         description, memo = row[2], row[5]
         if not description:
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-074-001')
         amount = cls._history_money(row[3], allow_dash=True)
         balance = cls._history_money(row[4], allow_dash=True)
         return {
@@ -555,54 +585,73 @@ class TaishinCrawler(BankCrawler):
             "main_frame_request", "request_frame_url", "request_body",
             "response_result", "body_size", "request_sequence",
         }
-        if (
-            not isinstance(transport, dict)
-            or set(transport) != keys
-            or not isinstance(transport.get("url"), str)
-            or not isinstance(transport.get("request_frame_url"), str)
-        ):
-            raise RuntimeError(error)
+        if not isinstance(transport, dict):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-056-001')
+        elif set(transport) != keys:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-056-002')
+        elif not isinstance(transport.get('url'), str):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-056-003')
+        elif not isinstance(transport.get('request_frame_url'), str):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-056-004')
         try:
             parsed = urlparse(transport["url"])
             frame_url = urlparse(transport["request_frame_url"])
         except ValueError:
-            raise RuntimeError(error) from None
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname != "my.taishinbank.com.tw"
-            or parsed.port not in (None, 443)
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path != "/TIBNetBank/svc/web1/rb0102/query"
-            or parsed.query
-            or parsed.fragment
-            or transport.get("method") != "POST"
-            or transport.get("status") != 200
-            or transport.get("content_type") != "application/json"
-            or transport.get("redirected") is not False
-            or transport.get("main_frame_request") is not False
-            or frame_url.scheme != "https"
-            or frame_url.hostname != "my.taishinbank.com.tw"
-            or frame_url.port not in (None, 443)
-            or frame_url.username is not None
-            or frame_url.password is not None
-            or frame_url.path not in {
-                "/TIBNetBank/svc/rwd/", "/TIBNetBank/svc/rwd/index.html",
-            }
-            or frame_url.query
-            or re.fullmatch(r"/RB0102/0100(?:\?ts=\d+)?", frame_url.fragment) is None
-            or transport.get("request_body") != {
-                "account": identity,
-                "start": start.strftime("%Y%m%d"),
-                "end": end.strftime("%Y%m%d"),
-            }
-            or transport.get("response_result") != "NORMAL"
-            or type(transport.get("body_size")) is not int
-            or not 0 < transport["body_size"] <= 5_000_000
-            or type(transport.get("request_sequence")) is not int
-            or transport["request_sequence"] <= 0
-        ):
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-057-001') from None
+        if parsed.scheme != 'https':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-001')
+        elif parsed.hostname != 'my.taishinbank.com.tw':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-002')
+        elif parsed.port not in (None, 443):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-003')
+        elif parsed.username is not None:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-004')
+        elif parsed.password is not None:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-005')
+        elif parsed.path != '/TIBNetBank/svc/web1/rb0102/query':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-006')
+        elif parsed.query:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-007')
+        elif parsed.fragment:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-008')
+        elif transport.get('method') != 'POST':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-009')
+        elif transport.get('status') != 200:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-010')
+        elif transport.get('content_type') != 'application/json':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-011')
+        elif transport.get('redirected') is not False:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-012')
+        elif transport.get('main_frame_request') is not False:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-013')
+        elif frame_url.scheme != 'https':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-014')
+        elif frame_url.hostname != 'my.taishinbank.com.tw':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-015')
+        elif frame_url.port not in (None, 443):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-016')
+        elif frame_url.username is not None:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-017')
+        elif frame_url.password is not None:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-018')
+        elif frame_url.path not in {'/TIBNetBank/svc/rwd/', '/TIBNetBank/svc/rwd/index.html'}:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-019')
+        elif frame_url.query:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-020')
+        elif re.fullmatch('/RB0102/0100(?:\\?ts=\\d+)?', frame_url.fragment) is None:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-021')
+        elif transport.get('request_body') != {'account': identity, 'start': start.strftime('%Y%m%d'), 'end': end.strftime('%Y%m%d')}:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-022')
+        elif transport.get('response_result') != 'NORMAL':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-023')
+        elif type(transport.get('body_size')) is not int:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-024')
+        elif not 0 < transport['body_size'] <= 5000000:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-025')
+        elif type(transport.get('request_sequence')) is not int:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-026')
+        elif transport['request_sequence'] <= 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-058-027')
         return transport
 
     @classmethod
@@ -641,47 +690,57 @@ class TaishinCrawler(BankCrawler):
             cls._validate_history_transport(
                 transport, identity=identity, start=start, end=end,
             )
-        except RuntimeError:
-            raise RuntimeError(error) from None
+        except RuntimeError as source_error:
+            raise with_error_code(RuntimeError(error), exception_error_id(source_error, bank="taishin") or 'TAISHIN-05-059-001') from None
         expected_frame = _OriginGuardProxy._unwrap(expected_frame)
-        if (
-            hit.url != transport["url"]
-            or hit.request_sequence <= boundary
-            or (expected_frame is not None and hit.request_frame is not expected_frame)
-            or not isinstance(response, dict)
-            or response.get("RESULT") != "NORMAL"
-            or not isinstance(output, dict)
-            or not isinstance(rows, list)
-            or len(rows) > 10_000
-            or any(not isinstance(row, dict) or not required <= set(row) for row in rows)
-        ):
-            raise RuntimeError(error)
+        if hit.url != transport['url']:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-001')
+        if hit.request_sequence <= boundary:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-002')
+        if expected_frame is not None and hit.request_frame is not expected_frame:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-003')
+        if not isinstance(response, dict):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-004')
+        if response.get('RESULT') != 'NORMAL':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-005')
+        if not isinstance(output, dict):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-006')
+        if not isinstance(rows, list):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-007')
+        if len(rows) > 10000:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-008')
+        for row in rows:
+            if not isinstance(row, dict):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-010')
+            if not required <= set(row):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-060-011')
         normalized = []
         for row in rows:
-            if (
-                any(
-                    not isinstance(row[key], str)
-                    for key in ("sysdate", "dateNew", "memo", "txnamtOut", "txnamtIn")
-                )
-                or not isinstance(row["message"], (str, type(None)))
-                or isinstance(row["txnamt"], bool)
-                or not isinstance(row["txnamt"], (str, int))
-                or isinstance(row["newbal"], bool)
-                or not isinstance(row["newbal"], (str, int, type(None)))
-            ):
-                raise RuntimeError(error)
+            for key in ('sysdate', 'dateNew', 'memo', 'txnamtOut', 'txnamtIn'):
+                if not isinstance(row[key], str):
+                    raise with_error_code(RuntimeError(error), {'sysdate': 'TAISHIN-05-061-007', 'dateNew': 'TAISHIN-05-061-008', 'memo': 'TAISHIN-05-061-009', 'txnamtOut': 'TAISHIN-05-061-010', 'txnamtIn': 'TAISHIN-05-061-011'}[key])
+            if not isinstance(row['message'], (str, type(None))):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-061-002')
+            if isinstance(row['txnamt'], bool):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-061-003')
+            if not isinstance(row['txnamt'], (str, int)):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-061-004')
+            if isinstance(row['newbal'], bool):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-061-005')
+            if not isinstance(row['newbal'], (str, int, type(None))):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-061-006')
             stamp = re.fullmatch(r"(\d{8})\s?(\d{1,8})", row["sysdate"])
             account_day = re.fullmatch(r"\d{8}", row["dateNew"])
             description = row["memo"]
             note = row["message"] or ""
             incoming = row["txnamtIn"] != "-"
             outgoing = row["txnamtOut"] != "-"
-            if (
-                stamp is None
-                or account_day is None
-                or (incoming and outgoing)
-            ):
-                raise RuntimeError(error)
+            if stamp is None:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-062-001')
+            elif account_day is None:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-062-002')
+            elif incoming and outgoing:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-062-003')
             time_digits = stamp[2].zfill(8)
             try:
                 amount = None
@@ -690,15 +749,16 @@ class TaishinCrawler(BankCrawler):
                     direction_amount = cls._history_money(
                         row["txnamtIn"] if incoming else row["txnamtOut"],
                     )
-                    if (
-                        direction_amount is None
-                        or direction_amount <= 0
-                        or amount is None
-                        or direction_amount != abs(amount)
-                    ):
-                        raise RuntimeError(error)
-                elif row["txnamt"] != "-" and cls._history_money(str(row["txnamt"])) != 0:
-                    raise RuntimeError(error)
+                    if direction_amount is None:
+                        raise with_error_code(RuntimeError(error), 'TAISHIN-05-063-001')
+                    elif direction_amount <= 0:
+                        raise with_error_code(RuntimeError(error), 'TAISHIN-05-063-002')
+                    elif amount is None:
+                        raise with_error_code(RuntimeError(error), 'TAISHIN-05-063-003')
+                    elif direction_amount != abs(amount):
+                        raise with_error_code(RuntimeError(error), 'TAISHIN-05-063-004')
+                elif row['txnamt'] != '-' and cls._history_money(str(row['txnamt'])) != 0:
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-064-001')
                 balance = cls._history_money(
                     "-" if row["newbal"] is None else str(row["newbal"]),
                     allow_dash=True,
@@ -716,8 +776,8 @@ class TaishinCrawler(BankCrawler):
                 normalized.append(cls._normalize_history_cells(
                     cells, identity=identity, start=start, end=end,
                 ))
-            except (RuntimeError, TypeError, ValueError):
-                raise RuntimeError(error) from None
+            except (RuntimeError, TypeError, ValueError) as source_error:
+                raise with_error_code(RuntimeError(error), exception_error_id(source_error, bank="taishin") or 'TAISHIN-05-065-001') from None
         return {"row_count": len(normalized), "rows": normalized, "transport": transport}
 
     @classmethod
@@ -740,63 +800,87 @@ class TaishinCrawler(BankCrawler):
             "headers", "rows", "total_count", "more_button_count", "no_more_count",
             "pager_count", "no_result_count", "result_scope_bound",
         }
-        if (
-            not isinstance(snapshot, dict)
-            or set(snapshot) != keys
-            or snapshot.get("evidence_fresh") is not True
-            or snapshot.get("route_bound") is not True
-            or snapshot.get("result_scope_bound") is not True
-            or snapshot.get("selected_identity") != identity
-            or snapshot.get("selected_period") != period
-            or snapshot.get("selected_sort") != "forward"
-            or any(
-                type(snapshot.get(key)) is not int or snapshot[key] < 0
-                for key in (
-                    "mutation_count", "quiet_ms", "busy_count", "dialog_count",
-                    "error_count", "table_count",
-                    "total_count", "more_button_count", "no_more_count", "pager_count",
-                    "no_result_count",
-                )
-            )
-            or snapshot["busy_count"] != 0
-            or snapshot["dialog_count"] != 0
-            or snapshot["error_count"] != 0
-            or snapshot["pager_count"] != 0
-            or snapshot["mutation_count"] <= 0
-            or snapshot["quiet_ms"] < 1500
-            or type(api_row_count) is not int
-            or api_row_count < 0
-            or not isinstance(snapshot.get("headers"), list)
-            or not isinstance(snapshot.get("rows"), list)
-        ):
-            raise RuntimeError(error)
+        if not isinstance(snapshot, dict):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-001')
+        if set(snapshot) != keys:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-002')
+        if snapshot.get('evidence_fresh') is not True:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-003')
+        if snapshot.get('route_bound') is not True:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-004')
+        if snapshot.get('result_scope_bound') is not True:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-005')
+        if snapshot.get('selected_identity') != identity:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-006')
+        if snapshot.get('selected_period') != period:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-007')
+        if snapshot.get('selected_sort') != 'forward':
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-008')
+        for key in ('mutation_count', 'quiet_ms', 'busy_count', 'dialog_count', 'error_count', 'table_count', 'total_count', 'more_button_count', 'no_more_count', 'pager_count', 'no_result_count'):
+            if type(snapshot.get(key)) is not int:
+                raise with_error_code(RuntimeError(error), {'mutation_count': 'TAISHIN-05-066-020', 'quiet_ms': 'TAISHIN-05-066-021', 'busy_count': 'TAISHIN-05-066-022', 'dialog_count': 'TAISHIN-05-066-023', 'error_count': 'TAISHIN-05-066-024', 'table_count': 'TAISHIN-05-066-025', 'total_count': 'TAISHIN-05-066-026', 'more_button_count': 'TAISHIN-05-066-027', 'no_more_count': 'TAISHIN-05-066-028', 'pager_count': 'TAISHIN-05-066-029', 'no_result_count': 'TAISHIN-05-066-030'}[key])
+            if snapshot[key] < 0:
+                raise with_error_code(RuntimeError(error), {'mutation_count': 'TAISHIN-05-066-031', 'quiet_ms': 'TAISHIN-05-066-032', 'busy_count': 'TAISHIN-05-066-033', 'dialog_count': 'TAISHIN-05-066-034', 'error_count': 'TAISHIN-05-066-035', 'table_count': 'TAISHIN-05-066-036', 'total_count': 'TAISHIN-05-066-037', 'more_button_count': 'TAISHIN-05-066-038', 'no_more_count': 'TAISHIN-05-066-039', 'pager_count': 'TAISHIN-05-066-040', 'no_result_count': 'TAISHIN-05-066-041'}[key])
+        if snapshot['busy_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-010')
+        if snapshot['dialog_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-011')
+        if snapshot['error_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-012')
+        if snapshot['pager_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-013')
+        if snapshot['mutation_count'] <= 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-014')
+        if snapshot['quiet_ms'] < 1500:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-015')
+        if type(api_row_count) is not int:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-016')
+        if api_row_count < 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-017')
+        if not isinstance(snapshot.get('headers'), list):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-018')
+        if not isinstance(snapshot.get('rows'), list):
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-066-019')
         if api_row_count == 0:
-            if (
-                snapshot["table_count"] != 0
-                or snapshot["headers"]
-                or snapshot["rows"]
-                or snapshot["total_count"] != 0
-                or snapshot["more_button_count"] != 0
-                or snapshot["no_more_count"] != 0
-                or snapshot["no_result_count"] != 1
-            ):
-                raise RuntimeError(error)
+            if snapshot['table_count'] != 0:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-001')
+            elif snapshot['headers']:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-002')
+            elif snapshot['rows']:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-003')
+            elif snapshot['total_count'] != 0:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-004')
+            elif snapshot['more_button_count'] != 0:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-005')
+            elif snapshot['no_more_count'] != 0:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-006')
+            elif snapshot['no_result_count'] != 1:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-067-007')
             return {"status": "explicit_empty", "rows": []}
-        if (
-            snapshot["table_count"] != 1
-            or snapshot["headers"] != ["交易日", "帳務日", "摘要", "金額", "餘額", "備註", ""]
-            or len(snapshot["rows"]) != api_row_count
-            or snapshot["total_count"] != api_row_count
-            or snapshot["more_button_count"] != 0
-            or snapshot["no_more_count"] != 1
-            or snapshot["no_result_count"] != 0
-        ):
-            raise RuntimeError(error)
+        if snapshot['table_count'] != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-001')
+        elif snapshot['headers'] != ['交易日', '帳務日', '摘要', '金額', '餘額', '備註', '']:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-002')
+        elif len(snapshot['rows']) != api_row_count:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-003')
+        elif snapshot['total_count'] != api_row_count:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-004')
+        elif snapshot['more_button_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-005')
+        elif snapshot['no_more_count'] != 1:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-006')
+        elif snapshot['no_result_count'] != 0:
+            raise with_error_code(RuntimeError(error), 'TAISHIN-05-068-007')
 
         normalized = []
         for row in snapshot["rows"]:
-            if not isinstance(row, list) or len(row) != 7 or not all(isinstance(v, str) for v in row):
-                raise RuntimeError(error)
+            if not isinstance(row, list):
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-069-001')
+            if len(row) != 7:
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-069-002')
+            for v in row:
+                if not isinstance(v, str):
+                    raise with_error_code(RuntimeError(error), 'TAISHIN-05-069-003')
             normalized.append(cls._normalize_history_cells(
                 row, identity=identity, start=start, end=end,
             ))
@@ -811,9 +895,9 @@ class TaishinCrawler(BankCrawler):
                     for row in api_rows
                 )
             except (TypeError, ValueError):
-                raise RuntimeError(error) from None
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-070-001') from None
             if bound_dom != bound_api:
-                raise RuntimeError(error)
+                raise with_error_code(RuntimeError(error), 'TAISHIN-05-071-001')
         return {"status": "complete", "rows": normalized}
 
     @staticmethod
@@ -834,7 +918,7 @@ class TaishinCrawler(BankCrawler):
             ):
                 matches.append(frame)
         if len(matches) != 1:
-            raise RuntimeError("taishin-twd-history-frame")
+            raise with_error_code(RuntimeError('taishin-twd-history-frame'), 'TAISHIN-05-040-001')
         return matches[0]
 
     _HISTORY_FORM_JS = r"""() => {
@@ -870,11 +954,13 @@ class TaishinCrawler(BankCrawler):
 
     @classmethod
     def _history_form_snapshot(cls, frame) -> dict:
-        return frame.evaluate(cls._HISTORY_FORM_JS)
+        with error_step('TAISHIN-05-041-001'):
+            return frame.evaluate(cls._HISTORY_FORM_JS)
 
     @classmethod
     def _history_result_snapshot(cls, frame, *, expected_form: dict | None = None) -> dict:
-        snapshot = frame.evaluate("() => { const form = (" + cls._HISTORY_FORM_JS + r""")();
+        with error_step('TAISHIN-05-080-001'):
+            snapshot = frame.evaluate("() => { const form = (" + cls._HISTORY_FORM_JS + r""")();
             const visible = el => {
                 if (!el || el.hidden || (el.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return false;
                 for (let p = el; p; p = p.parentElement) {
@@ -969,19 +1055,26 @@ class TaishinCrawler(BankCrawler):
     ) -> dict:
         as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
-        if mode not in {"full", "incremental"}:
-            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}")
+        if mode not in {'full', 'incremental'}:
+            raise with_error_code(ValueError(f'invalid BANK_CRAWLER_HISTORY_MODE: {mode!r}'), 'TAISHIN-05-001-001')
         frame = self._history_frame(page)
-        frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
+        with error_step('TAISHIN-05-002-001'):
+            frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
         form = None
         inventory_signature = None
         inventory_stable_count = 0
+        inventory_failure_id = None
         for _ in range(60):
-            page.wait_for_timeout(500)
+            inventory_failure_id = None
+            with error_step('TAISHIN-05-003-001'):
+                page.wait_for_timeout(500)
             frame = self._history_frame(page)
             try:
                 current_form = self._validate_history_form(self._history_form_snapshot(frame))
-            except RuntimeError:
+            except RuntimeError as _action_error:
+                inventory_failure_id = exception_error_id(_action_error, bank="taishin") or 'TAISHIN-05-004-001'
+                with contextlib.suppress(Exception):
+                    _log(format_error_id(inventory_failure_id, bank="taishin"))
                 inventory_signature = None
                 inventory_stable_count = 0
                 continue
@@ -994,65 +1087,78 @@ class TaishinCrawler(BankCrawler):
             form = current_form
             if inventory_stable_count >= 2 and current_form["accounts"]:
                 break
-        if form is None or inventory_stable_count < 2:
-            raise RuntimeError("taishin-twd-history-form")
+        if form is None:
+            raise with_error_code(RuntimeError('taishin-twd-history-form'), inventory_failure_id or 'TAISHIN-05-005-001')
+        elif inventory_stable_count < 2:
+            raise with_error_code(RuntimeError('taishin-twd-history-form'), inventory_failure_id or 'TAISHIN-05-005-002')
         inventory = form["accounts"]
         if not inventory:
             state = self._history_result_snapshot(frame)
-            if (
-                state.get("route_bound") is not True
-                or any(
-                    type(state.get(key)) is not int or state[key] != 0
-                    for key in (
-                        "busy_count", "dialog_count", "error_count", "table_count",
-                        "no_result_count", "more_button_count", "no_more_count", "pager_count",
-                    )
-                )
-                or getattr(self, "_shared_dialog_blocked", False)
-            ):
-                raise RuntimeError("taishin-twd-history-empty-inventory")
+            if state.get('route_bound') is not True:
+                raise with_error_code(RuntimeError('taishin-twd-history-empty-inventory'), 'TAISHIN-05-006-001')
+            for key in ('busy_count', 'dialog_count', 'error_count', 'table_count', 'no_result_count', 'more_button_count', 'no_more_count', 'pager_count'):
+                if type(state.get(key)) is not int:
+                    raise with_error_code(RuntimeError('taishin-twd-history-empty-inventory'), {'busy_count': 'TAISHIN-05-006-004', 'dialog_count': 'TAISHIN-05-006-005', 'error_count': 'TAISHIN-05-006-006', 'table_count': 'TAISHIN-05-006-007', 'no_result_count': 'TAISHIN-05-006-008', 'more_button_count': 'TAISHIN-05-006-009', 'no_more_count': 'TAISHIN-05-006-010', 'pager_count': 'TAISHIN-05-006-011'}[key])
+                if state[key] != 0:
+                    raise with_error_code(RuntimeError('taishin-twd-history-empty-inventory'), {'busy_count': 'TAISHIN-05-006-012', 'dialog_count': 'TAISHIN-05-006-013', 'error_count': 'TAISHIN-05-006-014', 'table_count': 'TAISHIN-05-006-015', 'no_result_count': 'TAISHIN-05-006-016', 'more_button_count': 'TAISHIN-05-006-017', 'no_more_count': 'TAISHIN-05-006-018', 'pager_count': 'TAISHIN-05-006-019'}[key])
+            if getattr(self, '_shared_dialog_blocked', False):
+                raise with_error_code(RuntimeError('taishin-twd-history-empty-inventory'), 'TAISHIN-05-006-003')
         results, expected, receipts = [], [], []
         response_bytes = 0
         inventory_signature = form
 
         for position, account in enumerate(inventory):
             if position:
-                frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
+                with error_step('TAISHIN-05-007-001'):
+                    frame.evaluate("location.hash = '#/RB0102/0100?ts=' + Date.now()")
+                inventory_failure_id = None
                 for _ in range(60):
-                    page.wait_for_timeout(500)
+                    inventory_failure_id = None
+                    with error_step('TAISHIN-05-008-001'):
+                        page.wait_for_timeout(500)
                     frame = self._history_frame(page)
                     try:
                         form = self._validate_history_form(self._history_form_snapshot(frame))
-                    except RuntimeError:
+                    except RuntimeError as _action_error:
+                        inventory_failure_id = exception_error_id(_action_error, bank="taishin") or 'TAISHIN-05-009-001'
+                        with contextlib.suppress(Exception):
+                            _log(format_error_id(inventory_failure_id, bank="taishin"))
                         continue
                     if form == inventory_signature:
                         break
                 else:
-                    raise RuntimeError("taishin-twd-history-inventory")
+                    raise with_error_code(RuntimeError('taishin-twd-history-inventory'), inventory_failure_id or 'TAISHIN-05-010-001')
             window = self._history_window(account["identity"], as_of)
             self._select_history_options(
                 frame, form, identity=account["identity"], period=window["period"],
             )
 
             # Release hover menus before checking readiness; never force the query click.
-            page.mouse.move(-1, -1)
+            with error_step('TAISHIN-05-850-001'):
+                page.mouse.move(-1, -1)
             # Selection can briefly show a loader before any history submission.
             for attempt in range(21):
                 if self._history_frame(page) is not frame:
-                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                    raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), 'TAISHIN-05-011-001')
                 before_result = self._history_result_snapshot(frame, expected_form=inventory_signature)
-                if any(type(before_result.get(key)) is not int or before_result[key] != 0
-                       for key in ('table_count', 'no_result_count', 'dialog_count', 'error_count')):
-                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                for key in ('table_count', 'no_result_count', 'dialog_count', 'error_count'):
+                    if type(before_result.get(key)) is not int:
+                        raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), {'table_count': 'TAISHIN-05-012-002', 'no_result_count': 'TAISHIN-05-012-003', 'dialog_count': 'TAISHIN-05-012-004', 'error_count': 'TAISHIN-05-012-005'}[key])
+                    if before_result[key] != 0:
+                        raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), {'table_count': 'TAISHIN-05-012-006', 'no_result_count': 'TAISHIN-05-012-007', 'dialog_count': 'TAISHIN-05-012-008', 'error_count': 'TAISHIN-05-012-009'}[key])
                 busy = before_result.get('busy_count')
-                if type(busy) is not int or busy < 0:
-                    raise RuntimeError('taishin-twd-history-stale-before-query')
+                if type(busy) is not int:
+                    raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), 'TAISHIN-05-013-001')
+                elif busy < 0:
+                    raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), 'TAISHIN-05-013-002')
                 if busy == 0:
                     break
                 if attempt == 20:
-                    raise RuntimeError('taishin-twd-history-stale-before-query')
-                page.wait_for_timeout(500)
-            frame.evaluate("""() => {
+                    raise with_error_code(RuntimeError('taishin-twd-history-stale-before-query'), 'TAISHIN-05-014-001')
+                with error_step('TAISHIN-05-015-001'):
+                    page.wait_for_timeout(500)
+            with error_step('TAISHIN-05-016-001'):
+                frame.evaluate("""() => {
                 window.__thothTaishinHistoryObserver?.disconnect();
                 const state = {count: 0, last: 0};
                 window.__thothTaishinHistoryMutation = state;
@@ -1076,14 +1182,18 @@ class TaishinCrawler(BankCrawler):
             }""")
             boundary = collector.request_sequence
             issued_before = collector.issued_count("query")
-            query = frame.locator("input[value='查詢']")
-            if query.count() <= form["query_button"]:
-                raise RuntimeError("taishin-twd-history-query")
+            with error_step('TAISHIN-05-017-001'):
+                query = frame.locator("input[value='查詢']")
+            with error_step('TAISHIN-05-018-001'):
+                if query.count() <= form['query_button']:
+                    raise with_error_code(RuntimeError('taishin-twd-history-query'), 'TAISHIN-05-019-001')
             submitted_frame = frame
-            query.nth(form["query_button"]).click(timeout=8000)
+            with error_step('TAISHIN-05-020-001'):
+                error_step('TAISHIN-05-703-001')(lambda: error_step('TAISHIN-05-704-001')(lambda: query.nth(form["query_button"]))().click(timeout=8000))()
             matching = []
             for _ in range(120):
-                page.wait_for_timeout(500)
+                with error_step('TAISHIN-05-021-001'):
+                    page.wait_for_timeout(500)
                 matching = [
                     hit for hit in collector.hits
                     if hit.request_sequence > boundary
@@ -1092,43 +1202,48 @@ class TaishinCrawler(BankCrawler):
                 if matching:
                     break
             if len(matching) != 1:
-                raise RuntimeError("taishin-twd-history-response")
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-022-001')
             response = self._validate_history_hit(
                 matching[0], identity=account["identity"], start=window["start"],
                 end=window["end"], boundary=boundary, expected_frame=submitted_frame,
             )
             body_size = matching[0].body_size
             if type(body_size) is not int:
-                raise RuntimeError("taishin-twd-history-response-budget")
+                raise with_error_code(RuntimeError('taishin-twd-history-response-budget'), 'TAISHIN-05-023-001')
             response_bytes = self._add_history_response_bytes(response_bytes, body_size)
 
             frame = self._history_frame(page)
             if frame is not submitted_frame:
-                raise RuntimeError("taishin-twd-history-frame")
+                raise with_error_code(RuntimeError('taishin-twd-history-frame'), 'TAISHIN-05-024-001')
             for _ in range(min(response["row_count"] + 2, 10_002)):
                 if self._history_frame(page) is not submitted_frame:
-                    raise RuntimeError("taishin-twd-history-frame")
+                    raise with_error_code(RuntimeError('taishin-twd-history-frame'), 'TAISHIN-05-025-001')
                 snapshot = self._history_result_snapshot(frame, expected_form=inventory_signature)
                 if snapshot["more_button_count"] == 0:
                     break
                 before = len(snapshot["rows"])
-                buttons = frame.locator("._table_more__btn:visible")
-                if buttons.count() != 1:
-                    raise RuntimeError("taishin-twd-history-pagination")
-                buttons.nth(0).click(timeout=5000)
-                page.wait_for_timeout(300)
-                if len(self._history_result_snapshot(frame, expected_form=inventory_signature)["rows"]) <= before:
-                    raise RuntimeError("taishin-twd-history-pagination")
+                with error_step('TAISHIN-05-026-001'):
+                    buttons = frame.locator("._table_more__btn:visible")
+                with error_step('TAISHIN-05-027-001'):
+                    if buttons.count() != 1:
+                        raise with_error_code(RuntimeError('taishin-twd-history-pagination'), 'TAISHIN-05-028-001')
+                with error_step('TAISHIN-05-029-001'):
+                    error_step('TAISHIN-05-705-001')(lambda: error_step('TAISHIN-05-706-001')(lambda: buttons.nth(0))().click(timeout=5000))()
+                with error_step('TAISHIN-05-030-001'):
+                    page.wait_for_timeout(300)
+                if len(self._history_result_snapshot(frame, expected_form=inventory_signature)['rows']) <= before:
+                    raise with_error_code(RuntimeError('taishin-twd-history-pagination'), 'TAISHIN-05-031-001')
             else:
-                raise RuntimeError("taishin-twd-history-pagination")
+                raise with_error_code(RuntimeError('taishin-twd-history-pagination'), 'TAISHIN-05-032-001')
 
             stable = None
             stable_count = 0
             for _ in range(60):
-                page.wait_for_timeout(500)
+                with error_step('TAISHIN-05-033-001'):
+                    page.wait_for_timeout(500)
                 frame = self._history_frame(page)
                 if frame is not submitted_frame:
-                    raise RuntimeError("taishin-twd-history-frame")
+                    raise with_error_code(RuntimeError('taishin-twd-history-frame'), 'TAISHIN-05-034-001')
                 snapshot = self._history_result_snapshot(frame, expected_form=inventory_signature)
                 signature = repr({**snapshot, "evidence_fresh": False, "quiet_ms": 0})
                 if signature == stable and snapshot["busy_count"] == 0:
@@ -1144,16 +1259,18 @@ class TaishinCrawler(BankCrawler):
                     snapshot["evidence_fresh"] = True
                     break
             else:
-                raise RuntimeError("taishin-twd-history-settle")
+                raise with_error_code(RuntimeError('taishin-twd-history-settle'), 'TAISHIN-05-035-001')
             if self._shared_dialog_blocked:
-                raise RuntimeError("taishin-twd-history-dialog")
+                raise with_error_code(RuntimeError('taishin-twd-history-dialog'), 'TAISHIN-05-036-001')
             matching = [
                 hit for hit in collector.hits
                 if hit.request_sequence > boundary
                 and urlparse(hit.raw_url or hit.url).path == "/TIBNetBank/svc/web1/rb0102/query"
             ]
-            if len(matching) != 1 or collector.issued_count("query") != issued_before + 1:
-                raise RuntimeError("taishin-twd-history-response")
+            if len(matching) != 1:
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-037-001')
+            elif collector.issued_count('query') != issued_before + 1:
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-037-002')
             quiescent_hit = self._require_history_network_quiescence(
                 page,
                 collector,
@@ -1163,10 +1280,11 @@ class TaishinCrawler(BankCrawler):
                 issued_count=issued_before + 1,
             )
             if quiescent_hit is not matching[0]:
-                raise RuntimeError("taishin-twd-history-response")
+                raise with_error_code(RuntimeError('taishin-twd-history-response'), 'TAISHIN-05-038-001')
             snapshot = self._history_result_snapshot(submitted_frame, expected_form=inventory_signature)
             snapshot["evidence_fresh"] = True
-            submitted_frame.evaluate("window.__thothTaishinHistoryObserver?.disconnect()")
+            with error_step('TAISHIN-05-039-001'):
+                submitted_frame.evaluate("window.__thothTaishinHistoryObserver?.disconnect()")
             self._require_history_inventory(
                 self._history_form_snapshot(frame), inventory_signature,
             )
@@ -1222,11 +1340,12 @@ class TaishinCrawler(BankCrawler):
         }
         from backend.core.base import validate_history_coverage
 
-        validate_history_coverage(
-            coverage,
-            expected_mode=mode,
-            expected_domains=self.HISTORY_COVERAGE_DOMAINS,
-        )
+        with error_step('TAISHIN-07-001-001'):
+            validate_history_coverage(
+                coverage,
+                expected_mode=mode,
+                expected_domains=self.HISTORY_COVERAGE_DOMAINS,
+            )
         return {"twd_txn_results": results, "history_coverage": coverage}
 
     def _find_login_frame(self, page):
@@ -1241,8 +1360,10 @@ class TaishinCrawler(BankCrawler):
             and IFRAME_HINT in (current.path or "").lower()
         )
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             if not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS):
                 return False
@@ -1258,17 +1379,25 @@ class TaishinCrawler(BankCrawler):
                 ),
             ]
             for scope in scopes:
-                login_fields = scope.locator("input[placeholder='身分證字號']")
-                if any(
-                    login_fields.nth(index).is_visible()
-                    for index in range(login_fields.count())
-                ):
-                    return False
-            body = "\n".join(
-                scope.evaluate("() => document.body && document.body.innerText || ''") or ""
-                for scope in scopes
-            )
-        except Exception:
+                with error_step('TAISHIN-03-006-001'):
+                    login_fields = scope.locator("input[placeholder='身分證字號']")
+                with error_step('TAISHIN-03-007-001'):
+                    if any(
+                        error_step('TAISHIN-03-707-001')(lambda: error_step('TAISHIN-03-708-001')(lambda: login_fields.nth(index))().is_visible())()
+                        for index in range(error_step('TAISHIN-03-709-001')(lambda: login_fields.count())())
+                    ):
+                        return False
+            with error_step('TAISHIN-03-008-001'):
+                body = "\n".join(
+                    scope.evaluate("() => document.body && document.body.innerText || ''") or ""
+                    for scope in scopes
+                )
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='taishin')
+                if error_id in ('TAISHIN-03-006-001', 'TAISHIN-03-707-001', 'TAISHIN-03-708-001',
+                 'TAISHIN-03-709-001', 'TAISHIN-03-008-001'):
+                    _auth_probe_ids[:] = [error_id]
             return False
         keywords = (
             "帳戶總覽",
@@ -1290,10 +1419,15 @@ class TaishinCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(10000)
+        with error_step('TAISHIN-01-001-001'):
+            page.wait_for_timeout(10000)
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         duplicate_body = re.compile(
@@ -1322,6 +1456,7 @@ class TaishinCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"taishin-otp-required-{suffix}",
+                    error_id={'modal': 'TAISHIN-03-050-001', 'dialog': 'TAISHIN-03-055-001'}[suffix],
                     bank="taishin",
                     phases=all_phases,
                     kind=CheckpointKind.OTP_REQUIRED,
@@ -1336,6 +1471,7 @@ class TaishinCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"taishin-mandatory-password-{suffix}",
+                    error_id={'modal': 'TAISHIN-03-060-001', 'dialog': 'TAISHIN-03-065-001'}[suffix],
                     bank="taishin",
                     phases=all_phases,
                     kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
@@ -1350,6 +1486,7 @@ class TaishinCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"taishin-pre-duplicate-{suffix}",
+                    error_id={'modal': 'TAISHIN-03-800-001', 'dialog': 'TAISHIN-03-805-001'}[suffix],
                     bank="taishin",
                     phases=(CheckpointPhase.PRE_SUBMIT,),
                     kind=CheckpointKind.DUPLICATE_SESSION,
@@ -1365,6 +1502,7 @@ class TaishinCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"taishin-post-protocol-{suffix}",
+                    error_id={'modal': 'TAISHIN-03-810-001', 'dialog': 'TAISHIN-03-815-001'}[suffix],
                     bank="taishin",
                     phases=(CheckpointPhase.POST_SUBMIT,),
                     kind=CheckpointKind.PROTOCOL_RESUBMIT,
@@ -1380,6 +1518,7 @@ class TaishinCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"taishin-post-notice-{suffix}",
+                    error_id={'modal': 'TAISHIN-03-820-001', 'dialog': 'TAISHIN-03-825-001'}[suffix],
                     bank="taishin",
                     phases=post_settle,
                     kind=CheckpointKind.DISMISSIBLE_NOTICE,
@@ -1394,6 +1533,7 @@ class TaishinCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="taishin-unknown-modal",
+                error_id='TAISHIN-03-070-001',
                 bank="taishin",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -1401,6 +1541,7 @@ class TaishinCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="taishin-unknown-dialog",
+                error_id='TAISHIN-03-075-001',
                 bank="taishin",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -1408,6 +1549,7 @@ class TaishinCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="taishin-login-form-still-visible",
+                error_id='TAISHIN-03-080-001',
                 bank="taishin",
                 phases=post_settle,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -1431,7 +1573,8 @@ class TaishinCrawler(BankCrawler):
         """
         # Step 1: 找 LI bbox（page coordinate，需加 iframe offset）
         try:
-            li_bbox = target_frame.evaluate("""() => {
+            with error_step('TAISHIN-06-001-001'):
+                li_bbox = target_frame.evaluate("""() => {
                 for (const sp of document.querySelectorAll('span._nav_menu__text')) {
                     if ((sp.textContent || '').trim() !== '信用卡') continue;
                     if (sp.offsetParent === null) continue;
@@ -1443,7 +1586,9 @@ class TaishinCrawler(BankCrawler):
                 }
                 return null;
             }""")
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-002-001', bank="taishin"))
             _log("[taishin][collect] 取 LI bbox 例外")
             return False
 
@@ -1457,16 +1602,20 @@ class TaishinCrawler(BankCrawler):
         iframe_offset_x = 0
         iframe_offset_y = 0
         try:
-            for fel in page.query_selector_all("iframe"):
-                src = fel.get_attribute("src") or ""
+            for fel in error_step('TAISHIN-06-850-001')(lambda: page.query_selector_all("iframe"))():
+                with error_step('TAISHIN-06-003-001'):
+                    src = fel.get_attribute("src") or ""
                 if "svc/rwd" in src:
-                    fbox = fel.bounding_box()
+                    with error_step('TAISHIN-06-004-001'):
+                        fbox = fel.bounding_box()
                     if fbox:
                         iframe_offset_x = fbox["x"]
                         iframe_offset_y = fbox["y"]
                         _log(f"[taishin][collect] iframe offset: ({int(iframe_offset_x)},{int(iframe_offset_y)})")
                     break
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-005-001', bank="taishin"))
             _log("[taishin][collect] 取 iframe offset 失敗（用 0,0）")
 
         # Step 3: 真實 mouse.move 到 LI 中心
@@ -1476,17 +1625,24 @@ class TaishinCrawler(BankCrawler):
 
         try:
             # 先 move 到主畫面中央（避開所有 nav）→ 再 move 到 LI（保證觸發 mouseenter）
-            page.mouse.move(li_center_x, 400)
-            page.wait_for_timeout(200)
-            page.mouse.move(li_center_x, li_center_y, steps=10)
-            page.wait_for_timeout(1500)  # 等 mega menu 展開動畫
-        except Exception:
+            with error_step('TAISHIN-06-851-001'):
+                page.mouse.move(li_center_x, 400)
+            with error_step('TAISHIN-06-006-001'):
+                page.wait_for_timeout(200)
+            with error_step('TAISHIN-06-852-001'):
+                page.mouse.move(li_center_x, li_center_y, steps=10)
+            with error_step('TAISHIN-06-007-001'):
+                page.wait_for_timeout(1500)  # 等 mega menu 展開動畫
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-008-001', bank="taishin"))
             _log("[taishin][collect] mouse.move 例外")
             return False
 
         # Step 4: dump mega menu 內可見 link（hover 還在，menu 還展開）
         try:
-            mega_links = target_frame.evaluate("""(li_y) => {
+            with error_step('TAISHIN-06-009-001'):
+                mega_links = target_frame.evaluate("""(li_y) => {
                 const out = [];
                 for (const a of document.querySelectorAll('a, button, li')) {
                     if (a.offsetParent === null) continue;
@@ -1508,7 +1664,9 @@ class TaishinCrawler(BankCrawler):
                     return true;
                 });
             }""", li_bbox["y"])
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-010-001', bank="taishin"))
             _log("[taishin][collect] dump mega links 失敗")
             mega_links = []
 
@@ -1553,13 +1711,19 @@ class TaishinCrawler(BankCrawler):
         try:
             click_x = iframe_offset_x + target_link["x"] + target_link["w"] / 2
             click_y = iframe_offset_y + target_link["y"] + target_link["h"] / 2
-            page.mouse.move(click_x, click_y, steps=5)
-            page.wait_for_timeout(300)
-            page.mouse.click(click_x, click_y)
+            with error_step('TAISHIN-06-853-001'):
+                page.mouse.move(click_x, click_y, steps=5)
+            with error_step('TAISHIN-06-011-001'):
+                page.wait_for_timeout(300)
+            with error_step('TAISHIN-06-012-001'):
+                page.mouse.click(click_x, click_y)
             _log(f"[taishin][collect] page.mouse.click({click_x:.0f},{click_y:.0f})")
-            page.wait_for_timeout(6000)
+            with error_step('TAISHIN-06-013-001'):
+                page.wait_for_timeout(6000)
             return True
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-06-014-001', bank="taishin"))
             _log("[taishin][collect] click 子項例外")
             return False
 
@@ -1741,10 +1905,13 @@ class TaishinCrawler(BankCrawler):
 
     def _ocr_captcha(self, frame, max_attempts=5):
         """Read a six-digit CAPTCHA, refreshing natively at most four times."""
+        self._ocr_failure_id = None
         attempts = min(max(max_attempts, 0), 5)
         for attempt in range(attempts):
+            self._ocr_failure_id = None
             try:
-                cap_b64 = frame.evaluate("""() => {
+                with error_step('TAISHIN-02-077-001'):
+                    cap_b64 = frame.evaluate("""() => {
                     const inputs = [...document.querySelectorAll('input')];
                     const capInput = inputs.find(i => i.placeholder === '驗證碼');
                     if (!capInput) return null;
@@ -1762,36 +1929,45 @@ class TaishinCrawler(BankCrawler):
                     }
                     return null;
                 }""")
-                text = (
-                    ocr_bytes(
-                        base64.b64decode(cap_b64, validate=True),
-                        expected_len=6,
-                        alnum_only=True,
-                        min_confidence=0.98,
+                with error_step('TAISHIN-02-078-001'):
+                    text = (
+                        ocr_bytes(
+                            base64.b64decode(cap_b64, validate=True),
+                            expected_len=6,
+                            alnum_only=True,
+                            min_confidence=0.98,
+                        )
+                        if cap_b64
+                        else None
                     )
-                    if cap_b64
-                    else None
-                )
-            except Exception:
+            except Exception as error:
+                self._ocr_failure_id = exception_error_id(error, bank="taishin")
                 return None
             if text and len(text) == 6 and text.isdigit():
                 return text
             if attempt == attempts - 1:
                 break
             try:
-                candidates = frame.locator(
-                    "[class*='refresh'], [class*='reload'], i.fa-sync, .icon-refresh"
-                )
+                with error_step('TAISHIN-02-079-001'):
+                    candidates = frame.locator(
+                        "[class*='refresh'], [class*='reload'], i.fa-sync, .icon-refresh"
+                    )
                 eligible = []
-                for index in range(candidates.count()):
-                    action = candidates.nth(index)
-                    if action.is_visible() and action.is_enabled():
-                        eligible.append(action)
+                with error_step('TAISHIN-02-080-001'):
+                    for index in range(candidates.count()):
+                        with error_step('TAISHIN-02-081-001'):
+                            action = candidates.nth(index)
+                        with error_step('TAISHIN-02-082-001'):
+                            if error_step('TAISHIN-02-710-001')(lambda: action.is_visible())() and error_step('TAISHIN-02-711-001')(lambda: action.is_enabled())():
+                                eligible.append(action)
                 if len(eligible) != 1:
                     return None
-                eligible[0].click()
-                frame.wait_for_timeout(1500)
-            except Exception:
+                with error_step('TAISHIN-02-083-001'):
+                    eligible[0].click()
+                with error_step('TAISHIN-02-084-001'):
+                    frame.wait_for_timeout(1500)
+            except Exception as error:
+                self._ocr_failure_id = exception_error_id(error, bank="taishin")
                 return None
         return None
 
@@ -1799,73 +1975,130 @@ class TaishinCrawler(BankCrawler):
         try:
             frame = self._find_login_frame(page)
         except Exception:
-            raise TaishinLoginError("無法安全確認登入頁面；未送出登入") from None
+            raise with_error_code(TaishinLoginError('無法安全確認登入頁面；未送出登入'), 'TAISHIN-02-001-001') from None
         if frame is None:
-            raise TaishinLoginError("找不到登入頁面；未送出登入") from None
+            raise with_error_code(TaishinLoginError('找不到登入頁面；未送出登入'), 'TAISHIN-02-002-001') from None
 
         try:
             for label in ("national_id", "user_code", "password"):
                 value = getattr(self.creds, label)
-                candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS[label]))
+                with error_step({'national_id': 'TAISHIN-02-032-001', 'user_code': 'TAISHIN-02-047-001', 'password': 'TAISHIN-02-062-001'}[label]):
+                    candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS[label]))
+                with error_step({'national_id': 'TAISHIN-02-033-001', 'user_code': 'TAISHIN-02-048-001', 'password': 'TAISHIN-02-063-001'}[label]):
+                    if candidates.count() != 1:
+                        raise with_error_code(TaishinLoginError('登入欄位無法安全填寫；未送出登入'), {'national_id': 'TAISHIN-02-034-001', 'user_code': 'TAISHIN-02-049-001', 'password': 'TAISHIN-02-064-001'}[label])
+                with error_step({'national_id': 'TAISHIN-02-035-001', 'user_code': 'TAISHIN-02-050-001', 'password': 'TAISHIN-02-065-001'}[label]):
+                    field = candidates.nth(0)
+                with error_step({'national_id': 'TAISHIN-02-036-001', 'user_code': 'TAISHIN-02-051-001', 'password': 'TAISHIN-02-066-001'}[label]):
+                    with error_step({'national_id': 'TAISHIN-02-037-001', 'user_code': 'TAISHIN-02-052-001', 'password': 'TAISHIN-02-067-001'}[label]):
+                        _error_condition = not field.is_visible()
+                    if _error_condition:
+                        raise with_error_code(TaishinLoginError('登入欄位無法安全填寫；未送出登入'), {'national_id': 'TAISHIN-02-038-001', 'user_code': 'TAISHIN-02-053-001', 'password': 'TAISHIN-02-068-001'}[label])
+                    else:
+                        with error_step({'national_id': 'TAISHIN-02-039-001', 'user_code': 'TAISHIN-02-054-001', 'password': 'TAISHIN-02-069-001'}[label]):
+                            _error_condition = not field.is_enabled()
+                        if _error_condition:
+                            raise with_error_code(TaishinLoginError('登入欄位無法安全填寫；未送出登入'), {'national_id': 'TAISHIN-02-038-002', 'user_code': 'TAISHIN-02-053-002', 'password': 'TAISHIN-02-068-002'}[label])
+                with error_step({'national_id': 'TAISHIN-02-040-001', 'user_code': 'TAISHIN-02-055-001', 'password': 'TAISHIN-02-070-001'}[label]):
+                    field.click()
+                with error_step({'national_id': 'TAISHIN-02-041-001', 'user_code': 'TAISHIN-02-056-001', 'password': 'TAISHIN-02-071-001'}[label]):
+                    field.click(click_count=3)
+                with error_step({'national_id': 'TAISHIN-02-042-001', 'user_code': 'TAISHIN-02-057-001', 'password': 'TAISHIN-02-072-001'}[label]):
+                    page.keyboard.press("Backspace")
+                with error_step({'national_id': 'TAISHIN-02-043-001', 'user_code': 'TAISHIN-02-058-001', 'password': 'TAISHIN-02-073-001'}[label]):
+                    page.keyboard.type(value, delay=80)
+                with error_step({'national_id': 'TAISHIN-02-044-001', 'user_code': 'TAISHIN-02-059-001', 'password': 'TAISHIN-02-074-001'}[label]):
+                    page.wait_for_timeout(200)
+                with error_step({'national_id': 'TAISHIN-02-045-001', 'user_code': 'TAISHIN-02-060-001', 'password': 'TAISHIN-02-075-001'}[label]):
+                    if len(field.input_value()) != len(value):
+                        raise with_error_code(TaishinLoginError('登入欄位輸入長度不符；未送出登入'), {'national_id': 'TAISHIN-02-046-001', 'user_code': 'TAISHIN-02-061-001', 'password': 'TAISHIN-02-076-001'}[label])
+        except TaishinLoginError:
+            raise
+        except Exception as error:
+            raise with_error_code(TaishinLoginError('登入欄位無法安全填寫；未送出登入'), exception_error_id(error, bank="taishin") or 'TAISHIN-02-003-001') from None
+
+        self._ocr_failure_id = None
+        try:
+            captcha = self._ocr_captcha(frame, max_attempts=1)
+        finally:
+            ocr_failure_id = self._ocr_failure_id
+            self._ocr_failure_id = None
+        if not captcha:
+            raise with_error_code(captcha_unreadable(TaishinLoginError('圖形驗證碼 OCR 失敗；未送出登入')), ocr_failure_id or 'TAISHIN-02-004-001')
+        elif len(captcha) != 6:
+            raise with_error_code(captcha_unreadable(TaishinLoginError('圖形驗證碼 OCR 失敗；未送出登入')), 'TAISHIN-02-004-002')
+        elif not captcha.isdigit():
+            raise with_error_code(captcha_unreadable(TaishinLoginError('圖形驗證碼 OCR 失敗；未送出登入')), 'TAISHIN-02-004-003')
+        try:
+            with error_step('TAISHIN-02-005-001'):
+                candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS["captcha"]))
+            with error_step('TAISHIN-02-006-001'):
                 if candidates.count() != 1:
-                    raise TaishinLoginError("登入欄位無法安全填寫；未送出登入")
+                    raise with_error_code(TaishinLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'TAISHIN-02-007-001')
+            with error_step('TAISHIN-02-008-001'):
                 field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
-                    raise TaishinLoginError("登入欄位無法安全填寫；未送出登入")
+            with error_step('TAISHIN-02-009-001'):
+                with error_step('TAISHIN-02-010-001'):
+                    _error_condition = not field.is_visible()
+                if _error_condition:
+                    raise with_error_code(TaishinLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'TAISHIN-02-011-001')
+                else:
+                    with error_step('TAISHIN-02-012-001'):
+                        _error_condition = not field.is_enabled()
+                    if _error_condition:
+                        raise with_error_code(TaishinLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'TAISHIN-02-011-002')
+            with error_step('TAISHIN-02-013-001'):
                 field.click()
+            with error_step('TAISHIN-02-014-001'):
                 field.click(click_count=3)
+            with error_step('TAISHIN-02-015-001'):
                 page.keyboard.press("Backspace")
-                page.keyboard.type(value, delay=80)
-                page.wait_for_timeout(200)
-                if len(field.input_value()) != len(value):
-                    raise TaishinLoginError("登入欄位輸入長度不符；未送出登入")
+            with error_step('TAISHIN-02-016-001'):
+                page.keyboard.type(captcha, delay=80)
+            with error_step('TAISHIN-02-017-001'):
+                page.wait_for_timeout(300)
+            with error_step('TAISHIN-02-018-001'):
+                if len(field.input_value()) != 6:
+                    raise with_error_code(TaishinLoginError('驗證碼欄位輸入長度不符；未送出登入'), 'TAISHIN-02-019-001')
         except TaishinLoginError:
             raise
-        except Exception:
-            raise TaishinLoginError("登入欄位無法安全填寫；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(TaishinLoginError('驗證碼欄位無法安全填寫；未送出登入'), exception_error_id(error, bank="taishin") or 'TAISHIN-02-020-001') from None
 
-        captcha = self._ocr_captcha(frame, max_attempts=1)
-        if not captcha or len(captcha) != 6 or not captcha.isdigit():
-            raise captcha_unreadable(TaishinLoginError("圖形驗證碼 OCR 失敗；未送出登入"))
         try:
-            candidates = frame.locator(_ph_sel(FIELD_PLACEHOLDERS["captcha"]))
-            if candidates.count() != 1:
-                raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            field = candidates.nth(0)
-            if not field.is_visible() or not field.is_enabled():
-                raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            field.click()
-            field.click(click_count=3)
-            page.keyboard.press("Backspace")
-            page.keyboard.type(captcha, delay=80)
-            page.wait_for_timeout(300)
-            if len(field.input_value()) != 6:
-                raise TaishinLoginError("驗證碼欄位輸入長度不符；未送出登入")
+            with error_step('TAISHIN-02-021-001'):
+                candidates = frame.locator(f"#{LOGIN_BTN_ID}")
+            with error_step('TAISHIN-02-022-001'):
+                if candidates.count() != 1:
+                    raise with_error_code(TaishinLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'TAISHIN-02-023-001')
+            with error_step('TAISHIN-02-024-001'):
+                button = candidates.nth(0)
+            with error_step('TAISHIN-02-025-001'):
+                with error_step('TAISHIN-02-026-001'):
+                    _error_condition = not button.is_visible()
+                if _error_condition:
+                    raise with_error_code(TaishinLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'TAISHIN-02-027-001')
+                else:
+                    with error_step('TAISHIN-02-028-001'):
+                        _error_condition = not button.is_enabled()
+                    if _error_condition:
+                        raise with_error_code(TaishinLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'TAISHIN-02-027-002')
         except TaishinLoginError:
             raise
-        except Exception:
-            raise TaishinLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(TaishinLoginError('無法安全確認登入按鈕；未送出登入'), exception_error_id(error, bank="taishin") or 'TAISHIN-02-029-001') from None
+        try:
+            with error_step('TAISHIN-02-030-001'):
+                button.click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(TaishinLoginError('登入送出狀態不明；禁止自動重試'), exception_error_id(error, bank="taishin") or 'TAISHIN-02-031-001') from None
 
         try:
-            candidates = frame.locator(f"#{LOGIN_BTN_ID}")
-            if candidates.count() != 1:
-                raise TaishinLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
-            button = candidates.nth(0)
-            if not button.is_visible() or not button.is_enabled():
-                raise TaishinLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
-        except TaishinLoginError:
-            raise
-        except Exception:
-            raise TaishinLoginError("無法安全確認登入按鈕；未送出登入") from None
-        try:
-            button.click(timeout=8000)
-        except Exception:
-            raise TaishinLoginError("登入送出狀態不明；禁止自動重試") from None
-
-        try:
-            page.wait_for_timeout(10000)
+            with error_step('TAISHIN-03-001-001'):
+                page.wait_for_timeout(10000)
             for _ in range(30):
-                page.wait_for_timeout(1000)
+                with error_step('TAISHIN-03-002-001'):
+                    page.wait_for_timeout(1000)
                 if self._logged_in(page):
                     return
                 scopes = [
@@ -1874,25 +2107,34 @@ class TaishinCrawler(BankCrawler):
                 ]
                 for scope in scopes:
                     for selector in (".modal.show", "[role='dialog']"):
-                        checkpoints = scope.locator(selector)
-                        if any(
-                            checkpoints.nth(index).is_visible()
-                            for index in range(checkpoints.count())
-                        ):
-                            return
-        except Exception:
+                        with error_step({'.modal.show': 'TAISHIN-03-003-002', "[role='dialog']": 'TAISHIN-03-003-003'}[selector]):
+                            checkpoints = scope.locator(selector)
+                        with error_step('TAISHIN-03-004-001'):
+                            if any(
+                                error_step({'.modal.show': 'TAISHIN-03-712-002', "[role='dialog']": 'TAISHIN-03-712-003'}[selector])(lambda: error_step({'.modal.show': 'TAISHIN-03-713-002', "[role='dialog']": 'TAISHIN-03-713-003'}[selector])(lambda: checkpoints.nth(index))().is_visible())()
+                                for index in range(error_step({'.modal.show': 'TAISHIN-03-714-002', "[role='dialog']": 'TAISHIN-03-714-003'}[selector])(lambda: checkpoints.count())())
+                            ):
+                                return
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-03-005-001', bank="taishin"))
             return
 
     @staticmethod
-    def _overview_accounts(page) -> list[dict]:
+    def _overview_accounts(page, *, _failure=None) -> list[dict]:
         """Deposit rows from the overview table: 帳號別名 | 帳號 | 利率 | 累計利息 | 帳戶餘額."""
         js = """() => [...document.querySelectorAll('tr')].map(tr =>
             [...tr.querySelectorAll('td')].map(td => (td.innerText || '').trim()))"""
         seen, out = set(), []
         for f in page.frames:
             try:
-                rows = f.evaluate(js) or []
-            except Exception:
+                with error_step('TAISHIN-04-001-001'):
+                    rows = f.evaluate(js) or []
+            except Exception as _action_error:
+                if _failure is not None:
+                    _failure[:] = [exception_error_id(_action_error, bank="taishin") or 'TAISHIN-04-002-001']
+                with contextlib.suppress(Exception):
+                    _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-04-002-001', bank="taishin"))
                 continue
             for cells in rows:
                 hit = [i for i, c in enumerate(cells) if re.fullmatch(r"\d{4}-\d{2}-\d{7}-\d", c.split("\n")[0])]
@@ -1917,12 +2159,14 @@ class TaishinCrawler(BankCrawler):
         「信用卡」是第 5 個，約 x:1390/2160 寬。直接從 DOM 找元素點，不依賴座標猜測。
         """
         out: dict = {}
-        page.wait_for_timeout(8000)
+        with error_step('TAISHIN-04-003-001'):
+            page.wait_for_timeout(8000)
         # Live 2026-10-02: the rb0100 response body is not capturable, but the
         # landing overview table renders every deposit account; read it first.
-        dom_accounts = self._overview_accounts(page)
+        overview_failure = []
+        dom_accounts = self._overview_accounts(page, _failure=overview_failure)
         if not dom_accounts:
-            raise RuntimeError("taishin-accounts-empty")
+            raise with_error_code(RuntimeError('taishin-accounts-empty'), overview_failure[0] if overview_failure else 'TAISHIN-04-004-001')
 
         # ── Step 2: 從所有 frames（含主 page）找 top nav「信用卡」DOM 元素並點 ──
         # 台新 SPA 整個介面在 svc/rwd iframe 內，top nav 也在裡面（不在主 page）
@@ -1933,7 +2177,8 @@ class TaishinCrawler(BankCrawler):
             for f in [page] + [fr for fr in page.frames if fr != page.main_frame]:
                 kind = "page" if f == page else "frame"
                 try:
-                    found = f.evaluate("""() => {
+                    with error_step('TAISHIN-06-016-001'):
+                        found = f.evaluate("""() => {
                         // 找 text='信用卡' 的元素，但更要找它的可點父鏈（a / button / [onclick] / [role=button]）
                         const all = document.querySelectorAll('a, button, [role="menuitem"], li, span, div');
                         const out = [];
@@ -1972,7 +2217,9 @@ class TaishinCrawler(BankCrawler):
                         }
                         return out;
                     }""")
-                except Exception:
+                except Exception as _action_error:
+                    with contextlib.suppress(Exception):
+                        _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-008-001', bank="taishin"))
                     found = []
                 if found:
                     _log(f"[taishin][collect] {kind} 信用卡候選數={len(found)}")
@@ -1990,11 +2237,14 @@ class TaishinCrawler(BankCrawler):
                 clicked_credit_card = self._try_ancestor_clicks(target_frame, page)
             else:
                 _log("[taishin][collect] 全 frames 都找不到「信用卡」元素")
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-009-001', bank="taishin"))
             _log("[taishin][collect] 找信用卡 nav 例外")
 
         # ── Step 3: 等信用卡頁載入 + 等 API call 跑完（10 秒） ──
-        page.wait_for_timeout(10000)
+        with error_step('TAISHIN-06-017-001'):
+            page.wait_for_timeout(10000)
 
         # ── Step 4: dump 信用卡頁 frame text + 攔 API ──
         # 已經點過「查詢信用卡明細」（在 _try_ancestor_clicks 內），現在直接 dump
@@ -2005,13 +2255,16 @@ class TaishinCrawler(BankCrawler):
                 if f == page.main_frame:
                     continue
                 try:
-                    ct = f.evaluate("() => document.body.innerText.slice(0, 12000)")
+                    with error_step('TAISHIN-06-018-001'):
+                        ct = f.evaluate("() => document.body.innerText.slice(0, 12000)")
                     if ct and ("信用卡" in ct or "帳單" in ct or "消費" in ct or "應繳" in ct):
                         credit_card_frame = f
                         page_text = ct
                         _log(f"[taishin][collect] 信用卡頁 frame text len={len(ct)}")
                         break
-                except Exception:
+                except Exception as _action_error:
+                    with contextlib.suppress(Exception):
+                        _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-010-001', bank="taishin"))
                     pass
 
         # ── Step 4b: parse 信用卡頁 frame text 抽結構化資料 ──
@@ -2034,7 +2287,8 @@ class TaishinCrawler(BankCrawler):
                 if credit_card_frame:
                     month_options = []
                     try:
-                        month_options = credit_card_frame.evaluate("""() => {
+                        with error_step('TAISHIN-06-019-001'):
+                            month_options = credit_card_frame.evaluate("""() => {
                             const sels = [...document.querySelectorAll('select')];
                             const monthSel = sels.find(s => [...s.options].some(o => /^\\d{4}\\/\\d{2}$/.test((o.textContent || '').trim())));
                             if (!monthSel) return [];
@@ -2042,7 +2296,9 @@ class TaishinCrawler(BankCrawler):
                                 .map((o, index) => ({index, text: (o.textContent || '').trim()}))
                                 .filter(o => /^\\d{4}\\/\\d{2}$/.test(o.text));
                         }""") or []
-                    except Exception:
+                    except Exception as _action_error:
+                        with contextlib.suppress(Exception):
+                            _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-011-001', bank="taishin"))
                         _log("[taishin][collect] 月份下拉 dump 失敗")
                     # 穩定按時間降序排 (2026/06, 2026/05, ...)，log 才不會神秘跳
                     month_options.sort(key=lambda o: o.get("text") or "", reverse=True)
@@ -2053,15 +2309,20 @@ class TaishinCrawler(BankCrawler):
                     }
                     for opt in month_options[:12]:
                         try:
-                            credit_card_frame.evaluate("location.hash = '#/RB0708/0100?ts=' + Date.now()")
-                            page.wait_for_timeout(4000)
+                            with error_step('TAISHIN-06-020-001'):
+                                credit_card_frame.evaluate("location.hash = '#/RB0708/0100?ts=' + Date.now()")
+                            with error_step('TAISHIN-06-021-001'):
+                                page.wait_for_timeout(4000)
                             for f in page.frames:
                                 if "svc/rwd" in (f.url or ""):
                                     credit_card_frame = f
                                     break
-                            credit_card_frame.locator("select").nth(1).select_option(index=opt.get("index") or 0)
-                            page.wait_for_timeout(5000)
-                            month_text = credit_card_frame.evaluate("() => document.body.innerText.slice(0, 50000)") or ""
+                            with error_step('TAISHIN-06-022-001'):
+                                error_step('TAISHIN-06-715-001')(lambda: error_step('TAISHIN-06-716-001')(lambda: error_step('TAISHIN-06-717-001')(lambda: credit_card_frame.locator("select"))().nth(1))().select_option(index=opt.get("index") or 0))()
+                            with error_step('TAISHIN-06-023-001'):
+                                page.wait_for_timeout(5000)
+                            with error_step('TAISHIN-06-024-001'):
+                                month_text = credit_card_frame.evaluate("() => document.body.innerText.slice(0, 50000)") or ""
                             month_parsed = self._parse_credit_card_page(month_text)
                             added = 0
                             for row in month_parsed.get("billed_txns", []):
@@ -2078,7 +2339,9 @@ class TaishinCrawler(BankCrawler):
                                 if amt < 0 and ("扣繳" in desc or "轉帳" in desc):
                                     added += 1
                             _log(f"[taishin][collect] 月份 {opt.get('text')} 補 payment rows={added}")
-                        except Exception:
+                        except Exception as _action_error:
+                            with contextlib.suppress(Exception):
+                                _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-012-001', bank="taishin"))
                             _log(f"[taishin][collect] 月份 {opt.get('text')} 查詢失敗")
 
                 out["credit_card_parsed"] = parsed
@@ -2087,7 +2350,9 @@ class TaishinCrawler(BankCrawler):
                      f"pending={len(parsed.get('pending_txns', []))} "
                      f"billed={len(parsed.get('billed_txns', []))} "
                      f"summary={'有' if parsed.get('summary') else '無'}")
-            except Exception:
+            except Exception as _action_error:
+                with contextlib.suppress(Exception):
+                    _log(format_error_id(exception_error_id(_action_error, bank="taishin") or 'TAISHIN-07-013-001', bank="taishin"))
                 _log("[taishin][collect] parser 例外")
                 out["credit_card_parsed"] = {"error": "parse_failed"}
 
@@ -2100,7 +2365,8 @@ class TaishinCrawler(BankCrawler):
             hits_by_endpoint["query"] = {"OUTPUTDATA": {"SavingAccount": dom_accounts}}
         out["api_responses"] = hits_by_endpoint
         parsed = out.get("credit_card_parsed") or {}
-        publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])
+        with error_step('TAISHIN-07-014-001'):
+            publish_card_bill_facts(out, [_taishin_card_bill_fact(parsed)])
         _log(f"[taishin][collect] 攔到 {len(hits_by_endpoint)} 個 endpoint")
         return BankCollectResult(**out)
 

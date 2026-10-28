@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step
 from datetime import datetime
 
 from backend.core import account_classify, classify
@@ -23,7 +24,8 @@ def _scb_due_to_stmt(due_iso: str | None) -> str | None:
     if not due_iso:
         return None
     try:
-        due = datetime.strptime(due_iso, "%Y-%m-%d")
+        with error_step('SCB-08-001-001'):
+            due = datetime.strptime(due_iso, "%Y-%m-%d")
         from datetime import timedelta
         stmt = due - timedelta(days=25)
         return stmt.strftime("%Y-%m-%d")
@@ -66,10 +68,12 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
         # 共用 limit (兩張卡都套這個值)
         m = _re_scb.search(r"信用額度\s*\n+\s*TWD\s+([\d,]+(?:\.\d+)?)", card_text)
         if m:
-            shared_credit_limit = float(m.group(1).replace(",", ""))
+            with error_step('SCB-08-002-009'):
+                shared_credit_limit = float(m.group(1).replace(",", ""))
         m = _re_scb.search(r"可用額度\s*\n+\s*TWD\s+([\d,]+(?:\.\d+)?)", card_text)
         if m:
-            shared_available = float(m.group(1).replace(",", ""))
+            with error_step('SCB-08-002-010'):
+                shared_available = float(m.group(1).replace(",", ""))
         # per-card due_date: 切 by 卡號然後找後段
         parts = _re_scb.split(r"(\d{4}-XXXX-XXXX-\d{4})", card_text)
         for i in range(1, len(parts), 2):
@@ -78,7 +82,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             after = parts[i + 1] if i + 1 < len(parts) else ""
             due_m = _re_scb.search(
                 r"最近一期繳款截止日\s*\n+\s*(\d{4}/\d{2}/\d{2})", after[:300])
-            per_card_due[last4] = _ubot_date(due_m.group(1)) if due_m else None
+            with error_step('SCB-08-002-011'):
+                per_card_due[last4] = _ubot_date(due_m.group(1)) if due_m else None
 
     # used_credit = shared limit - shared available (兩張卡共用)
     shared_used: float | None = None
@@ -116,19 +121,21 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
                 "active": bool(c.get("open")),
             })
         if cards_payload:
-            store.upsert_cards(cards_payload)
+            with error_step('SCB-08-002-012'):
+                store.upsert_cards(cards_payload)
             cards_n = len(cards_payload)
 
         # 額度/帳戶資料（E2EE 加密 + 明碼遮罩混合）
-        store.put_daily_metric("scb_card_shared_limits", {
-            "n_cards": len(shared_cards),
-            "credit_limit_encrypted": shared.get("creditLimitAmt"),
-            "available_limit_encrypted": shared.get("availiableLimitAmt"),  # 拼字保留 API 原樣
-            "cash_advance_amt_encrypted": shared.get("cashAdvanceAmt"),
-            "cash_advance_available_encrypted": shared.get("availableCashAdvanceAmt"),
-            "single_cards_present": cc_body.get("singleCards") is not None,
-            "encrypted": True,
-        }, today)
+        with error_step('SCB-08-002-003'):
+            store.put_daily_metric("scb_card_shared_limits", {
+                "n_cards": len(shared_cards),
+                "credit_limit_encrypted": shared.get("creditLimitAmt"),
+                "available_limit_encrypted": shared.get("availiableLimitAmt"),  # 拼字保留 API 原樣
+                "cash_advance_amt_encrypted": shared.get("cashAdvanceAmt"),
+                "cash_advance_available_encrypted": shared.get("availableCashAdvanceAmt"),
+                "single_cards_present": cc_body.get("singleCards") is not None,
+                "encrypted": True,
+            }, today)
 
     # === B. card_text 解析：明碼額度 + 卡片繳款資訊 (保留 daily_metric snapshot) ===
     if card_text:
@@ -139,35 +146,40 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             cd["available_credit"] = shared_available
         m = _re_scb.search(r"預借現金額度\s*\n+\s*TWD\s+([\d,]+(?:\.\d+)?)", card_text)
         if m:
-            cd["cash_advance_limit"] = float(m.group(1).replace(",", ""))
+            with error_step('SCB-08-002-013'):
+                cd["cash_advance_limit"] = float(m.group(1).replace(",", ""))
         m = _re_scb.search(r"可用預借現金餘額\s*\n+\s*TWD\s+([\d,]+(?:\.\d+)?)", card_text)
         if m:
-            cd["cash_advance_available"] = float(m.group(1).replace(",", ""))
+            with error_step('SCB-08-002-014'):
+                cd["cash_advance_available"] = float(m.group(1).replace(",", ""))
         cd["currency"] = "TWD"
         if per_card_due:
             cd["per_card_due"] = per_card_due
         if cd:
-            store.put_daily_metric("scb_card_text_summary", cd, today)
+            with error_step('SCB-08-002-015'):
+                store.put_daily_metric("scb_card_text_summary", cd, today)
 
     # === C. getMoneyOverview → dashboard 統計 ===
     mo_hits = apis.get("getMoneyOverview") or []
     if mo_hits:
         mo_resp = mo_hits[0].get("resp") or {}
         body = mo_resp.get("body") or {}
-        store.put_daily_metric("scb_money_overview_meta", {
-            "n_accounts": len(body.get("accounts") or []),
-            "has_credit_cards": body.get("creditCards") is not None,
-            "has_investments": body.get("investments") is not None,
-            "has_loans": body.get("loans") is not None,
-            "n_month_assets": len(body.get("monthAssets") or []),
-            "trust_account_flag": body.get("trustAccountFlag"),
-            "totalAccountAmtCurrency": body.get("totalAccountAmtCurrency"),
-            "encrypted": True,
-        }, today)
-        store.put_daily_metric("scb_money_overview_raw", {
-            "body_encrypted": body,
-            "header_code": mo_resp.get("header", {}).get("code"),
-        }, today)
+        with error_step('SCB-08-002-004'):
+            store.put_daily_metric("scb_money_overview_meta", {
+                "n_accounts": len(body.get("accounts") or []),
+                "has_credit_cards": body.get("creditCards") is not None,
+                "has_investments": body.get("investments") is not None,
+                "has_loans": body.get("loans") is not None,
+                "n_month_assets": len(body.get("monthAssets") or []),
+                "trust_account_flag": body.get("trustAccountFlag"),
+                "totalAccountAmtCurrency": body.get("totalAccountAmtCurrency"),
+                "encrypted": True,
+            }, today)
+        with error_step('SCB-08-002-005'):
+            store.put_daily_metric("scb_money_overview_raw", {
+                "body_encrypted": body,
+                "header_code": mo_resp.get("header", {}).get("code"),
+            }, today)
 
     # === D. 從 home_text 解析 dashboard 顯示值 ===
     home_text = data.get("home_text") or ""
@@ -179,7 +191,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             m = re.search(rf"{re.escape(label)}\s*\n+\s*TWD\s+([\d,]+)", home_text)
             if m:
                 try:
-                    return int(m.group(1).replace(",", ""))
+                    with error_step('SCB-08-003-001'):
+                        return int(m.group(1).replace(",", ""))
                 except ValueError:
                     return m.group(1)
             return None
@@ -201,7 +214,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             m = re.search(rf"{re.escape(label)}\s*\n+\s*約等值\s*TWD\s+([\d,]+)", home_text)
             if m:
                 try:
-                    dashboard[key] = int(m.group(1).replace(",", ""))
+                    with error_step('SCB-08-002-018'):
+                        dashboard[key] = int(m.group(1).replace(",", ""))
                 except ValueError:
                     dashboard[key] = m.group(1)
         if "您目前沒有任何保險" in home_text:
@@ -211,7 +225,8 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
             dashboard["rm_name"] = m.group(1)
             dashboard["rm_phone"] = m.group(2).strip()
         if dashboard:
-            store.put_daily_metric("scb_dashboard_text", dashboard, today)
+            with error_step('SCB-08-002-016'):
+                store.put_daily_metric("scb_dashboard_text", dashboard, today)
 
     # === D2. consumptionDetail → 信用卡逐筆消費 (2026-06-13 升級) ===
     # SCB API: /mobilebank/rest/creditcard/consumptionDetail
@@ -248,11 +263,13 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
                 card_no = t.get("cardNo") or t.get("cardNumber") or ""
                 card_last4 = card_no[-4:] if card_no else ""
                 try:
-                    twd_int = int(float(str(twd_amount).replace(",", "")))
+                    with error_step('SCB-08-002-019'):
+                        twd_int = int(float(str(twd_amount).replace(",", "")))
                 except (ValueError, TypeError):
                     twd_int = 0
                 try:
-                    fx_float = float(str(fx_amount).replace(",", "")) if fx_amount else None
+                    with error_step('SCB-08-002-020'):
+                        fx_float = float(str(fx_amount).replace(",", "")) if fx_amount else None
                 except (ValueError, TypeError):
                     fx_float = None
                 billed_payload.append({
@@ -267,13 +284,16 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
                     "txn_type": classify.classify_by_desc_and_sign(desc or "", twd_int),
                 })
         if billed_payload:
-            billed_n = store.upsert_card_billed(billed_payload, rules=rules) or 0
-    store.put_daily_metric("scb_consumption_detail_meta", cd_meta, today)
+            with error_step('SCB-08-002-017'):
+                billed_n = store.upsert_card_billed(billed_payload, rules=rules) or 0
+    with error_step('SCB-08-002-001'):
+        store.put_daily_metric("scb_consumption_detail_meta", cd_meta, today)
 
     # === E. endpoint 地圖 dump ===
     eps = data.get("_all_endpoints") or []
     if eps:
-        store.put_daily_metric("scb_endpoints", {"endpoints": eps}, today)
+        with error_step('SCB-08-002-006'):
+            store.put_daily_metric("scb_endpoints", {"endpoints": eps}, today)
 
     delta["balance_days"] = 0
     delta["twd_txn_new"] = 0
@@ -281,20 +301,23 @@ def persist_scb(data: dict, store: BankStore, rules: list[dict] | None = None) -
     delta["card_unbilled"] = 0
     delta["card_current"] = 0
     delta["cards_n"] = cards_n
-    store.log_sync(delta)
+    with error_step('SCB-08-002-002'):
+        store.log_sync(delta)
     # === Deposit accounts (rendered 帳戶綜覽; masked number is the stable key) ===
     accts = []
     for a in data.get("accounts") or []:
         if not isinstance(a, dict) or not a.get("account_no"):
             continue
         raw = {**a, "type": a.get("type") or "活期存款"}
-        accts.append({
-            "account_no": a["account_no"], "currency": a.get("currency") or "TWD", "branch": None,
-            "nickname": None, "type": a.get("type"),
-            "product_type": account_classify.classify_account("scb", raw),
-            "raw_balance": _num_real(a.get("balance")), "raw_balance_date": today,
-        })
+        with error_step('SCB-08-002-007'):
+            accts.append({
+                "account_no": a["account_no"], "currency": a.get("currency") or "TWD", "branch": None,
+                "nickname": None, "type": a.get("type"),
+                "product_type": account_classify.classify_account("scb", raw),
+                "raw_balance": _num_real(a.get("balance"), _codes=('SYS-08-001-001', 'SCB-08-830-002', 'SYS-08-001-003', 'SCB-08-830-004', 'SCB-08-830-005', 'SCB-08-830-006', 'SYS-08-001-007', 'SCB-08-830-008', 'SCB-08-830-009', 'SCB-08-830-010')), "raw_balance_date": today,
+            })
     if accts:
-        store.upsert_accounts(accts)
+        with error_step('SCB-08-002-008'):
+            store.upsert_accounts(accts)
     delta["accounts"] = len(accts)
     return delta

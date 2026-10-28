@@ -155,7 +155,13 @@ def test_stale_queued_jobs_are_failed_without_execution(client) -> None:
     row = sync_jobs_repo.get(job_id)
     assert row is not None
     assert row["status"] == "failed"
-    assert row["error_msg"] == "stale_queue: worker did not claim within 1 hour"
+    assert row["error_msg"] == (
+        "[SYS-09-001-001] 同步排隊：等待工作程序執行逾時 | "
+        "stale_queue: worker did not claim within 1 hour"
+    )
+    assert row["finished_at"] is not None
+    assert row["started_at"] is None
+    assert row["result_summary"] is None
     scheduled_row = sync_jobs_repo.get(scheduled_job)
     assert scheduled_row is not None
     assert scheduled_row["status"] == "queued"

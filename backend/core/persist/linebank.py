@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step
 from datetime import datetime
 
 from backend.core import account_classify
@@ -59,42 +60,47 @@ def persist_linebank(data: dict, store: BankStore, rules: list[dict] | None = No
             acct_no = (a.get("acctNbr") or "").strip()
             if not acct_no:
                 continue
-            bal = _num(a.get("acctBal")) or 0
+            with error_step('LINEBANK-08-001-006'):
+                bal = _num(a.get("acctBal"), _codes=('SYS-08-001-001', 'LINEBANK-08-830-002', 'SYS-08-001-003', 'LINEBANK-08-830-004', 'LINEBANK-08-830-005', 'LINEBANK-08-830-006', 'LINEBANK-08-830-007', 'SYS-08-001-008', 'SYS-08-001-009', 'LINEBANK-08-830-010')) or 0
             # 餵 desc 含 pdNm + acctNick 給 keyword classifier，UNKNOWN 時 fallback deposit
             desc_hint = " ".join(filter(None, [a.get("acctNick"), a.get("pdNm"), "存款"]))
             raw = {**a, "desc": desc_hint, "currency": "TWD"}
             pt = account_classify.classify_account("linebank", raw)
             if pt == account_classify.ProductType.UNKNOWN:
                 pt = account_classify.ProductType.DEPOSIT  # dpstAcctList = 存款帳戶清單
-            accts.append({
-                "account_no": acct_no,
-                "currency": "TWD",
-                "branch": None,
-                "nickname": a.get("acctNick") or a.get("pdNm") or None,
-                "type": a.get("pdNm") or None,        # 如 "主帳戶"
-                "product_type": pt,
-                "raw_balance": _num_real(a.get("acctBal")),
-                "raw_balance_date": today,
-            })
+            with error_step('LINEBANK-08-001-007'):
+                accts.append({
+                    "account_no": acct_no,
+                    "currency": "TWD",
+                    "branch": None,
+                    "nickname": a.get("acctNick") or a.get("pdNm") or None,
+                    "type": a.get("pdNm") or None,        # 如 "主帳戶"
+                    "product_type": pt,
+                    "raw_balance": _num_real(a.get("acctBal"), _codes=('SYS-08-001-001', 'LINEBANK-08-831-002', 'SYS-08-001-003', 'LINEBANK-08-831-004', 'LINEBANK-08-831-005', 'LINEBANK-08-831-006', 'SYS-08-001-007', 'LINEBANK-08-831-008', 'LINEBANK-08-831-009', 'LINEBANK-08-831-010')),
+                    "raw_balance_date": today,
+                })
             twd_total += bal
             n_accounts += 1
         if accts:
-            store.upsert_accounts(accts)
+            with error_step('LINEBANK-08-001-008'):
+                store.upsert_accounts(accts)
 
         # 轉帳額度 / 全戶餘額摘要 → daily_metrics
-        store.put_daily_metric("linebank_payables_summary", {
-            "total_balance": twd_total,
-            "n_accounts": n_accounts,
-            "daily_txfr_remaining": pay_content.get("custDylyTxfrRmngLmtAmt"),
-            "monthly_txfr_remaining": pay_content.get("custMnlyTxfrRmngLmtAmt"),
-        }, today)
+        with error_step('LINEBANK-08-001-002'):
+            store.put_daily_metric("linebank_payables_summary", {
+                "total_balance": twd_total,
+                "n_accounts": n_accounts,
+                "daily_txfr_remaining": pay_content.get("custDylyTxfrRmngLmtAmt"),
+                "monthly_txfr_remaining": pay_content.get("custMnlyTxfrRmngLmtAmt"),
+            }, today)
 
     if accts:
-        store.upsert_balance_history([{
-            "snapshotDate": today,
-            "twdBalance": int(twd_total) if twd_total else None,
-            "fxBalance": None,
-        }])
+        with error_step('LINEBANK-08-001-003'):
+            store.upsert_balance_history([{
+                "snapshotDate": today,
+                "twdBalance": int(twd_total) if twd_total else None,
+                "fxBalance": None,
+            }])
         delta["balance_days"] = 1
 
     # ─── B. transactions: 每帳戶的交易明細 ───
@@ -120,11 +126,13 @@ def persist_linebank(data: dict, store: BankStore, rules: list[dict] | None = No
             iso_dt = f"{iso_date}T{tx_tm_padded[:2]}:{tx_tm_padded[2:4]}:{tx_tm_padded[4:6]}"
 
             dpst_wdrw = (t.get("dpstWdrwDsCd") or "").strip()
-            amt = _num(t.get("txAmt")) or 0
+            with error_step('LINEBANK-08-001-009'):
+                amt = _num(t.get("txAmt"), _codes=('SYS-08-001-001', 'LINEBANK-08-832-002', 'SYS-08-001-003', 'LINEBANK-08-832-004', 'LINEBANK-08-832-005', 'LINEBANK-08-832-006', 'LINEBANK-08-832-007', 'SYS-08-001-008', 'SYS-08-001-009', 'LINEBANK-08-832-010')) or 0
             # "1" = 入帳 (income), "2" = 出帳 (expend)
             expend = amt if dpst_wdrw == "2" else None
             income = amt if dpst_wdrw == "1" else None
-            bal_after = _num(t.get("afTxBal"))
+            with error_step('LINEBANK-08-001-010'):
+                bal_after = _num(t.get("afTxBal"), _codes=('SYS-08-001-001', 'LINEBANK-08-833-002', 'SYS-08-001-003', 'LINEBANK-08-833-004', 'LINEBANK-08-833-005', 'LINEBANK-08-833-006', 'LINEBANK-08-833-007', 'SYS-08-001-008', 'SYS-08-001-009', 'LINEBANK-08-833-010'))
 
             biz_nm = t.get("bizTxFuncTpNm") or ""
             rmk = t.get("txRmkCont") or ""
@@ -143,7 +151,8 @@ def persist_linebank(data: dict, store: BankStore, rules: list[dict] | None = No
                 "memo": t.get("txMemoVal") or None,
             })
         if txns:
-            twd_new += store.upsert_twd_txns(txns, rules=rules)
+            with error_step('LINEBANK-08-001-011'):
+                twd_new += store.upsert_twd_txns(txns, rules=rules)
     delta["twd_txn_new"] = twd_new
 
     # 信貸帳戶（loan_inferred）：拔除 — LINE Bank raw `api_responses` 沒有任何
@@ -160,10 +169,11 @@ def persist_linebank(data: dict, store: BankStore, rules: list[dict] | None = No
     info_hits = apis.get("informations") or []
     if info_hits:
         ic = (info_hits[0].get("resp") or {}).get("content") or {}
-        store.put_daily_metric("linebank_profile", {
-            "nick": ic.get("nick"),
-            "cust_nm": ic.get("custNm"),
-        }, today)
+        with error_step('LINEBANK-08-001-004'):
+            store.put_daily_metric("linebank_profile", {
+                "nick": ic.get("nick"),
+                "cust_nm": ic.get("custNm"),
+            }, today)
 
     # ─── D. 信用卡: LINE Bank 無信用卡產品, 跳過 ───
     delta["card_billed_new"] = 0
@@ -173,8 +183,10 @@ def persist_linebank(data: dict, store: BankStore, rules: list[dict] | None = No
     # ─── E. endpoint 地圖 (debug) ───
     endpoints = data.get("_all_endpoints") or sorted(apis.keys())
     if endpoints:
-        store.put_daily_metric("linebank_endpoints", {"endpoints": endpoints}, today)
+        with error_step('LINEBANK-08-001-005'):
+            store.put_daily_metric("linebank_endpoints", {"endpoints": endpoints}, today)
 
     delta.setdefault("balance_days", 0)
-    store.log_sync(delta)
+    with error_step('LINEBANK-08-001-001'):
+        store.log_sync(delta)
     return delta

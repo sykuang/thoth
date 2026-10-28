@@ -35,7 +35,16 @@ ACCOUNT = "90000000267053"
 def test_fubon_submit_binds_to_single_server_observed_action_preset_pair() -> None:
     source = inspect.getsource(FubonCrawler._collect_twd_window)
     assert "new FormData(form).getAll('checkedConvenientPeriod')" not in source
-    assert "_fubon_settled_control_guard(settled, option, query_control_pairs)" in source
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(source))
+    guards = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name) and node.func.id == "_fubon_settled_control_guard"]
+    expected = ast.parse(
+        "_fubon_settled_control_guard(settled, option, query_control_pairs, "
+        "raise_on_error=True, _shape_error_id=settled_reason)", mode="eval",
+    ).body
+    assert [ast.dump(node) for node in guards] == [ast.dump(expected)]
     assert "_control_action" not in source
     assert "submit_requests, preset_shapes" in source
     assert "radio_submitted = bounded_evaluate" in source
@@ -378,9 +387,13 @@ def test_fubon_frame_and_post_binding_are_exact(monkeypatch):
     )
     page = SimpleNamespace(frames=[misleading, lowercase, correct])
     assert crawler._fubon_content_frame(page, "/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces") is correct
-    monkeypatch.setattr(
-        FubonCrawler, "_fubon_content_frame", lambda self, page, *routes: lowercase,
-    )
+    def wrong_frame(self, actual_page, *routes, _error_role):
+        assert self is crawler and actual_page is page
+        assert routes == ("/B2C/cdsqu/cdsqu001/CDSQU001_Home.faces",)
+        assert _error_role == "publication"
+        return lowercase
+
+    monkeypatch.setattr(FubonCrawler, "_fubon_content_frame", wrong_frame)
     with pytest.raises(RuntimeError):
         crawler._bound_twd_result_frame(page, correct)
 
@@ -731,15 +744,44 @@ def test_fubon_window_stages_account_dependent_controls_after_ajax_settle():
     assert '("requestfailed", control_failed_request)' in source
     assert "remove_control_listeners()" in source
     assert source.count("add_control_listeners()") >= 2
-    assert 'click_control("#form1\\\\:rdoTxDetail")' in source
-    assert 'click_control("#form1\\\\:rdoFast")' in source
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(source))
+    controls = sorted((node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Name) and node.func.id == "click_control"),
+                      key=lambda node: node.lineno)
+    expected = ast.parse(
+        'click_control("#form1\\\\:rdoTxDetail", error_action="FUBON-05-100")\n'
+        'click_control("#form1\\\\:rdoFast", error_action="FUBON-05-110")\n'
+        'click_control(f"#form1\\\\:{window[\'preset\']}", expected_preset=window["preset"], error_action="FUBON-05-120")'
+    )
+    assert [ast.dump(node) for node in controls] == [ast.dump(node.value) for node in expected.body]
     assert "f\"#form1\\\\:{window['preset']}\"" in source
-    assert "control_pending or control_failed or stable_ticks < 10" in source
+    settle = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  and node.name == "wait_control_settle")
+    # The former OR is now three terminal guards in the SAME order; pin each
+    # complete suppression-free block, including its unchanged business error.
+    expected_guards = ast.parse("\n".join(
+        f"with error_step('FUBON-05-{239 + index}-001'):\n"
+        f"    if {predicate}:\n"
+        f"        raise with_error_code(RuntimeError('fubon-twd-history-controls'), 'FUBON-05-{239 + index}-001')"
+        for index, predicate in enumerate(("control_pending", "control_failed", "stable_ticks < 10"))
+    ))
+    assert [ast.dump(node) for node in settle.body[-3:]] == [ast.dump(node) for node in expected_guards.body]
     assert 'settled["viewState"]' in inspect.getsource(_fubon_settled_control_guard)
     assert source.index("stable_ticks < 10") < source.index("settled_guard =")
     assert "expected_preset: str | None = None" in source
     assert "before_checked is True and expected_preset is None" in source
-    assert "if not preset or len(preset) > 128" in source
+    click = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                 and node.name == "click_control")
+    attempt = next(node for node in click.body if isinstance(node, ast.Try))
+    expected_preset_guards = ast.parse("\n".join(
+        f'with error_step(f"{{error_action}}-{22 + index:03}"):\n'
+        f'    if {predicate}:\n'
+        f'        raise with_error_code(RuntimeError("fubon-twd-history-controls"), f"{{error_action}}-{22 + index:03}")'
+        for index, predicate in enumerate(("not preset", "len(preset) > 128"))
+    ))
+    assert [ast.dump(node) for node in attempt.body[-2:]] == [ast.dump(node) for node in expected_preset_guards.body]
     assert 'expected_preset=window["preset"]' in source
     assert "query_control_pairs = click_control" in source
     assert "_control_action" not in source

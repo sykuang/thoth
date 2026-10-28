@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import bank_error_id, error_step, with_error_code
 import hashlib
 import json
 import os
@@ -55,15 +56,18 @@ def _migration_cache_key(
     stat = resolved.stat()
     owns_connection = conn is None
     if conn is None:
-        conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+        with error_step('SYS-08-100-001'):
+            conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
     try:
-        schema = conn.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master "
-            "WHERE sql IS NOT NULL ORDER BY type, name"
-        ).fetchall()
+        with error_step('SYS-08-100-004'):
+            schema = error_step('SYS-08-100-002')(lambda: conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE sql IS NOT NULL ORDER BY type, name"
+            ))().fetchall()
     finally:
         if owns_connection:
-            conn.close()
+            with error_step('SYS-08-100-003'):
+                conn.close()
     fingerprint = hashlib.sha256(repr([tuple(row) for row in schema]).encode()).hexdigest()
     return f"{resolved}:{stat.st_dev}:{stat.st_ino}:{fingerprint}"
 
@@ -109,7 +113,8 @@ def _cursor_date(value) -> date | None:
         return None
     canonical = raw[:10].replace("/", "-")
     try:
-        parsed = date.fromisoformat(canonical)
+        with error_step('SYS-08-104-001'):
+            parsed = date.fromisoformat(canonical)
     except ValueError:
         return None
     return parsed if parsed.isoformat() == canonical else None
@@ -125,10 +130,11 @@ def _latest_cursor_dates(
         identity = row[identity_key]
         if not isinstance(identity, str) or not identity.strip():
             continue
-        parsed = next(
-            (value for key in date_keys if (value := _cursor_date(row[key])) is not None),
-            None,
-        )
+        with error_step('SYS-08-105-001'):
+            parsed = next(
+                (value for key in date_keys if (value := _cursor_date(row[key])) is not None),
+                None,
+            )
         if parsed is not None and parsed > result.get(identity, date.min):
             result[identity] = parsed
     return result
@@ -144,7 +150,8 @@ def _card_identity_conflicts(left, right) -> bool:
         if field.endswith("currency"):
             a, b = str(a).strip().upper(), str(b).strip().upper()
         elif field == "consume_amount":
-            a, b = Decimal(str(a)), Decimal(str(b))
+            with error_step('SYS-08-106-001'):
+                a, b = Decimal(str(a)), Decimal(str(b))
         if a != b:
             return True
     return False
@@ -165,25 +172,30 @@ def _pending_billed_identity(row) -> tuple | None:
         if row.get("post_date") is not None:
             dates.append(row["post_date"])
         for value in dates:
-            parsed = _cursor_date(value)
+            with error_step('SYS-08-107-004'):
+                parsed = _cursor_date(value)
             if parsed is None or not isinstance(value, str) or parsed.isoformat() != value:
                 return None
         # Use the writer's monetary rules before building any occurrence proof.
         try:
             currency = str(row.get("currency") or "TWD").strip().upper()
-            row["amount"] = native_money(row.get("amount"), currency)
+            with error_step('SYS-08-107-005'):
+                row["amount"] = native_money(row.get("amount"), currency, _codes=('SYS-08-860-001', 'SYS-08-860-002', 'SYS-08-860-003', 'SYS-08-860-004', 'SYS-08-860-005', 'SYS-08-860-006', 'SYS-08-860-007', 'SYS-08-860-008', 'SYS-08-860-009', 'SYS-08-860-010'))
             if row.get("consume_amount") is not None:
                 row["consume_currency"] = str(row.get("consume_currency") or currency).strip().upper()
-                row["consume_amount"] = native_money(row["consume_amount"], row["consume_currency"])
+                with error_step('SYS-08-107-007'):
+                    row["consume_amount"] = native_money(row["consume_amount"], row["consume_currency"], _codes=('SYS-08-861-001', 'SYS-08-861-002', 'SYS-08-861-003', 'SYS-08-861-004', 'SYS-08-861-005', 'SYS-08-861-006', 'SYS-08-861-007', 'SYS-08-861-008', 'SYS-08-861-009', 'SYS-08-861-010'))
         except ValueError:
             return None
         # Native references still need occurrence evidence. Only exact original FX
         # money permits a mutable settlement amount; local amounts stay guarded.
-        evidence = _pending_billed_identity({**row, "native_identity": None})
+        with error_step('SYS-08-107-001'):
+            evidence = _pending_billed_identity({**row, "native_identity": None})
         if evidence is None:
             return None
-        return ("native", row["native_identity"], evidence, row.get("txn_type"),
-                Decimal(str(row["amount"])).compare(0))
+        with error_step('SYS-08-107-002'):
+            return ("native", row["native_identity"], evidence, row.get("txn_type"),
+                    Decimal(str(row["amount"])).compare(0))
     card_no = row.get("card_no") if isinstance(row, dict) else row["card_no"]
     currency = row.get("consume_currency") if isinstance(row, dict) else row["consume_currency"]
     main_currency = row.get("currency") if isinstance(row, dict) else row["currency"]
@@ -198,13 +210,15 @@ def _pending_billed_identity(row) -> tuple | None:
     if currency and currency != "TWD" and consume_amount is not None:
         try:
             # Decimal(str(...)).normalize() 讓 100.20 與 100.2 視為同額，避免 float 表示差。
-            original = Decimal(str(consume_amount)).normalize()
+            with error_step('SYS-08-107-006'):
+                original = Decimal(str(consume_amount)).normalize()
             if not original.is_finite() or original == 0:
                 return None
         except (InvalidOperation, ValueError):
             return None
-        return ("fx", card_no, consume_date, currency, original, row.get("txn_type"),
-                None if amount is None else Decimal(str(amount)).compare(0))
+        with error_step('SYS-08-107-003'):
+            return ("fx", card_no, consume_date, currency, original, row.get("txn_type"),
+                    None if amount is None else Decimal(str(amount)).compare(0))
     # 只有明確 TWD／未標幣別的 row 才可退回 local amount。若主幣別已顯示外幣，
     # 卻缺 consume_*，代表資料不足，不可把外幣 amount 當 TWD identity 誤配。
     if main_currency and main_currency != "TWD":
@@ -217,13 +231,15 @@ def _pending_billed_identity(row) -> tuple | None:
 def _card_occurrence_matches(left, right) -> bool:
     """Exact money/card/date evidence, with known references and dates as vetoes."""
     left, right = dict(left), dict(right)
-    identity = _pending_billed_identity({**left, "native_identity": None})
-    return (identity is not None
-            and identity == _pending_billed_identity({**right, "native_identity": None})
-            and left.get("txn_type") == right.get("txn_type")
-            and left.get("amount") is not None and right.get("amount") is not None
-            and Decimal(str(left["amount"])).compare(0) == Decimal(str(right["amount"])).compare(0)
-            and not _card_identity_conflicts(left, right))
+    with error_step('SYS-08-108-001'):
+        identity = _pending_billed_identity({**left, "native_identity": None})
+    with error_step('SYS-08-108-002'):
+        return (identity is not None
+                and identity == _pending_billed_identity({**right, "native_identity": None})
+                and left.get("txn_type") == right.get("txn_type")
+                and left.get("amount") is not None and right.get("amount") is not None
+                and Decimal(str(left["amount"])).compare(0) == Decimal(str(right["amount"])).compare(0)
+                and not _card_identity_conflicts(left, right))
 
 
 def _native_occurrence_matches(left, right) -> bool:
@@ -248,16 +264,21 @@ def _rescale_splits(raw: str | None, target_amount) -> str | None:
     if not raw:
         return None
     try:
-        splits = json.loads(raw)
-        target_decimal = abs(Decimal(str(target_amount)))
+        with error_step('SYS-08-111-004'):
+            splits = json.loads(raw)
+        with error_step('SYS-08-111-005'):
+            target_decimal = abs(Decimal(str(target_amount)))
         if (not target_decimal.is_finite()
                 or target_decimal != target_decimal.to_integral_value()):
             return None
-        target = int(target_decimal)
-        amount_decimals = [Decimal(str(s["amount"])) for s in splits]
+        with error_step('SYS-08-111-006'):
+            target = int(target_decimal)
+        with error_step('SYS-08-111-007'):
+            amount_decimals = [Decimal(str(s["amount"])) for s in splits]
         if any(not a.is_finite() or a != a.to_integral_value() for a in amount_decimals):
             return None
-        amounts = [int(a) for a in amount_decimals]
+        with error_step('SYS-08-111-008'):
+            amounts = [int(a) for a in amount_decimals]
     except (TypeError, ValueError, KeyError, InvalidOperation, json.JSONDecodeError):
         return None
     total = sum(amounts)
@@ -267,8 +288,10 @@ def _rescale_splits(raw: str | None, target_amount) -> str | None:
     if total == target:
         return raw
 
-    scaled = [Decimal(a) * Decimal(target) / Decimal(total) for a in amounts]
-    floors = [int(v.to_integral_value(rounding=ROUND_FLOOR)) for v in scaled]
+    with error_step('SYS-08-111-001'):
+        scaled = [Decimal(a) * Decimal(target) / Decimal(total) for a in amounts]
+    with error_step('SYS-08-111-002'):
+        floors = [int(v.to_integral_value(rounding=ROUND_FLOOR)) for v in scaled]
     # 穩定 tie-break：小數尾數同分時保留原順序。
     order = sorted(range(len(splits)), key=lambda i: (scaled[i] - floors[i], -i), reverse=True)
     for i in order[:target - sum(floors)]:
@@ -277,7 +300,8 @@ def _rescale_splits(raw: str | None, target_amount) -> str | None:
         # 新母筆小到無法讓每份至少 1 元；不可產生違反 split invariant 的資料。
         return None
     out = [dict(s, amount=a) for s, a in zip(splits, floors, strict=True)]
-    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+    with error_step('SYS-08-111-003'):
+        return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
 
 
 def _normalize_date_text(s) -> str | None:
@@ -293,7 +317,8 @@ def _normalize_date_text(s) -> str | None:
     m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:T.*)?$", t)
     if not m:
         return t
-    return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    with error_step('SYS-08-112-001'):
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
 
 
 def _dedup_key(*parts) -> str:
@@ -645,7 +670,8 @@ CREATE TABLE IF NOT EXISTS sync_log (
 """
 
 def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None:
-    table_info = conn.execute("PRAGMA table_info(accounts)").fetchall()
+    with error_step('SYS-08-120-008'):
+        table_info = error_step('SYS-08-120-003')(lambda: conn.execute("PRAGMA table_info(accounts)"))().fetchall()
     if not table_info:
         return
     primary_key = [
@@ -656,11 +682,13 @@ def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None
     currency_info = next((row for row in table_info if row["name"] == "currency"), None)
     currencies_canonical = True
     if currency_info is not None:
-        for row in conn.execute("SELECT DISTINCT currency FROM accounts"):
+        with error_step('SYS-08-198-001'):
+            _error_database_rows_1 = conn.execute('SELECT DISTINCT currency FROM accounts')
+        for row in _error_database_rows_1:
             raw_currency = row[0]
             normalized = str(raw_currency or "TWD").strip().upper()
             if re.fullmatch(r"[A-Z]{3}", normalized) is None:
-                raise sqlite3.OperationalError("invalid account currency")
+                raise with_error_code(sqlite3.OperationalError("invalid account currency"), 'SYS-08-120-001')
             if raw_currency != normalized:
                 currencies_canonical = False
     if (
@@ -673,7 +701,7 @@ def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None
         return
     source_columns = {row["name"] for row in table_info}
     if not {"user_id", "account_no", "currency"}.issubset(source_columns):
-        raise sqlite3.OperationalError("accounts identity columns are incomplete")
+        raise with_error_code(sqlite3.OperationalError("accounts identity columns are incomplete"), 'SYS-08-120-002')
     optional = (
         "branch", "nickname", "type", "product_type", "raw_balance",
         "raw_balance_date",
@@ -723,8 +751,10 @@ def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None
             ORDER BY {order_updated} DESC, source.rowid DESC
             LIMIT 1
         )"""
-    conn.execute("ALTER TABLE accounts RENAME TO accounts_legacy_currency_identity")
-    conn.execute("""
+    with error_step('SYS-08-120-004'):
+        conn.execute("ALTER TABLE accounts RENAME TO accounts_legacy_currency_identity")
+    with error_step('SYS-08-120-005'):
+        conn.execute("""
         CREATE TABLE accounts (
             user_id INTEGER NOT NULL DEFAULT 1,
             account_no TEXT NOT NULL,
@@ -741,7 +771,8 @@ def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None
             PRIMARY KEY (user_id, account_no, currency)
         )
     """)
-    conn.execute(f"""
+    with error_step('SYS-08-120-006'):
+        conn.execute(f"""
         INSERT OR REPLACE INTO accounts
             (user_id, account_no, currency, branch, nickname, type,
              product_type, raw_balance, raw_balance_date, excluded,
@@ -759,7 +790,8 @@ def _migrate_sqlite_accounts_currency_identity(conn: sqlite3.Connection) -> None
             LIMIT 1
         )
     """)
-    conn.execute("DROP TABLE accounts_legacy_currency_identity")
+    with error_step('SYS-08-120-007'):
+        conn.execute("DROP TABLE accounts_legacy_currency_identity")
 
 
 class BankStore:
@@ -783,18 +815,19 @@ class BankStore:
         """
         if user_id is None:
             if os.environ.get("THOTH_REQUIRE_EXPLICIT_USER_ID", "").strip().lower() in ("1", "true", "yes"):
-                raise ValueError(
+                raise with_error_code(ValueError(
                     f"BankStore({bank!r}) 沒帶 user_id，但 THOTH_REQUIRE_EXPLICIT_USER_ID 啟用。"
                     " Production 必須顯式傳 user_id 防 multi-tenant data leak。"
                     " 若是 CLI / test / script，請顯式傳 user_id=1 或 unset env。",
-                )
+                ), 'SYS-08-121-001')
             user_id = 1
         self.bank = bank
         self.user_id = user_id
-        if source_account_id is not None and (
-            type(source_account_id) is not int or source_account_id < 1
-        ):
-            raise ValueError("source_account_id must be a positive integer")
+        if source_account_id is not None:
+            if type(source_account_id) is not int:
+                raise with_error_code(ValueError('source_account_id must be a positive integer'), 'SYS-08-121-011')
+            elif source_account_id < 1:
+                raise with_error_code(ValueError('source_account_id must be a positive integer'), 'SYS-08-121-010')
         self.source_account_id = source_account_id
         # 每次 persist run 內剛 INSERT 成功的 billed id。消失比對只可看這批，
         # 不能拿 pending 去配歷史同卡同額交易。BankStore 一個 sync request 用一次。
@@ -806,17 +839,21 @@ class BankStore:
         self._unsafe_pending_overlay_identities: set[tuple] = set()
         if bank_pg.enabled():
             self.db_path = None
-            self.conn = bank_pg.connect(bank)
+            with error_step('SYS-08-121-005'):
+                self.conn = bank_pg.connect(bank)
         else:
             data_root = _data_root()
             self.db_path = data_root / f"{bank}.sqlite"
-            data_root.mkdir(parents=True, exist_ok=True)
+            with error_step('SYS-08-121-006'):
+                data_root.mkdir(parents=True, exist_ok=True)
             # C-5 (2026-06-17): check_same_thread=False — FastAPI routers 在 threadpool
             # 可能跨 thread 取 BankStore；不加會撞 SQLite ProgrammingError。
             # 應用層用 _dispatch_lock / 模組級鎖序列化 write，並無真實 concurrent issue。
-            self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            with error_step('SYS-08-121-007'):
+                self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
+        with error_step('SYS-08-121-003'):
+            self.conn.executescript(SCHEMA)
         if bank_pg.enabled():
             self.conn.ensure_schema_migrations()  # type: ignore[attr-defined]
         # Cache is bound to file identity plus the complete SQLite schema. A restored
@@ -827,31 +864,38 @@ class BankStore:
             cache_key = _migration_cache_key(self.db_path, bank, self.conn)
             if cache_key not in _MIGRATED_DBS:
                 self._migrate()
-                self.conn.commit()
+                with error_step('SYS-08-121-008'):
+                    self.conn.commit()
                 cache_key = _migration_cache_key(self.db_path, bank, self.conn)
                 _MIGRATED_DBS.add(cache_key)
             else:
                 # Schema caching must never authorize malformed identity rows written
                 # in place by an older process or manual repair.
-                _migrate_sqlite_accounts_currency_identity(self.conn)
-        self.conn.commit()
+                with error_step('SYS-08-121-009'):
+                    _migrate_sqlite_accounts_currency_identity(self.conn)
+        with error_step('SYS-08-121-004'):
+            self.conn.commit()
 
     def _migrate_accounts_currency_identity(self) -> None:
         if bank_pg.enabled():
             return
         assert isinstance(self.conn, sqlite3.Connection)
-        _migrate_sqlite_accounts_currency_identity(self.conn)
+        with error_step('SYS-08-122-001'):
+            _migrate_sqlite_accounts_currency_identity(self.conn)
 
     def _migrate_balance_history_fx_real(self) -> None:
         if bank_pg.enabled():
             return
         assert isinstance(self.conn, sqlite3.Connection)
-        table_info = self.conn.execute("PRAGMA table_info(balance_history)").fetchall()
+        with error_step('SYS-08-123-006'):
+            table_info = error_step('SYS-08-123-001')(lambda: self.conn.execute("PRAGMA table_info(balance_history)"))().fetchall()
         fx_column = next(row for row in table_info if row["name"] == "fx_balance")
         if fx_column["type"].upper() == "REAL":
             return
-        self.conn.execute("ALTER TABLE balance_history RENAME TO balance_history_legacy_fx")
-        self.conn.execute("""
+        with error_step('SYS-08-123-002'):
+            self.conn.execute("ALTER TABLE balance_history RENAME TO balance_history_legacy_fx")
+        with error_step('SYS-08-123-003'):
+            self.conn.execute("""
             CREATE TABLE balance_history (
                 user_id INTEGER NOT NULL DEFAULT 1,
                 snapshot_date TEXT NOT NULL,
@@ -862,80 +906,97 @@ class BankStore:
                 PRIMARY KEY (user_id, snapshot_date)
             )
         """)
-        self.conn.execute("""
+        with error_step('SYS-08-123-004'):
+            self.conn.execute("""
             INSERT OR REPLACE INTO balance_history
                 (user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at)
             SELECT user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at
             FROM balance_history_legacy_fx
         """)
-        self.conn.execute("DROP TABLE balance_history_legacy_fx")
+        with error_step('SYS-08-123-005'):
+            self.conn.execute("DROP TABLE balance_history_legacy_fx")
 
     def _migrate(self):
         """對既有 DB 補新增欄位（CREATE TABLE IF NOT EXISTS 不會改既有表）。"""
-        cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(card_billed_txns)").fetchall()}
+        with error_step('SYS-08-124-035'):
+            cols = {r["name"] for r in error_step('SYS-08-124-001')(lambda: self.conn.execute(
+                "PRAGMA table_info(card_billed_txns)"))().fetchall()}
         if "post_date" not in cols:
             # 舊 schema 沒有來源可重建入帳日；新增 nullable 欄後保持 NULL。
-            self.conn.execute("ALTER TABLE card_billed_txns ADD COLUMN post_date TEXT")
+            with error_step('SYS-08-124-009'):
+                self.conn.execute("ALTER TABLE card_billed_txns ADD COLUMN post_date TEXT")
         # Bank memo is part of the persisted canonical description used by both UI and rules.
         # Keep raw_description for audit/dedup provenance; description is the canonical value.
-        twd_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(twd_transactions)").fetchall()}
+        with error_step('SYS-08-124-036'):
+            twd_cols = {r["name"] for r in error_step('SYS-08-124-002')(lambda: self.conn.execute(
+                "PRAGMA table_info(twd_transactions)"))().fetchall()}
         if "currency" not in twd_cols:
-            self.conn.execute(
-                "ALTER TABLE twd_transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
-            )
+            with error_step('SYS-08-124-010'):
+                self.conn.execute(
+                    "ALTER TABLE twd_transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
+                )
             twd_cols.add("currency")
         if "memo" not in twd_cols:
-            self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN memo TEXT")
+            with error_step('SYS-08-124-011'):
+                self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN memo TEXT")
         raw_description_added = "raw_description" not in twd_cols
         if raw_description_added:
-            self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN raw_description TEXT")
-            self.conn.execute(
-                "UPDATE twd_transactions SET raw_description = description "
-                "WHERE raw_description IS NULL",
-            )
+            with error_step('SYS-08-124-012'):
+                self.conn.execute("ALTER TABLE twd_transactions ADD COLUMN raw_description TEXT")
+            with error_step('SYS-08-124-013'):
+                self.conn.execute(
+                    "UPDATE twd_transactions SET raw_description = description "
+                    "WHERE raw_description IS NULL",
+                )
         key_column = "id" if "id" in twd_cols else "dedup_key"
-        for row in self.conn.execute(
-            f"SELECT {key_column} AS migration_key, raw_description, memo, description "
-            "FROM twd_transactions",
-        ).fetchall():
+        with error_step('SYS-08-198-007'):
+            _error_database_rows_2 = error_step('SYS-08-198-002')(lambda: self.conn.execute(f'SELECT {key_column} AS migration_key, raw_description, memo, description FROM twd_transactions'))().fetchall()
+        for row in _error_database_rows_2:
             canonical = _canonical_description(row["raw_description"], row["memo"])
             if canonical != row["description"]:
-                self.conn.execute(
-                    f"UPDATE twd_transactions SET description = ? WHERE {key_column} = ?",
-                    (canonical, row["migration_key"]),
-                )
+                with error_step('SYS-08-124-020'):
+                    self.conn.execute(
+                        f"UPDATE twd_transactions SET description = ? WHERE {key_column} = ?",
+                        (canonical, row["migration_key"]),
+                    )
         # Phase 5.1：分類欄位（三張交易表都加）
         for tbl in ("twd_transactions", "card_billed_txns", "card_pending_txns"):
-            tbl_cols = {r["name"] for r in self.conn.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
+            with error_step('SYS-08-124-041'):
+                tbl_cols = {r["name"] for r in error_step('SYS-08-124-014')(lambda: self.conn.execute(
+                    f"PRAGMA table_info({tbl})"))().fetchall()}
             if "category" not in tbl_cols:
-                self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN category TEXT")
+                with error_step('SYS-08-124-021'):
+                    self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN category TEXT")
         # Phase 6 (B-full): txn_type 欄位 — 區分 spending/cashback/refund/payment/fee/...
         # 統計層用這欄判斷「正向現金流 (cashback/refund) 不歸 expense」。
         # 兩張信用卡表都要；twd_transactions 暫不加（台幣存款 expend/income 已分開）。
         for tbl in ("card_billed_txns", "card_pending_txns"):
-            tbl_cols = {r["name"] for r in self.conn.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
+            with error_step('SYS-08-124-042'):
+                tbl_cols = {r["name"] for r in error_step('SYS-08-124-015')(lambda: self.conn.execute(
+                    f"PRAGMA table_info({tbl})"))().fetchall()}
             if "native_identity" not in tbl_cols:
-                self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN native_identity TEXT")
+                with error_step('SYS-08-124-022'):
+                    self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN native_identity TEXT")
             if "txn_type" not in tbl_cols:
-                self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN txn_type TEXT")
+                with error_step('SYS-08-124-023'):
+                    self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN txn_type TEXT")
         # Phase 6 (loan): balance_history 加 loan_balance 欄
         # 把信貸/房貸跟存款分開記錄，避免貸款餘額被當資產灌進 twd_balance。
-        bh_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(balance_history)").fetchall()}
+        with error_step('SYS-08-124-037'):
+            bh_cols = {r["name"] for r in error_step('SYS-08-124-003')(lambda: self.conn.execute(
+                "PRAGMA table_info(balance_history)"))().fetchall()}
         if "loan_balance" not in bh_cols:
-            self.conn.execute("ALTER TABLE balance_history ADD COLUMN loan_balance INTEGER")
+            with error_step('SYS-08-124-016'):
+                self.conn.execute("ALTER TABLE balance_history ADD COLUMN loan_balance INTEGER")
         # Phase 6 (FX pending): card_pending_txns 加外幣三欄
         # 過去外幣交易把 foreignAmount/currency 直接塞 amount/currency，
         # 害 detail UI 以為「沒台幣金額」(currency=EUR)。
         # 改用跟 card_billed_txns 對齊的 schema：
         #   amount/currency = 入帳金額 + TWD
         #   consume_amount/consume_currency/consume_country = 原始消費幣別與金額
-        pending_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(card_pending_txns)").fetchall()}
+        with error_step('SYS-08-124-038'):
+            pending_cols = {r["name"] for r in error_step('SYS-08-124-004')(lambda: self.conn.execute(
+                "PRAGMA table_info(card_pending_txns)"))().fetchall()}
         for col, ddl in [
             ("post_date", "ALTER TABLE card_pending_txns ADD COLUMN post_date TEXT"),
             ("consume_country", "ALTER TABLE card_pending_txns ADD COLUMN consume_country TEXT"),
@@ -943,7 +1004,8 @@ class BankStore:
             ("consume_amount", "ALTER TABLE card_pending_txns ADD COLUMN consume_amount REAL"),
         ]:
             if col not in pending_cols:
-                self.conn.execute(ddl)
+                with error_step('SYS-08-124-024'):
+                    self.conn.execute(ddl)
         # Phase 6 (raw balance): accounts 加 raw_balance + raw_balance_date 兩欄
         # 過去 portfolio 從 twd_transactions 最新一筆 balance 推算帳號餘額，
         # 但同日多筆 txn datetime 完全相同時 MAX() 不分先後（SCSB 11101 案）、
@@ -951,8 +1013,9 @@ class BankStore:
         # 沒入 twd_txn 也消失。改用爬蟲直接抓的帳號級餘額為主。
         # Phase 6 (excluded): 加 excluded 旗標讓使用者能標「不納入淨資產統計」
         # → portfolio summary 跳過、txn list 反灰、stats 不算
-        acc_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(accounts)").fetchall()}
+        with error_step('SYS-08-124-039'):
+            acc_cols = {r["name"] for r in error_step('SYS-08-124-005')(lambda: self.conn.execute(
+                "PRAGMA table_info(accounts)"))().fetchall()}
         for col, ddl in [
             ("raw_balance", "ALTER TABLE accounts ADD COLUMN raw_balance REAL"),
             ("raw_balance_date", "ALTER TABLE accounts ADD COLUMN raw_balance_date TEXT"),
@@ -961,11 +1024,13 @@ class BankStore:
             ("nickname_overwrite", "ALTER TABLE accounts ADD COLUMN nickname_overwrite TEXT"),
         ]:
             if col not in acc_cols:
-                self.conn.execute(ddl)
+                with error_step('SYS-08-124-025'):
+                    self.conn.execute(ddl)
         # Phase 6 (excluded) + Step 2 (per-card 信用額度/帳單日) +
         # 2026-06-14 (active): 過期卡 UI hide. 5 + 1 共 6 個 nullable migration.
-        card_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(cards)").fetchall()}
+        with error_step('SYS-08-124-040'):
+            card_cols = {r["name"] for r in error_step('SYS-08-124-006')(lambda: self.conn.execute(
+                "PRAGMA table_info(cards)"))().fetchall()}
         for col, ddl in [
             ("excluded", "ALTER TABLE cards ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0"),
             ("credit_limit", "ALTER TABLE cards ADD COLUMN credit_limit REAL"),
@@ -981,7 +1046,8 @@ class BankStore:
             ("nickname_overwrite", "ALTER TABLE cards ADD COLUMN nickname_overwrite TEXT"),
         ]:
             if col not in card_cols:
-                self.conn.execute(ddl)
+                with error_step('SYS-08-124-026'):
+                    self.conn.execute(ddl)
         # Phase 6 (category taxonomy 2026-06-15): 三張交易表加 4 個 COICOP 對齊欄位。
         # 詳見 wiki [[personal-finance-transaction-category-taxonomy]]
         #   flow_type        — 收支統計閘門 (expense/income/transfer/investment)
@@ -1020,8 +1086,9 @@ class BankStore:
         #                           每個子項可獨立 auto_excluded (該份不納入收支統計)。
         #                           NULL / [] = 未拆帳, 統計照母筆算。
         for tbl in ("twd_transactions", "card_billed_txns", "card_pending_txns"):
-            tbl_cols = {r["name"] for r in self.conn.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
+            with error_step('SYS-08-124-043'):
+                tbl_cols = {r["name"] for r in error_step('SYS-08-124-017')(lambda: self.conn.execute(
+                    f"PRAGMA table_info({tbl})"))().fetchall()}
             for col, ddl in [
                 ("flow_type", f"ALTER TABLE {tbl} ADD COLUMN flow_type TEXT NOT NULL DEFAULT 'expense'"),
                 ("is_subscription", f"ALTER TABLE {tbl} ADD COLUMN is_subscription INTEGER NOT NULL DEFAULT 0"),
@@ -1034,7 +1101,8 @@ class BankStore:
                 ("splits_overwrite", f"ALTER TABLE {tbl} ADD COLUMN splits_overwrite TEXT"),
             ]:
                 if col not in tbl_cols:
-                    self.conn.execute(ddl)
+                    with error_step('SYS-08-124-032'):
+                        self.conn.execute(ddl)
         # Phase C (2026-06-17): multi-user 隔離 — 所有 bank-level 表加 user_id NOT NULL DEFAULT 1
         # 既有 row backfill 成 user_id=1（使用者單人模式起家）; 新 row 由 BankStore(user_id=...) 顯式帶入。
         # 8 張表：twd_transactions / card_billed_txns / card_pending_txns /
@@ -1045,19 +1113,23 @@ class BankStore:
             "twd_transactions", "card_billed_txns", "card_pending_txns",
             "balance_history", "accounts", "cards", "daily_metrics", "sync_log",
         ):
-            tbl_cols = {r["name"] for r in self.conn.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
+            with error_step('SYS-08-124-044'):
+                tbl_cols = {r["name"] for r in error_step('SYS-08-124-018')(lambda: self.conn.execute(
+                    f"PRAGMA table_info({tbl})"))().fetchall()}
             if "user_id" not in tbl_cols:
-                self.conn.execute(
-                    f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
-                )
-        account_columns = {
-            row["name"] for row in self.conn.execute("PRAGMA table_info(accounts)")
-        }
+                with error_step('SYS-08-124-027'):
+                    self.conn.execute(
+                        f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
+                    )
+        with error_step('SYS-08-124-007'):
+            account_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(accounts)")
+            }
         if "currency" not in account_columns:
-            self.conn.execute(
-                "ALTER TABLE accounts ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
-            )
+            with error_step('SYS-08-124-019'):
+                self.conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN currency TEXT NOT NULL DEFAULT 'TWD'"
+                )
         self._migrate_accounts_currency_identity()
         self._migrate_balance_history_fx_real()
         # 舊 DB 在 ALTER 前可能已有「不含 user_id」的 UNIQUE index/legacy UNIQUE column,
@@ -1069,10 +1141,12 @@ class BankStore:
             ("card_billed_txns", "ux_card_billed_dedup"),
         ):
             try:
-                self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
-                self.conn.execute(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {tbl}(user_id, dedup_key)",
-                )
+                with error_step('SYS-08-124-028'):
+                    self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
+                with error_step('SYS-08-124-029'):
+                    self.conn.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {tbl}(user_id, dedup_key)",
+                    )
             except sqlite3.OperationalError as e:
                 # Composite unique 是 ON CONFLICT(user_id, dedup_key) 必要條件,
                 # 失敗就讓它炸 — 比 silent 後寫入時才爆好 debug。
@@ -1096,20 +1170,24 @@ class BankStore:
         ):
             try:
                 expected = [column.strip() for column in cols.strip("()").split(",")]
-                current = next(
-                    (
-                        row for row in self.conn.execute(f"PRAGMA index_list({tbl})")
-                        if row["name"] == idx
-                    ),
-                    None,
-                )
-                actual = (
-                    [row["name"] for row in self.conn.execute(f"PRAGMA index_info({idx})")]
-                    if current is not None else []
-                )
+                with error_step('SYS-08-124-030'):
+                    current = next(
+                        (
+                            row for row in self.conn.execute(f"PRAGMA index_list({tbl})")
+                            if row["name"] == idx
+                        ),
+                        None,
+                    )
+                with error_step('SYS-08-124-031'):
+                    actual = (
+                        [row["name"] for row in self.conn.execute(f"PRAGMA index_info({idx})")]
+                        if current is not None else []
+                    )
                 if current is None or current["unique"] != 1 or actual != expected:
-                    self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
-                    self.conn.execute(f"CREATE UNIQUE INDEX {idx} ON {tbl}{cols}")
+                    with error_step('SYS-08-124-033'):
+                        self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
+                    with error_step('SYS-08-124-034'):
+                        self.conn.execute(f"CREATE UNIQUE INDEX {idx} ON {tbl}{cols}")
             except sqlite3.OperationalError as e:
                 import logging
                 logging.error(
@@ -1118,10 +1196,12 @@ class BankStore:
                     tbl, idx, e,
                 )
                 raise
-        self.conn.commit()
+        with error_step('SYS-08-124-008'):
+            self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        with error_step('SYS-08-125-001'):
+            self.conn.close()
 
     def replace_loan_repayments(
         self, account_no: str, sub_account: str, currency: str,
@@ -1135,31 +1215,35 @@ class BankStore:
         if bank_pg.enabled():
             # A waiting DELETE keeps its old MVCC snapshot and can miss newly inserted
             # replacement rows. Lock the identity before that statement takes a snapshot.
-            lock_key = int.from_bytes(sha256(json.dumps(
-                ["loan_repayments", self.bank, *scope], separators=(",", ":")
-            ).encode()).digest()[:8], "big", signed=True)
-            self.conn.execute("SELECT pg_advisory_xact_lock(?)", (lock_key,))
-        self.conn.execute(
-            """DELETE FROM loan_repayments WHERE user_id = ? AND source_account_id = ?
+            with error_step('SYS-08-126-002'):
+                lock_key = int.from_bytes(sha256(json.dumps(
+                    ["loan_repayments", self.bank, *scope], separators=(",", ":")
+                ).encode()).digest()[:8], "big", signed=True)
+            with error_step('SYS-08-126-003'):
+                self.conn.execute("SELECT pg_advisory_xact_lock(?)", (lock_key,))
+        with error_step('SYS-08-126-001'):
+            self.conn.execute(
+                """DELETE FROM loan_repayments WHERE user_id = ? AND source_account_id = ?
                AND account_no = ? AND sub_account = ? AND currency = ?
                AND paid_on >= ? AND paid_on <= ?""", (*scope, start, end),
-        )
+            )
         occurrences: Counter[str] = Counter()
         for row in rows:
             key = sha256(row["raw_json"].encode("utf-8")).hexdigest()
             occurrences[key] += 1
-            self.conn.execute(
-                """INSERT INTO loan_repayments
+            with error_step('SYS-08-126-004'):
+                self.conn.execute(
+                    """INSERT INTO loan_repayments
                    (user_id, source_account_id, account_no, sub_account, currency,
                     row_key, occurrence, due_date, paid_on, principal, interest, penalty,
                     paid_total, principal_balance, status, query_start, query_end, raw_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(user_id, source_account_id, account_no, sub_account, currency, row_key, occurrence)
                    DO UPDATE SET query_start = excluded.query_start, query_end = excluded.query_end""",
-                (*scope, key, occurrences[key], row["due_date"], row["paid_on"],
-                 row["principal"], row["interest"], row["penalty"], row["paid_total"],
-                 row["principal_balance"], row["status"], start, end, row["raw_json"]),
-            )
+                    (*scope, key, occurrences[key], row["due_date"], row["paid_on"],
+                     row["principal"], row["interest"], row["penalty"], row["paid_total"],
+                     row["principal_balance"], row["status"], start, end, row["raw_json"]),
+                )
         return len(rows)
 
     def _record_transaction_cursor(
@@ -1168,10 +1252,11 @@ class BankStore:
         if self.source_account_id is None:
             return
         identity = identity.strip() if isinstance(identity, str) else ""
-        latest = next(
-            (value for raw in raw_dates if (value := _cursor_date(raw)) is not None),
-            None,
-        )
+        with error_step('SYS-08-127-001'):
+            latest = next(
+                (value for raw in raw_dates if (value := _cursor_date(raw)) is not None),
+                None,
+            )
         if not identity or latest is None:
             return
         sql = (
@@ -1192,13 +1277,14 @@ class BankStore:
                    ELSE history_transaction_cursors.latest_date
                  END"""
         )
-        self.conn.execute(
-            sql,
-            (
-                self.user_id, self.source_account_id, domain, identity,
-                latest.isoformat(),
-            ),
-        )
+        with error_step('SYS-08-127-002'):
+            self.conn.execute(
+                sql,
+                (
+                    self.user_id, self.source_account_id, domain, identity,
+                    latest.isoformat(),
+                ),
+            )
 
     def record_history_coverage_cursors(
         self, coverage, *, commit: bool = True, replace: bool = False,
@@ -1207,13 +1293,13 @@ class BankStore:
         if coverage is None:
             return
         if not isinstance(coverage, dict):
-            raise ValueError("invalid history coverage")
+            raise with_error_code(ValueError("invalid history coverage"), 'SYS-08-128-001')
         domains = coverage.get("domains")
         if not isinstance(domains, list):
-            raise ValueError("invalid history coverage")
+            raise with_error_code(ValueError("invalid history coverage"), 'SYS-08-128-002')
         mode = coverage.get("mode")
         if not isinstance(mode, str):
-            raise ValueError("invalid history coverage")
+            raise with_error_code(ValueError("invalid history coverage"), 'SYS-08-128-003')
         domain_names = frozenset(
             name
             for domain in domains
@@ -1222,35 +1308,41 @@ class BankStore:
         )
         from backend.core.base import validate_history_coverage
 
-        validate_history_coverage(
-            coverage,
-            expected_mode=mode,
-            expected_domains=domain_names,
-        )
+        with error_step('SYS-08-128-004'):
+            validate_history_coverage(
+                coverage,
+                expected_mode=mode,
+                expected_domains=domain_names,
+            )
         for domain in domains:
             if replace and self.source_account_id is not None:
-                self.conn.execute(
-                    """DELETE FROM history_transaction_cursors
+                with error_step('SYS-08-128-006'):
+                    self.conn.execute(
+                        """DELETE FROM history_transaction_cursors
                        WHERE user_id = ? AND source_account_id = ? AND domain = ?""",
-                    (self.user_id, self.source_account_id, domain["domain"]),
-                )
+                        (self.user_id, self.source_account_id, domain["domain"]),
+                    )
             for expected in domain["expected"]:
-                self._record_transaction_cursor(
-                    domain["domain"], expected["identity"], expected["end"],
-                    replace=replace,
-                )
+                with error_step('SYS-08-128-007'):
+                    self._record_transaction_cursor(
+                        domain["domain"], expected["identity"], expected["end"],
+                        replace=replace,
+                    )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-128-005'):
+                self.conn.commit()
 
     def _transaction_cursor_dates(self, domain: str) -> dict[str, date]:
         if self.source_account_id is None:
             return {}
-        rows = self.conn.execute(
-            """SELECT identity, latest_date FROM history_transaction_cursors
+        with error_step('SYS-08-129-003'):
+            rows = error_step('SYS-08-129-001')(lambda: self.conn.execute(
+                """SELECT identity, latest_date FROM history_transaction_cursors
                WHERE user_id = ? AND source_account_id = ? AND domain = ?""",
-            (self.user_id, self.source_account_id, domain),
-        ).fetchall()
-        return _latest_cursor_dates(rows, "identity", ("latest_date",))
+                (self.user_id, self.source_account_id, domain),
+            ))().fetchall()
+        with error_step('SYS-08-129-002'):
+            return _latest_cursor_dates(rows, "identity", ("latest_date",))
 
     def latest_twd_transaction_dates(self) -> dict[str, date]:
         """Return account-scoped latest persisted TWD transaction dates."""
@@ -1277,7 +1369,9 @@ class BankStore:
             args = (self.user_id, scope)
         sql += " ORDER BY id"
         snapshots: dict[tuple, list[tuple]] = {}
-        for row in self.conn.execute(sql, args).fetchall():
+        with error_step('SYS-08-198-008'):
+            _error_database_rows_3 = error_step('SYS-08-198-003')(lambda: self.conn.execute(sql, args))().fetchall()
+        for row in _error_database_rows_3:
             key = (
                 row["card_no"], row["consume_date"], row["amount"], row["description"],
             )
@@ -1294,15 +1388,17 @@ class BankStore:
         Local purchases without references still require the four-field exact key.
         """
         out: dict[tuple, list[tuple]] = {}
-        rows = self.conn.execute(
-            "SELECT id, card_no, consume_date, amount, currency, consume_currency, consume_amount, native_identity, txn_type, "
-            "category, subcategory, "
-            "description_overwrite, tags_overwrite, auto_excluded, splits_overwrite "
-            "FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id",
-            (self.user_id, scope),
-        ).fetchall()
+        with error_step('SYS-08-134-003'):
+            rows = error_step('SYS-08-134-001')(lambda: self.conn.execute(
+                "SELECT id, card_no, consume_date, amount, currency, consume_currency, consume_amount, native_identity, txn_type, "
+                "category, subcategory, "
+                "description_overwrite, tags_overwrite, auto_excluded, splits_overwrite "
+                "FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id",
+                (self.user_id, scope),
+            ))().fetchall()
         for r in rows:
-            identity = _pending_billed_identity(r)
+            with error_step('SYS-08-134-002'):
+                identity = _pending_billed_identity(r)
             if not identity or identity[0] not in ("fx", "native"):
                 continue
             out.setdefault(identity, []).append((
@@ -1321,7 +1417,8 @@ class BankStore:
         for txn in txns:
             currency = str(txn.get("currency") or "TWD").strip().upper()
             for field in ("expend", "income", "balance"):
-                txn[field] = native_money(txn.get(field), currency, optional=True)
+                with error_step('SYS-08-135-004'):
+                    txn[field] = native_money(txn.get(field), currency, optional=True, _codes={'expend': ('SYS-08-001-001', bank_error_id(self.bank, '08-862-002'), bank_error_id(self.bank, '08-862-003'), bank_error_id(self.bank, '08-862-004'), bank_error_id(self.bank, '08-862-005'), bank_error_id(self.bank, '08-862-006'), bank_error_id(self.bank, '08-862-007'), bank_error_id(self.bank, '08-862-008'), bank_error_id(self.bank, '08-862-009'), bank_error_id(self.bank, '08-862-010')), 'income': ('SYS-08-001-001', bank_error_id(self.bank, '08-863-002'), bank_error_id(self.bank, '08-863-003'), bank_error_id(self.bank, '08-863-004'), bank_error_id(self.bank, '08-863-005'), bank_error_id(self.bank, '08-863-006'), bank_error_id(self.bank, '08-863-007'), bank_error_id(self.bank, '08-863-008'), bank_error_id(self.bank, '08-863-009'), bank_error_id(self.bank, '08-863-010')), 'balance': ('SYS-08-001-001', bank_error_id(self.bank, '08-864-002'), bank_error_id(self.bank, '08-864-003'), bank_error_id(self.bank, '08-864-004'), bank_error_id(self.bank, '08-864-005'), bank_error_id(self.bank, '08-864-006'), bank_error_id(self.bank, '08-864-007'), bank_error_id(self.bank, '08-864-008'), bank_error_id(self.bank, '08-864-009'), bank_error_id(self.bank, '08-864-010'))}[field])
             txn["currency"] = currency
         inserted_count = 0
         now = _now()
@@ -1341,14 +1438,16 @@ class BankStore:
         for t, currency, key in zip(txns, currencies, dedup_keys, strict=True):
             raw_description = t.get("desc")
             description = _canonical_description(raw_description, t.get("memo"))
-            cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
-                                  if rules else (None, None, False))
+            with error_step('SYS-08-135-001'):
+                cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
+                                      if rules else (None, None, False))
             # 台幣: amount 方向可信 (income - expend), 給 _flow_fields 當 fallback
             net = (t.get("income") or 0) - (t.get("expend") or 0)
             flow, income_cat = _flow_fields(cat, sub, net)
             before_insert = self.conn.total_changes
-            self.conn.execute(
-                """INSERT INTO twd_transactions
+            with error_step('SYS-08-135-002'):
+                self.conn.execute(
+                    """INSERT INTO twd_transactions
                    (user_id, account_no, txn_datetime, account_date, description, raw_description,
                     expend, income, currency,
                     balance, counterparty_bank, counterparty_acct, memo, first_seen, dedup_key,
@@ -1356,47 +1455,54 @@ class BankStore:
                     is_subscription)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING""",
-                (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
-                 description, raw_description, t.get("expend"), t.get("income"), currency,
-                 t.get("balance"), t.get("counterparty_bank"), t.get("counterparty_acct"),
-                 t.get("memo"),
-                 now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
-                 1 if _is_subscription(sub) else 0),
-            )
+                    (self.user_id, t.get("account_no"), t.get("datetime"), t.get("account_date"),
+                     description, raw_description, t.get("expend"), t.get("income"), currency,
+                     t.get("balance"), t.get("counterparty_bank"), t.get("counterparty_acct"),
+                     t.get("memo"),
+                     now, key, cat, sub, 1 if auto_ex else 0, flow, income_cat,
+                     1 if _is_subscription(sub) else 0),
+                )
             inserted_count += self.conn.total_changes - before_insert
             if not suppress_history_cursor:
-                self._record_transaction_cursor(
-                    t.get("history_domain") or "twd_transactions",
-                    t.get("history_identity") or t.get("account_no"),
-                    t.get("datetime"),
-                )
+                with error_step('SYS-08-135-005'):
+                    self._record_transaction_cursor(
+                        t.get("history_domain") or "twd_transactions",
+                        t.get("history_identity") or t.get("account_no"),
+                        t.get("datetime"),
+                    )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-135-003'):
+                self.conn.commit()
         return inserted_count
 
     def twd_dedup_rows(self, user_columns: tuple[str, ...]) -> list[dict]:
         """Rows needed by the one-off cross-sync duplicate repair."""
         cols = ", ".join(("id", "account_no", "txn_datetime", "expend", "income", "balance",
-                          "currency", "first_seen", "dedup_key") + user_columns)
-        return [dict(r) for r in self.conn.execute(
-            f"SELECT {cols} FROM twd_transactions WHERE user_id = ?", (self.user_id,)
-        ).fetchall()]
+                          "currency", "first_seen", "dedup_key", *user_columns))
+        with error_step('SYS-08-136-002'):
+            return [dict(r) for r in error_step('SYS-08-136-001')(lambda: self.conn.execute(
+                f"SELECT {cols} FROM twd_transactions WHERE user_id = ?", (self.user_id,)
+            ))().fetchall()]
 
     def apply_twd_dedup(self, actions: list[dict], user_columns: tuple[str, ...]) -> None:
         """Drop each duplicate and re-key/re-edit its survivor in one transaction."""
         sets = ", ".join(f"{c} = ?" for c in user_columns)
         for a in actions:
-            self.conn.execute("DELETE FROM twd_transactions WHERE id = ? AND user_id = ?",
-                              (a["drop"], self.user_id))
+            with error_step('SYS-08-137-002'):
+                self.conn.execute("DELETE FROM twd_transactions WHERE id = ? AND user_id = ?",
+                                  (a["drop"], self.user_id))
             if a["edits"] is not None:
-                self.conn.execute(
-                    f"UPDATE twd_transactions SET {sets} WHERE id = ? AND user_id = ?",
-                    (*(a["edits"][c] for c in user_columns), a["keep"], self.user_id))
+                with error_step('SYS-08-137-003'):
+                    self.conn.execute(
+                        f"UPDATE twd_transactions SET {sets} WHERE id = ? AND user_id = ?",
+                        (*(a["edits"][c] for c in user_columns), a["keep"], self.user_id))
             else:
-                self.conn.execute(
-                    "UPDATE twd_transactions SET dedup_key = ? WHERE id = ? AND user_id = ?",
-                    (a["dedup_key"], a["keep"], self.user_id))
-        self.conn.commit()
+                with error_step('SYS-08-137-004'):
+                    self.conn.execute(
+                        "UPDATE twd_transactions SET dedup_key = ? WHERE id = ? AND user_id = ?",
+                        (a["dedup_key"], a["keep"], self.user_id))
+        with error_step('SYS-08-137-001'):
+            self.conn.commit()
 
     def card_dedup_rows(self, user_columns: tuple[str, ...]) -> list[dict]:
         """Legacy card billed rows needed by the one-off cross-sync repair.
@@ -1404,61 +1510,73 @@ class BankStore:
         Content-only repair cannot disambiguate native occurrences; exclude them.
         """
         cols = ", ".join(("id", "card_no", "consume_date", "post_date", "description", "amount",
-                          "consume_amount", "first_seen") + user_columns)
-        return [dict(r) for r in self.conn.execute(
-            f"SELECT {cols} FROM card_billed_txns WHERE user_id = ? AND native_identity IS NULL", (self.user_id,)
-        ).fetchall()]
+                          "consume_amount", "first_seen", *user_columns))
+        with error_step('SYS-08-138-002'):
+            return [dict(r) for r in error_step('SYS-08-138-001')(lambda: self.conn.execute(
+                f"SELECT {cols} FROM card_billed_txns WHERE user_id = ? AND native_identity IS NULL", (self.user_id,)
+            ))().fetchall()]
 
     def apply_card_dedup(self, actions: list[dict]) -> None:
         """Delete duplicate card rows and patch survivors in one transaction."""
         for a in actions:
             for drop in a["drop"]:
-                self.conn.execute("DELETE FROM card_billed_txns WHERE id = ? AND user_id = ?",
-                                  (drop, self.user_id))
+                with error_step('SYS-08-139-002'):
+                    self.conn.execute("DELETE FROM card_billed_txns WHERE id = ? AND user_id = ?",
+                                      (drop, self.user_id))
             if a["edits"]:
                 sets = ", ".join(f"{c} = ?" for c in a["edits"])
-                self.conn.execute(
-                    f"UPDATE card_billed_txns SET {sets} WHERE id = ? AND user_id = ?",
-                    (*a["edits"].values(), a["keep"], self.user_id))
-        self.conn.commit()
+                with error_step('SYS-08-139-003'):
+                    self.conn.execute(
+                        f"UPDATE card_billed_txns SET {sets} WHERE id = ? AND user_id = ?",
+                        (*a["edits"].values(), a["keep"], self.user_id))
+        with error_step('SYS-08-139-001'):
+            self.conn.commit()
 
     # ---- 2. 信用卡已出帳明細：append-only ----
     def _validate_native_card_occurrences(self, txns: list[dict]) -> None:
         # Missing proof is not new-purchase permission. Quarantine this user's card
         # writes if pre-validation native rows exist, including pending disappearance.
         def validate(rows, *, incoming=False):
-            if any(row.get("native_identity") and (
-                _pending_billed_identity(row) is None
-                # Incoming writers persist `date`; a conflicting stored-row alias
-                # must not steer either validation or later occurrence matching.
-                or (incoming and row.get("consume_date", row.get("date")) != row.get("date"))
-            ) for row in rows):
-                raise ValueError("incomplete native card occurrence")
+            for row in rows:
+                if row.get("native_identity"):
+                    if _pending_billed_identity(row) is None:
+                        if incoming:
+                            raise with_error_code(ValueError("incomplete native card occurrence"), 'SYS-08-141-001')
+                        elif table == "card_billed_txns":
+                            raise with_error_code(ValueError("incomplete native card occurrence"), 'SYS-08-141-003')
+                        else:
+                            raise with_error_code(ValueError("incomplete native card occurrence"), 'SYS-08-141-004')
+                    # Incoming writers persist `date`; the alias cannot steer matching.
+                    if incoming and row.get("consume_date", row.get("date")) != row.get("date"):
+                        raise with_error_code(ValueError("incomplete native card occurrence"), 'SYS-08-141-002')
 
         validate(txns, incoming=True)
         # ponytail: scan native rows; index/quarantine at migration if history grows.
         for table in ("card_billed_txns", "card_pending_txns"):
-            validate(dict(row) for row in self.conn.execute(
-                f"SELECT card_no, consume_date, post_date, currency, consume_currency, consume_amount, "
-                f"amount, native_identity, txn_type FROM {table} "
-                "WHERE user_id = ? AND native_identity IS NOT NULL", (self.user_id,),
-            ).fetchall())
+            with error_step('SYS-08-140-002'):
+                validate(dict(row) for row in error_step('SYS-08-140-001')(lambda: self.conn.execute(
+                    f"SELECT card_no, consume_date, post_date, currency, consume_currency, consume_amount, "
+                    f"amount, native_identity, txn_type FROM {table} "
+                    "WHERE user_id = ? AND native_identity IS NOT NULL", (self.user_id,),
+                ))().fetchall())
 
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None,
                            *, suppress_history_cursor: bool = False) -> int:
         from backend.server.categorizer import categorize_with_excluded
-        self._validate_native_card_occurrences(txns)
+        with error_step('SYS-08-142-013'):
+            self._validate_native_card_occurrences(txns)
         txns = [dict(txn) for txn in txns]
         for txn in txns:
             currency = str(txn.get("currency") or "TWD").strip().upper()
             txn["currency"] = currency
-            txn["amount"] = native_money(txn.get("amount"), currency, optional=True)
+            with error_step('SYS-08-142-015'):
+                txn["amount"] = native_money(txn.get("amount"), currency, optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-865-002'), bank_error_id(self.bank, '08-865-003'), bank_error_id(self.bank, '08-865-004'), bank_error_id(self.bank, '08-865-005'), bank_error_id(self.bank, '08-865-006'), bank_error_id(self.bank, '08-865-007'), bank_error_id(self.bank, '08-865-008'), bank_error_id(self.bank, '08-865-009'), bank_error_id(self.bank, '08-865-010')))
             consume_currency = str(txn.get("consume_currency") or currency).strip().upper()
             if txn.get("consume_amount") is not None:
                 txn["consume_currency"] = consume_currency
-                txn["consume_amount"] = native_money(
-                    txn.get("consume_amount"), consume_currency,
-                )
+                with error_step('SYS-08-142-019'):
+                    txn["consume_amount"] = native_money(
+                        txn.get("consume_amount"), consume_currency, _codes=(bank_error_id(self.bank, '08-866-001'), bank_error_id(self.bank, '08-866-002'), bank_error_id(self.bank, '08-866-003'), bank_error_id(self.bank, '08-866-004'), bank_error_id(self.bank, '08-866-005'), bank_error_id(self.bank, '08-866-006'), bank_error_id(self.bank, '08-866-007'), bank_error_id(self.bank, '08-866-008'), bank_error_id(self.bank, '08-866-009'), bank_error_id(self.bank, '08-866-010')))
         inserted_count = 0
         now = _now()
         prepared_txns = []
@@ -1469,16 +1587,18 @@ class BankStore:
                 t.get("post_date") and not t.get("card_no") and t.get("date")
                 and t.get("amount") is not None and t.get("desc")
             ):
-                candidates = self.conn.execute(
-                    """SELECT * FROM card_billed_txns
+                with error_step('SYS-08-142-051'):
+                    candidates = error_step('SYS-08-142-020')(lambda: self.conn.execute(
+                        """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
                          AND consume_date = ? AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                    (self.user_id, t.get("date"), t.get("amount"), t.get("desc"),
-                     t.get("consume_amount")),
-                ).fetchall()
-                candidates = [row for row in candidates if not _card_identity_conflicts(row, t)]
+                        (self.user_id, t.get("date"), t.get("amount"), t.get("desc"),
+                         t.get("consume_amount")),
+                    ))().fetchall()
+                with error_step('SYS-08-142-021'):
+                    candidates = [row for row in candidates if not _card_identity_conflicts(row, t)]
                 if len(candidates) == 1:
                     t["card_no"] = candidates[0]["card_no"]
                 elif len(candidates) > 1:
@@ -1489,62 +1609,72 @@ class BankStore:
         # 信用卡無 running balance，重複刷卡更需 occurrence index 防誤殺。
         # dedup_key 同時納入 consume_date(消費日) 與 post_date(入帳日)：
         # 同消費日但不同入帳日（如分期、跨月折算）算不同筆，不可去重誤殺。
-        content_keys = [
-            (_dedup_key("native", t["native_identity"], t.get("card_no"), t.get("date"),
-                        t.get("post_date") or t.get("bill_date"),
-                        _pending_billed_identity(t) or (t.get("amount"), t.get("consume_currency"), t.get("consume_amount")),
-                        t.get("currency"), t.get("txn_type")) if t.get("native_identity") else
-             _dedup_key(t.get("card_no"), t.get("bill_date"), t.get("date"),
-                       t.get("post_date"), t.get("desc"), t.get("amount"),
-                       t.get("consume_amount")))
-            for t in txns
-        ]
+        with error_step('SYS-08-142-014'):
+            content_keys = [
+                (_dedup_key("native", t["native_identity"], t.get("card_no"), t.get("date"),
+                            t.get("post_date") or t.get("bill_date"),
+                            _pending_billed_identity(t) or (t.get("amount"), t.get("consume_currency"), t.get("consume_amount")),
+                            t.get("currency"), t.get("txn_type")) if t.get("native_identity") else
+                 _dedup_key(t.get("card_no"), t.get("bill_date"), t.get("date"),
+                           t.get("post_date"), t.get("desc"), t.get("amount"),
+                           t.get("consume_amount")))
+                for t in txns
+            ]
         dedup_keys = _with_occurrence(content_keys)
         claimed_ids: set[int] = set()
         for t, key in zip(txns, dedup_keys, strict=True):
             post_date = t.get("post_date") or None
             native = t.get("native_identity")
-            keyed = self.conn.execute(
-                "SELECT * FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
-                (self.user_id, key),
-            ).fetchone()
+            with error_step('SYS-08-142-049'):
+                keyed = error_step('SYS-08-142-016')(lambda: self.conn.execute(
+                    "SELECT * FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                    (self.user_id, key),
+                ))().fetchone()
             if keyed is not None and _card_identity_conflicts(keyed, t):
-                raise ValueError("conflicting billed card dedup identity currency")
+                raise with_error_code(ValueError("conflicting billed card dedup identity currency"), 'SYS-08-142-006')
             if "native_identity" in t and t.get("bill_date"):
                 # Legacy promoted rows have no cross-source identity. Same dates/
                 # amount are only an ambiguity alarm, never permission to merge.
-                legacy = self.conn.execute(
-                    "SELECT * FROM card_billed_txns WHERE user_id = ? "
-                    "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
-                    "AND bill_date IS NULL",
-                    (self.user_id, t.get("card_no"), t.get("date")),
-                ).fetchall()
-                if any((native is None or row["native_identity"] is None)
-                       and _pending_raw_key(row) != _pending_raw_key(t)
-                       and _card_occurrence_matches(row, t) for row in legacy):
-                    raise ValueError("ambiguous native card identity for legacy promoted row")
+                with error_step('SYS-08-142-052'):
+                    legacy = error_step('SYS-08-142-022')(lambda: self.conn.execute(
+                        "SELECT * FROM card_billed_txns WHERE user_id = ? "
+                        "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                        "AND bill_date IS NULL",
+                        (self.user_id, t.get("card_no"), t.get("date")),
+                    ))().fetchall()
+                for _error_leaf_13_row in legacy:
+                    if native is None:
+                        if _pending_raw_key(_error_leaf_13_row) != _pending_raw_key(t):
+                            if _card_occurrence_matches(_error_leaf_13_row, t):
+                                raise with_error_code(ValueError('ambiguous native card identity for legacy promoted row'), 'SYS-08-142-044')
+                    elif _error_leaf_13_row['native_identity'] is None:
+                        if _pending_raw_key(_error_leaf_13_row) != _pending_raw_key(t):
+                            if _card_occurrence_matches(_error_leaf_13_row, t):
+                                raise with_error_code(ValueError('ambiguous native card identity for legacy promoted row'), 'SYS-08-142-043')
             if native:
-                candidates = self.conn.execute(
-                    "SELECT * FROM card_billed_txns WHERE user_id = ? "
-                    "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
-                    "AND (post_date IS NOT DISTINCT FROM ? OR post_date IS NULL OR CAST(? AS TEXT) IS NULL) "
-                    "AND txn_type IS NOT DISTINCT FROM ? "
-                    "AND (native_identity = ? OR (native_identity IS NULL AND description = ? "
-                    "AND amount IS NOT DISTINCT FROM ?)) "
-                    "ORDER BY CASE WHEN post_date IS NULL THEN 1 ELSE 0 END, id",
-                    (self.user_id, t.get("card_no"), t.get("date"), post_date, post_date,
-                     t.get("txn_type"), native, t.get("desc"), t.get("amount")),
-                ).fetchall()
+                with error_step('SYS-08-142-053'):
+                    candidates = error_step('SYS-08-142-023')(lambda: self.conn.execute(
+                        "SELECT * FROM card_billed_txns WHERE user_id = ? "
+                        "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                        "AND (post_date IS NOT DISTINCT FROM ? OR post_date IS NULL OR CAST(? AS TEXT) IS NULL) "
+                        "AND txn_type IS NOT DISTINCT FROM ? "
+                        "AND (native_identity = ? OR (native_identity IS NULL AND description = ? "
+                        "AND amount IS NOT DISTINCT FROM ?)) "
+                        "ORDER BY CASE WHEN post_date IS NULL THEN 1 ELSE 0 END, id",
+                        (self.user_id, t.get("card_no"), t.get("date"), post_date, post_date,
+                         t.get("txn_type"), native, t.get("desc"), t.get("amount")),
+                    ))().fetchall()
                 if any(row["native_identity"] == native and _card_identity_conflicts(row, t)
                        for row in candidates):
-                    raise ValueError("conflicting native card occurrence currency")
+                    raise with_error_code(ValueError("conflicting native card occurrence currency"), 'SYS-08-142-008')
                 available = [row for row in candidates if row["id"] not in claimed_ids
                              and (post_date or not t.get("bill_date") or row["bill_date"] is None
                                   or row["bill_date"] == t.get("bill_date"))]
-                same = [row for row in available if not _card_identity_conflicts(row, t)
-                        and (not row["native_identity"] or _native_occurrence_matches(row, t))]
+                with error_step('SYS-08-142-024'):
+                    same = [row for row in available if not _card_identity_conflicts(row, t)
+                            and (not row["native_identity"] or _native_occurrence_matches(row, t))]
                 if not same and any(row["native_identity"] == native for row in available):
-                    raise ValueError("ambiguous native card occurrence evidence")
+                    raise with_error_code(ValueError("ambiguous native card occurrence evidence"), 'SYS-08-142-009')
                 if same:
                     target = same[0]
                     splits = target["splits_overwrite"]
@@ -1553,22 +1683,36 @@ class BankStore:
                         # Exact original FX allows settlement, not arbitrary rewrites.
                         # Only snapshot -> statement provides authoritative ordering.
                         incoming_count = sum(_native_occurrence_matches(target, other) for other in txns)
-                        if len(same) != 1 or incoming_count != 1:
-                            raise ValueError("ambiguous native FX settlement occurrences")
-                        if suppress_history_cursor or target["bill_date"] or not t.get("bill_date"):
-                            raise ValueError("ambiguous native FX settlement ordering")
+                        if len(same) != 1:
+                            raise with_error_code(ValueError('ambiguous native FX settlement occurrences'), 'SYS-08-142-001')
+                        elif incoming_count != 1:
+                            raise with_error_code(ValueError('ambiguous native FX settlement occurrences'), 'SYS-08-142-002')
+                        if suppress_history_cursor:
+                            raise with_error_code(ValueError('ambiguous native FX settlement ordering'), 'SYS-08-142-003')
+                        elif target['bill_date']:
+                            raise with_error_code(ValueError('ambiguous native FX settlement ordering'), 'SYS-08-142-004')
+                        elif not t.get('bill_date'):
+                            raise with_error_code(ValueError('ambiguous native FX settlement ordering'), 'SYS-08-142-005')
                         amount = t["amount"]
                         splits = _rescale_splits(target["splits_overwrite"], amount)
                         if target["splits_overwrite"] and splits is None:
-                            raise ValueError("cannot preserve native billed splits")
+                            raise with_error_code(ValueError("cannot preserve native billed splits"), 'SYS-08-142-010')
                     if target["post_date"] is None and post_date:
                         fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                                   "auto_excluded", "splits_overwrite")
-                        incoming_dates = {other.get("post_date") for other in txns
-                                          if _pending_billed_identity(other) == _pending_billed_identity(t)}
-                        if ((len(same) > 1 or len(incoming_dates) > 1)
-                                and any(row[field] for row in same for field in fields)):
-                            raise ValueError("ambiguous native undated occurrence overlays")
+                        with error_step('SYS-08-142-037'):
+                            incoming_dates = {other.get("post_date") for other in txns
+                                              if _pending_billed_identity(other) == _pending_billed_identity(t)}
+                        if len(same) > 1:
+                            for _error_leaf_15_row in same:
+                                for _error_leaf_15_field in fields:
+                                    if _error_leaf_15_row[_error_leaf_15_field]:
+                                        raise with_error_code(ValueError('ambiguous native undated occurrence overlays'), 'SYS-08-142-046')
+                        elif len(incoming_dates) > 1:
+                            for _error_leaf_14_row in same:
+                                for _error_leaf_14_field in fields:
+                                    if _error_leaf_14_row[_error_leaf_14_field]:
+                                        raise with_error_code(ValueError('ambiguous native undated occurrence overlays'), 'SYS-08-142-045')
                     if target["native_identity"] is None:
                         fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                                   "auto_excluded", "splits_overwrite")
@@ -1578,113 +1722,132 @@ class BankStore:
                             (t.get("card_no"), t.get("date"), post_date, t.get("amount"), t.get("desc"))
                             for other in txns
                         )
-                        if ((len(same) > 1 or incoming_count > 1)
-                                and any(row[field] for row in same for field in fields)):
-                            raise ValueError("ambiguous legacy native card occurrence overlays")
-                    self.conn.execute(
-                        "UPDATE card_billed_txns SET native_identity = ?, "
-                        "post_date = COALESCE(post_date, ?), "
-                        "bill_date = COALESCE(bill_date, ?), amount = ?, splits_overwrite = ? "
-                        "WHERE user_id = ? AND id = ?",
-                        (native, post_date, t.get("bill_date"), amount, splits, self.user_id, target["id"]),
-                    )
+                        if len(same) > 1:
+                            for _error_leaf_17_row in same:
+                                for _error_leaf_17_field in fields:
+                                    if _error_leaf_17_row[_error_leaf_17_field]:
+                                        raise with_error_code(ValueError('ambiguous legacy native card occurrence overlays'), 'SYS-08-142-048')
+                        elif incoming_count > 1:
+                            for _error_leaf_16_row in same:
+                                for _error_leaf_16_field in fields:
+                                    if _error_leaf_16_row[_error_leaf_16_field]:
+                                        raise with_error_code(ValueError('ambiguous legacy native card occurrence overlays'), 'SYS-08-142-047')
+                    with error_step('SYS-08-142-033'):
+                        self.conn.execute(
+                            "UPDATE card_billed_txns SET native_identity = ?, "
+                            "post_date = COALESCE(post_date, ?), "
+                            "bill_date = COALESCE(bill_date, ?), amount = ?, splits_overwrite = ? "
+                            "WHERE user_id = ? AND id = ?",
+                            (native, post_date, t.get("bill_date"), amount, splits, self.user_id, target["id"]),
+                        )
                     claimed_ids.add(target["id"])
                     self._current_billed_ids.append(target["id"])
                     if not suppress_history_cursor:
-                        self._record_transaction_cursor(
-                            "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
-                        )
+                        with error_step('SYS-08-142-038'):
+                            self._record_transaction_cursor(
+                                "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
+                            )
                     continue
             if not native and post_date and t.get("date") and t.get("amount") is not None and t.get("desc"):
                 # The same posted row can reach us with a different dedup_key: float vs int
                 # money, a statement row without the card number, or a later statement
                 # (new bill_date) relisting it. Reuse one unclaimed equivalent row instead
                 # of inserting a copy; claimed_ids keeps genuine same-batch repeats apart.
-                if self.conn.execute(
-                    "SELECT 1 FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
-                    (self.user_id, key),
-                ).fetchone() is None:
-                    same = [r["id"] for r in self.conn.execute(
-                        """SELECT * FROM card_billed_txns
+                with error_step('SYS-08-198-011'):
+                    _error_database_rows_6 = error_step('SYS-08-198-006')(lambda: self.conn.execute('SELECT 1 FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?', (self.user_id, key)))().fetchone() is None
+                if _error_database_rows_6:
+                    with error_step('SYS-08-142-059'):
+                        same = [r["id"] for r in error_step('SYS-08-142-034')(lambda: self.conn.execute(
+                            """SELECT * FROM card_billed_txns
                            WHERE user_id = ? AND consume_date = ? AND post_date = ?
                              AND amount = ? AND TRIM(description) = TRIM(?)
                              AND consume_amount IS NOT DISTINCT FROM ?
                              AND (COALESCE(card_no, '') = COALESCE(?, '')
                                   OR COALESCE(card_no, '') = '' OR COALESCE(?, '') = '')
                            ORDER BY id""",
-                        (self.user_id, t.get("date"), post_date, t.get("amount"), t.get("desc"),
-                         t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
-                    ).fetchall() if r["id"] not in claimed_ids and not _card_identity_conflicts(r, t)]
+                            (self.user_id, t.get("date"), post_date, t.get("amount"), t.get("desc"),
+                             t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
+                        ))().fetchall() if r["id"] not in claimed_ids and not _card_identity_conflicts(r, t)]
                     if same:
                         claimed_ids.add(same[0])
                         self._current_billed_ids.append(same[0])
-                        self.conn.execute(
-                            "UPDATE card_billed_txns SET bill_date = COALESCE(bill_date, ?) "
-                            "WHERE user_id = ? AND id = ?",
-                            (t.get("bill_date"), self.user_id, same[0]),
-                        )
-                        if not suppress_history_cursor:
-                            self._record_transaction_cursor(
-                                "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
-                            )
-                        if t.get("card_no"):
+                        with error_step('SYS-08-142-039'):
                             self.conn.execute(
-                                "UPDATE card_billed_txns SET card_no = ? WHERE user_id = ? AND id = ?"
-                                " AND COALESCE(card_no, '') = ''",
-                                (t.get("card_no"), self.user_id, same[0]),
+                                "UPDATE card_billed_txns SET bill_date = COALESCE(bill_date, ?) "
+                                "WHERE user_id = ? AND id = ?",
+                                (t.get("bill_date"), self.user_id, same[0]),
                             )
+                        if not suppress_history_cursor:
+                            with error_step('SYS-08-142-041'):
+                                self._record_transaction_cursor(
+                                    "card_billed_transactions", t.get("card_no"), post_date, t.get("date"),
+                                )
+                        if t.get("card_no"):
+                            with error_step('SYS-08-142-042'):
+                                self.conn.execute(
+                                    "UPDATE card_billed_txns SET card_no = ? WHERE user_id = ? AND id = ?"
+                                    " AND COALESCE(card_no, '') = ''",
+                                    (t.get("card_no"), self.user_id, same[0]),
+                                )
                         continue
             if (
                 not native and post_date and t.get("card_no") and t.get("date")
                 and t.get("amount") is not None and t.get("desc")
             ):
-                blank_candidates = self.conn.execute(
-                    """SELECT * FROM card_billed_txns
+                with error_step('SYS-08-142-054'):
+                    blank_candidates = error_step('SYS-08-142-025')(lambda: self.conn.execute(
+                        """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND (card_no IS NULL OR card_no = '')
                          AND consume_date = ? AND post_date = ?
                          AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                    (self.user_id, t.get("date"), post_date, t.get("amount"),
-                     t.get("desc"), t.get("consume_amount")),
-                ).fetchall()
-                blank_candidates = [row for row in blank_candidates
-                                    if row["id"] not in claimed_ids and not _card_identity_conflicts(row, t)]
+                        (self.user_id, t.get("date"), post_date, t.get("amount"),
+                         t.get("desc"), t.get("consume_amount")),
+                    ))().fetchall()
+                with error_step('SYS-08-142-026'):
+                    blank_candidates = [row for row in blank_candidates
+                                        if row["id"] not in claimed_ids and not _card_identity_conflicts(row, t)]
                 if len(blank_candidates) > 1:
                     continue
-                key_exists = self.conn.execute(
-                    "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
-                    (self.user_id, key),
-                ).fetchone()
+                with error_step('SYS-08-142-055'):
+                    key_exists = error_step('SYS-08-142-027')(lambda: self.conn.execute(
+                        "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                        (self.user_id, key),
+                    ))().fetchone()
                 if len(blank_candidates) == 1 and key_exists is None:
-                    self.conn.execute(
-                        "UPDATE card_billed_txns SET card_no = ?, dedup_key = ?, "
-                        "bill_date = COALESCE(?, bill_date) WHERE user_id = ? AND id = ?",
-                        (t.get("card_no"), key, t.get("bill_date"), self.user_id,
-                         blank_candidates[0]["id"]),
-                    )
+                    with error_step('SYS-08-142-035'):
+                        self.conn.execute(
+                            "UPDATE card_billed_txns SET card_no = ?, dedup_key = ?, "
+                            "bill_date = COALESCE(?, bill_date) WHERE user_id = ? AND id = ?",
+                            (t.get("card_no"), key, t.get("bill_date"), self.user_id,
+                             blank_candidates[0]["id"]),
+                        )
             if (
                 not native and (post_date or t.get("bill_date")) and t.get("date") and t.get("amount") is not None
                 and t.get("desc")
             ):
-                candidates = self.conn.execute(
-                    """SELECT * FROM card_billed_txns
+                with error_step('SYS-08-142-056'):
+                    candidates = error_step('SYS-08-142-028')(lambda: self.conn.execute(
+                        """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND post_date IS NULL
                          AND card_no IS NOT DISTINCT FROM ?
                          AND consume_date = ? AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                    (self.user_id, t.get("card_no"), t.get("date"), t.get("amount"),
-                     t.get("desc"), t.get("consume_amount")),
-                ).fetchall()
-                candidates = [row for row in candidates if row["id"] not in claimed_ids
-                              and not _card_identity_conflicts(row, t)
-                              and (post_date or row["bill_date"] is None
-                                   or row["bill_date"] == t.get("bill_date"))]
-                existing_key = self.conn.execute(
-                    "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
-                    (self.user_id, key),
-                ).fetchone()
+                        (self.user_id, t.get("card_no"), t.get("date"), t.get("amount"),
+                         t.get("desc"), t.get("consume_amount")),
+                    ))().fetchall()
+                with error_step('SYS-08-142-029'):
+                    candidates = [row for row in candidates if row["id"] not in claimed_ids
+                                  and not _card_identity_conflicts(row, t)
+                                  and (post_date or row["bill_date"] is None
+                                       or row["bill_date"] == t.get("bill_date"))]
+                with error_step('SYS-08-142-057'):
+                    existing_key = error_step('SYS-08-142-030')(lambda: self.conn.execute(
+                        "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
+                        (self.user_id, key),
+                    ))().fetchone()
                 if len(candidates) > 1:
                     fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                               "auto_excluded", "splits_overwrite")
@@ -1693,20 +1856,23 @@ class BankStore:
                 if candidates and existing_key is None:
                     # 同一 canonical row 從「尚無入帳日」升級為銀行真值；原地更新可保留
                     # 使用者分類／備註／拆帳，且避免新 dedup key 造成雙列。
-                    self.conn.execute(
-                        "UPDATE card_billed_txns SET post_date = ?, "
-                        "bill_date = COALESCE(?, bill_date), dedup_key = ? "
-                        "WHERE user_id = ? AND id = ?",
-                        (post_date, t.get("bill_date"), key, self.user_id, candidates[0]["id"]),
-                    )
-            cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
-                                  if rules else (None, None, False))
+                    with error_step('SYS-08-142-036'):
+                        self.conn.execute(
+                            "UPDATE card_billed_txns SET post_date = ?, "
+                            "bill_date = COALESCE(?, bill_date), dedup_key = ? "
+                            "WHERE user_id = ? AND id = ?",
+                            (post_date, t.get("bill_date"), key, self.user_id, candidates[0]["id"]),
+                        )
+            with error_step('SYS-08-142-017'):
+                cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
+                                      if rules else (None, None, False))
             description_overwrite = tags_overwrite = splits_overwrite = None
             # 信用卡: amount=None 讓 _flow_fields 不走「正值即收入」fallback
             # (帳單視角的正負跟 user cashflow 方向不一致, 只信 txn_type/category)
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
-            inserted = self.conn.execute(
-                """INSERT INTO card_billed_txns
+            with error_step('SYS-08-142-050'):
+                inserted = error_step('SYS-08-142-018')(lambda: self.conn.execute(
+                    """INSERT INTO card_billed_txns
                    (user_id, card_no, bill_date, currency, consume_date, post_date, description,
                     amount, consume_country, consume_currency, consume_amount, first_seen,
                     dedup_key, category, subcategory, txn_type, auto_excluded,
@@ -1715,13 +1881,13 @@ class BankStore:
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, dedup_key) DO NOTHING
                    RETURNING id""",
-                (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
-                 post_date, t.get("desc"), t.get("amount"), t.get("consume_country"),
-                 t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
-                 t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0, splits_overwrite, native),
-            ).fetchone()
+                    (self.user_id, t.get("card_no"), t.get("bill_date"), t.get("currency"), t.get("date"),
+                     post_date, t.get("desc"), t.get("amount"), t.get("consume_country"),
+                     t.get("consume_currency"), t.get("consume_amount"), now, key, cat, sub,
+                     t.get("txn_type"), 1 if auto_ex else 0,
+                     description_overwrite, tags_overwrite, flow, income_cat,
+                     1 if _is_subscription(sub) else 0, splits_overwrite, native),
+                ))().fetchone()
             existing = None
             if inserted:
                 claimed_ids.add(inserted["id"])
@@ -1729,29 +1895,32 @@ class BankStore:
                 self._current_billed_ids.append(inserted["id"])
                 inserted_count += 1
             else:
-                existing = self.conn.execute(
-                    "SELECT id, post_date FROM card_billed_txns "
-                    "WHERE user_id = ? AND dedup_key = ?",
-                    (self.user_id, key),
-                ).fetchone()
+                with error_step('SYS-08-142-058'):
+                    existing = error_step('SYS-08-142-031')(lambda: self.conn.execute(
+                        "SELECT id, post_date FROM card_billed_txns "
+                        "WHERE user_id = ? AND dedup_key = ?",
+                        (self.user_id, key),
+                    ))().fetchone()
                 if existing:
                     claimed_ids.add(existing["id"])
                     self._current_billed_ids.append(existing["id"])
                     if not native and post_date is None and existing["post_date"]:
                         # 舊 store 寫入 consume_date fallback，但 dedup_key 是用來源的
                         # post_date=None 生成；同 key 再同步即是可證明的 legacy 假值。
-                        self.conn.execute(
-                            "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
-                            (existing["id"],),
-                        )
+                        with error_step('SYS-08-142-040'):
+                            self.conn.execute(
+                                "UPDATE card_billed_txns SET post_date = NULL WHERE id = ?",
+                                (existing["id"],),
+                            )
             if not suppress_history_cursor:
-                self._record_transaction_cursor(
-                    "card_billed_transactions",
-                    t.get("card_no"),
-                    post_date,
-                    t.get("date"),
-                    t.get("bill_date"),
-                )
+                with error_step('SYS-08-142-032'):
+                    self._record_transaction_cursor(
+                        "card_billed_transactions",
+                        t.get("card_no"),
+                        post_date,
+                        t.get("date"),
+                        t.get("bill_date"),
+                    )
         # 不在此 commit：billed INSERT、overlay adoption、pending refresh 必須同一 transaction。
         # 各 persist 最後由 refresh_card_pending／log_sync commit；中途 crash 會整批 rollback，
         # 避免下一輪 ON CONFLICT 後失去「本次新增 billed」candidate。
@@ -1792,8 +1961,9 @@ class BankStore:
         # Native occurrences are outside this legacy content-only repair's proof.
         # 用 ROW_NUMBER 視窗函數 (SQLite 3.25+, macOS 自帶 3.43+)
         # Phase C (2026-06-17): 只 dedup 本 user 的 row, partition 多加 user_id 也安全。
-        cur = self.conn.execute(
-            """DELETE FROM card_billed_txns
+        with error_step('SYS-08-143-001'):
+            cur = self.conn.execute(
+                """DELETE FROM card_billed_txns
                WHERE id IN (
                    SELECT id FROM (
                        SELECT id,
@@ -1815,10 +1985,11 @@ class BankStore:
                    ) ranked
                    WHERE rn > 1
                )""",
-            (self.user_id,),
-        )
+                (self.user_id,),
+            )
         deleted = cur.rowcount or 0
-        self.conn.commit()
+        with error_step('SYS-08-143-002'):
+            self.conn.commit()
         return deleted
 
     def purge_legacy_masked_card_no_rows(self, commit: bool = True) -> tuple[int, int]:
@@ -1831,16 +2002,19 @@ class BankStore:
 
         Returns: (billed_deleted, pending_deleted)
         """
-        cur_b = self.conn.execute(
-            "DELETE FROM card_billed_txns WHERE user_id = ? AND card_no LIKE '%-XXXX-XXXX-%'",
-            (self.user_id,),
-        )
-        cur_p = self.conn.execute(
-            "DELETE FROM card_pending_txns WHERE user_id = ? AND card_no LIKE '%-XXXX-XXXX-%'",
-            (self.user_id,),
-        )
+        with error_step('SYS-08-144-001'):
+            cur_b = self.conn.execute(
+                "DELETE FROM card_billed_txns WHERE user_id = ? AND card_no LIKE '%-XXXX-XXXX-%'",
+                (self.user_id,),
+            )
+        with error_step('SYS-08-144-002'):
+            cur_p = self.conn.execute(
+                "DELETE FROM card_pending_txns WHERE user_id = ? AND card_no LIKE '%-XXXX-XXXX-%'",
+                (self.user_id,),
+            )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-144-003'):
+                self.conn.commit()
         return (cur_b.rowcount or 0, cur_p.rowcount or 0)
 
     # ---- 3. 未出帳/即時：refresh-by-scope ----
@@ -1852,13 +2026,14 @@ class BankStore:
         scan. Still-observed unknowns retain pending membership. Ambiguous native
         occurrences, conflicting edits/currencies and invalid splits fail closed.
         """
-        rows = self.conn.execute(
-            "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
-            "consume_currency, consume_amount, category, subcategory, description_overwrite, "
-            "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
-            "WHERE user_id = ? AND scope = ?",
-            (self.user_id, scope),
-        ).fetchall()
+        with error_step('SYS-08-145-014'):
+            rows = error_step('SYS-08-145-006')(lambda: self.conn.execute(
+                "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
+                "consume_currency, consume_amount, category, subcategory, description_overwrite, "
+                "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
+                "WHERE user_id = ? AND scope = ?",
+                (self.user_id, scope),
+            ))().fetchall()
         candidate_billed_ids = [*self._new_billed_ids, *self._current_billed_ids]
         candidate_billed_ids = list(dict.fromkeys(candidate_billed_ids))
         if not rows or not candidate_billed_ids:
@@ -1867,24 +2042,27 @@ class BankStore:
         # 只有外幣原幣 identity 足夠強，可在可信 snapshot overlap 時接手。
         incoming_by_identity: dict[tuple, list[dict]] = {}
         for t in txns:
-            identity = _pending_billed_identity(t)
+            with error_step('SYS-08-145-009'):
+                identity = _pending_billed_identity(t)
             if identity is not None:
                 incoming_by_identity.setdefault(identity, []).append(t)
         candidate_identities: set[tuple] = set()
         for r in rows:
-            identity = _pending_billed_identity(r)
+            with error_step('SYS-08-145-010'):
+                identity = _pending_billed_identity(r)
             if identity is None or identity[0] not in ("fx", "native"):
                 continue
             candidate_identities.add(identity)
 
         placeholders = ",".join("?" for _ in candidate_billed_ids)
-        billed_rows = self.conn.execute(
-            f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, "
-            f"category, subcategory, txn_type, description_overwrite, tags_overwrite, "
-            f"auto_excluded, splits_overwrite FROM card_billed_txns "
-            f"WHERE user_id = ? AND id IN ({placeholders})",
-            (self.user_id, *candidate_billed_ids),
-        ).fetchall()
+        with error_step('SYS-08-145-015'):
+            billed_rows = error_step('SYS-08-145-007')(lambda: self.conn.execute(
+                f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, "
+                f"category, subcategory, txn_type, description_overwrite, tags_overwrite, "
+                f"auto_excluded, splits_overwrite FROM card_billed_txns "
+                f"WHERE user_id = ? AND id IN ({placeholders})",
+                (self.user_id, *candidate_billed_ids),
+            ))().fetchall()
         fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                   "auto_excluded", "splits_overwrite")
         for pending_row in rows:
@@ -1895,25 +2073,28 @@ class BankStore:
                 continue  # A still-observed unknown keeps its overlay in pending.
             native_targets = [row for row in billed_rows if row["native_identity"] == native]
             if native_targets and not any(_native_occurrence_matches(pending_row, row) for row in native_targets):
-                raise ValueError("conflicting native vanished pending occurrence")
+                raise with_error_code(ValueError("conflicting native vanished pending occurrence"), 'SYS-08-145-001')
         billed_by_identity: dict[tuple, list] = {}
         for b in billed_rows:
-            identity = _pending_billed_identity(b)
+            with error_step('SYS-08-145-011'):
+                identity = _pending_billed_identity(b)
             if identity is not None and (identity[0] == "native" or b["id"] in self._new_billed_ids):
                 billed_by_identity.setdefault(identity, []).append(b)
 
         # 同交易可能同時出現在 unbilled/current/realtime；跨 scope 一起判定
         # overlay 是否一致，但每次 refresh 只刪自己 scope，避免回傳 count 失真。
-        all_pending = self.conn.execute(
-            "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
-            "consume_currency, consume_amount, category, subcategory, description_overwrite, "
-            "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
-            "WHERE user_id = ? AND scope IN ('unbilled', 'current', 'realtime')",
-            (self.user_id,),
-        ).fetchall()
+        with error_step('SYS-08-145-016'):
+            all_pending = error_step('SYS-08-145-008')(lambda: self.conn.execute(
+                "SELECT id, scope, card_no, consume_date, post_date, amount, currency, description, native_identity, txn_type, "
+                "consume_currency, consume_amount, category, subcategory, description_overwrite, "
+                "tags_overwrite, auto_excluded, splits_overwrite FROM card_pending_txns "
+                "WHERE user_id = ? AND scope IN ('unbilled', 'current', 'realtime')",
+                (self.user_id,),
+            ))().fetchall()
         pending_by_identity: dict[tuple, list] = {}
         for p in all_pending:
-            identity = _pending_billed_identity(p)
+            with error_step('SYS-08-145-012'):
+                identity = _pending_billed_identity(p)
             if identity is not None:
                 pending_by_identity.setdefault(identity, []).append(p)
 
@@ -1950,7 +2131,7 @@ class BankStore:
             if (any(n > 1 for n in scope_counts.values()) or len(raw_keys) != 1
                     or len(overlay_signatures) != 1 or len(targets) != 1):
                 if identity[0] == "native":
-                    raise ValueError("ambiguous native pending overlays")
+                    raise with_error_code(ValueError("ambiguous native pending overlays"), 'SYS-08-145-002')
                 self._unsafe_pending_overlay_identities.add(identity)
                 continue
 
@@ -1958,11 +2139,11 @@ class BankStore:
             target = targets[0]
             if _card_identity_conflicts(p, target):
                 if identity[0] == "native":
-                    raise ValueError("conflicting native pending occurrence")
+                    raise with_error_code(ValueError("conflicting native pending occurrence"), 'SYS-08-145-003')
                 continue
             splits = _rescale_splits(p["splits_overwrite"], target["amount"])
             if identity[0] == "native" and p["splits_overwrite"] and splits is None:
-                raise ValueError("cannot preserve native pending splits")
+                raise with_error_code(ValueError("cannot preserve native pending splits"), 'SYS-08-145-004')
             pending_signature = (
                 p["category"], p["subcategory"], p["description_overwrite"],
                 p["tags_overwrite"], p["auto_excluded"], splits,
@@ -1974,7 +2155,7 @@ class BankStore:
             if (target["id"] not in new_billed_ids and any(target_signature)
                     and target_signature != pending_signature):
                 if identity[0] == "native":
-                    raise ValueError("conflicting native billed overlays")
+                    raise with_error_code(ValueError("conflicting native billed overlays"), 'SYS-08-145-005')
                 # Existing billed 只有 outcome-equivalent overlay 才可重用；衝突時不猜。
                 self._unsafe_pending_overlay_identities.add(identity)
                 continue
@@ -1985,16 +2166,17 @@ class BankStore:
             ))
 
         for identity, incoming, p, target, splits, flow, income_cat in plans:
-            self.conn.execute(
-                "UPDATE card_billed_txns SET category = ?, subcategory = ?, "
-                "description_overwrite = ?, tags_overwrite = ?, auto_excluded = ?, "
-                "splits_overwrite = ?, flow_type = ?, income_category = ?, "
-                "is_subscription = ? WHERE id = ?",
-                (p["category"], p["subcategory"], p["description_overwrite"],
-                 p["tags_overwrite"], p["auto_excluded"], splits,
-                 flow, income_cat, 1 if _is_subscription(p["subcategory"]) else 0,
-                 target["id"]),
-            )
+            with error_step('SYS-08-145-013'):
+                self.conn.execute(
+                    "UPDATE card_billed_txns SET category = ?, subcategory = ?, "
+                    "description_overwrite = ?, tags_overwrite = ?, auto_excluded = ?, "
+                    "splits_overwrite = ?, flow_type = ?, income_category = ?, "
+                    "is_subscription = ? WHERE id = ?",
+                    (p["category"], p["subcategory"], p["description_overwrite"],
+                     p["tags_overwrite"], p["auto_excluded"], splits,
+                     flow, income_cat, 1 if _is_subscription(p["subcategory"]) else 0,
+                     target["id"]),
+                )
             scope_ledgers = self._adopted_pending_raw_keys.setdefault(identity, {})
             counter = scope_ledgers.setdefault(scope, Counter())
             counter.update(_pending_raw_key(t) for t in incoming)
@@ -2003,26 +2185,33 @@ class BankStore:
     @contextmanager
     def savepoint(self, name: str):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise ValueError("invalid savepoint name")
-        self.conn.execute(f"SAVEPOINT {name}")
+            raise with_error_code(ValueError("invalid savepoint name"), 'SYS-08-146-001')
+        with error_step('SYS-08-146-002'):
+            self.conn.execute(f"SAVEPOINT {name}")
         try:
             yield
         except Exception:
-            self.conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            self.conn.execute(f"RELEASE SAVEPOINT {name}")
+            with error_step('SYS-08-146-004'):
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            with error_step('SYS-08-146-005'):
+                self.conn.execute(f"RELEASE SAVEPOINT {name}")
             raise
         else:
-            self.conn.execute(f"RELEASE SAVEPOINT {name}")
+            with error_step('SYS-08-146-003'):
+                self.conn.execute(f"RELEASE SAVEPOINT {name}")
 
     def begin_transaction(self) -> None:
         """Keep nested savepoint releases inside the final commit/rollback."""
-        self.conn.execute("SAVEPOINT bank_store_transaction")
+        with error_step('SYS-08-147-001'):
+            self.conn.execute("SAVEPOINT bank_store_transaction")
 
     def commit(self) -> None:
-        self.conn.commit()
+        with error_step('SYS-08-148-001'):
+            self.conn.commit()
 
     def rollback(self) -> None:
-        self.conn.rollback()
+        with error_step('SYS-08-149-001'):
+            self.conn.rollback()
 
     def _promote_card_pending_overlays(self, scope: str, booked: list[dict], pending: list[dict],
                                        target_ids: list[int], new_ids: set[int]) -> None:
@@ -2031,40 +2220,46 @@ class BankStore:
         Legacy card rows lack credential provenance. The refresh boundary rejects
         proven foreign native namespaces; it never backfills ownership on legacy rows.
         """
-        if len(target_ids) != len(booked) or len(set(target_ids)) != len(target_ids):
-            raise ValueError("ambiguous booked occurrence targets")
+        if len(target_ids) != len(booked):
+            raise with_error_code(ValueError('ambiguous booked occurrence targets'), 'SYS-08-150-001')
+        elif len(set(target_ids)) != len(target_ids):
+            raise with_error_code(ValueError('ambiguous booked occurrence targets'), 'SYS-08-150-002')
         fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                   "auto_excluded", "splits_overwrite")
-        donors = self.conn.execute(
-            "SELECT * FROM card_pending_txns WHERE user_id = ? ORDER BY id", (self.user_id,),
-        ).fetchall()
+        with error_step('SYS-08-150-018'):
+            donors = error_step('SYS-08-150-012')(lambda: self.conn.execute(
+                "SELECT * FROM card_pending_txns WHERE user_id = ? ORDER BY id", (self.user_id,),
+            ))().fetchall()
         targets = []
         for txn, target_id in zip(booked, target_ids, strict=True):
-            target = self.conn.execute(
-                "SELECT * FROM card_billed_txns WHERE user_id = ? AND id = ?", (self.user_id, target_id),
-            ).fetchone()
+            with error_step('SYS-08-150-019'):
+                target = error_step('SYS-08-150-013')(lambda: self.conn.execute(
+                    "SELECT * FROM card_billed_txns WHERE user_id = ? AND id = ?", (self.user_id, target_id),
+                ))().fetchone()
             if target is None:
-                raise ValueError("missing booked occurrence target")
+                raise with_error_code(ValueError("missing booked occurrence target"), 'SYS-08-150-006')
             if _card_identity_conflicts(target, txn):
-                raise ValueError("conflicting booked occurrence target currency")
+                raise with_error_code(ValueError("conflicting booked occurrence target currency"), 'SYS-08-150-007')
             targets.append(dict(target))
             if not txn.get("card_no"):
-                cards = self.conn.execute(
-                    "SELECT card_no FROM card_billed_txns WHERE user_id = ? AND consume_date = ? "
-                    "AND amount = ? AND description = ? AND consume_amount IS NOT DISTINCT FROM ? "
-                    "AND (post_date = ? OR post_date IS NULL)",
-                    (self.user_id, target["consume_date"], target["amount"], target["description"],
-                     target["consume_amount"], target["post_date"]),
-                ).fetchall()
-                if len({row["card_no"] or "" for row in cards}) > 1:
-                    raise ValueError("ambiguous blank-card booking identity")
+                with error_step('SYS-08-150-020'):
+                    cards = error_step('SYS-08-150-014')(lambda: self.conn.execute(
+                        "SELECT card_no FROM card_billed_txns WHERE user_id = ? AND consume_date = ? "
+                        "AND amount = ? AND description = ? AND consume_amount IS NOT DISTINCT FROM ? "
+                        "AND (post_date = ? OR post_date IS NULL)",
+                        (self.user_id, target["consume_date"], target["amount"], target["description"],
+                         target["consume_amount"], target["post_date"]),
+                    ))().fetchall()
+                if len({row['card_no'] or '' for row in cards}) > 1:
+                    raise with_error_code(ValueError('ambiguous blank-card booking identity'), 'SYS-08-150-017')
 
         def exact(row):
             row = dict(row)
             currency = str(row.get("currency") or "TWD").strip().upper()
             consume_date, amount, description = _pending_raw_key(row)
-            return (row.get("card_no") or "", consume_date,
-                    native_money(amount, currency, optional=True), description, currency)
+            with error_step('SYS-08-151-001'):
+                return (row.get("card_no") or "", consume_date,
+                        native_money(amount, currency, optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-867-002'), bank_error_id(self.bank, '08-867-003'), bank_error_id(self.bank, '08-867-004'), bank_error_id(self.bank, '08-867-005'), bank_error_id(self.bank, '08-867-006'), bank_error_id(self.bank, '08-867-007'), bank_error_id(self.bank, '08-867-008'), bank_error_id(self.bank, '08-867-009'), bank_error_id(self.bank, '08-867-010'))), description, currency)
 
         def matches_source(row, source):
             if _card_identity_conflicts(row, source):
@@ -2072,10 +2267,12 @@ class BankStore:
             row, source = dict(row), dict(source)
             if row.get("native_identity") and source.get("native_identity"):
                 return _native_occurrence_matches(row, source)
-            identity = _pending_billed_identity(source)
-            return exact(row) == exact(source) or (
-                identity is not None and identity[0] == "fx" and identity == _pending_billed_identity(row)
-            )
+            with error_step('SYS-08-152-001'):
+                identity = _pending_billed_identity(source)
+            with error_step('SYS-08-152-002'):
+                return exact(row) == exact(source) or (
+                    identity is not None and identity[0] == "fx" and identity == _pending_billed_identity(row)
+                )
 
         # Keep the source's blank identity even if billed upsert safely enriched it.
         sources = [{**target, **{field: txn[field] for field in
@@ -2097,37 +2294,42 @@ class BankStore:
             if match_count != 1:
                 # A promotion must not silently erase an unmatchable edited row,
                 # or choose which identical booked/unknown occurrence owned its edits.
-                raise ValueError("ambiguous pending booking overlay identity")
+                raise with_error_code(ValueError("ambiguous pending booking overlay identity"), 'SYS-08-150-009')
         for target, siblings in zip(targets, matches, strict=True):
             edited = [p for p in siblings if any(p[field] for field in fields)]
             if edited:
                 signatures = {tuple(p[field] for field in fields) for p in edited}
                 scope_counts = Counter(p["scope"] for p in siblings)
-                if (len(signatures) != 1 or any(n > 1 for n in scope_counts.values())
-                        or any(sum(p in group for group in matches) != 1 for p in edited)):
-                    raise ValueError("ambiguous pending booking overlays")
+                if len(signatures) != 1:
+                    raise with_error_code(ValueError('ambiguous pending booking overlays'), 'SYS-08-150-003')
+                elif any((n > 1 for n in scope_counts.values())):
+                    raise with_error_code(ValueError('ambiguous pending booking overlays'), 'SYS-08-150-004')
+                elif any((sum((p in group for group in matches)) != 1 for p in edited)):
+                    raise with_error_code(ValueError('ambiguous pending booking overlays'), 'SYS-08-150-005')
                 donor = edited[0]
                 splits = _rescale_splits(donor["splits_overwrite"], target["amount"])
                 if donor["splits_overwrite"] and splits is None:
-                    raise ValueError("cannot preserve booked splits")
+                    raise with_error_code(ValueError("cannot preserve booked splits"), 'SYS-08-150-010')
                 signature = (*(donor[field] for field in fields[:-1]), splits)
                 existing = tuple(target[field] for field in fields)
                 if target["id"] not in new_ids and any(existing) and existing != signature:
-                    raise ValueError("conflicting billed booking overlays")
+                    raise with_error_code(ValueError("conflicting billed booking overlays"), 'SYS-08-150-011')
                 flow, income_cat = _flow_fields(donor["category"], donor["subcategory"], None, target["txn_type"])
-                self.conn.execute(
-                    "UPDATE card_billed_txns SET category=?, subcategory=?, description_overwrite=?, "
-                    "tags_overwrite=?, auto_excluded=?, splits_overwrite=?, flow_type=?, "
-                    "income_category=?, is_subscription=? WHERE user_id=? AND id=?",
-                    (*signature, flow, income_cat, 1 if _is_subscription(donor["subcategory"]) else 0,
-                     self.user_id, target["id"]),
-                )
+                with error_step('SYS-08-150-015'):
+                    self.conn.execute(
+                        "UPDATE card_billed_txns SET category=?, subcategory=?, description_overwrite=?, "
+                        "tags_overwrite=?, auto_excluded=?, splits_overwrite=?, flow_type=?, "
+                        "income_category=?, is_subscription=? WHERE user_id=? AND id=?",
+                        (*signature, flow, income_cat, 1 if _is_subscription(donor["subcategory"]) else 0,
+                         self.user_id, target["id"]),
+                    )
             for donor in siblings:
                 if donor["scope"] == scope:
-                    self.conn.execute(
-                        "DELETE FROM card_pending_txns WHERE user_id = ? AND id = ?",
-                        (self.user_id, donor["id"]),
-                    )
+                    with error_step('SYS-08-150-016'):
+                        self.conn.execute(
+                            "DELETE FROM card_pending_txns WHERE user_id = ? AND id = ?",
+                            (self.user_id, donor["id"]),
+                        )
 
     def persist_card_batch(self, billed: list[dict], pending: list[dict], *, scope: str,
                            fetch_ok: bool, rules: list[dict] | None = None,
@@ -2135,26 +2337,31 @@ class BankStore:
         """Own SQL and occurrence ledgers together, even behind a write barrier."""
         from copy import deepcopy
 
-        self._validate_native_card_occurrences([*billed, *pending])
+        with error_step('SYS-08-153-002'):
+            self._validate_native_card_occurrences([*billed, *pending])
         names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
                  "_unsafe_pending_overlay_identities")
-        before = {name: deepcopy(getattr(self, name)) for name in names}
-        self.begin_transaction()
+        with error_step('SYS-08-153-003'):
+            before = {name: deepcopy(getattr(self, name)) for name in names}
+        with error_step('SYS-08-153-004'):
+            self.begin_transaction()
         try:
             with self.savepoint("card_batch"):
                 self._new_billed_ids = []
                 self._current_billed_ids = []
                 self._adopted_pending_raw_keys = {}
                 self._unsafe_pending_overlay_identities = set()
-                billed_n = self.upsert_card_billed(billed, rules=rules) if billed else 0
+                with error_step('SYS-08-153-006'):
+                    billed_n = self.upsert_card_billed(billed, rules=rules) if billed else 0
                 if fetch_ok:
                     # Native-aware producers explicitly attest a missing reference too.
                     # Keep legacy callers' membership contract; never infer ownership.
                     incoming = {(t.get("card_no"), *_pending_raw_key(t)) for t in pending}
-                    donors = self.conn.execute(
-                        "SELECT * FROM card_pending_txns WHERE user_id=? AND scope=?",
-                        (self.user_id, scope),
-                    ).fetchall()
+                    with error_step('SYS-08-153-009'):
+                        donors = error_step('SYS-08-153-008')(lambda: self.conn.execute(
+                            "SELECT * FROM card_pending_txns WHERE user_id=? AND scope=?",
+                            (self.user_id, scope),
+                        ))().fetchall()
                     fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                               "auto_excluded", "splits_overwrite")
                     if any("native_identity" in txn and not txn.get("native_identity")
@@ -2163,16 +2370,18 @@ class BankStore:
                            and _pending_raw_key(donor) != _pending_raw_key(txn)
                            and _card_occurrence_matches(donor, txn)
                            for donor in donors for txn in billed):
-                        raise ValueError("ambiguous native pending overlay identity")
-                pending_n = self.refresh_card_pending(
-                    scope, pending, rules=rules, fetch_ok=fetch_ok, commit=False,
-                )
+                        raise with_error_code(ValueError("ambiguous native pending overlay identity"), 'SYS-08-153-001')
+                with error_step('SYS-08-153-007'):
+                    pending_n = self.refresh_card_pending(
+                        scope, pending, rules=rules, fetch_ok=fetch_ok, commit=False,
+                    )
         except Exception:
             for name, value in before.items():
                 setattr(self, name, value)
             raise
         if commit:
-            self.commit()
+            with error_step('SYS-08-153-005'):
+                self.commit()
         return billed_n, pending_n
 
     def refresh_card_pending(self, scope: str, txns: list[dict],
@@ -2180,16 +2389,19 @@ class BankStore:
                              fetch_ok: bool | None = None,
                              commit: bool = True) -> int:
         if fetch_ok is not False:
-            self._validate_native_card_occurrences(txns)
+            with error_step('SYS-08-154-003'):
+                self._validate_native_card_occurrences(txns)
             # Only the native producer's exact namespace proves credential ownership.
             # Legacy rows remain unowned; do not invent a backfill from current login.
-            native_rows = self.conn.execute(
-                "SELECT native_identity FROM card_pending_txns WHERE user_id = ? "
-                "AND native_identity IS NOT NULL", (self.user_id,),
-            ).fetchall()
+            with error_step('SYS-08-154-010'):
+                native_rows = error_step('SYS-08-154-004')(lambda: self.conn.execute(
+                    "SELECT native_identity FROM card_pending_txns WHERE user_id = ? "
+                    "AND native_identity IS NOT NULL", (self.user_id,),
+                ))().fetchall()
             for row in native_rows:
                 try:
-                    namespace = json.loads(row["native_identity"])
+                    with error_step('SYS-08-154-009'):
+                        namespace = json.loads(row["native_identity"])
                 except (TypeError, ValueError):
                     continue
                 if (isinstance(namespace, list) and len(namespace) == 5
@@ -2197,7 +2409,7 @@ class BankStore:
                         and type(namespace[2]) is int and namespace[2] > 0
                         and all(isinstance(value, str) and value for value in namespace[3:])
                         and namespace[2] != self.source_account_id):
-                    raise ValueError("foreign credential source owns native pending rows")
+                    raise with_error_code(ValueError("foreign credential source owns native pending rows"), 'SYS-08-154-001')
         if fetch_ok is not True:
             return self._refresh_card_pending(scope, txns, rules, fetch_ok, commit)
         txns = [dict(txn) for txn in txns]
@@ -2208,10 +2420,11 @@ class BankStore:
             post_date = txn.get("post_date")
             # Producers attest booking provenance; this boundary accepts only their
             # canonical calendar date (or explicit booked-without-date), never sentinels.
-            valid_date = post_date is None or (
-                isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
-                and _cursor_date(post_date) is not None
-            )
+            with error_step('SYS-08-154-005'):
+                valid_date = post_date is None or (
+                    isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
+                    and _cursor_date(post_date) is not None
+                )
             if not valid_date:
                 txn["post_date"] = None
             (booked if txn.get("booking_status") == "booked" and valid_date else pending).append(txn)
@@ -2221,15 +2434,18 @@ class BankStore:
 
         ledger_names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
                         "_unsafe_pending_overlay_identities")
-        before = {name: deepcopy(getattr(self, name)) for name in ledger_names}
+        with error_step('SYS-08-154-002'):
+            before = {name: deepcopy(getattr(self, name)) for name in ledger_names}
         # SQLite RELEASE of an outermost savepoint commits even with commit=False.
         if isinstance(self.conn, sqlite3.Connection) and not self.conn.in_transaction:
-            self.conn.execute("BEGIN")
+            with error_step('SYS-08-154-006'):
+                self.conn.execute("BEGIN")
         try:
             with self.savepoint("card_booking_promotion"):
                 start = len(self._current_billed_ids)
                 new_before = set(self._new_billed_ids)
-                self.upsert_card_billed(booked, rules, suppress_history_cursor=True)
+                with error_step('SYS-08-154-008'):
+                    self.upsert_card_billed(booked, rules, suppress_history_cursor=True)
                 target_ids = self._current_billed_ids[start:]
                 self._promote_card_pending_overlays(
                     scope, booked, pending, target_ids, set(self._new_billed_ids) - new_before,
@@ -2250,7 +2466,8 @@ class BankStore:
                 setattr(self, name, value)
             raise
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-154-007'):
+                self.conn.commit()
         return count
 
     def _refresh_card_pending(self, scope: str, txns: list[dict],
@@ -2268,42 +2485,48 @@ class BankStore:
         from backend.server.categorizer import categorize_with_excluded
         if fetch_ok is False:
             if commit:
-                self.conn.commit()
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
-                (self.user_id, scope),
-            ).fetchone()
-            return int(row["n"] if row else 0)
+                with error_step('SYS-08-155-027'):
+                    self.conn.commit()
+            with error_step('SYS-08-155-032'):
+                row = error_step('SYS-08-155-014')(lambda: self.conn.execute(
+                    "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+                    (self.user_id, scope),
+                ))().fetchone()
+            with error_step('SYS-08-155-015'):
+                return int(row["n"] if row else 0)
         txns = [dict(txn) for txn in txns]
         for txn in txns:
             currency = str(txn.get("currency") or "TWD").strip().upper()
             txn["currency"] = currency
-            txn["amount"] = native_money(txn.get("amount"), currency, optional=True)
+            with error_step('SYS-08-155-016'):
+                txn["amount"] = native_money(txn.get("amount"), currency, optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-868-002'), bank_error_id(self.bank, '08-868-003'), bank_error_id(self.bank, '08-868-004'), bank_error_id(self.bank, '08-868-005'), bank_error_id(self.bank, '08-868-006'), bank_error_id(self.bank, '08-868-007'), bank_error_id(self.bank, '08-868-008'), bank_error_id(self.bank, '08-868-009'), bank_error_id(self.bank, '08-868-010')))
             consume_currency = str(txn.get("consume_currency") or currency).strip().upper()
             if txn.get("consume_amount") is not None:
                 txn["consume_currency"] = consume_currency
-                txn["consume_amount"] = native_money(
-                    txn.get("consume_amount"), consume_currency,
-                )
+                with error_step('SYS-08-155-028'):
+                    txn["consume_amount"] = native_money(
+                        txn.get("consume_amount"), consume_currency, _codes=(bank_error_id(self.bank, '08-869-001'), bank_error_id(self.bank, '08-869-002'), bank_error_id(self.bank, '08-869-003'), bank_error_id(self.bank, '08-869-004'), bank_error_id(self.bank, '08-869-005'), bank_error_id(self.bank, '08-869-006'), bank_error_id(self.bank, '08-869-007'), bank_error_id(self.bank, '08-869-008'), bank_error_id(self.bank, '08-869-009'), bank_error_id(self.bank, '08-869-010')))
         now = _now()
         for txn in txns:
             if not txn.get("native_identity") or "booking_status" not in txn:
                 continue
-            authoritative = self.conn.execute(
-                "SELECT * FROM card_billed_txns WHERE user_id=? AND native_identity=? "
-                "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
-                "AND bill_date IS NOT NULL",
-                (self.user_id, txn["native_identity"], txn.get("card_no"), txn.get("date")),
-            ).fetchall()
+            with error_step('SYS-08-155-033'):
+                authoritative = error_step('SYS-08-155-017')(lambda: self.conn.execute(
+                    "SELECT * FROM card_billed_txns WHERE user_id=? AND native_identity=? "
+                    "AND card_no IS NOT DISTINCT FROM ? AND consume_date IS NOT DISTINCT FROM ? "
+                    "AND bill_date IS NOT NULL",
+                    (self.user_id, txn["native_identity"], txn.get("card_no"), txn.get("date")),
+                ))().fetchall()
             if any(_native_occurrence_matches(row, txn) and row["amount"] != txn.get("amount")
                    for row in authoritative):
                 # Historical equality can veto stale snapshots, never promote an unknown.
-                raise ValueError("ambiguous native FX snapshot settlement ordering")
+                raise with_error_code(ValueError("ambiguous native FX snapshot settlement ordering"), 'SYS-08-155-003')
         pending_metadata = self._pending_user_metadata(scope)
-        native_pending = {row["id"]: dict(row) for row in self.conn.execute(
-            "SELECT * FROM card_pending_txns WHERE user_id = ? AND scope = ?",
-            (self.user_id, scope),
-        ).fetchall()}
+        with error_step('SYS-08-155-035'):
+            native_pending = {row["id"]: dict(row) for row in error_step('SYS-08-155-008')(lambda: self.conn.execute(
+                "SELECT * FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+                (self.user_id, scope),
+            ))().fetchall()}
         incoming_native = {txn.get("native_identity") for txn in txns}
         for txn in txns:
             if txn.get("native_identity"):
@@ -2311,14 +2534,14 @@ class BankStore:
                     if (old.get("native_identity") == txn["native_identity"]
                             and _pending_raw_key(old)[0] == _pending_raw_key(txn)[0]
                             and _card_identity_conflicts(old, txn)):
-                        raise ValueError("conflicting native pending occurrence currency")
+                        raise with_error_code(ValueError("conflicting native pending occurrence currency"), 'SYS-08-155-004')
             exact_key = (txn.get("card_no"), *_pending_raw_key(txn))
             for metadata in pending_metadata.get(exact_key, []):
                 old_native = native_pending[metadata[-1]].get("native_identity")
                 if (old_native and txn.get("native_identity") and old_native != txn["native_identity"]
                         and old_native not in incoming_native):
                     if any(metadata[:-1]):
-                        raise ValueError("conflicting native pending overlay identity")
+                        raise with_error_code(ValueError("conflicting native pending overlay identity"), 'SYS-08-155-005')
         fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
                   "auto_excluded", "splits_overwrite")
         for old in native_pending.values():
@@ -2326,13 +2549,11 @@ class BankStore:
                 continue
             incoming = [txn for txn in txns if txn.get("native_identity") == old["native_identity"]]
             if incoming and not any(_native_occurrence_matches(old, txn) for txn in incoming):
-                raise ValueError("conflicting native pending overlay occurrence")
+                raise with_error_code(ValueError("conflicting native pending overlay occurrence"), 'SYS-08-155-006')
         pending_refreshed_at: dict[tuple, list[str]] = {}
-        for row in self.conn.execute(
-            "SELECT card_no, consume_date, amount, description, refreshed_at "
-            "FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id",
-            (self.user_id, scope),
-        ).fetchall():
+        with error_step('SYS-08-198-009'):
+            _error_database_rows_4 = error_step('SYS-08-198-004')(lambda: self.conn.execute('SELECT card_no, consume_date, amount, description, refreshed_at FROM card_pending_txns WHERE user_id = ? AND scope = ? ORDER BY id', (self.user_id, scope)))().fetchall()
+        for row in _error_database_rows_4:
             exact_key = (
                 row["card_no"], row["consume_date"], row["amount"], row["description"],
             )
@@ -2365,19 +2586,25 @@ class BankStore:
             }
             for identity, scope_ledgers in self._adopted_pending_raw_keys.items()
         }
-        self.conn.execute("SAVEPOINT pending_refresh_scope")
+        with error_step('SYS-08-155-009'):
+            self.conn.execute("SAVEPOINT pending_refresh_scope")
 
         def abort_refresh() -> int:
-            self.conn.execute("ROLLBACK TO SAVEPOINT pending_refresh_scope")
-            self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")
+            with error_step('SYS-08-157-001'):
+                self.conn.execute("ROLLBACK TO SAVEPOINT pending_refresh_scope")
+            with error_step('SYS-08-157-002'):
+                self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")
             self._adopted_pending_raw_keys = adopted_before
             if commit:
-                self.conn.commit()
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
-                (self.user_id, scope),
-            ).fetchone()
-            return int(row["n"] if row else 0)
+                with error_step('SYS-08-157-005'):
+                    self.conn.commit()
+            with error_step('SYS-08-157-006'):
+                row = error_step('SYS-08-157-003')(lambda: self.conn.execute(
+                    "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+                    (self.user_id, scope),
+                ))().fetchone()
+            with error_step('SYS-08-157-004'):
+                return int(row["n"] if row else 0)
 
         incoming_exact_counts = Counter(
             (t.get("card_no"), t.get("date"), t.get("amount"), t.get("desc"))
@@ -2388,9 +2615,9 @@ class BankStore:
         }
         all_pending_metadata = self._pending_user_metadata()
         exact_evidence: dict[tuple, list] = {}
-        for row in self.conn.execute(
-            "SELECT * FROM card_pending_txns WHERE user_id = ?", (self.user_id,),
-        ).fetchall():
+        with error_step('SYS-08-198-010'):
+            _error_database_rows_5 = error_step('SYS-08-198-005')(lambda: self.conn.execute('SELECT * FROM card_pending_txns WHERE user_id = ?', (self.user_id,)))().fetchall()
+        for row in _error_database_rows_5:
             exact_evidence.setdefault((row["card_no"], *_pending_raw_key(row)), []).append(row)
         for txn in txns:
             exact_evidence.setdefault((txn.get("card_no"), *_pending_raw_key(txn)), []).append(txn)
@@ -2401,13 +2628,14 @@ class BankStore:
         current_billed_ids = list(dict.fromkeys(self._current_billed_ids))
         if current_billed_ids:
             placeholders = ",".join("?" for _ in current_billed_ids)
-            rows = self.conn.execute(
-                f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, description, txn_type, first_seen, "
-                f"category, subcategory, description_overwrite, tags_overwrite, auto_excluded, "
-                f"splits_overwrite FROM card_billed_txns "
-                f"WHERE user_id = ? AND id IN ({placeholders})",
-                (self.user_id, *current_billed_ids),
-            ).fetchall()
+            with error_step('SYS-08-155-034'):
+                rows = error_step('SYS-08-155-018')(lambda: self.conn.execute(
+                    f"SELECT id, card_no, consume_date, post_date, amount, currency, consume_currency, consume_amount, native_identity, description, txn_type, first_seen, "
+                    f"category, subcategory, description_overwrite, tags_overwrite, auto_excluded, "
+                    f"splits_overwrite FROM card_billed_txns "
+                    f"WHERE user_id = ? AND id IN ({placeholders})",
+                    (self.user_id, *current_billed_ids),
+                ))().fetchall()
             observed_billed = [dict(row) for row in rows] if fetch_ok is True else []
             for row in rows:
                 exact_key = (
@@ -2454,7 +2682,8 @@ class BankStore:
                 and len(transition_targets.get(exact_key, [])) == 1
                 and unsafe_marker not in self._unsafe_pending_overlay_identities
             )
-            planned_prune_counts[exact_key] = int(merge_allowed and incoming_count == 1)
+            with error_step('SYS-08-155-019'):
+                planned_prune_counts[exact_key] = int(merge_allowed and incoming_count == 1)
             if merge_allowed and previous_count == 1:
                 planned_transfer_keys.add(exact_key)
         for exact_key in planned_transfer_keys:
@@ -2485,15 +2714,16 @@ class BankStore:
             ):
                 continue
             flow, income_cat = _flow_fields(cat, sub, None, target["txn_type"])
-            self.conn.execute(
-                "UPDATE card_billed_txns SET category=?, subcategory=?, "
-                "description_overwrite=?, tags_overwrite=?, auto_excluded=?, "
-                "splits_overwrite=?, flow_type=?, income_category=?, "
-                "is_subscription=? WHERE user_id=? AND id=?",
-                (cat, sub, description_overwrite, tags_overwrite, 1 if auto_ex else 0,
-                 splits_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0, self.user_id, target["id"]),
-            )
+            with error_step('SYS-08-155-020'):
+                self.conn.execute(
+                    "UPDATE card_billed_txns SET category=?, subcategory=?, "
+                    "description_overwrite=?, tags_overwrite=?, auto_excluded=?, "
+                    "splits_overwrite=?, flow_type=?, income_category=?, "
+                    "is_subscription=? WHERE user_id=? AND id=?",
+                    (cat, sub, description_overwrite, tags_overwrite, 1 if auto_ex else 0,
+                     splits_overwrite, flow, income_cat,
+                     1 if _is_subscription(sub) else 0, self.user_id, target["id"]),
+                )
             # Reserve the vanished exact donor before any renamed FX fallback.
             consumed_pending_ids.add(_pending_id)
         unsafe_exact_keys: set[tuple] = set()
@@ -2533,7 +2763,8 @@ class BankStore:
         for index, t in enumerate(txns):
             if index in pruned_indices or index in exact_metadata_by_index:
                 continue
-            identity = _pending_billed_identity(t)
+            with error_step('SYS-08-155-021'):
+                identity = _pending_billed_identity(t)
             if identity and identity[0] in ("fx", "native"):
                 fx_fallback_counts[identity] += 1
 
@@ -2542,16 +2773,22 @@ class BankStore:
                 continue
             remaining = [metadata for metadata in pending_fx_metadata.get(identity, [])
                          if metadata[-1] not in consumed_pending_ids]
-            if ((count != 1 or len(remaining) != 1)
-                    and any(any(metadata[:-1]) for metadata in remaining)):
-                raise ValueError("ambiguous native pending occurrence overlays")
+            if count != 1:
+                for _error_leaf_12_metadata in remaining:
+                    if any(_error_leaf_12_metadata[:-1]):
+                        raise with_error_code(ValueError('ambiguous native pending occurrence overlays'), 'SYS-08-155-030')
+            elif len(remaining) != 1:
+                for _error_leaf_11_metadata in remaining:
+                    if any(_error_leaf_11_metadata[:-1]):
+                        raise with_error_code(ValueError('ambiguous native pending occurrence overlays'), 'SYS-08-155-029')
 
         # Resolve every pending donor before replacing the scope, not just exact keys.
         # A missing reference is not proof that a renamed edited purchase disappeared.
         for index, txn in enumerate(txns):
             if index in pruned_indices or index in exact_metadata_by_index:
                 continue
-            identity = _pending_billed_identity(txn)
+            with error_step('SYS-08-155-022'):
+                identity = _pending_billed_identity(txn)
             candidates = pending_fx_metadata.get(identity, []) if identity else []
             remaining = [m for m in candidates if m[-1] not in consumed_pending_ids]
             if fx_fallback_counts.get(identity, 0) == 1 and len(remaining) == 1:
@@ -2567,24 +2804,28 @@ class BankStore:
             ambiguous_billed = any((old.get("native_identity") or txn.get("native_identity"))
                                    and not (old.get("native_identity") and txn.get("native_identity"))
                                    and _card_occurrence_matches(old, txn) for txn in observed_billed)
-            if ambiguous_pending or ambiguous_billed:
-                raise ValueError("ambiguous orphan pending overlay identity")
+            if ambiguous_pending:
+                raise with_error_code(ValueError('ambiguous orphan pending overlay identity'), 'SYS-08-155-001')
+            elif ambiguous_billed:
+                raise with_error_code(ValueError('ambiguous orphan pending overlay identity'), 'SYS-08-155-002')
 
         # 外幣原幣 identity 的唯一 1:1 overlay adoption；台幣只走上方 exact gate。
         # 找不到唯一安全對象時不搬 overlay，但可信 snapshot 仍決定 membership。
         if fetch_ok is True:
             self._adopt_vanished_pending_overlay(scope, txns)
         # Phase C (2026-06-17): refresh 只清本 user 的, 不影響別 user。
-        self.conn.execute(
-            "DELETE FROM card_pending_txns WHERE user_id = ? AND scope = ?",
-            (self.user_id, scope),
-        )
+        with error_step('SYS-08-155-010'):
+            self.conn.execute(
+                "DELETE FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+                (self.user_id, scope),
+            )
         for index, t in enumerate(txns):
             if index in pruned_indices:
                 # Exact merge 的 metadata 已在本次可信 refresh 搬到唯一新 billed；
                 # 直接略過 source occurrence，避免先 INSERT 再依 id 猜哪筆該刪。
                 continue
-            identity = _pending_billed_identity(t)
+            with error_step('SYS-08-155-023'):
+                identity = _pending_billed_identity(t)
             scope_ledgers = (self._adopted_pending_raw_keys.get(identity)
                              if identity else None)
             adopted_raw_keys = scope_ledgers.get(scope) if scope_ledgers else None
@@ -2593,8 +2834,9 @@ class BankStore:
                 adopted_raw_keys[raw_key] -= 1
                 # Counter 只扣已接手 occurrence 數；額外同 raw row 必須保留。
                 continue
-            cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
-                                  if rules else (None, None, False))
+            with error_step('SYS-08-155-024'):
+                cat, sub, auto_ex = (categorize_with_excluded(_categorizer_text(t), rules)
+                                      if rules else (None, None, False))
             metadata = exact_metadata_by_index.get(index)
             description_overwrite = tags_overwrite = splits_overwrite = None
             if metadata:
@@ -2611,51 +2853,57 @@ class BankStore:
                     else:
                         return abort_refresh()
             flow, income_cat = _flow_fields(cat, sub, None, t.get("txn_type"))
-            self.conn.execute(
-                """INSERT INTO card_pending_txns
+            with error_step('SYS-08-155-025'):
+                self.conn.execute(
+                    """INSERT INTO card_pending_txns
                    (user_id, scope, card_no, consume_date, post_date, description, amount, currency,
                     consume_country, consume_currency, consume_amount,
                     refreshed_at, category, subcategory, txn_type, auto_excluded,
                     description_overwrite, tags_overwrite, flow_type, income_category,
                     is_subscription, splits_overwrite, native_identity)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (self.user_id, scope, t.get("card_no"), t.get("date"),
-                 t.get("post_date") or None, t.get("desc"),
-                 t.get("amount"), t.get("currency"),
-                 t.get("consume_country"), t.get("consume_currency"),
-                 t.get("consume_amount"),
-                 now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
-                 description_overwrite, tags_overwrite, flow, income_cat,
-                 1 if _is_subscription(sub) else 0, splits_overwrite, t.get("native_identity")),
-            )
+                    (self.user_id, scope, t.get("card_no"), t.get("date"),
+                     t.get("post_date") or None, t.get("desc"),
+                     t.get("amount"), t.get("currency"),
+                     t.get("consume_country"), t.get("consume_currency"),
+                     t.get("consume_amount"),
+                     now, cat, sub, t.get("txn_type"), 1 if auto_ex else 0,
+                     description_overwrite, tags_overwrite, flow, income_cat,
+                     1 if _is_subscription(sub) else 0, splits_overwrite, t.get("native_identity")),
+                )
 
-        self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")
+        with error_step('SYS-08-155-011'):
+            self.conn.execute("RELEASE SAVEPOINT pending_refresh_scope")
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-155-026'):
+                self.conn.commit()
         # 回傳這次 refresh 後該 scope 實際留下的 row 數。不能用 len(txns)-pruned：
         # 被本次新 billed 接手的 identity 會在 INSERT 前 skip，並不在 pruned 裡。
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
-            (self.user_id, scope),
-        ).fetchone()
-        return int(row["n"] if row else 0)
+        with error_step('SYS-08-155-031'):
+            row = error_step('SYS-08-155-012')(lambda: self.conn.execute(
+                "SELECT COUNT(*) AS n FROM card_pending_txns WHERE user_id = ? AND scope = ?",
+                (self.user_id, scope),
+            ))().fetchone()
+        with error_step('SYS-08-155-013'):
+            return int(row["n"] if row else 0)
 
     # ---- 4. 餘額走勢：同日 UPSERT ----
     def upsert_balance_history(self, rows: list[dict], commit: bool = True) -> int:
         rows = [dict(row) for row in rows]
         for row in rows:
-            row["twdBalance"] = native_money(
-                row.get("twdBalance"), "TWD", optional=True,
-            )
-            row["loanBalance"] = native_money(
-                row.get("loanBalance"), "TWD", optional=True, absolute=True,
-            )
+            with error_step('SYS-08-158-001'):
+                row["twdBalance"] = native_money(
+                    row.get("twdBalance"), "TWD", optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-870-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-870-004'), bank_error_id(self.bank, '08-870-005'), bank_error_id(self.bank, '08-870-006'), bank_error_id(self.bank, '08-870-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-870-010')))
+            with error_step('SYS-08-158-002'):
+                row["loanBalance"] = native_money(
+                    row.get("loanBalance"), "TWD", optional=True, absolute=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-871-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-871-004'), bank_error_id(self.bank, '08-871-005'), bank_error_id(self.bank, '08-871-006'), bank_error_id(self.bank, '08-871-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-871-010')))
         before = self.conn.total_changes
         now = _now()
         for r in rows:
             loan_balance = r.get("loanBalance")
-            self.conn.execute(
-                """INSERT INTO balance_history
+            with error_step('SYS-08-158-003'):
+                self.conn.execute(
+                    """INSERT INTO balance_history
                        (user_id, snapshot_date, twd_balance, fx_balance, loan_balance, updated_at)
                    VALUES (?,?,?,?,?,?)
                    ON CONFLICT(user_id, snapshot_date)
@@ -2663,11 +2911,12 @@ class BankStore:
                                  fx_balance=excluded.fx_balance,
                                  loan_balance=excluded.loan_balance,
                                  updated_at=excluded.updated_at""",
-                (self.user_id, r.get("snapshotDate"), r.get("twdBalance"), r.get("fxBalance"),
-                 loan_balance, now),
-            )
+                    (self.user_id, r.get("snapshotDate"), r.get("twdBalance"), r.get("fxBalance"),
+                     loan_balance, now),
+                )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-158-004'):
+                self.conn.commit()
         return self.conn.total_changes - before
 
     # ---- 5. 帳戶狀態：UPSERT ----
@@ -2688,10 +2937,10 @@ class BankStore:
                 continue
             currency = str(account.get("currency") or "TWD").strip().upper()
             if re.fullmatch(r"[A-Z]{3}", currency) is None:
-                raise ValueError("account currency must be an uppercase ISO code")
-            raw_balance = native_money(
-                account.get("raw_balance"), currency, optional=True,
-            )
+                raise with_error_code(ValueError("account currency must be an uppercase ISO code"), 'SYS-08-159-001')
+            with error_step('SYS-08-159-002'):
+                raw_balance = native_money(
+                    account.get("raw_balance"), currency, optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-872-002'), bank_error_id(self.bank, '08-872-003'), bank_error_id(self.bank, '08-872-004'), bank_error_id(self.bank, '08-872-005'), bank_error_id(self.bank, '08-872-006'), bank_error_id(self.bank, '08-872-007'), bank_error_id(self.bank, '08-872-008'), bank_error_id(self.bank, '08-872-009'), bank_error_id(self.bank, '08-872-010')))
             account["currency"] = currency
             account["raw_balance"] = account_classify.normalize_account_balance(
                 account.get("product_type"), raw_balance,
@@ -2702,8 +2951,9 @@ class BankStore:
                 continue
             currency = a["currency"]
             raw_balance = a.get("raw_balance")
-            self.conn.execute(
-                """INSERT INTO accounts
+            with error_step('SYS-08-159-003'):
+                self.conn.execute(
+                    """INSERT INTO accounts
                        (user_id, account_no, currency, branch, nickname, type, product_type,
                         raw_balance, raw_balance_date, updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -2713,27 +2963,29 @@ class BankStore:
                      raw_balance=COALESCE(excluded.raw_balance, accounts.raw_balance),
                      raw_balance_date=COALESCE(excluded.raw_balance_date, accounts.raw_balance_date),
                      updated_at=excluded.updated_at""",
-                (self.user_id, a.get("account_no"), currency, a.get("branch"), a.get("nickname"),
-                 a.get("type"), a.get("product_type"),
-                 raw_balance, a.get("raw_balance_date"),
-                 now),
-            )
+                    (self.user_id, a.get("account_no"), currency, a.get("branch"), a.get("nickname"),
+                     a.get("type"), a.get("product_type"),
+                     raw_balance, a.get("raw_balance_date"),
+                     now),
+                )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-159-004'):
+                self.conn.commit()
         return len(accts)
 
     # ---- 6. 卡片狀態：UPSERT ----
     def list_cards(self) -> list[dict]:
         """回傳本 user 既有卡片 metadata，供銀行整戶欄位同步。"""
-        return [
-            dict(row)
-            for row in self.conn.execute(
-                "SELECT card_no, name, association, type, is_cube, active, "
-                "last_payment_amount, last_payment_date "
-                "FROM cards WHERE user_id = ?",
-                (self.user_id,),
-            )
-        ]
+        with error_step('SYS-08-160-001'):
+            return [
+                dict(row)
+                for row in self.conn.execute(
+                    "SELECT card_no, name, association, type, is_cube, active, "
+                    "last_payment_amount, last_payment_date "
+                    "FROM cards WHERE user_id = ?",
+                    (self.user_id,),
+                )
+            ]
 
     def upsert_cards(self, cards: list[dict], commit: bool = True) -> int:
         """Step 2 (2026-06-14): 接 credit_limit / used_credit /
@@ -2751,7 +3003,13 @@ class BankStore:
             for field in (
                 "credit_limit", "used_credit", "bill_due_amount", "last_payment_amount",
             ):
-                card[field] = native_money(card.get(field), "TWD", optional=True)
+                with error_step(bank_error_id(self.bank, {
+                    "credit_limit": "08-802-001",
+                    "used_credit": "08-802-002",
+                    "bill_due_amount": "08-802-003",
+                    "last_payment_amount": "08-802-004",
+                }[field])):
+                    card[field] = native_money(card.get(field), "TWD", optional=True, _codes={'credit_limit': ('SYS-08-001-001', bank_error_id(self.bank, '08-873-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-873-004'), bank_error_id(self.bank, '08-873-005'), bank_error_id(self.bank, '08-873-006'), bank_error_id(self.bank, '08-873-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-873-010')), 'used_credit': ('SYS-08-001-001', bank_error_id(self.bank, '08-874-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-874-004'), bank_error_id(self.bank, '08-874-005'), bank_error_id(self.bank, '08-874-006'), bank_error_id(self.bank, '08-874-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-874-010')), 'bill_due_amount': ('SYS-08-001-001', bank_error_id(self.bank, '08-875-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-875-004'), bank_error_id(self.bank, '08-875-005'), bank_error_id(self.bank, '08-875-006'), bank_error_id(self.bank, '08-875-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-875-010')), 'last_payment_amount': ('SYS-08-001-001', bank_error_id(self.bank, '08-876-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-876-004'), bank_error_id(self.bank, '08-876-005'), bank_error_id(self.bank, '08-876-006'), bank_error_id(self.bank, '08-876-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-876-010'))}[field])
         now = _now()
         for c in cards:
             if not c.get("number"):
@@ -2764,11 +3022,15 @@ class BankStore:
             active_update_marker = active_insert if active_provided else None
             # ON CONFLICT 時, 若 active_update_marker=None 走 cards.active 保留;
             # 否則覆寫. 用 CASE WHEN 而不是 COALESCE 因為 0 也是合法值不能被 COALESCE 跳過.
-            statement_close_date = _normalize_date_text(c.get("statement_close_date"))
-            payment_due_date = _normalize_date_text(c.get("payment_due_date"))
-            last_payment_date = _normalize_date_text(c.get("last_payment_date"))
-            self.conn.execute(
-                """INSERT INTO cards (user_id, card_no, name, association, type, is_cube,
+            with error_step('SYS-08-161-001'):
+                statement_close_date = _normalize_date_text(c.get("statement_close_date"))
+            with error_step('SYS-08-161-002'):
+                payment_due_date = _normalize_date_text(c.get("payment_due_date"))
+            with error_step('SYS-08-161-003'):
+                last_payment_date = _normalize_date_text(c.get("last_payment_date"))
+            with error_step('SYS-08-161-004'):
+                self.conn.execute(
+                    """INSERT INTO cards (user_id, card_no, name, association, type, is_cube,
                                       credit_limit, used_credit,
                                       statement_close_date, payment_due_date,
                                       bill_due_amount, last_payment_amount, last_payment_date,
@@ -2786,40 +3048,45 @@ class BankStore:
                      last_payment_date=COALESCE(excluded.last_payment_date, cards.last_payment_date),
                      active=CASE WHEN ? IS NULL THEN cards.active ELSE ? END,
                      updated_at=excluded.updated_at""",
-                (self.user_id, c.get("number"), c.get("name"), c.get("association"), c.get("type"),
-                 1 if c.get("is_cube") else 0,
-                 c.get("credit_limit"), c.get("used_credit"),
-                 statement_close_date, payment_due_date,
-                 c.get("bill_due_amount"), c.get("last_payment_amount"), last_payment_date,
-                 active_insert,
-                 now,
-                 active_update_marker, active_update_marker),
-            )
+                    (self.user_id, c.get("number"), c.get("name"), c.get("association"), c.get("type"),
+                     1 if c.get("is_cube") else 0,
+                     c.get("credit_limit"), c.get("used_credit"),
+                     statement_close_date, payment_due_date,
+                     c.get("bill_due_amount"), c.get("last_payment_amount"), last_payment_date,
+                     active_insert,
+                     now,
+                     active_update_marker, active_update_marker),
+                )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-161-005'):
+                self.conn.commit()
         return len(cards)
 
     def update_card_bill_facts(self, facts: list[dict], *, commit: bool = True) -> int:
         """Atomically apply canonical bill facts without regressing a newer payment pair."""
         facts = [dict(fact) for fact in facts]
         for fact in facts:
-            fact["bill_due_amount"] = native_money(
-                fact.get("bill_due_amount"), "TWD", optional=True,
-            )
-            fact["last_payment_amount"] = native_money(
-                fact.get("last_payment_amount"), "TWD", optional=True,
-            )
+            with error_step('SYS-08-162-001'):
+                fact["bill_due_amount"] = native_money(
+                    fact.get("bill_due_amount"), "TWD", optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-877-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-877-004'), bank_error_id(self.bank, '08-877-005'), bank_error_id(self.bank, '08-877-006'), bank_error_id(self.bank, '08-877-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-877-010')))
+            with error_step('SYS-08-162-002'):
+                fact["last_payment_amount"] = native_money(
+                    fact.get("last_payment_amount"), "TWD", optional=True, _codes=('SYS-08-001-001', bank_error_id(self.bank, '08-878-002'), 'SYS-08-001-003', bank_error_id(self.bank, '08-878-004'), bank_error_id(self.bank, '08-878-005'), bank_error_id(self.bank, '08-878-006'), bank_error_id(self.bank, '08-878-007'), 'SYS-08-001-008', 'SYS-08-001-009', bank_error_id(self.bank, '08-878-010')))
         updated = 0
         now = _now()
         for fact in facts:
             if not fact.get("number"):
                 continue
-            statement_date = _normalize_date_text(fact.get("statement_close_date"))
-            due_date = _normalize_date_text(fact.get("payment_due_date"))
-            payment_date = _normalize_date_text(fact.get("last_payment_date"))
+            with error_step('SYS-08-162-003'):
+                statement_date = _normalize_date_text(fact.get("statement_close_date"))
+            with error_step('SYS-08-162-004'):
+                due_date = _normalize_date_text(fact.get("payment_due_date"))
+            with error_step('SYS-08-162-005'):
+                payment_date = _normalize_date_text(fact.get("last_payment_date"))
             cycle_date = due_date or statement_date
-            cursor = self.conn.execute(
-                """UPDATE cards
+            with error_step('SYS-08-162-006'):
+                cursor = self.conn.execute(
+                    """UPDATE cards
                       SET bill_due_amount = CASE
                             WHEN COALESCE(payment_due_date, statement_close_date) IS NULL
                               OR (CAST(? AS TEXT) IS NOT NULL AND ? >= COALESCE(payment_due_date, statement_close_date))
@@ -2858,44 +3125,49 @@ class BankStore:
                         AND last_payment_date IS NOT NULL
                         AND (CAST(? AS TEXT) IS NULL OR ? < last_payment_date)
                       )""",
-                (
-                    cycle_date, cycle_date, fact.get("bill_due_amount"),
-                    cycle_date, cycle_date, statement_date,
-                    cycle_date, cycle_date, due_date,
-                    payment_date, payment_date, fact.get("last_payment_amount"),
-                    payment_date, payment_date, payment_date,
-                    now, self.user_id, fact.get("number"),
-                    due_date, due_date,
-                    statement_date, statement_date,
-                    due_date, statement_date,
-                    payment_date, payment_date,
-                ),
-            )
+                    (
+                        cycle_date, cycle_date, fact.get("bill_due_amount"),
+                        cycle_date, cycle_date, statement_date,
+                        cycle_date, cycle_date, due_date,
+                        payment_date, payment_date, fact.get("last_payment_amount"),
+                        payment_date, payment_date, payment_date,
+                        now, self.user_id, fact.get("number"),
+                        due_date, due_date,
+                        statement_date, statement_date,
+                        due_date, statement_date,
+                        payment_date, payment_date,
+                    ),
+                )
             updated += cursor.rowcount
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-162-007'):
+                self.conn.commit()
         return updated
 
     def twd_debits_since(self, account_no: str, since: str) -> list[tuple[str, str, int]]:
         """(date, description, expend) TWD debits of one account since `since`, oldest first."""
-        rows = self.conn.execute(
-            "SELECT txn_datetime, description, expend FROM twd_transactions "
-            "WHERE user_id = ? AND account_no = ? AND currency = 'TWD' AND expend > 0 "
-            "AND txn_datetime >= ? ORDER BY txn_datetime",
-            (self.user_id, account_no, since),
-        ).fetchall()
-        return [(r[0][:10], r[1] or "", int(r[2])) for r in rows]
+        with error_step('SYS-08-163-003'):
+            rows = error_step('SYS-08-163-001')(lambda: self.conn.execute(
+                "SELECT txn_datetime, description, expend FROM twd_transactions "
+                "WHERE user_id = ? AND account_no = ? AND currency = 'TWD' AND expend > 0 "
+                "AND txn_datetime >= ? ORDER BY txn_datetime",
+                (self.user_id, account_no, since),
+            ))().fetchall()
+        with error_step('SYS-08-163-002'):
+            return [(r[0][:10], r[1] or "", int(r[2])) for r in rows]
 
     def record_auto_debit_payment(self, payment_date: str, amount: int, *,
                                   commit: bool = True) -> int:
         """Advance every card's last-payment pair to a newer auto-debit; never regress."""
-        cursor = self.conn.execute(
-            "UPDATE cards SET last_payment_amount = ?, last_payment_date = ?, updated_at = ? "
-            "WHERE user_id = ? AND (last_payment_date IS NULL OR last_payment_date < ?)",
-            (amount, payment_date, _now(), self.user_id, payment_date),
-        )
+        with error_step('SYS-08-164-001'):
+            cursor = self.conn.execute(
+                "UPDATE cards SET last_payment_amount = ?, last_payment_date = ?, updated_at = ? "
+                "WHERE user_id = ? AND (last_payment_date IS NULL OR last_payment_date < ?)",
+                (amount, payment_date, _now(), self.user_id, payment_date),
+            )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-164-002'):
+                self.conn.commit()
         return cursor.rowcount
 
     # ---- 7. 每日數值快照：同日同 category 覆蓋 ----
@@ -2905,50 +3177,56 @@ class BankStore:
             return
         now = _now()
         day = snapshot_date or datetime.now().strftime("%Y-%m-%d")
-        self.conn.execute(
-            """INSERT INTO daily_metrics (user_id, snapshot_date, category, payload_json, updated_at)
+        with error_step('SYS-08-165-003'):
+            _error_write_params = (self.user_id, day, category, json.dumps(payload, ensure_ascii=False, allow_nan=False), now)
+        with error_step('SYS-08-165-001'):
+            self.conn.execute(
+                """INSERT INTO daily_metrics (user_id, snapshot_date, category, payload_json, updated_at)
                VALUES (?,?,?,?,?)
                ON CONFLICT(user_id, snapshot_date, category)
                DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
-            (
-                self.user_id,
-                day,
-                category,
-                json.dumps(payload, ensure_ascii=False, allow_nan=False),
-                now,
-            ),
-        )
+                _error_write_params,
+            )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-165-002'):
+                self.conn.commit()
 
     def delete_daily_metrics(self, categories: list[str], commit: bool = True) -> int:
         if not categories:
             return 0
         placeholders = ",".join("?" for _ in categories)
-        deleted = self.conn.execute(
-            f"DELETE FROM daily_metrics WHERE user_id = ? AND category IN ({placeholders})",
-            (self.user_id, *categories),
-        ).rowcount
+        with error_step('SYS-08-166-001'):
+            deleted = self.conn.execute(
+                f"DELETE FROM daily_metrics WHERE user_id = ? AND category IN ({placeholders})",
+                (self.user_id, *categories),
+            ).rowcount
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-166-002'):
+                self.conn.commit()
         return deleted
 
     def clear_sync_log(self, commit: bool = True) -> int:
-        deleted = self.conn.execute(
-            "DELETE FROM sync_log WHERE user_id = ?",
-            (self.user_id,),
-        ).rowcount
+        with error_step('SYS-08-167-001'):
+            deleted = self.conn.execute(
+                "DELETE FROM sync_log WHERE user_id = ?",
+                (self.user_id,),
+            ).rowcount
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-167-002'):
+                self.conn.commit()
         return deleted
 
     def log_sync(self, summary: dict, commit: bool = True) -> None:
-        self.conn.execute(
-            "INSERT INTO sync_log (user_id, synced_at, summary) VALUES (?,?,?)",
-            (self.user_id, _now(), json.dumps(summary, ensure_ascii=False)),
-        )
+        with error_step('SYS-08-168-003'):
+            _error_write_params = (self.user_id, _now(), json.dumps(summary, ensure_ascii=False))
+        with error_step('SYS-08-168-001'):
+            self.conn.execute(
+                "INSERT INTO sync_log (user_id, synced_at, summary) VALUES (?,?,?)",
+                _error_write_params,
+            )
         if commit:
-            self.conn.commit()
+            with error_step('SYS-08-168-002'):
+                self.conn.commit()
 
     # ---- 查詢 ----
     def stats(self) -> dict:
@@ -2956,10 +3234,11 @@ class BankStore:
         out = {}
         for tbl in ["twd_transactions", "card_billed_txns", "card_pending_txns",
                     "balance_history", "accounts", "cards", "daily_metrics", "sync_log"]:
-            out[tbl] = self.conn.execute(
-                f"SELECT COUNT(*) FROM {tbl} WHERE user_id = ?",
-                (self.user_id,),
-            ).fetchone()[0]
+            with error_step('SYS-08-169-002'):
+                out[tbl] = error_step('SYS-08-169-001')(lambda: self.conn.execute(
+                    f"SELECT COUNT(*) FROM {tbl} WHERE user_id = ?",
+                    (self.user_id,),
+                ))().fetchone()[0]
         return out
 
 
@@ -2970,4 +3249,5 @@ def migrate_existing_bank_stores(banks: Iterable[str]) -> None:
         if not bank_pg.enabled() and not (root / f"{bank}.sqlite").exists():
             continue
         store = BankStore(str(bank), user_id=1)
-        store.close()
+        with error_step('SYS-08-170-001'):
+            store.close()

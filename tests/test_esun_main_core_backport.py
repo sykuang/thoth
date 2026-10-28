@@ -133,6 +133,7 @@ def test_late_publication_logs_same_structured_error_as_early_failure(monkeypatc
     assert 'data' not in result
     assert result['collect_diagnostics'] == {
         'exception': 'RuntimeError', 'code': 'collect_contract', 'phase': 'capture_publication',
+        'error_id': 'ESUN-07-920-001',
     }
     stderr = capsys.readouterr().err
     assert result['error'] in stderr
@@ -163,7 +164,10 @@ def test_collector_selection_failure_is_sanitized_before_login(monkeypatch, tmp_
     result, page = run_offline(monkeypatch, tmp_path, Broken(name="esun"))
     assert "data" not in result
     assert "PRIVATE-SPA-LOGIN-DOM" not in str(result)
-    assert result["error"].startswith("RuntimeError:")
+    assert result == {
+        "error": "[ESUN-01-920-001] 登入頁面：回應觀察器建立失敗 (RuntimeError)",
+        "failure_diagnostics": {"exception": "RuntimeError", "error_id": "ESUN-01-920-001"},
+    }
     assert page.listeners == {}
 
 
@@ -175,7 +179,10 @@ def test_dialog_handler_setup_failure_detaches_before_login(monkeypatch, tmp_pat
 
     crawler.attach_shared_dialog_handler = fail
     result, page = run_offline(monkeypatch, tmp_path, crawler)
-    assert result["error"].startswith("RuntimeError:")
+    assert result == {
+        "error": "[ESUN-01-940-001] 登入頁面：對話框處理器掛載失敗 (RuntimeError)",
+        "failure_diagnostics": {"exception": "RuntimeError", "error_id": "ESUN-01-940-001"},
+    }
     assert "PRIVATE-DIALOG-DOM" not in str(result)
     assert "login" not in crawler.events
     assert page.listeners["response"] == []
@@ -184,7 +191,9 @@ def test_dialog_handler_setup_failure_detaches_before_login(monkeypatch, tmp_pat
 def test_repeated_callback_cannot_publish_or_login_again(monkeypatch, tmp_path):
     crawler = Crawler(name="esun")
     result, page = run_offline(monkeypatch, tmp_path, crawler, repeat=True)
-    assert result == {"error": "browser_callback_repeated"}
+    assert result == {"error": "browser_callback_repeated", "failure_diagnostics": {
+        "exception": "RuntimeError", "error_id": "ESUN-07-930-001",
+    }}
     assert crawler.events == ["make", "login", "collect", "proof", "logout", "proof"]
     assert page.listeners["response"] == []
 
@@ -227,7 +236,9 @@ def test_reentrant_callback_during_collection_cannot_publish(monkeypatch, tmp_pa
 
     monkeypatch.setattr(crawler, "_execute_browser_flow", execute)
     result = crawler.run(page.url, headless=True)
-    assert result == {"error": "browser_callback_repeated"}
+    assert result == {"error": "browser_callback_repeated", "failure_diagnostics": {
+        "exception": "RuntimeError", "error_id": "ESUN-07-930-001",
+    }}
     assert crawler.events.count("login") == 1
     assert crawler.events.count("collect") == 1
     assert page.listeners["response"] == []
@@ -237,7 +248,9 @@ def test_reentrant_callback_during_collection_cannot_publish(monkeypatch, tmp_pa
 def test_post_collect_origin_or_dialog_change_blocks_proof(monkeypatch, tmp_path, shift):
     crawler = Crawler(name="esun", move_after_collect=shift == "origin", dialog_after_collect=shift == "dialog")
     result, page = run_offline(monkeypatch, tmp_path, crawler)
-    assert result["error"].startswith("collect_failed:")
+    error_id, label = ("ESUN-07-970-002", "憑證來源檢查未通過") if shift == "origin" else ("ESUN-07-970-001", "原生JavaScript對話框阻擋")
+    assert result["error"] == f"[{error_id}] 收集來源驗證：{label} | collect_failed: LoginCheckpointBlocked: code=collect_checkpoint"
+    assert result["collect_diagnostics"] == {"exception": "LoginCheckpointBlocked", "code": "collect_checkpoint", "error_id": error_id}
     assert "data" not in result
     assert "proof" not in crawler.events
     assert "logout" in crawler.events if shift == "dialog" else "logout" not in crawler.events
@@ -247,7 +260,10 @@ def test_post_collect_origin_or_dialog_change_blocks_proof(monkeypatch, tmp_path
 def test_publication_failure_is_redacted_and_detached(monkeypatch, tmp_path):
     crawler = Crawler(name="esun", reject_publication=True)
     result, page = run_offline(monkeypatch, tmp_path, crawler)
-    assert result["error"].startswith("collect_failed:")
+    assert result == {
+        "error": "[ESUN-07-920-001] 結果發佈：發佈證據檢查失敗 | collect_failed: RuntimeError: code=collect_contract",
+        "collect_diagnostics": {"exception": "RuntimeError", "code": "collect_contract", "error_id": "ESUN-07-920-001"},
+    }
     assert "PRIVATE-RESPONSE-BODY" not in str(result)
     assert "data" not in result
     assert page.listeners["response"] == []
@@ -259,7 +275,10 @@ def test_collect_error_barrier_and_empty_carrier(monkeypatch, tmp_path, error):
     result, _ = run_offline(monkeypatch, tmp_path, crawler)
     if error:
         assert "data" not in result
-        assert result["error"].startswith("collect_failed:")
+        assert result == {
+            "error": "[ESUN-07-900-002] 結果驗證：回傳內容帶有失敗標記 | collect_failed: ValueError: code=collect_contract",
+            "collect_diagnostics": {"exception": "ValueError", "code": "collect_contract", "error_id": "ESUN-07-900-002"},
+        }
         assert error not in str(result)
         assert "proof" not in crawler.events
     else:
@@ -350,7 +369,10 @@ def test_logout_invalidated_publication_never_returns_data(monkeypatch, tmp_path
 
     result, page = run_offline(monkeypatch, tmp_path, LateFailure(name="esun"))
     assert "data" not in result
-    assert result["error"].startswith("collect_failed:")
+    assert result == {
+        "error": "[ESUN-07-920-001] 結果發佈：發佈證據檢查失敗 | collect_failed: RuntimeError: code=collect_contract",
+        "collect_diagnostics": {"exception": "RuntimeError", "code": "collect_contract", "error_id": "ESUN-07-920-001"},
+    }
     assert "PRIVATE-RESPONSE-BODY" not in str(result)
     assert page.listeners["response"] == []
 
