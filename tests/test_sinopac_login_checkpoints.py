@@ -342,7 +342,7 @@ def test_submit_uses_keyboard_cardinality_fresh_ocr_and_one_native_click() -> No
         call("PASSWORD-PRIVATE", delay=80),
         call("123456", delay=80),
     ]
-    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=1)
+    crawler._ocr_captcha.assert_called_once_with(page, max_attempts=1, _diagnostic=[], _required=True)
     button.click.assert_called_once_with(timeout=8000)
     page.fill.assert_not_called()
     page.evaluate.assert_not_called()
@@ -528,8 +528,312 @@ def test_login_source_has_no_legacy_synthetic_or_private_debug_paths() -> None:
     assert re.search(r"def login\(self, page\).*return self\._shared_login\(page\)", login_region, re.DOTALL)
 
 
+def _sinopac_loan_projection(method, original):
+    """Only the four reviewed loan fragments; never drop unmatched raises.
+
+    Repayment and transaction fragments belong to their separate exact adapters;
+    this projection must never consume any part of either method.
+    """
+    from copy import deepcopy
+
+    method = deepcopy(method)
+    dump = lambda node: ast.dump(node, include_attributes=False)
+
+    def replace(before, after):
+        expected = ast.parse(before).body
+        replacement = ast.parse(after).body
+        matches = 0
+        for parent in ast.walk(method):
+            for field, children in ast.iter_fields(parent):
+                if not isinstance(children, list) or not children or not all(isinstance(n, ast.stmt) for n in children):
+                    continue
+                for index in range(len(children) - len(expected) + 1):
+                    if [dump(n) for n in children[index:index + len(expected)]] == [dump(n) for n in expected]:
+                        children[index:index + len(expected)] = deepcopy(replacement)
+                        matches += 1
+                        break
+        assert matches == 1, ("unproved loan fragment", before, matches)
+
+    for value, guard in (("account_raw", "inventory"), ("info_raw", "response")):
+        replace(
+            f"if not isinstance({value}, list) or not {value} or not isinstance({value}[0], dict) or not isinstance({value}[0].get('SubInfo'), list):\n"
+            f"    raise RuntimeError('sinopac-loan-{guard}-envelope')",
+            f"if not (isinstance({value}, list) and {value} and isinstance({value}[0], dict) and isinstance({value}[0].get('SubInfo'), list)):\n"
+            f"    raise RuntimeError('sinopac-loan-{guard}-envelope')",
+        )
+    replace(
+        """if body.get('Message') or not records:
+    raise RuntimeError('sinopac-loan-response-records')
+for record in records:
+    if not isinstance(record, dict):
+        raise RuntimeError('sinopac-loan-response-records')
+    for key in required:
+        error_id = {'LoanKind': 'SINOPAC-05-235-102', 'Currency': 'SINOPAC-05-235-103', 'LoanBalance': 'SINOPAC-05-235-104'}[key]
+        if record.get(key) in (None, ''):
+            raise with_error_code(RuntimeError('sinopac-loan-response-records'), error_id)""",
+        """if body.get('Message') or not records or any(
+    not isinstance(record, dict) or any(record.get(key) in (None, '') for key in required)
+    for record in records
+):
+    raise RuntimeError('sinopac-loan-response-records')""",
+    )
+    replace(
+        """for key, error_action in (('AcctValue', 'SINOPAC-05-160'), ('AcctValueFormat', 'SINOPAC-05-170')):
+    with error_step(f'{error_action}-001'):
+        control = page.locator('#' + key)
+    with error_step(f'{error_action}-002'):
+        if control.count() != 1:
+            raise with_error_code(RuntimeError('sinopac-loan-restore-account'), f'{error_action}-002')
+    with error_step(f'{error_action}-003'):
+        if control.input_value() != account[key]:
+            raise with_error_code(RuntimeError('sinopac-loan-restore-account'), f'{error_action}-003')""",
+        """for key in ('AcctValue', 'AcctValueFormat'):
+    control = page.locator('#' + key)
+    if control.count() != 1 or control.input_value() != account[key]:
+        raise RuntimeError('sinopac-loan-restore-account')""",
+    )
+    replace(
+        """loan_control_reason = None
+if isinstance(clicked, dict) and clicked.get('errorId') in ('SINOPAC-05-780-001', 'SINOPAC-05-780-002', 'SINOPAC-05-780-003'):
+    loan_control_reason = clicked['errorId']
+    clicked = False
+if not clicked:
+    raise with_error_code(RuntimeError('sinopac-loan-query-control'), loan_control_reason or 'SINOPAC-05-215-001')""",
+        """if not clicked:
+    raise RuntimeError('sinopac-loan-query-control')""",
+    )
+    old_js = [n for n in ast.walk(original) if isinstance(n, ast.Constant)
+              and isinstance(n.value, str) and 'const account = document.querySelector' in n.value]
+    new_js = [n for n in ast.walk(method) if isinstance(n, ast.Constant)
+              and isinstance(n.value, str) and 'const account = document.querySelector' in n.value]
+    assert len(old_js) == len(new_js) == 1
+    before = 'if (!account || !formatted || !button) return false;'
+    after = "if (!account) return {errorId:'SINOPAC-05-780-001'};\n                  if (!formatted) return {errorId:'SINOPAC-05-780-002'};\n                  if (!button) return {errorId:'SINOPAC-05-780-003'};"
+    assert old_js[0].value.count(before) == 1
+    assert new_js[0].value == old_js[0].value.replace(before, after)
+    new_js[0].value = old_js[0].value
+    assert dump(method) == dump(original), "loan projection left an unproved operand/reference"
+    assert sum(isinstance(n, ast.Raise) for n in ast.walk(method)) == 10
+    return method
+
+
+def _sinopac_repayment_projection(method, original):
+    """Finite role/primary-error projection, with the original finally intact."""
+    from copy import deepcopy
+    method = deepcopy(method)
+    dump = lambda node: ast.dump(node, include_attributes=False)
+
+    def replace(before, after):
+        expected, replacement = ast.parse(before).body, ast.parse(after).body
+        matches = 0
+        for parent in ast.walk(method):
+            for field, children in ast.iter_fields(parent):
+                if not isinstance(children, list) or not children or not all(isinstance(n, ast.stmt) for n in children):
+                    continue
+                for index in range(len(children) - len(expected) + 1):
+                    if [dump(n) for n in children[index:index + len(expected)]] == [dump(n) for n in expected]:
+                        children[index:index + len(expected)] = deepcopy(replacement)
+                        matches += 1
+                        break
+        assert matches == 1, ("unproved repayment fragment", before, matches)
+
+    replace('primary_error_id = None', '')
+    # Exact handler body and alias lifetime: bare re-raise, no return/cause policy
+    # change, and no removal/reordering/suppression of any native cleanup.
+    inner = [n for n in ast.walk(method) if isinstance(n, ast.Try) and n.finalbody]
+    assert len(inner) == 1
+    expected_handler = ast.parse("try:\n    pass\nexcept Exception as source_error:\n    primary_error_id = exception_error_id(source_error, bank='sinopac')\n    raise").body[0].handlers[0]
+    assert [dump(n) for n in inner[0].handlers] == [dump(expected_handler)]
+    assert [dump(n) for n in inner[0].finalbody] == [dump(n) for n in ast.parse("page.remove_listener('response', handler)\nobserver.close()\ncollector.attach(page)").body]
+    inner[0].handlers = []
+    outer = [n for n in ast.walk(method) if isinstance(n, ast.ExceptHandler)]
+    assert len(outer) == 1
+    expected_outer = ast.parse("try:\n    pass\nexcept Exception as source_error:\n    raise with_error_code(RuntimeError(error), primary_error_id or exception_error_id(source_error, bank='sinopac') or 'SINOPAC-05-333-001') from None").body[0].handlers[0]
+    assert dump(outer[0]) == dump(expected_outer)
+    outer[0].name = None
+    outer[0].body = ast.parse('raise RuntimeError(error) from None').body
+
+    replace(
+        """for key, error_action in (('AcctValue', 'SINOPAC-05-100'), ('AcctValueFormat', 'SINOPAC-05-110')):
+    with error_step(f'{error_action}-001'):
+        control = page.locator('#' + key)
+    with error_step(f'{error_action}-002'):
+        if control.count() != 1:
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-account-control'), f'{error_action}-002')
+    with error_step(f'{error_action}-003'):
+        if control.input_value() != account[key]:
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-account-control'), f'{error_action}-003')""",
+        """for key in ('AcctValue', 'AcctValueFormat'):
+    control = page.locator('#' + key)
+    if control.count() != 1 or control.input_value() != account[key]:
+        raise RuntimeError('sinopac-loan-repayments-account-control')""",
+    )
+    replace(
+        """for selector, error_action in (('#StartDate', 'SINOPAC-05-740'), ('#EndDate', 'SINOPAC-05-750'), ('#btnQuery', 'SINOPAC-05-760')):
+    with error_step(f'{error_action}-001'):
+        control = page.locator(selector)
+    with error_step(f'{error_action}-002'):
+        if control.count() != 1:
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-query-control'), f'{error_action}-005')
+    with error_step(f'{error_action}-003'):
+        if not control.is_visible():
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-query-control'), f'{error_action}-006')
+    with error_step(f'{error_action}-004'):
+        if not control.is_enabled():
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-query-control'), f'{error_action}-007')""",
+        """for selector in ('#StartDate', '#EndDate', '#btnQuery'):
+    control = page.locator(selector)
+    if control.count() != 1 or not control.is_visible() or not control.is_enabled():
+        raise RuntimeError('sinopac-loan-repayments-query-control')""",
+    )
+    replace(
+        """if set(body) != {'HeadInfo', 'SubInfo', 'Header', 'Message'} or body.get('Header') != 'SUCCESS' or not isinstance(body.get('Message'), str) or len(body['Message']) > 2000 or not isinstance(metadata, list) or len(metadata) != 3:
+    raise RuntimeError('sinopac-loan-repayments-response-metadata')
+for item in metadata:
+    if not isinstance(item, dict) or set(item) != {'HeadText', 'HeadAlign', 'DataAlign', 'MainShow', 'DetailShow', 'FieldKey', 'OrderIndex', 'FieldWidth'}:
+        raise RuntimeError('sinopac-loan-repayments-response-metadata')
+    for key, value in zip(item, item.values()):
+        error_action = {'HeadText': 'SINOPAC-05-730', 'HeadAlign': 'SINOPAC-05-731', 'DataAlign': 'SINOPAC-05-732', 'MainShow': 'SINOPAC-05-733', 'DetailShow': 'SINOPAC-05-734', 'FieldKey': 'SINOPAC-05-735', 'OrderIndex': 'SINOPAC-05-736', 'FieldWidth': 'SINOPAC-05-737'}[key]
+        if not isinstance(value, str):
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-response-metadata'), f'{error_action}-001')
+        if len(value) > 2000:
+            raise with_error_code(RuntimeError('sinopac-loan-repayments-response-metadata'), f'{error_action}-002')""",
+        """if (set(body) != {'HeadInfo', 'SubInfo', 'Header', 'Message'} or body.get('Header') != 'SUCCESS'
+    or not isinstance(body.get('Message'), str) or len(body['Message']) > 2000
+    or not isinstance(metadata, list) or len(metadata) != 3
+    or any(not isinstance(item, dict) or set(item) != {'HeadText', 'HeadAlign', 'DataAlign', 'MainShow', 'DetailShow', 'FieldKey', 'OrderIndex', 'FieldWidth'}
+           or any(not isinstance(v, str) or len(v) > 2000 for v in item.values()) for item in metadata)):
+    raise RuntimeError('sinopac-loan-repayments-response-metadata')""",
+    )
+    for target, field, role in (('start', 'StartDate', 'SINOPAC-05-151'), ('end', 'EndDate', 'SINOPAC-05-152')):
+        suffix = 'start' if target == 'start' else 'end'
+        replace(
+            f"{target} = self._yyyymmdd(params[{field!r}][0], 'sinopac-loan-repayments-{suffix}-date', error_action={role!r})",
+            f"{target} = self._yyyymmdd(params[{field!r}][0], 'sinopac-loan-repayments-{suffix}-date')",
+        )
+    assert not any(isinstance(n, ast.Name) and n.id in {'primary_error_id', 'source_error', 'error_action'} for n in ast.walk(method)), 'unproved diagnostic state reference'
+    assert dump(method) == dump(original), 'repayment projection left unproved operand/reference'
+    return method
+
+
+def _sinopac_transaction_projection(method, original):
+    """Project only the reviewed lazy roles and bounded JS metadata delta."""
+    from copy import deepcopy
+    from tests.test_ordered_sinopac_fubon_codes import _query_metadata_contract
+    method = deepcopy(method)
+    dump = lambda node: ast.dump(node, include_attributes=False)
+
+    def replace(before, after):
+        expected = ast.parse(before).body if isinstance(before, str) else before
+        replacement = ast.parse(after).body if isinstance(after, str) else after
+        matches = 0
+        for parent in ast.walk(method):
+            for field, children in ast.iter_fields(parent):
+                if not isinstance(children, list) or not children or not all(isinstance(n, ast.stmt) for n in children):
+                    continue
+                for index in range(len(children) - len(expected) + 1):
+                    if [dump(n) for n in children[index:index + len(expected)]] == [dump(n) for n in expected]:
+                        children[index:index + len(expected)] = deepcopy(replacement)
+                        matches += 1
+                        break
+        assert matches == 1, ("unproved transaction fragment", before, matches)
+
+    replace(
+        """for control, error_action in ((start_control, 'SINOPAC-05-700'), (end_control, 'SINOPAC-05-710'), (button, 'SINOPAC-05-720')):
+    with error_step(f'{error_action}-001'):
+        if control.count() != 1:
+            raise with_error_code(RuntimeError('sinopac-twd-history-query-control'), f'{error_action}-006')
+    with error_step(f'{error_action}-002'):
+        if not error_step(f'{error_action}-003')(lambda: control.nth(0))().is_visible():
+            raise with_error_code(RuntimeError('sinopac-twd-history-query-control'), f'{error_action}-007')
+    with error_step(f'{error_action}-004'):
+        if not error_step(f'{error_action}-005')(lambda: control.nth(0))().is_enabled():
+            raise with_error_code(RuntimeError('sinopac-twd-history-query-control'), f'{error_action}-008')""",
+        """if any(control.count() != 1 or not control.nth(0).is_visible() or not control.nth(0).is_enabled()
+       for control in (start_control, end_control, button)):
+    raise RuntimeError('sinopac-twd-history-query-control')""",
+    )
+    # Reconstruct the ENTIRE expected lowering from the original ordered OR
+    # operands, including common_invalid's leading None role. No zip truncation.
+    originals = [n for n in ast.walk(original) if isinstance(n, ast.Assign)
+                 and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                 and n.targets[0].id in {'common_invalid', 'invalid'}]
+    assert len(originals) == 3
+    for assignment, roles in zip(originals, (
+        tuple(f'SINOPAC-05-{i}-001' for i in range(600, 605)),
+        (None, *(f'SINOPAC-05-{i}-001' for i in range(605, 618))),
+        (None, *(f'SINOPAC-05-{i}-001' for i in range(618, 635))),
+    ), strict=True):
+        target = assignment.targets[0].id
+        assert isinstance(assignment.value, ast.BoolOp) and isinstance(assignment.value.op, ast.Or)
+        predicates = assignment.value.values
+        assert len(predicates) == len(roles)
+        loop = ast.parse(f"""for predicate_error_id, rejected in ():
+    with error_step(predicate_error_id):
+        if rejected():
+            {target} = True
+            if predicate_error_id is not None:
+                dom_error_id = predicate_error_id
+            break""").body[0]
+        empty_args = ast.parse('lambda: None', mode='eval').body.args
+        loop.iter = ast.Tuple(elts=[ast.Tuple(elts=[ast.Constant(role), ast.Lambda(args=deepcopy(empty_args), body=deepcopy(predicate))], ctx=ast.Load())
+                                   for role, predicate in zip(roles, predicates, strict=True)], ctx=ast.Load())
+        before = [*ast.parse(target + ' = False' + ('\ndom_error_id = None' if target == 'common_invalid' else '')).body, loop]
+        replace(before, [assignment])
+    replace('last_dom_detail_id = None', '')
+    replace('last_dom_detail_id = dom_error_id', '')
+    replace(
+        """pre_dom_reason = pre_dom_marker.get('errorId') if isinstance(pre_dom_marker, dict) else None
+if pre_dom_reason == 'SINOPAC-05-781-001':
+    pre_dom_marker = None
+else:
+    pre_dom_reason = None""", '',
+    )
+    replace(
+        """final_dom_reason = final_dom.get('errorId') if isinstance(final_dom, dict) else None
+if final_dom_reason in ('SINOPAC-05-782-001', 'SINOPAC-05-782-002', 'SINOPAC-05-782-003', 'SINOPAC-05-782-004'):
+    final_dom = None
+else:
+    final_dom_reason = None
+if final_dom != stable_dom:
+    raise with_error_code(RuntimeError('sinopac-twd-history-result-table'), final_dom_reason or 'SINOPAC-05-429-001')""",
+        """if final_dom != stable_dom:
+    raise RuntimeError('sinopac-twd-history-result-table')""",
+    )
+    reasons = ('unknown', 'shape', 'pager', 'error', 'mutation-shape', 'mutation-range', 'table-count', 'table-visibility',
+               'nonempty-binding', 'nonempty-attestation', 'empty-no-row', 'empty-hidden-full-transaction', 'empty-hidden-date-cell',
+               'empty-hidden-numeric-cell', 'empty-hidden-control', 'empty-hidden-header', 'empty-hidden-template-text',
+               'empty-extra-hidden-rows', 'empty-multiple-visible-rows', 'empty-marker', 'empty-binding', 'empty-signature')
+    metadata = {reason: f'SINOPAC-05-{500 + index}-001' for index, reason in enumerate(reasons)}
+    expected = ast.parse("raise with_error_code(RuntimeError(f'sinopac-twd-history-result-table-{last_dom_reason}'), "
+                         "(pre_dom_reason if last_dom_reason == 'table-count' else None) or "
+                         "(last_dom_detail_id if last_dom_reason in ('nonempty-attestation', 'empty-signature') else None) or "
+                         + repr(metadata) + ".get(last_dom_reason, 'SINOPAC-05-500-001'))").body
+    replace(expected, ast.parse("raise RuntimeError(f'sinopac-twd-history-result-table-{last_dom_reason}')").body)
+    # Only two exact literal preimages change. Every other JS byte is retained,
+    # including the unchanged DOM probe and native cleanup/timer/state access.
+    old_literals = [n for n in ast.walk(original) if isinstance(n, ast.Constant) and isinstance(n.value, str) and '=>' in n.value]
+    changed = 0
+    for old in old_literals:
+        reviewed = _query_metadata_contract('sinopac', old.value)
+        if reviewed == old.value:
+            continue
+        matches = [n for n in ast.walk(method) if isinstance(n, ast.Constant) and n.value == reviewed]
+        assert len(matches) == 1
+        matches[0].value = old.value
+        changed += 1
+    assert changed == 2
+    forbidden = {'error_action', 'predicate_error_id', 'rejected', 'dom_error_id', 'last_dom_detail_id', 'pre_dom_reason', 'final_dom_reason'}
+    assert not any(isinstance(n, ast.Name) and n.id in forbidden for n in ast.walk(method)), 'unproved transaction state reference'
+    assert dump(method) == dump(original), 'transaction projection left unproved operand/reference'
+    return method
+
+
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
-    tree = ast.parse(Path(sinopac_module.__file__).read_text())
+    from tests.test_protected_ast import normalize_tree, registered_codes
+
+    # Diagnostic transparency is proved against read-only baseline 16f2d4b.
+    tree = normalize_tree(Path(sinopac_module.__file__).read_text(), "sinopac", registered_codes("sinopac"))
     crawler = next(
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "SinopacCrawler"
@@ -538,6 +842,19 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         index for index, node in enumerate(crawler.body)
         if isinstance(node, ast.FunctionDef) and node.name == "collect"
     )
+    # Exact bank-owned loan projections. These cannot admit transactions or any
+    # other residual: the existing whole-body fingerprints below still apply.
+    from tests.test_ordered_sinopac_fubon_codes import _baseline_bank
+    original_tree = normalize_tree(inspect.getsource(_baseline_bank("sinopac")), "sinopac", registered_codes("sinopac"))
+    original_crawler = next(n for n in original_tree.body if isinstance(n, ast.ClassDef) and n.name == "SinopacCrawler")
+    for name, project in (("_collect_loans", _sinopac_loan_projection), ("_collect_loan_repayments", _sinopac_repayment_projection), ("_collect_transactions", _sinopac_transaction_projection)):
+        index = next(i for i, n in enumerate(crawler.body) if isinstance(n, ast.FunctionDef) and n.name == name)
+        original = next(n for n in original_crawler.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        crawler.body[index] = project(crawler.body[index], original)
+    # Keep a separate source projection for the unchanged 16f2 source golden;
+    # the older legacy-message fingerprint below is independently preserved.
+    from copy import deepcopy
+    projected_source = ast.unparse(ast.fix_missing_locations(deepcopy(tree)))
     # Normalize only the reviewed diagnostic arguments, never predicates/calls/JS.
     # The original fingerprint below remains unchanged.
     from tests.test_sinopac_loan_diagnostics import LOAN_GUARDS, REPAYMENT_GUARDS
@@ -557,7 +874,13 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
         ), None), (None,) * 18),
     ):
         method = next(node for node in crawler.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
-        raises = sorted((node for node in ast.walk(method) if isinstance(node, ast.Raise)), key=lambda node: node.lineno)
+        # Projection templates have synthetic locations. Walk lexical AST order,
+        # not line-number sorting; retain EVERY raise and the strict count check.
+        raises = []
+        class RaiseOrder(ast.NodeVisitor):
+            def visit_Raise(self, node):
+                raises.append(node)
+        RaiseOrder().visit(method)
         assert len(raises) == len(expected) == len(originals)
         for node, guard, original in zip(raises, expected, originals, strict=True):
             assert isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name)
@@ -587,3 +910,7 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     assert hashlib.sha256(payload.encode()).hexdigest() == (
         "f37aab629a4130f879bd4a473db9cbec868df564f76d45a782fd2da4d371f1d8"
     )
+    # Also pin the source-owned messages before the legacy argument mapping.
+    from tests.test_protected_ast import assert_protected_source
+
+    assert_protected_source(projected_source, "sinopac")

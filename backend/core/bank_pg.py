@@ -11,6 +11,7 @@ Design:
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, with_error_code
 import os
 import re
 import sqlite3
@@ -74,14 +75,15 @@ _PHASE_C_PG_PK_SWAPS = (
 
 
 def _merge_pg_account_currency_collisions(conn: Any, schema: str) -> None:
-    columns = {
-        row[0]
-        for row in conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = %s AND table_name = 'accounts'",
-            (schema,),
-        ).fetchall()
-    }
+    with error_step('SYS-08-171-008'):
+        columns = {
+            row[0]
+            for row in error_step('SYS-08-171-002')(lambda: conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'accounts'",
+                (schema,),
+            ))().fetchall()
+        }
     optional = [
         column for column in (
             "branch", "nickname", "type", "product_type", "raw_balance",
@@ -89,27 +91,29 @@ def _merge_pg_account_currency_collisions(conn: Any, schema: str) -> None:
         )
         if column in columns
     ]
-    rows = conn.execute(
-        f'SELECT ctid::text, user_id, account_no, currency'
-        f'{"," if optional else ""}{", ".join(optional)} '
-        f'FROM "{schema}"."accounts"'
-    ).fetchall()
+    with error_step('SYS-08-171-007'):
+        rows = error_step('SYS-08-171-003')(lambda: conn.execute(
+            f'SELECT ctid::text, user_id, account_no, currency'
+            f'{"," if optional else ""}{", ".join(optional)} '
+            f'FROM "{schema}"."accounts"'
+        ))().fetchall()
     groups: dict[tuple[Any, Any, str], list[dict[str, Any]]] = {}
     for row in rows:
         raw_currency = row[3]
         currency = str(raw_currency or "TWD").strip().upper()
         if re.fullmatch(r"[A-Z]{3}", currency) is None:
-            raise RuntimeError("invalid legacy account currency")
+            raise with_error_code(RuntimeError("invalid legacy account currency"), 'SYS-08-171-001')
         values = dict(zip(optional, row[4:], strict=True))
         values.update({"ctid": row[0], "currency": currency})
         groups.setdefault((row[1], row[2], currency), []).append(values)
 
     def order_key(row: dict[str, Any]) -> tuple[str, tuple[int, int]]:
         tid = re.fullmatch(r"\((\d+),(\d+)\)", row["ctid"])
-        return (
-            str(row.get("updated_at") or ""),
-            (int(tid.group(1)), int(tid.group(2))) if tid else (0, 0),
-        )
+        with error_step('SYS-08-172-001'):
+            return (
+                str(row.get("updated_at") or ""),
+                (int(tid.group(1)), int(tid.group(2))) if tid else (0, 0),
+            )
 
     for duplicates in groups.values():
         if len(duplicates) < 2:
@@ -117,15 +121,17 @@ def _merge_pg_account_currency_collisions(conn: Any, schema: str) -> None:
         winner = max(duplicates, key=order_key)
         for duplicate in duplicates:
             if duplicate is not winner:
-                conn.execute(
-                    f'DELETE FROM "{schema}"."accounts" WHERE ctid = %s::tid',
-                    (duplicate["ctid"],),
-                )
+                with error_step('SYS-08-171-006'):
+                    conn.execute(
+                        f'DELETE FROM "{schema}"."accounts" WHERE ctid = %s::tid',
+                        (duplicate["ctid"],),
+                    )
         assignments = []
         params = []
         if "excluded" in optional:
             assignments.append("excluded = %s")
-            params.append(int(any(bool(row.get("excluded")) for row in duplicates)))
+            with error_step('SYS-08-171-004'):
+                params.append(int(any(bool(row.get("excluded")) for row in duplicates)))
         if "nickname_overwrite" in optional:
             nickname = next(
                 (
@@ -160,11 +166,12 @@ def _merge_pg_account_currency_collisions(conn: Any, schema: str) -> None:
             params.append(value)
         if assignments:
             params.append(winner["ctid"])
-            conn.execute(
-                f'UPDATE "{schema}"."accounts" SET {", ".join(assignments)} '
-                "WHERE ctid = %s::tid",
-                tuple(params),
-            )
+            with error_step('SYS-08-171-005'):
+                conn.execute(
+                    f'UPDATE "{schema}"."accounts" SET {", ".join(assignments)} '
+                    "WHERE ctid = %s::tid",
+                    tuple(params),
+                )
 
 
 def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
@@ -176,21 +183,25 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
     # Schema oid changes when a schema is dropped and recreated, so it is a
     # lock-free revalidation key. Re-running the ALTERs on every open took
     # ACCESS EXCLUSIVE locks and deadlocked readers against sync writers.
-    oid_row = conn.execute(
-        "SELECT oid FROM pg_namespace WHERE nspname = %s", (schema,)
-    ).fetchone()
-    schema_oid = int(oid_row[0]) if oid_row else None
+    with error_step('SYS-08-173-035'):
+        oid_row = error_step('SYS-08-173-002')(lambda: conn.execute(
+            "SELECT oid FROM pg_namespace WHERE nspname = %s", (schema,)
+        ))().fetchone()
+    with error_step('SYS-08-173-003'):
+        schema_oid = int(oid_row[0]) if oid_row else None
     if schema_oid is not None and _PHASE_C_PG_MIGRATED.get(schema) == schema_oid:
         return
     _PHASE_C_PG_MIGRATED.pop(schema, None)
     try:
         # 1) Existing tables in this schema
-        cur = conn.execute(
-            """SELECT table_name FROM information_schema.tables
+        with error_step('SYS-08-173-004'):
+            cur = conn.execute(
+                """SELECT table_name FROM information_schema.tables
                WHERE table_schema = %s AND table_type = 'BASE TABLE'""",
-            (schema,),
-        )
-        existing = {r[0] for r in cur.fetchall()}
+                (schema,),
+            )
+        with error_step('SYS-08-173-005'):
+            existing = {r[0] for r in cur.fetchall()}
         if not existing:
             return
         complete_schema = set(_PHASE_C_PG_TABLES).issubset(existing)
@@ -199,65 +210,75 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
         for tbl in _PHASE_C_PG_TABLES:
             if tbl not in existing:
                 continue
-            conn.execute(
-                f'ALTER TABLE "{schema}"."{tbl}" '
-                f'ADD COLUMN IF NOT EXISTS user_id INTEGER NOT NULL DEFAULT 1'
-            )
-            conn.execute(
-                f'UPDATE "{schema}"."{tbl}" SET user_id = 1 '
-                f'WHERE user_id IS NULL OR user_id = 0'
-            )
-            conn.execute(
-                f'ALTER TABLE "{schema}"."{tbl}" '
-                "ALTER COLUMN user_id TYPE INTEGER USING user_id::integer, "
-                "ALTER COLUMN user_id SET DEFAULT 1, "
-                "ALTER COLUMN user_id SET NOT NULL"
-            )
+            with error_step('SYS-08-173-007'):
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."{tbl}" '
+                    f'ADD COLUMN IF NOT EXISTS user_id INTEGER NOT NULL DEFAULT 1'
+                )
+            with error_step('SYS-08-173-008'):
+                conn.execute(
+                    f'UPDATE "{schema}"."{tbl}" SET user_id = 1 '
+                    f'WHERE user_id IS NULL OR user_id = 0'
+                )
+            with error_step('SYS-08-173-009'):
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."{tbl}" '
+                    "ALTER COLUMN user_id TYPE INTEGER USING user_id::integer, "
+                    "ALTER COLUMN user_id SET DEFAULT 1, "
+                    "ALTER COLUMN user_id SET NOT NULL"
+                )
 
         for tbl in ("card_billed_txns", "card_pending_txns"):
             if tbl in existing:
-                conn.execute(
-                    f'ALTER TABLE "{schema}"."{tbl}" '
-                    'ADD COLUMN IF NOT EXISTS native_identity TEXT'
-                )
+                with error_step('SYS-08-173-019'):
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."{tbl}" '
+                        'ADD COLUMN IF NOT EXISTS native_identity TEXT'
+                    )
 
         if "accounts" in existing:
-            conn.execute(
-                f'ALTER TABLE "{schema}"."accounts" '
-                "ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'TWD'"
-            )
+            with error_step('SYS-08-173-010'):
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."accounts" '
+                    "ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'TWD'"
+                )
             _merge_pg_account_currency_collisions(conn, schema)
-            conn.execute(
-                f'UPDATE "{schema}"."accounts" '
-                "SET currency = COALESCE(NULLIF(UPPER(TRIM(currency)), ''), 'TWD')"
-            )
-            invalid_currency = conn.execute(
-                f'SELECT 1 FROM "{schema}"."accounts" '
-                "WHERE currency !~ '^[A-Z]{3}$' LIMIT 1"
-            ).fetchone()
+            with error_step('SYS-08-173-011'):
+                conn.execute(
+                    f'UPDATE "{schema}"."accounts" '
+                    "SET currency = COALESCE(NULLIF(UPPER(TRIM(currency)), ''), 'TWD')"
+                )
+            with error_step('SYS-08-173-036'):
+                invalid_currency = error_step('SYS-08-173-012')(lambda: conn.execute(
+                    f'SELECT 1 FROM "{schema}"."accounts" '
+                    "WHERE currency !~ '^[A-Z]{3}$' LIMIT 1"
+                ))().fetchone()
             if invalid_currency is not None:
-                raise RuntimeError("invalid legacy account currency")
-            conn.execute(
-                f'ALTER TABLE "{schema}"."accounts" '
-                "ALTER COLUMN currency SET DEFAULT 'TWD', "
-                "ALTER COLUMN currency SET NOT NULL"
-            )
+                raise with_error_code(RuntimeError("invalid legacy account currency"), 'SYS-08-173-001')
+            with error_step('SYS-08-173-013'):
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."accounts" '
+                    "ALTER COLUMN currency SET DEFAULT 'TWD', "
+                    "ALTER COLUMN currency SET NOT NULL"
+                )
 
         # Native-currency account history: preserve ISO currency and fractional units.
         if "twd_transactions" in existing:
             try:
-                conn.execute(
-                    f'ALTER TABLE "{schema}"."twd_transactions" '
-                    "ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'TWD'"
-                )
-                columns = {
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_schema = %s AND table_name = %s",
-                        (schema, "twd_transactions"),
-                    ).fetchall()
-                }
+                with error_step('SYS-08-173-020'):
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."twd_transactions" '
+                        "ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'TWD'"
+                    )
+                with error_step('SYS-08-173-040'):
+                    columns = {
+                        row[0]
+                        for row in error_step('SYS-08-173-021')(lambda: conn.execute(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema = %s AND table_name = %s",
+                            (schema, "twd_transactions"),
+                        ))().fetchall()
+                    }
                 decimal_columns = [
                     column for column in ("expend", "income", "balance")
                     if column in columns
@@ -268,36 +289,41 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                         f"USING {column}::double precision"
                         for column in decimal_columns
                     )
-                    conn.execute(
-                        f'ALTER TABLE "{schema}"."twd_transactions" {clauses}'
-                    )
+                    with error_step('SYS-08-173-030'):
+                        conn.execute(
+                            f'ALTER TABLE "{schema}"."twd_transactions" {clauses}'
+                        )
             except Exception:
-                conn.rollback()
+                with error_step('SYS-08-173-031'):
+                    conn.rollback()
                 raise
 
         if "balance_history" in existing:
-            columns = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = %s AND table_name = %s",
-                    (schema, "balance_history"),
-                ).fetchall()
-            }
+            with error_step('SYS-08-173-039'):
+                columns = {
+                    row[0]
+                    for row in error_step('SYS-08-173-014')(lambda: conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = %s AND table_name = %s",
+                        (schema, "balance_history"),
+                    ))().fetchall()
+                }
             if "fx_balance" in columns:
-                conn.execute(
-                    f'ALTER TABLE "{schema}"."balance_history" '
-                    "ALTER COLUMN fx_balance TYPE DOUBLE PRECISION "
-                    "USING fx_balance::double precision"
-                )
+                with error_step('SYS-08-173-022'):
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."balance_history" '
+                        "ALTER COLUMN fx_balance TYPE DOUBLE PRECISION "
+                        "USING fx_balance::double precision"
+                    )
 
         # Remove constraint-owned legacy single-column dedup uniqueness first;
         # PostgreSQL cannot drop its backing index directly.
         for tbl in ("twd_transactions", "card_billed_txns"):
             if tbl not in existing:
                 continue
-            constraint_rows = conn.execute(
-                """SELECT con.conname, array_agg(a.attname ORDER BY key.ord)
+            with error_step('SYS-08-173-037'):
+                constraint_rows = error_step('SYS-08-173-015')(lambda: conn.execute(
+                    """SELECT con.conname, array_agg(a.attname ORDER BY key.ord)
                    FROM pg_constraint con
                    JOIN pg_class t ON t.oid = con.conrelid
                    JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -305,15 +331,16 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = key.attnum
                    WHERE con.contype = 'u' AND n.nspname = %s AND t.relname = %s
                    GROUP BY con.conname""",
-                (schema, tbl),
-            ).fetchall()
+                    (schema, tbl),
+                ))().fetchall()
             for constraint_name, constraint_columns in constraint_rows:
                 if list(constraint_columns) == ["dedup_key"]:
                     safe_constraint = constraint_name.replace('"', '""')
-                    conn.execute(
-                        f'ALTER TABLE "{schema}"."{tbl}" '
-                        f'DROP CONSTRAINT "{safe_constraint}"'
-                    )
+                    with error_step('SYS-08-173-032'):
+                        conn.execute(
+                            f'ALTER TABLE "{schema}"."{tbl}" '
+                            f'DROP CONSTRAINT "{safe_constraint}"'
+                        )
 
         # 3) Composite UNIQUE INDEX. Names already existed on legacy schemas with
         # single-column definitions, so validate their shape before reusing them.
@@ -321,8 +348,9 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
             if tbl not in existing:
                 continue
             desired = [column.strip() for column in cols.strip("()").split(",")]
-            index_rows = conn.execute(
-                """SELECT a.attname, i.indisunique
+            with error_step('SYS-08-173-038'):
+                index_rows = error_step('SYS-08-173-016')(lambda: conn.execute(
+                    """SELECT a.attname, i.indisunique
                    FROM pg_index i
                    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ord)
                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
@@ -330,16 +358,18 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                    JOIN pg_namespace n ON n.oid = c.relnamespace
                    WHERE n.nspname = %s AND c.relname = %s
                    ORDER BY key.ord""",
-                (schema, idx),
-            ).fetchall()
+                    (schema, idx),
+                ))().fetchall()
             current = [row[0] for row in index_rows]
             if current == desired and all(row[1] for row in index_rows):
                 continue
-            conn.execute(f'DROP INDEX IF EXISTS "{schema}"."{idx}"')
-            conn.execute(
-                f'CREATE UNIQUE INDEX "{idx}" '
-                f'ON "{schema}"."{tbl}" {cols}'
-            )
+            with error_step('SYS-08-173-017'):
+                conn.execute(f'DROP INDEX IF EXISTS "{schema}"."{idx}"')
+            with error_step('SYS-08-173-018'):
+                conn.execute(
+                    f'CREATE UNIQUE INDEX "{idx}" '
+                    f'ON "{schema}"."{tbl}" {cols}'
+                )
 
         # 4) Phase C-pk (2026-06-18): swap legacy single-column PRIMARY KEY
         # to composite (user_id, ...). Without this, multi-tenant INSERT of
@@ -351,8 +381,9 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                 continue
             try:
                 # Query current PK columns
-                cur = conn.execute(
-                    """SELECT a.attname
+                with error_step('SYS-08-173-023'):
+                    cur = conn.execute(
+                        """SELECT a.attname
                        FROM pg_index i
                        CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ord)
                        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
@@ -361,9 +392,10 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                        WHERE i.indisprimary
                          AND n.nspname = %s AND c.relname = %s
                        ORDER BY key.ord""",
-                    (schema, tbl),
-                )
-                current_pk_cols = [r[0] for r in cur.fetchall()]
+                        (schema, tbl),
+                    )
+                with error_step('SYS-08-173-024'):
+                    current_pk_cols = [r[0] for r in cur.fetchall()]
                 desired_pk_cols = [
                     column.strip()
                     for column in new_pk_cols.strip("()").split(",")
@@ -372,45 +404,53 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                     continue
 
                 # Find PK constraint name (Postgres autogenerates as <table>_pkey)
-                cur = conn.execute(
-                    """SELECT con.conname FROM pg_constraint con
+                with error_step('SYS-08-173-025'):
+                    cur = conn.execute(
+                        """SELECT con.conname FROM pg_constraint con
                        JOIN pg_class c ON c.oid = con.conrelid
                        JOIN pg_namespace n ON n.oid = c.relnamespace
                        WHERE con.contype = 'p'
                          AND n.nspname = %s AND c.relname = %s""",
-                    (schema, tbl),
-                )
-                pk_name_row = cur.fetchone()
+                        (schema, tbl),
+                    )
+                with error_step('SYS-08-173-026'):
+                    pk_name_row = cur.fetchone()
                 if pk_name_row is None:
                     # No PK at all — just add the composite one
-                    conn.execute(
-                        f'ALTER TABLE "{schema}"."{tbl}" '
-                        f'ADD PRIMARY KEY {new_pk_cols}'
-                    )
+                    with error_step('SYS-08-173-033'):
+                        conn.execute(
+                            f'ALTER TABLE "{schema}"."{tbl}" '
+                            f'ADD PRIMARY KEY {new_pk_cols}'
+                        )
                     continue
 
                 pk_name = pk_name_row[0]
                 # Drop legacy PK + add composite PK in one transaction
-                conn.execute(
-                    f'ALTER TABLE "{schema}"."{tbl}" '
-                    f'DROP CONSTRAINT "{pk_name}"'
-                )
-                conn.execute(
-                    f'ALTER TABLE "{schema}"."{tbl}" '
-                    f'ADD PRIMARY KEY {new_pk_cols}'
-                )
+                with error_step('SYS-08-173-027'):
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."{tbl}" '
+                        f'DROP CONSTRAINT "{pk_name}"'
+                    )
+                with error_step('SYS-08-173-028'):
+                    conn.execute(
+                        f'ALTER TABLE "{schema}"."{tbl}" '
+                        f'ADD PRIMARY KEY {new_pk_cols}'
+                    )
 
             except Exception:
                 try:
-                    conn.rollback()
+                    with error_step('SYS-08-173-034'):
+                        conn.rollback()
                 except Exception:
                     pass
                 raise
 
-        conn.commit()
+        with error_step('SYS-08-173-006'):
+            conn.commit()
     except Exception:
         try:
-            conn.rollback()
+            with error_step('SYS-08-173-029'):
+                conn.rollback()
         except Exception:
             pass
         raise
@@ -480,7 +520,8 @@ class Cursor:
             self._rows = []
             return self._rows
         cols = [d.name for d in self._cur.description]
-        raw = self._cur.fetchall()
+        with error_step('SYS-08-180-001'):
+            raw = self._cur.fetchall()
         out: list[Row] = []
         for tup in raw:
             out.append(Row(dict(zip(cols, tup, strict=True)), cols))
@@ -516,7 +557,7 @@ _SQLITE_MASTER_ONE_LITERAL_RE = re.compile(
 def _dsn() -> str:
     dsn = os.environ.get("DATABASE_URL", "")
     if not dsn:
-        raise RuntimeError("DB_BACKEND=postgres requires DATABASE_URL")
+        raise with_error_code(RuntimeError("DB_BACKEND=postgres requires DATABASE_URL"), 'SYS-08-184-001')
     return dsn
 
 
@@ -599,22 +640,28 @@ class Connection:
     def __init__(self, bank: str):
         self.bank = bank
         self.schema = schema_name(bank)
-        self._checkout_cm = _get_pg_pool().connection(timeout=_PG_POOL_TIMEOUT)
-        self._conn = self._checkout_cm.__enter__()
+        with error_step('SYS-08-189-001'):
+            self._checkout_cm = _get_pg_pool().connection(timeout=_PG_POOL_TIMEOUT)
+        with error_step('SYS-08-189-002'):
+            self._conn = self._checkout_cm.__enter__()
         self._closed = False
         try:
             self.total_changes = 0
-            self.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+            with error_step('SYS-08-189-003'):
+                self.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
             # Search path applies to all unqualified table names below.
-            self.execute(f'SET search_path TO "{self.schema}", public')
-            self.commit()
+            with error_step('SYS-08-189-004'):
+                self.execute(f'SET search_path TO "{self.schema}", public')
+            with error_step('SYS-08-189-005'):
+                self.commit()
             # Phase C (2026-06-18): backfill user_id columns + composite UNIQUE
             # INDEX for legacy PG schemas created before Path A multi-user. SQLite
             # side has db.py:_ensure_phase_c_user_id; this is the PG mirror and
             # deliberately revalidates every opened schema authority.
             _ensure_phase_c_user_id_pg(self._conn, self.schema)
         except BaseException as e:
-            self._checkout_cm.__exit__(type(e), e, e.__traceback__)
+            with error_step('SYS-08-189-006'):
+                self._checkout_cm.__exit__(type(e), e, e.__traceback__)
             self._closed = True
             raise
 
@@ -623,58 +670,68 @@ class Connection:
         m = _PRAGMA_RE.match(sql_stripped)
         if m:
             table = m.group(1).strip().strip('"')
-            cur = self._conn.execute(
-                """SELECT column_name AS name
+            with error_step('SYS-08-190-002'):
+                cur = self._conn.execute(
+                    """SELECT column_name AS name
                    FROM information_schema.columns
                    WHERE table_schema = %s AND table_name = %s
                    ORDER BY ordinal_position""",
-                (self.schema, table),
-            )
+                    (self.schema, table),
+                )
             return Cursor(cur)
 
         if _SQLITE_MASTER_ALL_RE.match(sql_stripped):
-            cur = self._conn.execute(
-                """SELECT table_name AS name
+            with error_step('SYS-08-190-003'):
+                cur = self._conn.execute(
+                    """SELECT table_name AS name
                    FROM information_schema.tables
                    WHERE table_schema = %s AND table_type = 'BASE TABLE'""",
-                (self.schema,),
-            )
+                    (self.schema,),
+                )
             return Cursor(cur)
 
         if _SQLITE_MASTER_ONE_RE.match(sql_stripped):
             table = params[0] if params else ""
-            cur = self._conn.execute(
-                """SELECT 1 AS exists
+            with error_step('SYS-08-190-004'):
+                cur = self._conn.execute(
+                    """SELECT 1 AS exists
                    FROM information_schema.tables
                    WHERE table_schema = %s AND table_name = %s
                    LIMIT 1""",
-                (self.schema, table),
-            )
+                    (self.schema, table),
+                )
             return Cursor(cur)
 
         m = _SQLITE_MASTER_ONE_LITERAL_RE.match(sql_stripped)
         if m:
             table = m.group(1)
-            cur = self._conn.execute(
-                """SELECT 1 AS exists
+            with error_step('SYS-08-190-005'):
+                cur = self._conn.execute(
+                    """SELECT 1 AS exists
                    FROM information_schema.tables
                    WHERE table_schema = %s AND table_name = %s
                    LIMIT 1""",
-                (self.schema, table),
-            )
+                    (self.schema, table),
+                )
             return Cursor(cur)
 
         try:
             cur = self._conn.execute(q(sql), tuple(params))
         except Exception as e:
+            if e.__class__.__name__ == 'UndefinedTable':
+                with_error_code(e, 'SYS-08-190-008')
+            elif e.__class__.__name__ == 'UndefinedColumn':
+                with_error_code(e, 'SYS-08-190-009')
+            # Other driver errors retain the exact caller's storage action.
             # Match SQLite router behavior: missing per-bank tables/columns are
             # treated as "bank has no data yet" and swallowed by existing
             # sqlite3.OperationalError handlers. PostgreSQL marks the current
             # transaction failed after an error, so rollback immediately before
             # surfacing the compatibility exception.
             if e.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"}:
-                self._conn.rollback()
-                raise sqlite3.OperationalError(str(e)) from e
+                with error_step('SYS-08-190-007'):
+                    self._conn.rollback()
+                raise with_error_code(sqlite3.OperationalError(str(e)), 'SYS-08-190-001') from e
             raise
         if cur.rowcount and cur.rowcount > 0 and not cur.description:
             self.total_changes += cur.rowcount
@@ -682,16 +739,19 @@ class Connection:
 
     def executescript(self, script: str) -> None:
         for stmt in split_statements(script):
-            self.execute(stmt)
+            with error_step('SYS-08-191-001'):
+                self.execute(stmt)
 
     def ensure_schema_migrations(self) -> None:
         _ensure_phase_c_user_id_pg(self._conn, self.schema)
 
     def commit(self) -> None:
-        self._conn.commit()
+        with error_step('SYS-08-193-001'):
+            self._conn.commit()
 
     def rollback(self) -> None:
-        self._conn.rollback()
+        with error_step('SYS-08-194-001'):
+            self._conn.rollback()
 
     def close(self) -> None:
         if self._closed:
@@ -700,9 +760,11 @@ class Connection:
         # sync_runner finally 執行，若 persist 中途拋錯，不能把未完成的 billed→pending
         # transition 當正常離場提交；已 commit 的正常路徑 rollback 是 no-op。
         try:
-            self._conn.rollback()
+            with error_step('SYS-08-195-001'):
+                self._conn.rollback()
         finally:
-            self._checkout_cm.__exit__(None, None, None)
+            with error_step('SYS-08-195-002'):
+                self._checkout_cm.__exit__(None, None, None)
             self._closed = True
 
 

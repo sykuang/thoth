@@ -624,7 +624,8 @@ def test_hsbc_detail_stream_overflow_aborts_before_posted_history(monkeypatch) -
     crawler = _crawler()
     called = False
 
-    def overflow(_page, _path, _token, *, byte_budget):
+    def overflow(_page, _path, _token, *, byte_budget, diagnostics=None):
+        assert diagnostics is None or (type(diagnostics) is list and not diagnostics)
         byte_budget[0] = 0
         return None
 

@@ -1,6 +1,7 @@
 """Canonical credit-card remaining-due facts shared by all bank adapters."""
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, with_error_code
 import re
 from decimal import Decimal
 from typing import Any
@@ -24,7 +25,8 @@ class CardBillWriteBarrier:
         self._store = store
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._store, name)
+        with error_step('SYS-08-020-001'):
+            return getattr(self._store, name)
 
     def upsert_cards(
         self, rows: list[dict[str, Any]], commit: bool = True,
@@ -33,12 +35,14 @@ class CardBillWriteBarrier:
             {key: value for key, value in row.items() if key not in _CANONICAL_BILL_COLUMNS}
             for row in rows
         ]
-        return self._store.upsert_cards(sanitized, commit=commit)
+        with error_step('SYS-08-021-001'):
+            return self._store.upsert_cards(sanitized, commit=commit)
 
 
 def _money(value: Any) -> int | None:
     try:
-        amount = native_money(value, "TWD", optional=True, absolute=True)
+        with error_step('SYS-08-022-001'):
+            amount = native_money(value, "TWD", optional=True, absolute=True)
     except ValueError:
         return None
     if amount is None or amount > MAX_CARD_BILL_MONEY:
@@ -49,7 +53,8 @@ def _money(value: Any) -> int | None:
 
 def card_bill_money(value: Any) -> int | None:
     """Validate a bank-native money scalar before bill arithmetic."""
-    return _money(value)
+    with error_step('SYS-08-023-001'):
+        return _money(value)
 
 
 def _iso_date(value: Any) -> str | None:
@@ -67,7 +72,8 @@ def _iso_date(value: Any) -> str | None:
 
         try:
             normalized = text.replace("/", "-").replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).date().isoformat()
+            with error_step('SYS-08-024-001'):
+                return datetime.fromisoformat(normalized).date().isoformat()
         except ValueError:
             return None
     else:
@@ -75,7 +81,8 @@ def _iso_date(value: Any) -> str | None:
 
         for fmt in ("%d %b %Y", "%d %B %Y", "%d-%m-%Y", "%d/%m/%Y"):
             try:
-                return datetime.strptime(text, fmt).date().isoformat()
+                with error_step('SYS-08-024-002'):
+                    return datetime.strptime(text, fmt).date().isoformat()
             except ValueError:
                 continue
         return None
@@ -89,7 +96,8 @@ def _iso_date(value: Any) -> str | None:
 
 def card_bill_date(value: Any) -> str | None:
     """Normalize a bank-native bill date before cycle comparisons."""
-    return _iso_date(value)
+    with error_step('SYS-08-025-001'):
+        return _iso_date(value)
 
 
 def summarize_persisted_card_bills(
@@ -103,21 +111,26 @@ def summarize_persisted_card_bills(
     dates: list[str] = []
     for card in cards:
         raw_amount = card.get("bill_due_amount")
-        amount = _money(raw_amount)
+        with error_step('SYS-08-026-003'):
+            amount = _money(raw_amount)
         if raw_amount is not None and amount is None:
-            raise ValueError("invalid persisted card-bill amount")
-        updated_on = _iso_date(card.get("updated_at"))
+            raise with_error_code(ValueError("invalid persisted card-bill amount"), 'SYS-08-026-001')
+        with error_step('SYS-08-026-004'):
+            updated_on = _iso_date(card.get("updated_at"))
         if amount is None or updated_on is None:
             return None
-        amounts.append(Decimal(str(amount)))
+        with error_step('SYS-08-026-005'):
+            amounts.append(Decimal(str(amount)))
         dates.append(updated_on)
     if bank == "hsbc":
-        total = sum(amounts, Decimal(0))
+        with error_step('SYS-08-026-006'):
+            total = sum(amounts, Decimal(0))
     elif any(amount != amounts[0] for amount in amounts[1:]):
         return None
     else:
         total = amounts[0]
-    return min(dates), int(total)
+    with error_step('SYS-08-026-002'):
+        return min(dates), int(total)
 
 
 def make_card_bill_fact(
@@ -132,17 +145,22 @@ def make_card_bill_fact(
     last_payment_date: Any = None,
 ) -> NormalizedCardBillFact | None:
     """Build one validated canonical fact; malformed raw input is unavailable."""
-    remaining = _money(remaining_due)
+    with error_step('SYS-08-027-001'):
+        remaining = _money(remaining_due)
     if remaining is None:
         return None
-    statement_date = _iso_date(statement_close_date)
-    due_date = _iso_date(payment_due_date)
+    with error_step('SYS-08-027-002'):
+        statement_date = _iso_date(statement_close_date)
+    with error_step('SYS-08-027-003'):
+        due_date = _iso_date(payment_due_date)
     if statement_close_date not in (None, "") and statement_date is None:
         return None
     if payment_due_date not in (None, "") and due_date is None:
         return None
-    payment_amount = _money(last_payment_amount)
-    payment_date = _iso_date(last_payment_date)
+    with error_step('SYS-08-027-004'):
+        payment_amount = _money(last_payment_amount)
+    with error_step('SYS-08-027-005'):
+        payment_date = _iso_date(last_payment_date)
     payment_supplied = last_payment_amount not in (None, "") or last_payment_date not in (None, "")
     if payment_supplied and (payment_amount is None or payment_date is None):
         return None
@@ -168,7 +186,8 @@ def make_card_bill_fact(
         if value is not None:
             fact[key] = value  # type: ignore[literal-required]
     try:
-        validate_card_bill_facts([fact], facts_ok=True)
+        with error_step('SYS-08-027-006'):
+            validate_card_bill_facts([fact], facts_ok=True)
     except ValueError:
         return None
     return fact
@@ -190,11 +209,13 @@ def apply_card_bill_facts(
     commit: bool = True,
 ) -> int:
     """Apply authoritative bill facts to known card inventory, fail-closed."""
-    validate_card_bill_facts(facts, facts_ok=facts_ok)
+    with error_step('SYS-08-029-001'):
+        validate_card_bill_facts(facts, facts_ok=facts_ok)
     if facts_ok is not True or not facts:
         return 0
 
-    known = {row["card_no"]: row for row in store.list_cards()}
+    with error_step('SYS-08-029-002'):
+        known = {row["card_no"]: row for row in store.list_cards()}
     fact = facts[0]
     targets: list[tuple[dict[str, Any], NormalizedCardBillFact]] = []
     if fact["scope"] == "bank":
@@ -224,4 +245,5 @@ def apply_card_bill_facts(
             row["last_payment_amount"] = card_fact.get("last_payment_amount")
             row["last_payment_date"] = card_fact["last_payment_date"]
         rows.append(row)
-    return store.update_card_bill_facts(rows, commit=commit)
+    with error_step('SYS-08-029-003'):
+        return store.update_card_bill_facts(rows, commit=commit)

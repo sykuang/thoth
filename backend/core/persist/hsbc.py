@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, with_error_code
 import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -33,12 +34,15 @@ _HSBC_MAX_MONEY = Decimal("100000000")
 
 
 def _hsbc_history_date(value) -> date:
-    if not isinstance(value, str) or _HSBC_DATETIME_RE.fullmatch(value) is None:
-        raise ValueError("invalid HSBC history transaction date")
+    if not isinstance(value, str):
+        raise with_error_code(ValueError('invalid HSBC history transaction date'), 'HSBC-08-001-001')
+    elif _HSBC_DATETIME_RE.fullmatch(value) is None:
+        raise with_error_code(ValueError('invalid HSBC history transaction date'), 'HSBC-08-001-002')
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        with error_step('HSBC-08-001-004'):
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
     except ValueError:
-        raise ValueError("invalid HSBC history transaction date") from None
+        raise with_error_code(ValueError("invalid HSBC history transaction date"), 'HSBC-08-001-003') from None
 
 
 def _hsbc_history_floor(end: date) -> date:
@@ -49,37 +53,48 @@ def _hsbc_history_floor(end: date) -> date:
 
 
 def _bounded_card_scalar(value, *, allow_negative: bool) -> bool:
+    return _card_scalar_error_code(value, allow_negative=allow_negative) is None
+
+
+def _card_scalar_error_code(value, *, allow_negative: bool) -> str | None:
     if value is None:
-        return True
+        return None
     text = str(value).strip()
-    if isinstance(value, bool) or _HSBC_SCALAR_RE.fullmatch(text) is None:
-        return False
+    if isinstance(value, bool):
+        return "HSBC-08-810-001"
+    if _HSBC_SCALAR_RE.fullmatch(text) is None:
+        return "HSBC-08-810-002"
     try:
         amount = Decimal(text.replace(",", ""))
     except (InvalidOperation, ValueError, AttributeError):
-        return False
-    return (
-        amount.is_finite()
-        and abs(amount) <= _HSBC_MAX_MONEY
-        and amount == amount.to_integral_value()
-        and (allow_negative or amount >= 0)
-    )
+        return "HSBC-08-810-003"
+    if not amount.is_finite():
+        return "HSBC-08-810-004"
+    if abs(amount) > _HSBC_MAX_MONEY:
+        return "HSBC-08-810-005"
+    if amount != amount.to_integral_value():
+        return "HSBC-08-810-006"
+    if not allow_negative and amount < 0:
+        return "HSBC-08-810-007"
+    return None
 
 
 def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> None:
     if not isinstance(row, dict):
-        raise ValueError("invalid HSBC history transaction")
+        raise with_error_code(ValueError("invalid HSBC history transaction"), 'HSBC-08-004-010')
     description = row.get("description")
     transaction_raw = row.get("transactionDate")
-    transaction = (
-        _hsbc_history_date(transaction_raw)
-        if transaction_raw not in (None, "")
-        else None
-    )
+    with error_step('HSBC-08-004-012'):
+        transaction = (
+            _hsbc_history_date(transaction_raw)
+            if transaction_raw not in (None, "")
+            else None
+        )
     posted_raw = row.get("postedDate")
     posted = None
     if posted_raw not in (None, "", "0002-11-30T00:00"):
-        posted = _hsbc_history_date(posted_raw)
+        with error_step('HSBC-08-004-013'):
+            posted = _hsbc_history_date(posted_raw)
     amount, currency = _hsbc_amt(row.get("ntdAmount") or row.get("amount"))
     is_positive = row.get("isPositive")
     is_foreign = row.get("isForeign")
@@ -90,103 +105,132 @@ def _validate_hsbc_txn(row: object, *, end: date, start: date | None = None) -> 
         and not isinstance(foreign_amount, bool)
         and (foreign_amount == 0 or (foreign_amount < 0) == (is_positive is False))
     )
-    if (
-        type(amount) is not int
-        or not 0 <= amount <= 100_000_000
-        or currency != "TWD"
-        or type(is_positive) is not bool
-        or type(is_foreign) is not bool
-        or not isinstance(description, str)
-        or not 0 < len(description.strip()) <= 512
-        or (start is None and transaction is None and posted is None)
-        or (start is not None and (transaction is None or posted is None))
-    ):
-        raise ValueError("invalid HSBC history transaction")
-    if is_foreign and (
-        not signed_foreign_valid or foreign_currency in (None, "TWD")
-    ):
-        raise ValueError("invalid HSBC history transaction")
+    if type(amount) is not int:
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-001')
+    elif not 0 <= amount <= 100000000:
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-002')
+    elif currency != 'TWD':
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-003')
+    elif type(is_positive) is not bool:
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-004')
+    elif type(is_foreign) is not bool:
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-005')
+    elif not isinstance(description, str):
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-006')
+    elif not 0 < len(description.strip()) <= 512:
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-007')
+    elif start is None and transaction is None and (posted is None):
+        raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-008')
+    else:
+        if start is not None:
+            if transaction is None:
+                raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-017')
+            elif posted is None:
+                raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-016')
+    if is_foreign:
+        if not signed_foreign_valid:
+            raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-015')
+        elif foreign_currency in (None, 'TWD'):
+            raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-004-014')
 
 
 def _validate_hsbc_history(data: dict, store: BankStore) -> None:
     coverage = data.get("history_coverage")
     if coverage is None:
-        raise ValueError("invalid HSBC history coverage")
+        raise with_error_code(ValueError("invalid HSBC history coverage"), 'HSBC-08-005-056')
     if not isinstance(coverage, dict):
-        raise ValueError("invalid HSBC history coverage")
+        raise with_error_code(ValueError("invalid HSBC history coverage"), 'HSBC-08-005-057')
     mode = coverage.get("mode")
     if mode not in {"full", "incremental"}:
-        raise ValueError("invalid HSBC history coverage")
-    validate_history_coverage(
-        coverage,
-        expected_mode=mode,
-        expected_domains=frozenset({"card_billed_transactions"}),
-    )
+        raise with_error_code(ValueError("invalid HSBC history coverage"), 'HSBC-08-005-058')
+    with error_step('HSBC-08-005-064'):
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=frozenset({"card_billed_transactions"}),
+        )
     domains = coverage["domains"]
-    if len(domains) != 1 or domains[0].get("domain") != "card_billed_transactions":
-        raise ValueError("invalid HSBC history coverage")
+    if len(domains) != 1:
+        raise with_error_code(ValueError('invalid HSBC history coverage'), 'HSBC-08-005-001')
+    elif domains[0].get('domain') != 'card_billed_transactions':
+        raise with_error_code(ValueError('invalid HSBC history coverage'), 'HSBC-08-005-002')
     domain = domains[0]
 
     cards = data.get("cards", [])
     details = data.get("card_detail", {})
-    if not isinstance(cards, list) or not isinstance(details, dict):
-        raise ValueError("invalid HSBC history inventory")
-    existing_cursors = store.latest_card_transaction_dates()
+    if not isinstance(cards, list):
+        raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-003')
+    elif not isinstance(details, dict):
+        raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-004')
+    with error_step('HSBC-08-005-065'):
+        existing_cursors = store.latest_card_transaction_dates()
     identities = []
     card_ids: set[str] = set()
     inventory: dict[str, str] = {}
     for card in cards:
         identity = card.get("maskedCardNumber") if isinstance(card, dict) else None
         card_id = card.get("id") if isinstance(card, dict) else None
-        if (
-            not isinstance(identity, str)
-            or re.fullmatch(r"[0-9]{4}-\*{4}-\*{4}-[0-9]{4}", identity) is None
-            or not isinstance(card_id, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", card_id) is None
-            or card.get("cardStatusDisplay") not in {
-                "ACTIVATED", "NOT_ACTIVATED", "CLOSED",
-            }
-            or identity in inventory
-            or card_id in card_ids
-            or not _bounded_card_scalar(
-                card.get("outstandingBalance"), allow_negative=True,
-            )
-            or not _bounded_card_scalar(
-                card.get("minimumPayableAmount"), allow_negative=False,
-            )
-            or any(
-                card.get(key) is not None and _dmy_to_iso(card.get(key)) is None
-                for key in ("paymentDueDate", "statementDate")
-            )
-        ):
-            raise ValueError("invalid HSBC history inventory")
+        if not isinstance(identity, str):
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-005')
+        elif re.fullmatch('[0-9]{4}-\\*{4}-\\*{4}-[0-9]{4}', identity) is None:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-006')
+        elif not isinstance(card_id, str):
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-007')
+        elif re.fullmatch('[A-Za-z0-9_-]{1,128}', card_id) is None:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-008')
+        elif card.get('cardStatusDisplay') not in {'ACTIVATED', 'NOT_ACTIVATED', 'CLOSED'}:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-009')
+        elif identity in inventory:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-010')
+        elif card_id in card_ids:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-011')
+        elif (_error_predicate_code := _card_scalar_error_code(card.get('outstandingBalance'), allow_negative=True)) is not None:  # noqa: SIM114 - keep native field decisions separate
+            raise with_error_code(ValueError('invalid HSBC history inventory'), _error_predicate_code)
+        elif (_error_predicate_code := _card_scalar_error_code(card.get('minimumPayableAmount'), allow_negative=False)) is not None:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), _error_predicate_code)
+        elif any((card.get(key) is not None and _dmy_to_iso(card.get(key)) is None for key in ('paymentDueDate', 'statementDate'))):
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-014')
         identities.append(identity)
         inventory[identity] = card_id
         card_ids.add(card_id)
 
     expected = domain.get("expected")
     windows = domain.get("windows")
-    if not isinstance(expected, list) or not isinstance(windows, list):
-        raise ValueError("invalid HSBC history coverage")
+    if not isinstance(expected, list):
+        raise with_error_code(ValueError('invalid HSBC history coverage'), 'HSBC-08-005-015')
+    elif not isinstance(windows, list):
+        raise with_error_code(ValueError('invalid HSBC history coverage'), 'HSBC-08-005-016')
     if not identities:
-        if details or expected or windows or "empty_window" not in domain:
-            raise ValueError("invalid HSBC history inventory")
+        if details:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-017')
+        elif expected:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-018')
+        elif windows:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-019')
+        elif 'empty_window' not in domain:
+            raise with_error_code(ValueError('invalid HSBC history inventory'), 'HSBC-08-005-020')
         empty = domain["empty_window"]
         try:
-            empty_start = date.fromisoformat(empty["start"])
-            empty_end = date.fromisoformat(empty["end"])
+            with error_step('HSBC-08-005-068'):
+                empty_start = date.fromisoformat(empty["start"])
+            with error_step('HSBC-08-005-069'):
+                empty_end = date.fromisoformat(empty["end"])
         except (KeyError, TypeError, ValueError):
-            raise ValueError("invalid HSBC history empty window") from None
-        if (
-            set(empty) != {"start", "end", "status", "pages"}
-            or empty.get("status") != "explicit_empty"
-            or empty.get("pages") != 1
-            or empty_start > empty_end
-            or empty_end > date.today()
-            or any(cursor > empty_end for cursor in existing_cursors.values())
-            or (mode == "full" and empty_start != _hsbc_history_floor(empty_end))
-        ):
-            raise ValueError("invalid HSBC history empty window")
+            raise with_error_code(ValueError("invalid HSBC history empty window"), 'HSBC-08-005-059') from None
+        if set(empty) != {'start', 'end', 'status', 'pages'}:
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-021')
+        elif empty.get('status') != 'explicit_empty':
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-022')
+        elif empty.get('pages') != 1:
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-023')
+        elif empty_start > empty_end:
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-024')
+        elif empty_end > date.today():
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-025')
+        elif any((cursor > empty_end for cursor in existing_cursors.values())):
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-026')
+        elif mode == 'full' and empty_start != _hsbc_history_floor(empty_end):
+            raise with_error_code(ValueError('invalid HSBC history empty window'), 'HSBC-08-005-027')
         return
 
     expected_by_identity = {
@@ -196,80 +240,100 @@ def _validate_hsbc_history(data: dict, store: BankStore) -> None:
         item.get("identity"): item for item in windows if isinstance(item, dict)
     }
     identity_set = set(identities)
-    if (
-        len(expected_by_identity) != len(expected)
-        or len(windows_by_identity) != len(windows)
-        or set(details) != identity_set
-        or set(expected_by_identity) != identity_set
-        or set(windows_by_identity) != identity_set
-    ):
-        raise ValueError("invalid HSBC history identity binding")
+    if len(expected_by_identity) != len(expected):
+        raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-028')
+    elif len(windows_by_identity) != len(windows):
+        raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-029')
+    elif set(details) != identity_set:
+        raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-030')
+    elif set(expected_by_identity) != identity_set:
+        raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-031')
+    elif set(windows_by_identity) != identity_set:
+        raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-032')
 
     receipt_fields = {"identity", "start", "end", "status", "pages", "rows"}
     for identity in identities:
         entry = details[identity]
         expected_item = expected_by_identity[identity]
         window = windows_by_identity[identity]
-        if (
-            not isinstance(entry, dict)
-            or entry.get("masked") != identity
-            or entry.get("card_id") != inventory[identity]
-        ):
-            raise ValueError("invalid HSBC history identity binding")
+        if not isinstance(entry, dict):
+            raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-033')
+        elif entry.get('masked') != identity:
+            raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-034')
+        elif entry.get('card_id') != inventory[identity]:
+            raise with_error_code(ValueError('invalid HSBC history identity binding'), 'HSBC-08-005-035')
         receipt = entry.get("posted_receipt")
         rows = entry.get("posted")
-        if (
-            not isinstance(receipt, dict)
-            or set(receipt) != receipt_fields
-            or receipt != window
-            or receipt.get("start") != expected_item.get("start")
-            or receipt.get("end") != expected_item.get("end")
-            or not isinstance(rows, list)
-            or type(receipt.get("rows")) is not int
-            or receipt["rows"] != len(rows)
-            or (receipt.get("status") == "complete") != bool(rows)
-        ):
-            raise ValueError("invalid HSBC history receipt")
-        start = date.fromisoformat(receipt["start"])
-        end = date.fromisoformat(receipt["end"])
-        if (
-            type(receipt.get("pages")) is not int
-            or not 1 <= receipt["pages"] <= 500
-            or end > date.today()
-            or (mode == "full" and start != _hsbc_history_floor(end))
-        ):
-            raise ValueError("invalid HSBC history receipt")
+        if not isinstance(receipt, dict):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-036')
+        elif set(receipt) != receipt_fields:
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-037')
+        elif receipt != window:
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-038')
+        elif receipt.get('start') != expected_item.get('start'):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-039')
+        elif receipt.get('end') != expected_item.get('end'):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-040')
+        elif not isinstance(rows, list):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-041')
+        elif type(receipt.get('rows')) is not int:
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-042')
+        elif receipt['rows'] != len(rows):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-043')
+        elif (receipt.get('status') == 'complete') != bool(rows):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-044')
+        with error_step('HSBC-08-005-066'):
+            start = date.fromisoformat(receipt["start"])
+        with error_step('HSBC-08-005-067'):
+            end = date.fromisoformat(receipt["end"])
+        if type(receipt.get('pages')) is not int:
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-045')
+        elif not 1 <= receipt['pages'] <= 500:
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-046')
+        elif end > date.today():
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-047')
+        elif mode == 'full' and start != _hsbc_history_floor(end):
+            raise with_error_code(ValueError('invalid HSBC history receipt'), 'HSBC-08-005-048')
         cursor = existing_cursors.get(identity)
         if isinstance(cursor, date) and cursor > end:
-            raise ValueError("invalid HSBC history cursor")
+            raise with_error_code(ValueError("invalid HSBC history cursor"), 'HSBC-08-005-060')
         if mode == "incremental":
             expected_start = _hsbc_history_floor(end)
             if isinstance(cursor, date):
                 expected_start = max(expected_start, cursor - timedelta(days=7))
             if start != expected_start:
-                raise ValueError("invalid HSBC history incremental start")
+                raise with_error_code(ValueError("invalid HSBC history incremental start"), 'HSBC-08-005-061')
         for row in rows:
-            _validate_hsbc_txn(row, start=start, end=end)
+            with error_step('HSBC-08-005-070'):
+                _validate_hsbc_txn(row, start=start, end=end)
         unposted = entry.get("unposted")
-        if not isinstance(unposted, list) or type(entry.get("unposted_ok")) is not bool:
-            raise ValueError("invalid HSBC history transaction")
+        if not isinstance(unposted, list):
+            raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-005-049')
+        elif type(entry.get('unposted_ok')) is not bool:
+            raise with_error_code(ValueError('invalid HSBC history transaction'), 'HSBC-08-005-050')
         for row in unposted:
-            _validate_hsbc_txn(row, end=end)
+            with error_step('HSBC-08-005-071'):
+                _validate_hsbc_txn(row, end=end)
         detail = entry.get("detail")
         if detail is not None:
             detail_rows = detail.get("details") if isinstance(detail, dict) else None
-            if not isinstance(detail_rows, list) or any(
-                not isinstance(item, dict)
-                or not isinstance(item.get("key"), str)
-                or not isinstance(item.get("value"), str)
-                or len(item["key"]) > 128
-                or len(item["value"]) > 512
-                for item in detail_rows
-            ):
-                raise ValueError("invalid HSBC card detail")
+            if not isinstance(detail_rows, list):
+                raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-051')
+            else:
+                for _error_leaf_3_item in detail_rows:
+                    if not isinstance(_error_leaf_3_item, dict):
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-076')
+                    elif not isinstance(_error_leaf_3_item.get('key'), str):
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-075')
+                    elif not isinstance(_error_leaf_3_item.get('value'), str):
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-074')
+                    elif len(_error_leaf_3_item['key']) > 128:
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-073')
+                    elif len(_error_leaf_3_item['value']) > 512:
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-072')
             keys = [item["key"].strip() for item in detail_rows]
             if len(set(keys)) != len(keys):
-                raise ValueError("invalid HSBC card detail")
+                raise with_error_code(ValueError("invalid HSBC card detail"), 'HSBC-08-005-062')
             for item in detail_rows:
                 key = item["key"].strip()
                 value = item["value"].strip()
@@ -277,16 +341,16 @@ def _validate_hsbc_history(data: dict, store: BankStore) -> None:
                     "Credit Limit", "Last Statement Amount", "Last Payment Amount",
                 }:
                     amount, currency = _hsbc_amt(value)
-                    if (
-                        type(amount) is not int
-                        or currency != "TWD"
-                        or (key == "Credit Limit" and amount < 0)
-                    ):
-                        raise ValueError("invalid HSBC card detail")
+                    if type(amount) is not int:
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-053')
+                    elif currency != 'TWD':
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-054')
+                    elif key == 'Credit Limit' and amount < 0:
+                        raise with_error_code(ValueError('invalid HSBC card detail'), 'HSBC-08-005-055')
                 elif key in {
                     "Last Statement Date", "Last Payment Date", "Payment Due Date",
                 } and _hsbc_dmy_text_to_iso(value) is None:
-                    raise ValueError("invalid HSBC card detail")
+                    raise with_error_code(ValueError("invalid HSBC card detail"), 'HSBC-08-005-063')
 
 
 def _hsbc_amt(s):
@@ -299,14 +363,17 @@ def _hsbc_amt(s):
     match = _HSBC_MONEY_RE.fullmatch(text)
     currency = match.group(2) if match else None
     try:
-        amount = Decimal(match.group(1).replace(",", "")) if match else None
+        with error_step('HSBC-08-006-002'):
+            amount = Decimal(match.group(1).replace(",", "")) if match else None
     except InvalidOperation:
         amount = None
     if amount is None or not amount.is_finite() or abs(amount) > _HSBC_MAX_MONEY:
         return None, currency
     if amount == amount.to_integral_value():
-        return int(amount), currency
-    return float(amount), currency
+        with error_step('HSBC-08-006-003'):
+            return int(amount), currency
+    with error_step('HSBC-08-006-001'):
+        return float(amount), currency
 
 def _hsbc_date(s):
     """HSBC 日期 '2026-05-18T00:00' → 'YYYY-MM-DD'。
@@ -335,7 +402,8 @@ def _hsbc_dmy_text_to_iso(s: str | None) -> str | None:
     if not mm or not yyyy.isdigit() or not dd.isdigit():
         return None
     try:
-        return date(int(yyyy), int(mm), int(dd)).isoformat()
+        with error_step('HSBC-08-008-001'):
+            return date(int(yyyy), int(mm), int(dd)).isoformat()
     except ValueError:
         return None
 
@@ -356,19 +424,20 @@ def _hsbc_card_txn(t: dict) -> dict:
     signed = ntd_val
     if ntd_val is not None and not is_positive:
         signed = -abs(ntd_val)
-    return {
-        "card_no": None,            # 由外層帶卡號
-        "bill_date": None,          # HSBC 明細 API 未直接給帳單日（卡詳情另有）
-        "currency": "TWD",          # 入帳幣別
-        "date": _hsbc_date(t.get("transactionDate")) or _hsbc_date(t.get("postedDate")),
-        "post_date": _hsbc_date(t.get("postedDate")),   # 入帳日（未入帳→None）
-        "desc": desc,
-        "amount": signed,           # 台幣入帳金額（還款為負）
-        "consume_country": None,
-        "consume_currency": fx_cur if is_foreign else "TWD",   # 原始消費幣別
-        "consume_amount": abs(fx_val) if is_foreign and fx_val is not None else None,
-        "txn_type": classify.classify_hsbc(is_positive, desc, signed),
-    }
+    with error_step('HSBC-08-009-001'):
+        return {
+            "card_no": None,            # 由外層帶卡號
+            "bill_date": None,          # HSBC 明細 API 未直接給帳單日（卡詳情另有）
+            "currency": "TWD",          # 入帳幣別
+            "date": _hsbc_date(t.get("transactionDate")) or _hsbc_date(t.get("postedDate")),
+            "post_date": _hsbc_date(t.get("postedDate")),   # 入帳日（未入帳→None）
+            "desc": desc,
+            "amount": signed,           # 台幣入帳金額（還款為負）
+            "consume_country": None,
+            "consume_currency": fx_cur if is_foreign else "TWD",   # 原始消費幣別
+            "consume_amount": abs(fx_val) if is_foreign and fx_val is not None else None,
+            "txn_type": classify.classify_hsbc(is_positive, desc, signed),
+        }
 
 def _dmy_to_iso(s: str | None) -> str | None:
     """'05-06-2026' → '2026-06-05'. HSBC 用 (DD-MM-YYYY)."""
@@ -378,7 +447,8 @@ def _dmy_to_iso(s: str | None) -> str | None:
         parts = str(s).strip().split("-")
         if len(parts) != 3:
             return None
-        d, mo, y = int(parts[0]), int(parts[1]), int(parts[2])
+        with error_step('HSBC-08-010-001'):
+            d, mo, y = int(parts[0]), int(parts[1]), int(parts[2])
         if re.fullmatch(r"\d{4}", parts[2]) is None:
             return None
         return date(y, mo, d).isoformat()
@@ -401,7 +471,8 @@ def _persist_hsbc(
       card_detail[tail].detail   → daily_metric(額度/繳款/紅利)
     HSBC 是信用卡 only，無台幣存款帳戶。
     """
-    _validate_hsbc_history(data, store)
+    with error_step('HSBC-08-011-001'):
+        _validate_hsbc_history(data, store)
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {}
 
@@ -425,7 +496,8 @@ def _persist_hsbc(
                 continue
             if k == "Credit Limit":
                 # "1,500,000 TWD" → 1500000.0
-                info["credit_limit"] = _num_to_float(v.split()[0] if v else "")
+                with error_step('HSBC-08-011-010'):
+                    info["credit_limit"] = _num_to_float(v.split()[0] if v else "", _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'HSBC-08-830-008', 'HSBC-08-830-009', 'HSBC-08-830-010'))
             elif k == "Last Statement Date":
                 # "18 May 2026" → "2026-05-18"
                 info["last_stmt_date"] = _hsbc_dmy_text_to_iso(v)
@@ -433,10 +505,12 @@ def _persist_hsbc(
                 # "71,032 TWD" → 71032.0
                 # HSBC 官方「本期應繳」直給 (不必靠 card_billed_txns latest bill_date sum;
                 # HSBC 明細表 bill_date 永遠 NULL 那條 derive 路徑會把整 12 月歷史消費當本期帳單)
-                info["bill_due_amount"] = _num_to_float(v.split()[0] if v else "")
+                with error_step('HSBC-08-011-011'):
+                    info["bill_due_amount"] = _num_to_float(v.split()[0] if v else "", _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'HSBC-08-831-008', 'HSBC-08-831-009', 'HSBC-08-831-010'))
             elif k == "Last Payment Amount":
                 # "622 TWD" → 622.0 (HSBC 官方「最近繳款金額」)
-                info["last_payment_amount"] = _num_to_float(v.split()[0] if v else "")
+                with error_step('HSBC-08-011-012'):
+                    info["last_payment_amount"] = _num_to_float(v.split()[0] if v else "", _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'HSBC-08-832-008', 'HSBC-08-832-009', 'HSBC-08-832-010'))
             elif k == "Last Payment Date":
                 # "11 Jun 2026" → "2026-06-11" (HSBC 官方「最近繳款日」)
                 info["last_payment_date"] = _hsbc_dmy_text_to_iso(v)
@@ -451,29 +525,31 @@ def _persist_hsbc(
         status_display = (c.get("cardStatusDisplay") or "").upper()
         is_active = status_display == "ACTIVATED"
         per_card_info = details_map.get(masked) or {}
-        card_rows.append({
-            "number": masked,                       # 用 masked 當卡號（HSBC 不給明碼）
-            "name": c.get("name"),
-            "association": None,
-            "type": c.get("cardType"),
-            "is_cube": False,
-            # Step 2: per-card 信用卡明細 (HSBC API 不直接給 limit; outstandingBalance=已欠)
-            # 2026-06-14：credit_limit / statement_close_date 從 card_detail.details[] 補
-            # 2026-06-20：bill_due_amount / last_payment_amount / last_payment_date 也從
-            #   card_detail.details[] 補 (HSBC 官方直給, 跳過 db_facade SQL derive 路徑.
-            #   原 derive 在 HSBC 表 bill_date 全 NULL 時, 把整 12 月歷史消費 SUM 成「本期應繳」)
-            "credit_limit": per_card_info.get("credit_limit"),
-            "used_credit": _num_to_float(c.get("outstandingBalance")),
-            "statement_close_date": (per_card_info.get("last_stmt_date")
-                                      or _dmy_to_iso(c.get("statementDate"))),
-            "payment_due_date": _dmy_to_iso(c.get("paymentDueDate")),
-            "bill_due_amount": per_card_info.get("bill_due_amount"),
-            "last_payment_amount": per_card_info.get("last_payment_amount"),
-            "last_payment_date": per_card_info.get("last_payment_date"),
-            "active": is_active,
-        })
+        with error_step('HSBC-08-011-004'):
+            card_rows.append({
+                "number": masked,                       # 用 masked 當卡號（HSBC 不給明碼）
+                "name": c.get("name"),
+                "association": None,
+                "type": c.get("cardType"),
+                "is_cube": False,
+                # Step 2: per-card 信用卡明細 (HSBC API 不直接給 limit; outstandingBalance=已欠)
+                # 2026-06-14：credit_limit / statement_close_date 從 card_detail.details[] 補
+                # 2026-06-20：bill_due_amount / last_payment_amount / last_payment_date 也從
+                #   card_detail.details[] 補 (HSBC 官方直給, 跳過 db_facade SQL derive 路徑.
+                #   原 derive 在 HSBC 表 bill_date 全 NULL 時, 把整 12 月歷史消費 SUM 成「本期應繳」)
+                "credit_limit": per_card_info.get("credit_limit"),
+                "used_credit": _num_to_float(c.get("outstandingBalance"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'HSBC-08-833-008', 'HSBC-08-833-009', 'HSBC-08-833-010')),
+                "statement_close_date": (per_card_info.get("last_stmt_date")
+                                          or _dmy_to_iso(c.get("statementDate"))),
+                "payment_due_date": _dmy_to_iso(c.get("paymentDueDate")),
+                "bill_due_amount": per_card_info.get("bill_due_amount"),
+                "last_payment_amount": per_card_info.get("last_payment_amount"),
+                "last_payment_date": per_card_info.get("last_payment_date"),
+                "active": is_active,
+            })
     if card_rows:
-        store.upsert_cards(card_rows, commit=False)
+        with error_step('HSBC-08-011-005'):
+            store.upsert_cards(card_rows, commit=False)
 
     # --- 逐卡明細 ---
     billed_new = 0
@@ -491,9 +567,10 @@ def _persist_hsbc(
             r = _hsbc_card_txn(t)
             r["card_no"] = masked
             rows.append(r)
-        billed_new += store.upsert_card_billed(
-            rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
-        )
+        with error_step('HSBC-08-011-006'):
+            billed_new += store.upsert_card_billed(
+                rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+            )
         # 未出帳（refresh-by-scope，彙整所有卡一起 refresh）
         for t in (entry.get("unposted") or []):
             r = _hsbc_card_txn(t)
@@ -524,14 +601,16 @@ def _persist_hsbc(
         for identity in expected_identities
     )
     # 每張有 id 的卡都必須帶 collector 明示 unposted_ok=True；aggregate 非空不代表完整。
-    delta["card_unbilled"] = store.refresh_card_pending(
-        "unbilled", unbilled_rows_all, rules=rules, fetch_ok=fetch_ok, commit=False,
-    )
+    with error_step('HSBC-08-011-002'):
+        delta["card_unbilled"] = store.refresh_card_pending(
+            "unbilled", unbilled_rows_all, rules=rules, fetch_ok=fetch_ok, commit=False,
+        )
     delta["card_current"] = 0
 
     # 同一交易內寫 metrics；由 persist_collected 在 facts/cursor 後一次 commit。
     for category, payload in detail_metrics:
-        store.put_daily_metric(category, payload, today, commit=False)
+        with error_step('HSBC-08-011-007'):
+            store.put_daily_metric(category, payload, today, commit=False)
 
     # 卡片彙總快照（應繳/額度）
     if cards:
@@ -541,10 +620,13 @@ def _persist_hsbc(
             "min_payment": c.get("minimumPayableAmount"),
             "due_date": c.get("paymentDueDate"),
         } for c in cards]
-        store.put_daily_metric("card_summary", summary, today, commit=False)
-    store.log_sync(delta, commit=False)
+        with error_step('HSBC-08-011-008'):
+            store.put_daily_metric("card_summary", summary, today, commit=False)
+    with error_step('HSBC-08-011-003'):
+        store.log_sync(delta, commit=False)
     if commit:
-        store.commit()
+        with error_step('HSBC-08-011-009'):
+            store.commit()
     return delta
 
 
@@ -560,5 +642,6 @@ def persist_hsbc(
     try:
         return _persist_hsbc(data, store, rules=rules, commit=True)
     except Exception:
-        store.rollback()
+        with error_step('HSBC-08-012-001'):
+            store.rollback()
         raise

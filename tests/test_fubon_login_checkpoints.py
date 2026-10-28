@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ast
-import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -550,7 +548,7 @@ def test_submit_uses_exact_dynamic_field_contract_and_true_keyboard() -> None:
         field.input_value.assert_called_once_with()
     page.keyboard.press.assert_not_called()
     page.keyboard.type.assert_not_called()
-    crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=1)
+    crawler._ocr_captcha.assert_called_once_with(frame, max_attempts=1, _diagnostic=[])
     submit.click.assert_called_once_with(timeout=8000)
     assert frame.locator.call_args_list.count(call("input[type='password']")) == 1
     page.evaluate.assert_not_called()
@@ -822,8 +820,6 @@ def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     assert "timeout=5000" in collect_source
     assert collect_source.count("bounded_evaluate(") > 10
 
-    tree = ast.parse(Path(fubon_module.__file__).read_text())
-    crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FubonCrawler")
-    start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
-    payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    assert hashlib.sha256(payload.encode()).hexdigest() == "b3bf4fdfeff60ff1c1cab40ad919bfb2d25d3b3cf36a8aed8640dec2e375a227"
+    from tests.test_protected_ast import assert_protected_source
+
+    assert_protected_source(Path(fubon_module.__file__).read_text(), "fubon")

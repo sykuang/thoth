@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 from backend.server.db import get_conn, now_iso
+from backend.core.error_codes import format_error_id
 
 _HISTORY_DOMAINS = frozenset({
     "twd_transactions", "account_transactions", "card_billed_transactions",
@@ -211,7 +212,7 @@ def sweep_stale_queued() -> StaleSweep:
     mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
     stale_hours = 7 if mode == "external" else 1
     threshold = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat()
-    error = f"stale_queue: worker did not claim within {stale_hours} hour{'s' if stale_hours != 1 else ''}"
+    error = format_error_id("SYS-09-001-001") + f" | stale_queue: worker did not claim within {stale_hours} hour{'s' if stale_hours != 1 else ''}"
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE sync_jobs SET status='failed', finished_at=?, error_msg=? "
@@ -228,7 +229,7 @@ def sweep_stale_queued() -> StaleSweep:
 
 def sweep_stale_scheduled_queued() -> StaleSweep:
     threshold = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
-    error = "stale_queue: scheduled worker did not claim within 7 hours"
+    error = format_error_id("SYS-09-002-001") + " | stale_queue: scheduled worker did not claim within 7 hours"
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE sync_jobs SET status='failed', finished_at=?, error_msg=? "
@@ -268,7 +269,7 @@ def sweep_stale_running() -> StaleSweep:
             "UPDATE sync_jobs SET status='failed', finished_at=?, "
             "error_msg=? WHERE status='running' AND started_at IS NOT NULL "
             "AND started_at < ? RETURNING batch_id, user_id",
-            (now_iso(), f"stale_sweep: job stuck >{stale_seconds}s "
+            (now_iso(), format_error_id("SYS-09-003-001") + f" | stale_sweep: job stuck >{stale_seconds}s "
                         "without mark_done/mark_failed (container restart / crash?)",
              threshold),
         )

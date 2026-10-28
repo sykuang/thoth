@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ast
-import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -670,18 +668,6 @@ def test_legacy_login_sources_are_absent_and_collect_ast_is_unchanged() -> None:
     ):
         assert forbidden not in login_region
 
-    tree = ast.parse(Path(hsbc_module.__file__).read_text())
-    crawler = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "HsbcCrawler"
-    )
-    start = next(
-        i for i, node in enumerate(crawler.body)
-        if isinstance(node, ast.FunctionDef) and node.name == "collect"
-    )
-    payload = "\n".join(
-        ast.dump(node, include_attributes=False) for node in crawler.body[start:]
-    )
-    assert hashlib.sha256(payload.encode()).hexdigest() == (
-        "c3cfdc8497312445be301124976b5aa51587bbaea37cc5d3822906491c09a013"
-    )
+    from tests.test_hsbc_containing_method_parity import assert_hsbc_protected_source
+
+    assert_hsbc_protected_source(Path(hsbc_module.__file__).read_text())

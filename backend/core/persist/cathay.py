@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step
 from datetime import datetime
 from math import isfinite
 
@@ -16,15 +17,17 @@ from backend.core.persist._common import _num_real, _num_to_float
 def _payment_date(value) -> str | None:
     text = str(value or "").strip()[:10].replace("/", "-")
     try:
-        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+        with error_step('CATHAY-08-001-001'):
+            return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
     except ValueError:
         return None
 
 
-def _finite_amount(value) -> float | None:
+def _finite_amount(value, *, _codes: tuple[str, ...] | None = None) -> float | None:
     if isinstance(value, bool):
         return None
-    amount = _num_to_float(value)
+    with error_step('CATHAY-08-002-001'):
+        amount = _num_to_float(value, _codes=_codes)
     return amount if amount is not None and isfinite(amount) else None
 
 
@@ -63,10 +66,12 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     for a in main_accts:
         cur = (a.get("currency") or "TWD").upper()
         if cur == "TWD" and bl_twd is not None and tw_main_count == 1:
-            a["raw_balance"] = float(bl_twd)
+            with error_step('CATHAY-08-003-021'):
+                a["raw_balance"] = float(bl_twd)
             a["raw_balance_date"] = bl_date
         elif cur != "TWD" and bl_fx is not None and fx_main_count == 1:
-            a["raw_balance"] = float(bl_fx)
+            with error_step('CATHAY-08-003-024'):
+                a["raw_balance"] = float(bl_fx)
             a["raw_balance_date"] = bl_date
     # 貸款帳戶：data.loan.accounts[] 獨立路徑（使用者鐵律：所有爬蟲都要處理貸款）
     loan_block = data.get("loan") or {}
@@ -84,22 +89,25 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # loan balance defensive：試多個欄位
         loan_bal_raw = (la.get("balance") or la.get("loanBalance")
                         or la.get("outstanding") or la.get("amount"))
-        loan_accts.append({
-            "account_no": acct_no,
-            "currency": la.get("currency") or "TWD",
-            "branch": la.get("branchName") or la.get("branch"),
-            "nickname": la.get("nickName") or la.get("nickname"),
-            "type": (la.get("loanName") or la.get("name")
-                     or la.get("product") or la.get("type") or "貸款"),
-            "product_type": account_classify.classify_account("cathay", raw),
-            "raw_balance": _num_real(loan_bal_raw),
-            "raw_balance_date": today,
-        })
+        with error_step('CATHAY-08-003-010'):
+            loan_accts.append({
+                "account_no": acct_no,
+                "currency": la.get("currency") or "TWD",
+                "branch": la.get("branchName") or la.get("branch"),
+                "nickname": la.get("nickName") or la.get("nickname"),
+                "type": (la.get("loanName") or la.get("name")
+                         or la.get("product") or la.get("type") or "貸款"),
+                "product_type": account_classify.classify_account("cathay", raw),
+                "raw_balance": _num_real(loan_bal_raw, _codes=('SYS-08-001-001', 'CATHAY-08-830-002', 'SYS-08-001-003', 'CATHAY-08-830-004', 'CATHAY-08-830-005', 'CATHAY-08-830-006', 'SYS-08-001-007', 'CATHAY-08-830-008', 'CATHAY-08-830-009', 'CATHAY-08-830-010')),
+                "raw_balance_date": today,
+            })
     all_accts = main_accts + loan_accts
     if all_accts:
-        store.upsert_accounts(all_accts)
+        with error_step('CATHAY-08-003-011'):
+            store.upsert_accounts(all_accts)
     cc = data.get("credit_card", {})
-    known_cards = store.list_cards()
+    with error_step('CATHAY-08-003-001'):
+        known_cards = store.list_cards()
     if cc.get("cards") or known_cards:
         # Step 2 (2026-06-14): Cathay quota / bill_summary 是整戶層 (不是 per-card),
         # 套到每張卡同一組值 (limit 是「整戶可用額度」, due_date/stmt_date 跨卡共用).
@@ -107,8 +115,10 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # 沒有 per-card endpoint 可打;整戶套是目前可行的最大化解析,等國泰 API 升級才能改善.
         quota_raw = cc.get("quota")
         quota = quota_raw if isinstance(quota_raw, dict) else {}
-        cathay_limit = _finite_amount(quota.get("credit_limit"))
-        cathay_used = _finite_amount(quota.get("current"))  # current=本期已動用
+        with error_step('CATHAY-08-003-012'):
+            cathay_limit = _finite_amount(quota.get("credit_limit"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-003-012', 'CATHAY-08-831-009', 'CATHAY-08-831-010'))
+        with error_step('CATHAY-08-003-013'):
+            cathay_used = _finite_amount(quota.get("current"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-003-013', 'CATHAY-08-832-009', 'CATHAY-08-832-010'))  # current=本期已動用
         bill_summary_raw = cc.get("bill_summary")
         bill_summary = bill_summary_raw if isinstance(bill_summary_raw, dict) else {}
         # payment_deadline = '2026-05-05T00:00:00' → 切 'T' 取 YYYY-MM-DD
@@ -125,14 +135,16 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # 真正最近繳款必須來自 billed_detail.TWD 的「本行自動扣繳」row。
         cathay_bill_due = None
         cathay_last_pay_amt = None
-        current_due = _finite_amount(cur0.get("currentPaymentAmount"))
+        with error_step('CATHAY-08-003-014'):
+            current_due = _finite_amount(cur0.get("currentPaymentAmount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-833-008', 'CATHAY-08-833-009', 'CATHAY-08-833-010'))
         if current_due is not None:
             cathay_bill_due = current_due
         latest_bill_raw = cc.get("latest_bill")
         latest_bill = latest_bill_raw if isinstance(latest_bill_raw, dict) else {}
         latest_twd_raw = latest_bill.get("twd")
         latest_twd = latest_twd_raw if isinstance(latest_twd_raw, dict) else {}
-        latest_bill_amount = _finite_amount(latest_twd.get("billAmount"))
+        with error_step('CATHAY-08-003-015'):
+            latest_bill_amount = _finite_amount(latest_twd.get("billAmount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-834-008', 'CATHAY-08-834-009', 'CATHAY-08-834-010'))
         if (latest_bill_amount is not None
                 and cathay_bill_status(latest_twd.get("payBillStatus")) is CathayBillStatus.PAID):
             cathay_bill_due = 0.0
@@ -154,10 +166,12 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
                         or not isinstance(record.get("desc"), str)
                         or not any(label in record["desc"] for label in ("自動扣繳", "繳款", "已繳"))):
                     continue
-                raw_amount = _finite_amount(record.get("amount"))
+                with error_step('CATHAY-08-003-025'):
+                    raw_amount = _finite_amount(record.get("amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-835-008', 'CATHAY-08-835-009', 'CATHAY-08-835-010'))
                 if raw_amount is None or raw_amount >= 0:
                     continue
-                pay_date = _payment_date(record.get("post_date"))
+                with error_step('CATHAY-08-003-026'):
+                    pay_date = _payment_date(record.get("post_date"))
                 if pay_date:
                     payment_candidates.append((pay_date, 0, abs(raw_amount)))
 
@@ -166,18 +180,24 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         for account in data.get("twd_transactions") or []:
             for txn in account.get("transactions") or []:
                 description = str(txn.get("desc") or "").strip()
-                amount = _finite_amount(txn.get("expend"))
-                pay_date = _payment_date(txn.get("account_date") or txn.get("datetime"))
+                with error_step('CATHAY-08-003-027'):
+                    amount = _finite_amount(txn.get("expend"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-836-008', 'CATHAY-08-836-009', 'CATHAY-08-836-010'))
+                with error_step('CATHAY-08-003-028'):
+                    pay_date = _payment_date(txn.get("account_date") or txn.get("datetime"))
                 if description != "信用卡款" or amount is None or amount <= 0 or not pay_date:
                     continue
-                payment_candidates.append((pay_date, 2, float(amount)))
+                with error_step('CATHAY-08-003-029'):
+                    payment_candidates.append((pay_date, 2, float(amount)))
 
         # 近 30 日活存列會自然消失；既有較新付款必須參與 max，避免倒退到舊帳單列。
         for row in known_cards:
-            pay_date = _payment_date(row.get("last_payment_date"))
-            amount = _finite_amount(row.get("last_payment_amount"))
+            with error_step('CATHAY-08-003-022'):
+                pay_date = _payment_date(row.get("last_payment_date"))
+            with error_step('CATHAY-08-003-023'):
+                amount = _finite_amount(row.get("last_payment_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-837-008', 'CATHAY-08-837-009', 'CATHAY-08-837-010'))
             if pay_date and amount is not None and amount > 0:
-                payment_candidates.append((pay_date, 1, float(amount)))
+                with error_step('CATHAY-08-003-030'):
+                    payment_candidates.append((pay_date, 1, float(amount)))
 
         if payment_candidates:
             cathay_last_pay_date, _, cathay_last_pay_amt = max(
@@ -211,11 +231,13 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             card["last_payment_amount"] = cathay_last_pay_amt
             # 最近繳款取 billed detail 或活存「信用卡款」中較新的真實入帳列
             card["last_payment_date"] = cathay_last_pay_date
-        store.upsert_cards(cards)
+        with error_step('CATHAY-08-003-016'):
+            store.upsert_cards(cards)
 
     # 餘額走勢（同日 UPSERT，跨日累積）
     if data.get("balance_history"):
-        delta["balance_days"] = store.upsert_balance_history(data["balance_history"])
+        with error_step('CATHAY-08-003-017'):
+            delta["balance_days"] = store.upsert_balance_history(data["balance_history"])
 
     # 台幣已過帳交易（append-only，回真正新增筆數）
     # 帳號正規化：cathay collector 在 twd_transactions[].account 加 4 個前綴 0
@@ -233,16 +255,17 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         # 外層帳號帶進每筆交易（交易本身沒有 account_no）
         for t in acct.get("transactions", []):
             if any(
-                t.get(field) is not None and _finite_amount(t.get(field)) is None
+                t.get(field) is not None and _finite_amount(t.get(field), _codes={'expend': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-838-008', 'CATHAY-08-838-009', 'CATHAY-08-838-010'), 'income': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-839-008', 'CATHAY-08-839-009', 'CATHAY-08-839-010'), 'balance': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-840-008', 'CATHAY-08-840-009', 'CATHAY-08-840-010')}[field]) is None
                 for field in ("expend", "income", "balance")
             ):
                 twd_skipped_invalid_amount += 1
                 continue
             t.setdefault("account_no", acct_no)
             txns.append(t)
-        twd_new += store.upsert_twd_txns(
-            txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
-        )
+        with error_step('CATHAY-08-003-018'):
+            twd_new += store.upsert_twd_txns(
+                txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+            )
     delta["twd_txn_new"] = twd_new
     if twd_skipped_invalid_amount:
         delta["twd_txn_skipped_invalid_amount"] = twd_skipped_invalid_amount
@@ -267,16 +290,17 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             desc = (t.get("desc") or "").strip()
             amt = t.get("amount")
             if any(
-                t.get(field) is not None and _finite_amount(t.get(field)) is None
+                t.get(field) is not None and _finite_amount(t.get(field), _codes={'amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-841-008', 'CATHAY-08-841-009', 'CATHAY-08-841-010'), 'consume_amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-842-008', 'CATHAY-08-842-009', 'CATHAY-08-842-010')}[field]) is None
                 for field in ("amount", "consume_amount")
             ):
                 billed_skipped_invalid_amount += 1
                 continue
             t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
             real_txns.append(t)
-        billed_new += store.upsert_card_billed(
-            real_txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
-        )
+        with error_step('CATHAY-08-003-019'):
+            billed_new += store.upsert_card_billed(
+                real_txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+            )
     delta["card_billed_new"] = billed_new
     if billed_skipped_summary:
         delta["card_billed_skipped_summary"] = billed_skipped_summary
@@ -311,7 +335,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             unb_skipped += 1
             continue
         if any(
-            t.get(field) is not None and _finite_amount(t.get(field)) is None
+            t.get(field) is not None and _finite_amount(t.get(field), _codes={'amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-843-008', 'CATHAY-08-843-009', 'CATHAY-08-843-010'), 'consume_amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-844-008', 'CATHAY-08-844-009', 'CATHAY-08-844-010')}[field]) is None
             for field in ("amount", "consume_amount")
         ):
             unb_skipped_invalid_amount += 1
@@ -320,10 +344,11 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         unb_txns.append(t)
     # fetch_ok: collector 明確帶回 unbilled_detail dict 才算可信；空 dict 是成功零筆，
     # key 缺失／非 dict 才是抓取失敗，必須保留舊 pending。
-    delta["card_unbilled"] = store.refresh_card_pending(
-        "unbilled", unb_txns, rules=rules,
-        fetch_ok=unb_ok and unb_skipped_invalid_amount == 0,
-        commit=False)
+    with error_step('CATHAY-08-003-002'):
+        delta["card_unbilled"] = store.refresh_card_pending(
+            "unbilled", unb_txns, rules=rules,
+            fetch_ok=unb_ok and unb_skipped_invalid_amount == 0,
+            commit=False)
     if unb_skipped:
         delta["card_unbilled_skipped_placeholder"] = unb_skipped
     if unb_skipped_invalid_amount:
@@ -352,7 +377,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
             cur_skipped += 1
             continue
         if any(
-            t.get(field) is not None and _finite_amount(t.get(field)) is None
+            t.get(field) is not None and _finite_amount(t.get(field), _codes={'amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-845-008', 'CATHAY-08-845-009', 'CATHAY-08-845-010'), 'consume_amount': ('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CATHAY-08-846-008', 'CATHAY-08-846-009', 'CATHAY-08-846-010')}[field]) is None
             for field in ("amount", "consume_amount")
         ):
             cur_skipped_invalid_amount += 1
@@ -360,27 +385,35 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         t["txn_type"] = classify.classify_by_desc_and_sign(desc, amt)
         cur_txns.append(t)
     # current_detail 同樣以 key 存在＋dict type 判可信，空 dict 可安全清 stale current。
-    delta["card_current"] = store.refresh_card_pending(
-        "current", cur_txns, rules=rules,
-        fetch_ok=cur_ok and cur_skipped_invalid_amount == 0)
+    with error_step('CATHAY-08-003-003'):
+        delta["card_current"] = store.refresh_card_pending(
+            "current", cur_txns, rules=rules,
+            fetch_ok=cur_ok and cur_skipped_invalid_amount == 0)
     if cur_skipped:
         delta["card_current_skipped_placeholder"] = cur_skipped
     if cur_skipped_invalid_amount:
         delta["card_current_skipped_invalid_amount"] = cur_skipped_invalid_amount
 
     # 每日數值快照（同日覆蓋，跨日保留時序）
-    store.put_daily_metric("net_present", data.get("net_present"), today)
-    store.put_daily_metric("investment", data.get("investment"), today)
-    store.put_daily_metric("insurance", data.get("insurance"), today)
-    store.put_daily_metric("loan", data.get("loan"), today)
-    store.put_daily_metric("balance_latest", data.get("balance_latest"), today)
+    with error_step('CATHAY-08-003-004'):
+        store.put_daily_metric("net_present", data.get("net_present"), today)
+    with error_step('CATHAY-08-003-005'):
+        store.put_daily_metric("investment", data.get("investment"), today)
+    with error_step('CATHAY-08-003-006'):
+        store.put_daily_metric("insurance", data.get("insurance"), today)
+    with error_step('CATHAY-08-003-007'):
+        store.put_daily_metric("loan", data.get("loan"), today)
+    with error_step('CATHAY-08-003-008'):
+        store.put_daily_metric("balance_latest", data.get("balance_latest"), today)
     # 信用卡彙總（額度/紅利/未出帳/最近帳單）
     card_summary = {
         k: cc.get(k) for k in ["quota", "reward_points", "next_bill", "latest_bill",
                                "total_consumption", "bill_summary"] if cc.get(k) is not None
     }
     if card_summary:
-        store.put_daily_metric("card_summary", card_summary, today)
+        with error_step('CATHAY-08-003-020'):
+            store.put_daily_metric("card_summary", card_summary, today)
 
-    store.log_sync(delta)
+    with error_step('CATHAY-08-003-009'):
+        store.log_sync(delta)
     return delta

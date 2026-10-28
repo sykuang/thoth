@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ast
-import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -613,16 +611,6 @@ def test_collect_logs_only_dbs_drilldown_metadata() -> None:
 
 
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
-    tree = ast.parse(Path(dbs_module.__file__).read_text())
-    crawler = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "DbsCrawler"
-    )
-    start = next(
-        index for index, node in enumerate(crawler.body)
-        if isinstance(node, ast.FunctionDef) and node.name == "collect"
-    )
-    payload = "\n".join(
-        ast.dump(node, include_attributes=False) for node in crawler.body[start:]
-    )
-    assert hashlib.sha256(payload.encode()).hexdigest() == "310af690662679eb5c861d68a05853a81bc2f18089d37236a57c23e589c3b0cc"
+    from tests.test_protected_ast import assert_protected_source
+
+    assert_protected_source(Path(dbs_module.__file__).read_text(), "dbs")
