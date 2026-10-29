@@ -694,7 +694,7 @@ class QueryLocator:
     def is_visible(self): return True
     def is_enabled(self): return True
     def is_checked(self): return True
-    def evaluate(self, *args): return True
+    def evaluate(self, script, *args) -> object: return True
     def input_value(self):
         return 'synthetic' if 'accountList' in self.selector else '2026/09/01'
     def inner_text(self):

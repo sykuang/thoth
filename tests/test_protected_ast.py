@@ -385,6 +385,15 @@ def registered_codes(bank):
                       and any(isinstance(t, ast.Name) and t.id == "CODES" for t in n.targets))
     codes = ast.literal_eval(assignment.value)
     assert type(codes) is dict
+    for node in tree.body:
+        if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == 'CODES' and node.value.func.attr == 'update'):
+            assert len(node.value.args) == 1 and not node.value.keywords
+            extra = ast.literal_eval(node.value.args[0])
+            assert type(extra) is dict and not (codes.keys() & extra.keys())
+            codes.update(extra)
     assert all(type(k) is str and type(v) is tuple and len(v) == 2
                and all(type(s) is str and s for s in v) for k, v in codes.items())
     return codes

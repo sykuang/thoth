@@ -206,7 +206,7 @@ INSPECT = r"""(el, args) => {
  let leaf;
  if(p.labels.length===2) {
    leaf=one(direct(group,'.level2-link'));
-   if(direct(group,'.level3-menu').length || all(group,actionable).length!==1) return false;
+   if(direct(group,'.level3-menu').length) return false;
  } else {
    const heading=one(direct(group,'.card-sub-title'));
    if(!text(heading,p.labels[1]) || !safe(heading) || !plain(heading) || heading.matches(actionable)) return false;
@@ -214,7 +214,6 @@ INSPECT = r"""(el, args) => {
    if(wrappers.length!==p.counts[2]) return false;
    const leaves=wrappers.flatMap(w=>direct(w,'.mib-obvious.card-sub-title[role="button"]'));
    if(leaves.filter(n=>text(n,p.labels[2])).length!==1) return false;
-   if(all(group,actionable).length!==leaves.length) return false;
    leaf=one(direct(wrappers[p.positions[2]],'.mib-obvious.card-sub-title[role="button"]'));
  }
  return leaf && safe(leaf) && plain(leaf) && leaf.getAttribute('role')==='button' &&

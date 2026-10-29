@@ -263,9 +263,20 @@ def test_legacy_actual_js_marker_collect_run_join(monkeypatch,fault,code,chinese
     assert not any(x[0]=='request' for x in trace if type(x) is tuple)
 
 
+# Separate the intentional CTW01001 repair from frozen TWD/history parity.
+# These literal JS contracts are pinned here, not read from production at runtime.
+OVERVIEW_CLICK = "(label) => { const b = [...document.querySelectorAll('a,button,[role=tab],[role=button],li')]\n            .find(e => e.offsetParent && (e.innerText || '').trim() === label);\n            if (!b) return false; b.click(); return true; }"
+OVERVIEW_READ = "root => [...root.querySelectorAll('.widget-balance-detail-down-container')].map(el => {\n            const one = selector => {\n                const nodes = el.querySelectorAll(selector);\n                return nodes.length === 1 ? nodes[0].textContent.trim() : null;\n            };\n            return {\n                no: one('.widget-balance-detail-down-account-no'),\n                category: one('.widget-balance-detail-down-type'),\n                currency: one('.widget-balance-detail-down-cur'),\n                amount: one('.widget-balance-detail-down-real-amount'),\n                pairs: [...el.querySelectorAll('.widget-balance-detail-down-cur-list')]\n                    .map(row => [...row.children].map(c => c.textContent.trim()))\n            };\n        })"
+OVERVIEW_FOOTER = '.ctwA1001 .summary-block .footer-btn[role="button"]:visible'
+OVERVIEW_ROOT = '.ctw01001:visible'
+OVERVIEW_TW = '.mib-tab #tw[role="tab"][aria-selected="true"]:visible'
+OVERVIEW_FR = '.mib-tab #fr[role="tab"]'
+OVERVIEW_SELECTED_FR = '.mib-tab #fr[role="tab"][aria-selected="true"]:visible'
+
+
 def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_date=None,
                 two_accounts=False, timeline_fault=None, calendar_state=False, native_observation=None,
-                cursor_day='2026-09-08', positive=False):
+                cursor_day='2026-09-08', positive=False, module=esun):
     """Native guards, plan, capture, admission and query remain production code.
     Only DOM/CDP/request events and preauthenticated setup are synthetic."""
     from datetime import date
@@ -284,7 +295,7 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
     monkeypatch.setattr(query.time,'monotonic',lambda:next(ticks)/100)
     monkeypatch.setenv('BANK_CRAWLER_HISTORY_MODE','incremental')
     collector=capture.SpaCollector()
-    crawler=object.__new__(esun.EsunCrawler)
+    crawler=object.__new__(module.EsunCrawler)
     crawler.transaction_cursors={'twd_transactions':{a['accountNo']:date.fromisoformat(cursor_day) for a in accounts}}
     crawler._logged_in=lambda _:True  # Auth is outside this finite terminal audit.
     def request(path,body,request,*,finish=True):
@@ -318,7 +329,22 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
             if 'not-login' in s:return 0
             if s.endswith('input[name=startDate][readonly]') or s.endswith('input[name=endDate][readonly]'):return 1
             return super().count()
-        def wait_for(self,**kw):trace.append(('wait_for',self.selector,kw))
+        def wait_for(self,**kw):
+            trace.append(('wait_for',self.selector,kw))
+            if self.selector in (OVERVIEW_FOOTER,OVERVIEW_ROOT,OVERVIEW_TW,OVERVIEW_SELECTED_FR):
+                assert kw==dict(state='visible',timeout=10000)
+                expected={OVERVIEW_FOOTER:('home',),OVERVIEW_ROOT:('tw','fr'),
+                          OVERVIEW_TW:('tw',),OVERVIEW_SELECTED_FR:('fr',)}
+                assert page.overview_phase in expected[self.selector]
+        def element_handle(self):
+            assert self.selector==OVERVIEW_ROOT and page.overview_phase=='tw'
+            generation=page.overview_generation
+            trace.append(('overview-handle',self.selector))
+            def wait(state,**kw):
+                trace.append(('overview-hidden',state,kw))
+                assert state=='hidden' and kw==dict(timeout=10000)
+                assert page.overview_phase=='fr' and page.overview_generation!=generation
+            return SimpleNamespace(wait_for_element_state=wait)
         def is_checked(self):return page.radio_checked
         def evaluate_handle(self,script):
             trace.append(('handle',self.selector))
@@ -329,7 +355,16 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
             if script==collection.BLOCKER_SNAPSHOT:return [True,'unknown','none']
             return True
         def evaluate(self,script,*args):
-            trace.append(('evaluate',self.selector,'SAFE' if script in (query.SAFE,query.SAFE_REASON)
+            if self.selector==OVERVIEW_ROOT:
+                assert script==OVERVIEW_READ and not args
+                assert page.overview_phase in ('tw','fr')
+                trace.append(('overview-read',self.selector,script,args))
+                if page.overview_phase=='fr':
+                    trace.append(('overview-end',))
+                    return []
+                return [dict(no=a['accountNo'],category='臺幣綜存',currency=None,
+                             amount='84',pairs=[]) for a in accounts]
+            trace.append(('evaluate',self.selector,'SAFE'  if script in (query.SAFE,query.SAFE_REASON)
                           else 'SETTLE' if 'getAnimations' in script else script))
             if script in (query.SAFE,query.SAFE_REASON) and safe_fault:
                 result=safe_fault(self,script)
@@ -365,6 +400,12 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
             s=self.selector
             trace.append(('click',s,kw))
             if page.native_failure and page.native_failure in s:raise TimeoutError('synthetic unrelated native failure')
+            if s==OVERVIEW_FOOTER:
+                assert page.overview_phase=='home' and kw==dict(timeout=10000)
+                page.overview_phase='tw';page.overview_generation+=1;return
+            if s==OVERVIEW_FR:
+                assert page.overview_phase=='tw' and kw==dict(timeout=10000)
+                page.overview_phase='fr';page.overview_generation+=1;return
             if s==navigation.HEADER:page.menu_open=True;return
             if '.level2-link' in s:
                 page.menu_open=False;request(capture.PATHS[1],body(),{'account':None});return
@@ -408,6 +449,8 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
         native_failure=None
         make_prequery_unavailable=False
         fail_date_read=False
+        overview_phase=None
+        overview_generation=0
         def __init__(self):
             super().__init__();self.values={'startDate':'2026/09/01','endDate':'2026/09/08'}
             self.submissions=[];self.safe_counts={}
@@ -416,7 +459,9 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
             crawler._spa_login_baseline=collector.snapshot()
             request(capture.PATHS[0],{'menuList':menu},{'locale':'zh-TW'})
             return True
-        def locator(self,s):return Locator(self,s)
+        def locator(self,s):
+            if self.overview_phase is not None:trace.append(('overview-locator',s))
+            return Locator(self,s)
         def evaluate_handle(self,script):
             trace.append(('document-handle',script))
             return SimpleNamespace(evaluate=lambda s,*args:self.evaluate(s,*args),dispose=lambda:trace.append('document-dispose'))
@@ -438,8 +483,25 @@ def spa_surface(monkeypatch, *, safe_fault=None, destination_fault=None, wrong_d
             if 'new Date();' in script:return [2026,9,8]
             if 'ds.map' in script:return [self.values['startDate'],self.values['endDate']]
             if 'innerWidth' in script:return 1200
-            if script=='document.body.innerText':return '\n'.join(a['accountNo']+' 臺幣綜存\n84\n' for a in accounts)
-            if '(label) =>' in script:return False
+            if script=='document.body.innerText':
+                assert not args and self.overview_phase in ('legacy_tw','legacy_fr')
+                trace.append(('overview-body',script,args))
+                if self.overview_phase=='legacy_fr':
+                    trace.append(('overview-end',));return ''
+                return '\n'.join(a['accountNo']+' 臺幣綜存\n84\n' for a in accounts)
+            if '(label) =>' in script:
+                assert script==OVERVIEW_CLICK and len(args)==1
+                label=args[0]
+                if label=='個人首頁':
+                    assert self.overview_phase is None
+                    trace.append(('overview-start',));self.overview_phase='home'
+                elif label=='交易明細':
+                    assert self.overview_phase=='home';self.overview_phase='legacy_tw'
+                else:
+                    assert label=='外幣' and self.overview_phase=='legacy_tw'
+                    self.overview_phase='legacy_fr'
+                trace.append(('overview-click',script,args))
+                return True
             raise AssertionError('unexpected SPA script')
         def wait_for_timeout(self,ms):trace.append(('wait',ms))
         def wait_for_function(self,*args,**kw):
@@ -963,6 +1025,48 @@ def test_two_accounts_success_retains_complete_coverage(monkeypatch):
     windows=result['data']['history_coverage']['domains'][0]['windows']
     assert [w['identity'] for w in windows]==['0000000000001','0000000000002']
     assert all(w['status']=='explicit_empty' for w in windows)
+    assert result['data']['accounts']==[
+        dict(account_no=no,category='臺幣綜存',currency='TWD',balance=84.0,source_frame='')
+        for no in ('0000000000001','0000000000002')]
+    assert_overview_trace(trace,legacy=False)
+
+
+def assert_overview_trace(trace, *, legacy):
+    starts=[i for i,event in enumerate(trace) if event==('overview-start',)]
+    ends=[i for i,event in enumerate(trace) if event==('overview-end',)]
+    assert len(starts)==len(ends)==1 and starts[0]<ends[0]
+    visible=dict(state='visible',timeout=10000)
+    expected=[('overview-click',OVERVIEW_CLICK,('個人首頁',))]
+    if legacy:
+        expected += [('wait',6000),('overview-click',OVERVIEW_CLICK,('交易明細',)),
+                     ('wait',6000),('overview-body','document.body.innerText',()),
+                     ('overview-click',OVERVIEW_CLICK,('外幣',)),('wait',2500),
+                     ('overview-body','document.body.innerText',())]
+    else:
+        expected += [('overview-locator',OVERVIEW_FOOTER),('wait_for',OVERVIEW_FOOTER,visible),
+                     ('click',OVERVIEW_FOOTER,dict(timeout=10000)),
+                     ('overview-locator',OVERVIEW_ROOT),('wait_for',OVERVIEW_ROOT,visible),
+                     ('overview-locator',OVERVIEW_TW),('wait_for',OVERVIEW_TW,visible),
+                     ('overview-read',OVERVIEW_ROOT,OVERVIEW_READ,()),
+                     ('overview-handle',OVERVIEW_ROOT),('overview-locator',OVERVIEW_FR),
+                     ('click',OVERVIEW_FR,dict(timeout=10000)),
+                     ('overview-hidden','hidden',dict(timeout=10000)),
+                     ('wait_for',OVERVIEW_ROOT,visible),
+                     ('overview-locator',OVERVIEW_SELECTED_FR),('wait_for',OVERVIEW_SELECTED_FR,visible),
+                     ('overview-read',OVERVIEW_ROOT,OVERVIEW_READ,())]
+    assert trace[starts[0]+1:ends[0]]==expected
+    # No filtering: every action outside the intentionally changed reader remains.
+    return trace[:starts[0]],trace[ends[0]+1:]
+
+
+def assert_history_and_overview_repair(outputs):
+    old,new=outputs
+    assert old[0]==new[0]  # Complete collected output, coverage and financial values.
+    assert old[2:]==new[2:]  # All budgets and recovery evidence.
+    assert assert_overview_trace(old[1],legacy=True)==assert_overview_trace(new[1],legacy=False)
+    assert new[0]['data']['accounts']==[
+        dict(account_no=no,category='臺幣綜存',currency='TWD',balance=84.0,source_frame='')
+        for no in ('0000000000001','0000000000002')]
 
 
 def in_caller(name):
@@ -1031,7 +1135,8 @@ def test_original_current_switch_and_recovery_native_order_budget(monkeypatch,re
             def fault(target,script):
                 if recover and target.selector==query.ROOT and len(seen)<2:
                     value=observations[len(seen)];seen.append(value);return value
-            crawler,page,collector,trace=spa_surface(patcher,two_accounts=True,safe_fault=fault)
+            crawler,page,collector,trace=spa_surface(patcher,two_accounts=True,safe_fault=fault,
+                                                     module=frozen_bank() if old else esun)
             budgets=[]
             def spy(*args,**kwargs):
                 try:return (original_query if old else current_query)(*args,**kwargs)
@@ -1043,7 +1148,7 @@ def test_original_current_switch_and_recovery_native_order_budget(monkeypatch,re
             assert page.submissions==[0,1]
             assert budgets==[[5],[5]]
             outputs.append((result,trace,budgets,seen))
-    assert outputs[0]==outputs[1]
+    assert_history_and_overview_repair(outputs)
 
 
 def test_safe_reason_a_b_success_then_independent_native_failure_does_not_leak(monkeypatch):
@@ -1142,7 +1247,8 @@ def test_original_current_window_then_account_transition_order_and_budget(monkey
     outputs=[]
     for old in (True,False):
         with monkeypatch.context() as patcher:
-            crawler,page,collector,trace=spa_surface(patcher,two_accounts=True,calendar_state=True,cursor_day='2026-01-08')
+            crawler,page,collector,trace=spa_surface(patcher,two_accounts=True,calendar_state=True,
+                                                     cursor_day='2026-01-08',module=frozen_bank() if old else esun)
             budgets=[]
             def spy(*args,**kwargs):
                 try:return (original_query if old else current_query)(*args,**kwargs)
@@ -1154,7 +1260,7 @@ def test_original_current_window_then_account_transition_order_and_budget(monkey
             assert page.submissions==[0,0,1,1]
             assert budgets==[[12],[11],[11],[11]]
             outputs.append((result,trace,budgets))
-    assert outputs[0]==outputs[1]
+    assert_history_and_overview_repair(outputs)
 
 
 def test_timeline_a_b_success_then_independent_native_owner_failure(monkeypatch):

@@ -987,32 +987,89 @@ class EsunCrawler(BankCrawler):
                 prove()
 
     def _spa_overview_accounts(self, page) -> list[dict]:
-        # The overview (account + 臺幣/外幣 tabs) lives on the 交易明細 page.
+        """Read CTW01001's native fields, never CTW01002's query form/aliases."""
+        import math
+
         click = """(label) => { const b = [...document.querySelectorAll('a,button,[role=tab],[role=button],li')]
             .find(e => e.offsetParent && (e.innerText || '').trim() === label);
             if (!b) return false; b.click(); return true; }"""
-        texts = []
-        try:
-            # Collection may end on a card page; go home first so 交易明細 is reachable.
-            with error_step('ESUN-06-414-001'):
-                if page.evaluate(click, "個人首頁") is True:
-                    with error_step('ESUN-06-415-001'):
-                        page.wait_for_timeout(6000)
-            with error_step('ESUN-06-416-001'):
-                if page.evaluate(click, "交易明細") is True:
-                    with error_step('ESUN-06-417-001'):
-                        page.wait_for_timeout(6000)
-            with error_step('ESUN-06-418-001'):
-                texts.append(page.evaluate("document.body.innerText") or "")
-            with error_step('ESUN-06-419-001'):
-                if page.evaluate(click, "外幣") is True:
-                    with error_step('ESUN-06-420-001'):
-                        page.wait_for_timeout(2500)
-                    with error_step('ESUN-06-421-001'):
-                        texts.append(page.evaluate("document.body.innerText") or "")
-        except Exception:
-            pass
-        return self._parse_account_overview([{"url": "", "text_preview": t} for t in texts])
+        with error_step('ESUN-06-414-001'):
+            if page.evaluate(click, "個人首頁") is not True:
+                raise with_error_code(ValueError('esun-overview-home-unavailable'), 'ESUN-06-880-001')
+        with error_step('ESUN-06-880-009'):
+            footer = page.locator('.ctwA1001 .summary-block .footer-btn[role="button"]:visible')
+        with error_step('ESUN-06-880-002'):
+            footer.wait_for(state='visible', timeout=10000)
+        with error_step('ESUN-06-880-003'):
+            footer.click(timeout=10000)
+        with error_step('ESUN-06-880-010'):
+            root = page.locator('.ctw01001:visible')
+        with error_step('ESUN-06-880-004'):
+            root.wait_for(state='visible', timeout=10000)
+        read = """root => [...root.querySelectorAll('.widget-balance-detail-down-container')].map(el => {
+            const one = selector => {
+                const nodes = el.querySelectorAll(selector);
+                return nodes.length === 1 ? nodes[0].textContent.trim() : null;
+            };
+            return {
+                no: one('.widget-balance-detail-down-account-no'),
+                category: one('.widget-balance-detail-down-type'),
+                currency: one('.widget-balance-detail-down-cur'),
+                amount: one('.widget-balance-detail-down-real-amount'),
+                pairs: [...el.querySelectorAll('.widget-balance-detail-down-cur-list')]
+                    .map(row => [...row.children].map(c => c.textContent.trim()))
+            };
+        })"""
+        accounts, seen = [], set()
+        for tab, read_code, codes in (
+            ('tw', 'ESUN-06-418-001', ('ESUN-06-881-001', 'ESUN-06-881-002', 'ESUN-06-881-003', 'ESUN-06-881-004', 'ESUN-06-881-005', 'ESUN-06-881-006', 'ESUN-06-881-007')),
+            ('fr', 'ESUN-06-421-001', ('ESUN-06-882-001', 'ESUN-06-882-002', 'ESUN-06-882-003', 'ESUN-06-882-004', 'ESUN-06-882-005', 'ESUN-06-882-006', 'ESUN-06-882-007')),
+        ):
+            if tab == 'fr':
+                with error_step('ESUN-06-880-005'):
+                    previous = root.element_handle()
+                    if previous is None:
+                        raise with_error_code(ValueError('esun-overview-root-missing'), 'ESUN-06-880-005')
+                with error_step('ESUN-06-880-011'):
+                    fx_tab = page.locator('.mib-tab #fr[role="tab"]')
+                with error_step('ESUN-06-880-006'):
+                    fx_tab.click(timeout=10000)
+                with error_step('ESUN-06-880-007'):
+                    previous.wait_for_element_state('hidden', timeout=10000)
+                with error_step('ESUN-06-880-008'):
+                    root.wait_for(state='visible', timeout=10000)
+            with error_step(codes[6]):
+                selected_tab = page.locator(f'.mib-tab #{tab}[role="tab"][aria-selected="true"]:visible')
+            with error_step(codes[5]):
+                selected_tab.wait_for(state='visible', timeout=10000)
+            with error_step(read_code):
+                rows = root.evaluate(read)
+            for row in rows:
+                no, category = row['no'], row['category']
+                if not isinstance(no, str) or re.fullmatch(r'[0-9]{13}', no) is None:
+                    raise with_error_code(ValueError('esun-overview-account-number'), codes[0])
+                if not category or not re.search(r'[A-Za-z\u4e00-\u9fff]', category):
+                    raise with_error_code(ValueError('esun-overview-account-category'), codes[1])
+                pairs = row['pairs'] or [[row['currency'] if tab == 'fr' else 'TWD', row['amount']]]
+                for pair in pairs:
+                    if len(pair) != 2:
+                        raise with_error_code(ValueError('esun-overview-currency-row'), codes[2])
+                    currency, amount = pair
+                    if (not isinstance(currency, str) or re.fullmatch(r'[A-Z]{3}', currency) is None
+                            or (currency == 'TWD') != (tab == 'tw')):
+                        raise with_error_code(ValueError('esun-overview-account-currency'), codes[2])
+                    if not isinstance(amount, str) or re.fullmatch(r'-?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?', amount) is None:
+                        raise with_error_code(ValueError('esun-overview-account-balance'), codes[3])
+                    balance = float(amount.replace(',', ''))
+                    if not math.isfinite(balance):
+                        raise with_error_code(ValueError('esun-overview-account-balance'), codes[3])
+                    key = (no, currency)
+                    if key in seen:
+                        raise with_error_code(ValueError('esun-overview-account-duplicate'), codes[4])
+                    seen.add(key)
+                    accounts.append(dict(account_no=no, category=category, currency=currency,
+                                         balance=balance, source_frame=''))
+        return accounts
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
@@ -1052,8 +1109,8 @@ class EsunCrawler(BankCrawler):
                     prove()
                 self._esun_spa_phase = 'incomplete_result' if result.error else 'capture_publication'
                 self._diagnostic_stage = "collect_validation"
-                # Live 2026-10-02: the SPA path never published accounts (0 rows). Read the
-                # home overview after every proof has run: TWD tab, then the 外幣 tab.
+                # Read native CTW01001 account fields, not CTW01002 transaction enquiry.
+                # BankCrawler.run revalidates retained proofs before publication.
                 if result.error is None:
                     result.accounts = self._spa_overview_accounts(page)
                     if not result.accounts:
