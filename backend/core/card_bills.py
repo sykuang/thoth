@@ -8,7 +8,7 @@ from typing import Any
 
 from backend.core.base import NormalizedCardBillFact, validate_card_bill_facts
 from backend.core.money import native_money
-from backend.core.store import BankStore
+from backend.core.store import BankStore, CARD_BILL_SNAPSHOT_FIELDS
 
 
 MAX_CARD_BILL_MONEY = Decimal("100000000")
@@ -201,12 +201,23 @@ def publish_card_bill_facts(
     out["card_bill_facts"] = [fact for fact in facts if fact is not None] if complete else []
 
 
+def capture_card_bill_snapshot(store: BankStore) -> dict[tuple, tuple]:
+    """Capture before collection, never refresh this baseline during persistence."""
+    return {
+        (store.bank, store.user_id, row["card_no"]): tuple(
+            row[column] for column in CARD_BILL_SNAPSHOT_FIELDS
+        )
+        for row in store.list_cards()
+    }
+
+
 def apply_card_bill_facts(
     store: BankStore,
     *,
     facts_ok: bool | None,
     facts: list[NormalizedCardBillFact],
     commit: bool = True,
+    bill_snapshot=None,
 ) -> int:
     """Apply authoritative bill facts to known card inventory, fail-closed."""
     with error_step('SYS-08-029-001'):
@@ -246,4 +257,6 @@ def apply_card_bill_facts(
             row["last_payment_date"] = card_fact["last_payment_date"]
         rows.append(row)
     with error_step('SYS-08-029-003'):
-        return store.update_card_bill_facts(rows, commit=commit)
+        if bill_snapshot is None:
+            return store.update_card_bill_facts(rows, commit=commit)
+        return store.update_card_bill_facts(rows, commit=commit, bill_snapshot=bill_snapshot)

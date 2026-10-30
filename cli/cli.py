@@ -81,6 +81,11 @@ def _cmd_sync(args):
             crawler.configure_transaction_cursor(
                 "card_billed_transactions", store.latest_card_transaction_dates(),
             )
+        bill_snapshot = None
+        if args.bank == "dbs":
+            from backend.core.card_bills import capture_card_bill_snapshot
+
+            bill_snapshot = capture_card_bill_snapshot(store)
         with error_step(bank_error_id(args.bank, "09-900-001")):
             result = crawler.run(login_url=login_url, headless=args.headless)
         if result.get("error"):
@@ -109,8 +114,11 @@ def _cmd_sync(args):
             rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
         from backend.core.persist import persist_collected
 
+        persist_options: dict = {"rules": rules}
+        if args.bank == "dbs":
+            persist_options["bill_snapshot"] = bill_snapshot
         with error_step(bank_error_id(args.bank, "08-900-001")):
-            delta = persist_collected(args.bank, data, store, rules=rules)
+            delta = persist_collected(args.bank, data, store, **persist_options)
         if args.bank not in {"esun", "rakuten"}:
             with error_step(bank_error_id(args.bank, "09-005-001")):
                 _write_private_json(raw, result)

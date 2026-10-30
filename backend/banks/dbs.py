@@ -82,7 +82,10 @@ def _dbs_card_bill_fact(out: dict):
         elif not fee_due:
             with contextlib.suppress(Exception):
                 _log(format_error_id('DBS-06-002-001', bank="dbs"))
-            return None
+            # A partial fee view must not block a complete dashboard statement.
+            # Require matching totals; never subtract across conflicting sources.
+            if fee_due is not None or statement_amount != fee_amount or not dashboard_due:
+                return None
         elif fee_due != dashboard_due:
             with contextlib.suppress(Exception):
                 _log(format_error_id('DBS-06-003-001', bank="dbs"))

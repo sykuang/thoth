@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from backend.server.db_facade.cards import CardSummary
 from backend.server.routers import cards as cards_router
 
@@ -11,6 +13,36 @@ class _FakeDate(date):
     @classmethod
     def today(cls) -> "_FakeDate":
         return cls(2026, 7, 3)
+
+
+@pytest.mark.parametrize("bank", ["dbs", "fubon", "hsbc"])
+@pytest.mark.parametrize(("due_date", "expected"), [
+    ("2026-07-04", "due"),
+    ("2026-07-03", "due"),
+    ("2026-07-02", "overdue"),
+    (None, "unknown"),
+])
+def test_payment_equal_to_positive_remaining_due_does_not_settle_bill(
+    monkeypatch, bank, due_date, expected,
+):
+    monkeypatch.setattr(cards_router, "date", _FakeDate)
+    # Original bill 800, posted payment 400: canonical remaining due is still 400.
+    card = CardSummary(
+        bank=bank,
+        card_no="****0001",
+        bill_due_amount=400.0,
+        statement_close_date="2026-06-18",
+        payment_due_date=due_date,
+        last_payment_amount=400.0,
+        last_payment_date="2026-07-01",
+    )
+
+    response = cards_router._card_to_response(card)
+
+    assert response["bill_status"] == expected
+    assert response["bill_due_amount"] == 400.0
+    assert response["last_payment_amount"] == 400.0
+    assert response["last_payment_date"] == "2026-07-01"
 
 
 def test_positive_remaining_due_is_overdue_even_with_recent_partial_payment(monkeypatch):
@@ -136,13 +168,14 @@ class _AfterFubonOctDue(date):
         return cls(2026, 10, 5)
 
 
-def test_full_current_cycle_payment_not_yet_posted_is_paid(monkeypatch):
+def test_equal_current_cycle_payment_with_positive_remaining_due_is_overdue(monkeypatch):
     monkeypatch.setattr(cards_router, "date", _AfterFubonOctDue)
     card = dict(bank="fubon", card_no="****2099", bill_due_amount=25724.0,
                 statement_close_date="2026-09-16", payment_due_date="2026-10-02",
                 last_payment_amount=25724.0, last_payment_date="2026-10-05")
 
-    assert cards_router._compute_bill_status(CardSummary(**card)) == "paid"
+    # Canonical remaining due is not the original bill; equality cannot prove settlement.
+    assert cards_router._compute_bill_status(CardSummary(**card)) == "overdue"
     # partial or previous-cycle payment still overdue
     assert cards_router._compute_bill_status(
         CardSummary(**{**card, "last_payment_amount": 25000.0})) == "overdue"

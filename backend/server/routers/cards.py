@@ -79,9 +79,9 @@ def _compute_bill_status(card: CardSummary) -> str:
 
       no_payment_required: remaining due == 0，且沒有本期付款
       paid               : remaining due == 0，且有本期付款
-      overdue            : 已過 due_date 且沒最近繳款紀錄
-      due                : 還沒到 due_date (正常待繳)
-      unknown            : 沒 payment_due_date 也沒 last_payment_date
+      overdue            : remaining due > 0，且已過 due_date
+      due                : remaining due > 0，且尚未超過 due_date
+      unknown            : remaining due 未知，或正數但沒有 due_date
     """
     due = _parse_iso_date(card.payment_due_date)
     last_pay = _parse_iso_date(card.last_payment_date)
@@ -96,20 +96,11 @@ def _compute_bill_status(card: CardSummary) -> str:
             return "paid"
         return "no_payment_required"
 
-    # Banks (e.g. Fubon) keep the remaining due at the full bill until the payment
-    # posts. A current-cycle payment of exactly that amount settles it; a posted
-    # payment would already have reduced the remaining due (HSBC partial case).
-    if (last_pay and payment_boundary and last_pay >= payment_boundary
-            and card.last_payment_amount is not None
-            and abs(card.last_payment_amount - card.bill_due_amount) < 0.5):
-        return "paid"
+    # Canonical remaining due already reflects payments; matching one cannot settle it.
     if due is None:
         return "unknown"
     if today <= due:
         return "due"
-    # today > due. A payment before the current statement close belongs to the
-    # previous cycle and cannot settle the displayed statement. Keep the old
-    # due-30 fallback only for banks without a statement close date.
     return "overdue"
 
 

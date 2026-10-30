@@ -67,7 +67,7 @@ def _validate_history_coverage_before_persist(coverage):
         )
 
 
-def persist_collected(bank, data, store, rules=None):
+def persist_collected(bank, data, store, rules=None, *, bill_snapshot=None):
     """Persist one collected result, then apply its canonical card-bill facts."""
     try:
         target = PERSISTERS[bank]
@@ -102,6 +102,7 @@ def persist_collected(bank, data, store, rules=None):
                 facts_ok=facts_ok,
                 facts=facts,
                 commit=not atomic,
+                bill_snapshot=bill_snapshot,
             )
         if data.get("card_bill_facts_ok") is not None:
             delta["card_bill_facts_applied"] = applied

@@ -187,9 +187,13 @@ def test_catalog_preserves_all_3693_existing_ids_and_chinese():
     import json
     from backend.core.error_catalog.persist import CODES
     added = {key: value for key, value in CODES.items() if value[1] == NATIVE_REASON}
-    old = {key: value for key, value in CODES.items() if key not in added}
+    revision_added = {
+        "SYS-08-173-041": ("PostgreSQL 信用卡帳單版本遷移", "新增權威帳單版本欄位失敗"),
+    }
+    assert {key: CODES[key] for key in revision_added} == revision_added
+    old = {key: value for key, value in CODES.items() if key not in added and key not in revision_added}
     assert len(added) == 336
-    assert len(CODES) == 4029 <= 4096
+    assert len(CODES) == 4030 <= 4096
     assert len(old) == 3693
     assert hashlib.sha256(json.dumps(old, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == "315a87274876c52ff6dfa441b40f7913043bbf45eb743e9d1fbb5441438b1fc3"
 

@@ -22,6 +22,7 @@ def test_dbs_optional_fact_rejection_survives_diagnostic_failure(monkeypatch, mo
         payment.pop("alreadyPaid")
     elif reason == "due":
         fee.pop("payment_due_date")
+        payment.pop("amount")  # The independent dashboard fallback is incomplete too.
     else:
         payment["dueDate"] = "2026-09-11"
     data = {"api_responses": {"liabilities": [{"resp": {"creditCard": {"paymentDetails": payment}}}]},

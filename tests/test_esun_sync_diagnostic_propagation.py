@@ -29,6 +29,7 @@ class HostileValue:
 def _sink(monkeypatch, crawler):
     failures = []
     fake_store = SimpleNamespace(
+        list_cards=Mock(return_value=[]),
         latest_twd_transaction_dates=lambda: {},
         latest_card_transaction_dates=lambda: {},
         close=Mock(),

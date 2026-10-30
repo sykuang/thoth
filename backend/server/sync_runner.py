@@ -723,6 +723,11 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
             crawler.configure_transaction_cursor(
                 "card_billed_transactions", store.latest_card_transaction_dates(),
             )
+        bill_snapshot = None
+        if bank == "dbs":
+            from backend.core.card_bills import capture_card_bill_snapshot
+
+            bill_snapshot = capture_card_bill_snapshot(store)
         with error_step(bank_error_id(bank, "09-900-001")):
             result = crawler.run(login_url=login_url, headless=headless)
         if result.get("error"):
@@ -741,9 +746,12 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
 
         from backend.core.persist import persist_collected
 
+        persist_options: dict = {"rules": rules}
+        if bank == "dbs":
+            persist_options["bill_snapshot"] = bill_snapshot
         try:
             with error_step(bank_error_id(bank, "08-900-001")):
-                delta = persist_collected(bank, data, store, rules=rules)
+                delta = persist_collected(bank, data, store, **persist_options)
         except Exception as exc:
             raise _PersistenceError("persistence_failed") from exc
         from backend.server.auto_debit_payments import apply_auto_debit_payments

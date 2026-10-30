@@ -30,11 +30,17 @@ from contextlib import contextmanager
 from datetime import date, datetime, UTC
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
+from uuid import uuid4
 
 from backend.core import account_classify, bank_pg
 from backend.core.money import native_money
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
+
+CARD_BILL_SNAPSHOT_FIELDS = (
+    "bill_due_amount", "statement_close_date", "payment_due_date",
+    "last_payment_amount", "last_payment_date", "bill_facts_revision",
+)
 
 # Phase C-Suggestion (2026-06-17): per-process migration cache.
 # _migrate 跑 30+ PRAGMA + ALTER 累積 ~50ms 每次, server-mode 每 sync request
@@ -634,6 +640,7 @@ CREATE TABLE IF NOT EXISTS cards (
     bill_due_amount      REAL,    -- 本期帳單應繳金額 (HSBC: Last Statement Amount)
     last_payment_amount  REAL,    -- 最近一次繳款金額 (HSBC: Last Payment Amount)
     last_payment_date    TEXT,    -- 最近一次繳款日 (HSBC: Last Payment Date, YYYY-MM-DD)
+    bill_facts_revision  TEXT,
     -- 2026-06-14 使用者指示: 過期卡 UI 不顯示但 txn 紀錄保留
     -- active=1 顯示, active=0 隱藏 (DBS isDisplayImg=False / 其他行各自判斷)
     -- transactions / stats / current_month_spending 一律不過濾, 保留歷史計算
@@ -1042,6 +1049,7 @@ class BankStore:
             ("bill_due_amount", "ALTER TABLE cards ADD COLUMN bill_due_amount REAL"),
             ("last_payment_amount", "ALTER TABLE cards ADD COLUMN last_payment_amount REAL"),
             ("last_payment_date", "ALTER TABLE cards ADD COLUMN last_payment_date TEXT"),
+            ("bill_facts_revision", "ALTER TABLE cards ADD COLUMN bill_facts_revision TEXT"),
             # Phase 8.2 C (2026-06-14): user 覆寫卡片暱稱
             ("nickname_overwrite", "ALTER TABLE cards ADD COLUMN nickname_overwrite TEXT"),
         ]:
@@ -2981,7 +2989,8 @@ class BankStore:
                 dict(row)
                 for row in self.conn.execute(
                     "SELECT card_no, name, association, type, is_cube, active, "
-                    "last_payment_amount, last_payment_date "
+                    "bill_due_amount, statement_close_date, payment_due_date, "
+                    "last_payment_amount, last_payment_date, bill_facts_revision "
                     "FROM cards WHERE user_id = ?",
                     (self.user_id,),
                 )
@@ -3028,14 +3037,18 @@ class BankStore:
                 payment_due_date = _normalize_date_text(c.get("payment_due_date"))
             with error_step('SYS-08-161-003'):
                 last_payment_date = _normalize_date_text(c.get("last_payment_date"))
+            revision = str(uuid4()) if any(value is not None for value in (
+                c.get("bill_due_amount"), statement_close_date, payment_due_date,
+                c.get("last_payment_amount"), last_payment_date,
+            )) else None
             with error_step('SYS-08-161-004'):
                 self.conn.execute(
                     """INSERT INTO cards (user_id, card_no, name, association, type, is_cube,
                                       credit_limit, used_credit,
                                       statement_close_date, payment_due_date,
                                       bill_due_amount, last_payment_amount, last_payment_date,
-                                      active, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                      active, updated_at, bill_facts_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(user_id, card_no) DO UPDATE SET
                      name=excluded.name, association=excluded.association, type=excluded.type,
                      is_cube=excluded.is_cube,
@@ -3046,6 +3059,7 @@ class BankStore:
                      bill_due_amount=COALESCE(excluded.bill_due_amount, cards.bill_due_amount),
                      last_payment_amount=COALESCE(excluded.last_payment_amount, cards.last_payment_amount),
                      last_payment_date=COALESCE(excluded.last_payment_date, cards.last_payment_date),
+                     bill_facts_revision=COALESCE(excluded.bill_facts_revision, cards.bill_facts_revision),
                      active=CASE WHEN ? IS NULL THEN cards.active ELSE ? END,
                      updated_at=excluded.updated_at""",
                     (self.user_id, c.get("number"), c.get("name"), c.get("association"), c.get("type"),
@@ -3054,7 +3068,7 @@ class BankStore:
                      statement_close_date, payment_due_date,
                      c.get("bill_due_amount"), c.get("last_payment_amount"), last_payment_date,
                      active_insert,
-                     now,
+                     now, revision,
                      active_update_marker, active_update_marker),
                 )
         if commit:
@@ -3062,7 +3076,9 @@ class BankStore:
                 self.conn.commit()
         return len(cards)
 
-    def update_card_bill_facts(self, facts: list[dict], *, commit: bool = True) -> int:
+    def update_card_bill_facts(
+        self, facts: list[dict], *, commit: bool = True, bill_snapshot=None,
+    ) -> int:
         """Atomically apply canonical bill facts without regressing a newer payment pair."""
         facts = [dict(fact) for fact in facts]
         for fact in facts:
@@ -3084,6 +3100,21 @@ class BankStore:
             with error_step('SYS-08-162-005'):
                 payment_date = _normalize_date_text(fact.get("last_payment_date"))
             cycle_date = due_date or statement_date
+            snapshot_where = ""
+            baseline = ()
+            observed_same_due = False
+            if bill_snapshot is not None:
+                baseline = bill_snapshot.get(
+                    (self.bank, self.user_id, fact["number"]), (None,) * 6,
+                )
+                snapshot_where = " AND " + " AND ".join(
+                    f"{column} IS ?" for column in CARD_BILL_SNAPSHOT_FIELDS
+                )
+                observed_same_due = (
+                    self.bank == "dbs" and due_date is not None
+                    and due_date == baseline[2] and payment_date is None
+                    and fact.get("last_payment_amount") is None
+                )
             with error_step('SYS-08-162-006'):
                 cursor = self.conn.execute(
                     """UPDATE cards
@@ -3107,9 +3138,9 @@ class BankStore:
                             WHEN CAST(? AS TEXT) IS NOT NULL
                              AND (last_payment_date IS NULL OR ? >= last_payment_date)
                             THEN ? ELSE last_payment_date END,
-                          updated_at = ?
+                          updated_at = ?, bill_facts_revision = ?
                     WHERE user_id = ? AND card_no = ?
-                      AND NOT (
+                      AND (? = 1 OR NOT (
                         (
                           (CAST(? AS TEXT) IS NOT NULL
                            AND payment_due_date IS NOT NULL
@@ -3124,18 +3155,20 @@ class BankStore:
                         )
                         AND last_payment_date IS NOT NULL
                         AND (CAST(? AS TEXT) IS NULL OR ? < last_payment_date)
-                      )""",
+                      ))""" + snapshot_where,
                     (
                         cycle_date, cycle_date, fact.get("bill_due_amount"),
                         cycle_date, cycle_date, statement_date,
                         cycle_date, cycle_date, due_date,
                         payment_date, payment_date, fact.get("last_payment_amount"),
                         payment_date, payment_date, payment_date,
-                        now, self.user_id, fact.get("number"),
+                        now, str(uuid4()), self.user_id, fact.get("number"),
+                        int(observed_same_due),
                         due_date, due_date,
                         statement_date, statement_date,
                         due_date, statement_date,
                         payment_date, payment_date,
+                        *baseline,
                     ),
                 )
             updated += cursor.rowcount
@@ -3161,9 +3194,10 @@ class BankStore:
         """Advance every card's last-payment pair to a newer auto-debit; never regress."""
         with error_step('SYS-08-164-001'):
             cursor = self.conn.execute(
-                "UPDATE cards SET last_payment_amount = ?, last_payment_date = ?, updated_at = ? "
+                "UPDATE cards SET last_payment_amount = ?, last_payment_date = ?, updated_at = ?, "
+                "bill_facts_revision = ? "
                 "WHERE user_id = ? AND (last_payment_date IS NULL OR last_payment_date < ?)",
-                (amount, payment_date, _now(), self.user_id, payment_date),
+                (amount, payment_date, _now(), str(uuid4()), self.user_id, payment_date),
             )
         if commit:
             with error_step('SYS-08-164-002'):

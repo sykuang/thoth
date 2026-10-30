@@ -236,6 +236,13 @@ def _ensure_phase_c_user_id_pg(conn: Any, schema: str) -> None:
                         'ADD COLUMN IF NOT EXISTS native_identity TEXT'
                     )
 
+        if "cards" in existing:
+            with error_step('SYS-08-173-041'):
+                conn.execute(
+                    f'ALTER TABLE "{schema}"."cards" '
+                    'ADD COLUMN IF NOT EXISTS bill_facts_revision TEXT'
+                )
+
         if "accounts" in existing:
             with error_step('SYS-08-173-010'):
                 conn.execute(
