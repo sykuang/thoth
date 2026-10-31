@@ -14,7 +14,9 @@ from backend.banks.ubot import UbotCrawler
 from backend.core import account_classify, classify
 from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
-from backend.core.persist._common import _num, _num_real, _num_to_float, _ubot_date
+from backend.core.persist._common import (
+    _num, _num_real, _num_to_float, _ubot_date, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers,
+)
 
 
 def _yyyymmdd_to_iso(s: str | None) -> str | None:
@@ -636,12 +638,17 @@ def persist_ubot(
         as_of = _validate_ubot_history(data, store)
     if not commit:
         return _persist_ubot(data, store, rules=rules, as_of=as_of)
+    before = _snapshot_occurrence_ledgers(store)
     try:
         delta = _persist_ubot(data, store, rules=rules, as_of=as_of)
         with error_step('UBOT-08-007-002'):
             store.commit()
         return delta
-    except Exception:
-        with error_step('UBOT-08-007-003'):
-            store.conn.rollback()
+    except Exception as error:
+        _restore_occurrence_ledgers(store, before)
+        try:
+            with error_step('UBOT-08-007-003'):
+                store.conn.rollback()
+        except Exception:
+            raise error  # Cleanup must not replace the operation failure.
         raise

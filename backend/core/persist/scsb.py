@@ -11,8 +11,9 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from backend.core import account_classify, classify
+from backend.core.card_bills import CardBillWriteBarrier
 from backend.core.store import BankStore
-from backend.core.persist._common import _num_real
+from backend.core.persist._common import _num_real, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers
 
 
 def _scsb_page_error(text: str) -> bool:
@@ -313,7 +314,7 @@ def _scsb_parse_card_rows(text: str, scope: str) -> tuple[list, bool]:
     return rows, candidate_rows > 0 and len(rows) == candidate_rows
 
 
-def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+def _persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
     """SCSB collect() 結構 → store 表增量。
 
     第一版只入庫帳號與餘額（DOM regex 抽出來的），明細待 API 解密路線完成。
@@ -770,3 +771,15 @@ def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) 
     with error_step('SCSB-08-008-040'):
         store.commit()
     return delta
+
+
+def persist_scsb(data: dict, store: BankStore, rules: list[dict] | None = None) -> dict:
+    """Keep RAM atomic with the existing SCSB SQL savepoint cleanup."""
+    # Barrier methods mutate the underlying store, not attributes on the proxy.
+    ledger_store = store._store if isinstance(store, CardBillWriteBarrier) else store
+    before = _snapshot_occurrence_ledgers(ledger_store)
+    try:
+        return _persist_scsb(data, store, rules=rules)
+    except Exception:
+        _restore_occurrence_ledgers(ledger_store, before)
+        raise

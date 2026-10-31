@@ -11,7 +11,9 @@ from decimal import Decimal, InvalidOperation
 
 from backend.core import classify
 from backend.core.base import validate_history_coverage
-from backend.core.persist._common import _num_to_float
+from backend.core.persist._common import (
+    _num_to_float, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers,
+)
 from backend.core.store import BankStore
 
 
@@ -639,9 +641,14 @@ def persist_hsbc(
 ) -> dict:
     if not commit:
         return _persist_hsbc(data, store, rules=rules, commit=False)
+    before = _snapshot_occurrence_ledgers(store)
     try:
         return _persist_hsbc(data, store, rules=rules, commit=True)
-    except Exception:
-        with error_step('HSBC-08-012-001'):
-            store.rollback()
+    except Exception as error:
+        _restore_occurrence_ledgers(store, before)
+        try:
+            with error_step('HSBC-08-012-001'):
+                store.rollback()
+        except Exception:
+            raise error  # Cleanup must not replace the operation failure.
         raise

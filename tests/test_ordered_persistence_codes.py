@@ -140,6 +140,73 @@ def test_native_transaction_and_cursor_boundaries(method, args):
     assert exception_error_id(raised.value, bank="esun")
 
 
+@pytest.mark.parametrize("site", ["batch_rollback", "booking_rollback", "refresh_commit", "refresh_rollback"])
+@pytest.mark.parametrize("native", [False, True])
+def test_card_cleanup_call_context_keeps_native_first_id(monkeypatch, site, native):
+    from contextlib import nullcontext
+    from backend.core.store import BankStore
+    from backend.core.error_codes import with_error_code
+
+    store = synthetic_store(None)
+    store.source_account_id = 7
+    store._new_billed_ids = []
+    store._current_billed_ids = []
+    store._adopted_pending_raw_keys = {}
+    store._unsafe_pending_overlay_identities = set()
+    store._billed_source_rows = {}
+    primary = with_error_code(BoundaryFailure("operation"), "ESUN-08-001-001")
+    cleanup = OSError("native cleanup or commit")
+    events = []
+
+    def driver(name):
+        events.append(name)
+        raise cleanup
+
+    store.conn.commit = lambda: driver("commit")
+    store.conn.rollback = lambda: driver("rollback")
+    if not native:
+        store.commit = store.conn.commit
+        store.rollback = store.conn.rollback
+    monkeypatch.setattr(store, "savepoint", lambda name: nullcontext())
+    monkeypatch.setattr(store, "begin_transaction", lambda: None)
+    monkeypatch.setattr(store, "_validate_native_card_occurrences", lambda rows: None)
+    store.conn.execute = lambda *args: SimpleNamespace(fetchall=lambda: [])
+
+    def fail(*args, **kwargs):
+        events.append("operation")
+        raise primary
+
+    if site == "batch_rollback":
+        monkeypatch.setattr(store, "upsert_card_billed", fail)
+        call = lambda: store.persist_card_batch([{}], [], scope="unbilled", fetch_ok=True)
+    elif site == "booking_rollback":
+        monkeypatch.setattr(store, "upsert_card_billed", fail)
+        call = lambda: store.refresh_card_pending("unbilled", [{
+            "booking_status": "booked", "post_date": "2026-01-01",
+        }], fetch_ok=True)
+    else:
+        monkeypatch.setattr(store, "_refresh_card_pending_with_overlays",
+                            (lambda *args: 0) if site == "refresh_commit" else fail)
+        call = lambda: store._refresh_card_pending("unbilled", [], fetch_ok=True)
+    with pytest.raises(Exception) as raised:
+        call()
+    if site == "refresh_commit":
+        assert raised.value is cleanup
+        assert exception_error_id(cleanup) == "SYS-08-148-001"
+        assert events == ["commit", "rollback"]
+    else:
+        assert raised.value is primary
+        assert exception_error_id(primary) == "ESUN-08-001-001"
+        assert primary.__context__ is cleanup
+        assert cleanup.__context__ is None  # Python breaks the cyclic link on re-raise.
+        assert exception_error_id(cleanup) == "SYS-08-149-001"
+        assert events == ["operation", "rollback"]
+    assert store._new_billed_ids == store._current_billed_ids == []
+    assert store._adopted_pending_raw_keys == store._billed_source_rows == {}
+    assert store._unsafe_pending_overlay_identities == set()
+    assert isinstance(store, BankStore)
+
+
 def test_optional_missing_cursor_is_still_nonfatal():
     store = synthetic_store("execute")
     store.source_account_id = None
@@ -148,15 +215,79 @@ def test_optional_missing_cursor_is_still_nonfatal():
     assert store.conn.events == []
 
 
+def _unregistered_failure_births(tree):
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def captured_reraise(node):
+        if not isinstance(node.exc, ast.Name):
+            return False
+        name = node.exc.id
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                return False  # A closure/parameter is not this handler's capture.
+            if isinstance(parent, ast.ExceptHandler) and parent.name == name:
+                # Conservative proof: no rebinding anywhere in the handler,
+                # including conditional writes and nested-scope shadowing.
+                for binding in ast.walk(parent):
+                    if isinstance(binding, ast.Name) and binding.id == name and isinstance(binding.ctx, (ast.Store, ast.Del)):
+                        return False
+                    if binding is not parent and isinstance(binding, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and binding.name == name:
+                        return False
+                    if isinstance(binding, ast.arg) and binding.arg == name:
+                        return False
+                    if isinstance(binding, ast.alias) and (binding.asname or binding.name.split('.')[0]) == name:
+                        return False
+                    if isinstance(binding, (ast.Global, ast.Nonlocal)) and name in binding.names:
+                        return False
+                    if isinstance(binding, (ast.MatchAs, ast.MatchStar)) and binding.name == name:
+                        return False
+                    if isinstance(binding, ast.MatchMapping) and binding.rest == name:
+                        return False
+                return True
+            parent = parents.get(parent)
+        return False
+
+    missing = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            registered = (isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name)
+                          and node.exc.func.id == "with_error_code" and bool(node.exc.args)
+                          and not (isinstance(node.exc.args[0], ast.Constant) and node.exc.args[0].value is None))
+            if not registered and not captured_reraise(node):
+                missing.append(node.lineno)
+    return missing
+
+
+@pytest.mark.parametrize("body,captured", [
+    ("try: work()\nexcept Exception as error:\n    raise error", True),
+    ("try: work()\nexcept Exception as error:\n    try: cleanup()\n    except Exception: raise error", True),
+    ("raise error", False),
+    ("error = ValueError()\nraise error", False),
+    ("try: work()\nexcept Exception as error:\n    error = ValueError()\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    def nested(error):\n        raise error", False),
+    ("try: work()\nexcept Exception as error:\n    def nested():\n        raise error", False),
+    ("try: work()\nexcept Exception as error:\n    try: cleanup()\n    except Exception as error: pass\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    del error\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    raise ValueError()", False),
+    ("try: work()\nexcept Exception as error:\n    if flag: error = ValueError()\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    for error in values: pass\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    error += other\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    import module as error\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    def error(): pass\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    match value:\n        case error: pass\n    raise error", False),
+    ("try: work()\nexcept Exception as error:\n    def nested():\n        nonlocal error\n        error = ValueError()\n    raise error", False),
+    ("raise with_error_code(ValueError(), 'SYS-08-145-001')", True),
+])
+def test_registration_oracle_requires_captured_unmodified_binding(body, captured):
+    assert (not _unregistered_failure_births(ast.parse(body))) is captured
+
+
 def test_all_owned_explicit_failure_leaves_are_registered():
     root = Path(__file__).resolve().parents[1] / "backend/core"
     paths = sorted((root / "persist").glob("*.py")) + [root / name for name in ("money.py", "card_bills.py", "card_status.py", "store.py", "bank_pg.py")]
-    missing = []
-    for path in paths:
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Raise) and node.exc is not None:
-                if not (isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name) and node.exc.func.id == "with_error_code"):
-                    missing.append((path.name, node.lineno))
+    missing = [(path.name, line) for path in paths
+               for line in _unregistered_failure_births(ast.parse(path.read_text()))]
     assert missing == []
 
 @pytest.mark.parametrize("boundary", ["begin_transaction", "persist", "bill", "cursor", "commit", "rollback"])
@@ -185,10 +316,15 @@ def test_dispatch_attributes_exact_boundary_and_retains_order(monkeypatch, bound
     code = exception_error_id(raised.value, bank="esun")
     assert code and code.startswith("ESUN-08-")
     if boundary == "rollback":
-        assert raised.value is cleanup
-        assert raised.value.__context__ is primary
-        # The terminal rollback is registered; handled primary context is incidental.
-        assert code == "ESUN-08-800-011"
+        # Approved policy: original operation E wins; cleanup C is independent.
+        assert raised.value is primary
+        assert str(primary) == "primary"
+        assert code == "ESUN-08-001-001"
+        assert primary.__context__ is cleanup
+        assert primary.__cause__ is None and not primary.__suppress_context__
+        assert exception_error_id(cleanup) == "ESUN-08-800-011"
+        assert cleanup.__context__ is None
+        assert str(cleanup) == "cleanup"
         assert events == ["begin_transaction", "persist", "rollback"]
     else:
         assert raised.value is cleanup

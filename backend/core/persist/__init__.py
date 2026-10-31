@@ -23,6 +23,7 @@ from backend.core.persist.sinopac import persist_sinopac
 from backend.core.persist.taishin import persist_taishin
 from backend.core.persist.ubot import persist_ubot
 from backend.core.card_bills import CardBillWriteBarrier, apply_card_bill_facts
+from backend.core.persist._common import _snapshot_occurrence_ledgers, _restore_occurrence_ledgers
 
 
 PERSISTERS = {
@@ -85,6 +86,7 @@ def persist_collected(bank, data, store, rules=None, *, bill_snapshot=None):
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
     atomic = bank in {"esun", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
+    before = _snapshot_occurrence_ledgers(store) if atomic else {}
     try:
         if atomic:
             # Nest adapter savepoints even before the first DML; the existing
@@ -116,10 +118,14 @@ def persist_collected(bank, data, store, rules=None, *, bill_snapshot=None):
             with error_step(bank_error_id(bank, '08-800-010')):
                 store.commit()
         return delta
-    except Exception:
+    except Exception as error:
+        _restore_occurrence_ledgers(store, before)
         if atomic:
-            with error_step(bank_error_id(bank, '08-800-011')):
-                store.conn.rollback()
+            try:
+                with error_step(bank_error_id(bank, '08-800-011')):
+                    store.conn.rollback()
+            except Exception:
+                raise error  # Cleanup must not replace the operation failure.
         raise
 
 __all__ = [

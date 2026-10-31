@@ -1632,17 +1632,36 @@ def test_bank_pg_connection_exposes_rollback_for_atomic_persisters() -> None:
 
 def test_direct_taishin_persister_surfaces_rollback_failure(monkeypatch) -> None:
     from backend.core.persist import taishin as taishin_persist
+    from backend.core.error_codes import exception_error_id, with_error_code
 
-    monkeypatch.setattr(
-        taishin_persist,
-        "_persist_taishin",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("forward failed")),
-    )
+    # Approved policy: preserve original E, not the independently tagged cleanup C.
+    primary = with_error_code(RuntimeError("forward failed"), "TAISHIN-08-001-018")
+    cleanup = OSError("rollback failed")
+    events = []
+
+    def forward(*args, **kwargs):
+        events.append("forward")
+        assert kwargs == {"commit": False}
+        raise primary
+
+    def rollback():
+        events.append("rollback")
+        raise cleanup
+
+    monkeypatch.setattr(taishin_persist, "_persist_taishin", forward)
     store = object.__new__(BankStore)
-    store.rollback = lambda: (_ for _ in ()).throw(OSError("rollback failed"))
-
-    with pytest.raises(OSError, match="rollback failed"):
+    store.rollback = rollback
+    with pytest.raises(RuntimeError, match="^forward failed$") as raised:
         taishin_persist.persist_taishin({}, store)
+    assert raised.value is primary
+    assert type(primary) is RuntimeError
+    assert primary.__context__ is cleanup
+    assert primary.__cause__ is None and not primary.__suppress_context__
+    assert exception_error_id(primary) == "TAISHIN-08-001-018"
+    assert type(cleanup) is OSError and str(cleanup) == "rollback failed"
+    assert cleanup.__context__ is None
+    assert exception_error_id(cleanup) == "TAISHIN-08-004-002"
+    assert events == ["forward", "rollback"]
 
 
 def test_direct_taishin_persister_rolls_back_all_writes_on_late_failure(

@@ -29,6 +29,8 @@ from backend.core.store import BankStore
 def store(tmp_path: Path, monkeypatch):
     from backend.core import store as store_mod
     monkeypatch.setattr(store_mod, "DATA_ROOT", tmp_path, raising=True)
+    monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(store_mod.bank_pg, "enabled", lambda: False)
     s = BankStore("hsbc_test")
     yield s
     s.close()
@@ -94,6 +96,112 @@ def _hsbc_card_payload(tail: str = "7034", details: list[dict] | None = None) ->
             }],
         },
     }
+
+
+def test_hsbc_unmatchable_pending_replacement_through_dispatcher_is_durable(store):
+    from copy import deepcopy
+    from backend.core.persist import persist_collected
+
+    out = _hsbc_card_payload()
+    card_no, detail = next(iter(out["card_detail"].items()))
+    detail["unposted"] = [{"description": "OLD SHOP", "transactionDate": "2026-07-01T00:00",
+                           "ntdAmount": "100 TWD", "isPositive": True, "isForeign": False}]
+    persist_collected("hsbc", out, store)
+    store.conn.execute("UPDATE card_pending_txns SET category='old category', subcategory='old sub', "
+                       "description_overwrite='old note', tags_overwrite='[\"old\"]', auto_excluded=1, "
+                       "splits_overwrite='[{\"amount\":40},{\"amount\":60}]'")
+    store.conn.commit()
+    updated = deepcopy(out)
+    updated["card_detail"][card_no]["unposted"][0].update(
+        description="NEW SHOP", postedDate="2026-07-03T00:00")
+    rules = [{"pattern": "NEW SHOP", "category": "餐飲", "subcategory": "其他"}]
+    assert persist_collected("hsbc", updated, store, rules=rules)["card_unbilled"] == 0
+    assert store.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 0
+    rows = store.conn.execute("SELECT * FROM card_billed_txns").fetchall()
+    assert len(rows) == 1 and rows[0]["description"] == "NEW SHOP"
+    assert (rows[0]["category"], rows[0]["subcategory"], rows[0]["description_overwrite"],
+            rows[0]["tags_overwrite"], rows[0]["auto_excluded"], rows[0]["splits_overwrite"]) == (
+                "餐飲", "其他", None, None, 0, None)
+    target_id = rows[0]["id"]
+    persist_collected("hsbc", updated, store, rules=rules)
+    assert [r[0] for r in store.conn.execute("SELECT id FROM card_billed_txns")] == [target_id]
+    assert store.conn.execute("SELECT SUM(amount) FROM card_billed_txns").fetchone()[0] == 100
+    observer = BankStore("hsbc_test")
+    try:
+        assert observer.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchall()[0][0] == 0
+        assert observer.conn.execute("SELECT id, description FROM card_billed_txns").fetchall()[0][0] == target_id
+    finally:
+        observer.close()
+
+
+@pytest.mark.parametrize("route", ["direct", "collected", "direct_commit_false"])
+@pytest.mark.parametrize("rollback_fault", [None, "before", "after"])
+def test_hsbc_outer_operation_error_survives_rollback_fault(store, route, rollback_fault):
+    import sqlite3
+    from copy import deepcopy
+
+    from backend.core.error_codes import exception_error_id
+    from backend.core.persist import persist_collected
+
+    class FaultConnection(sqlite3.Connection):
+        operation_error = None
+        rollback_calls = 0
+        commit_calls = 0
+
+        def execute(self, sql, parameters=()):
+            try:
+                return super().execute(sql, parameters)
+            except sqlite3.IntegrityError as error:
+                self.operation_error = error
+                raise
+
+        def rollback(self):
+            self.rollback_calls += 1
+            if rollback_fault == "before":
+                raise sqlite3.OperationalError("synthetic rollback failure")
+            super().rollback()
+            if rollback_fault == "after":
+                raise sqlite3.OperationalError("synthetic rollback failure")
+
+        def commit(self):
+            self.commit_calls += 1
+            super().commit()
+
+    store.conn.close()
+    store.conn = sqlite3.connect(store.db_path, factory=FaultConnection)
+    store.conn.row_factory = sqlite3.Row
+    store.conn.execute(
+        "CREATE TEMP TRIGGER fail_native_metric BEFORE INSERT ON daily_metrics "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic native INSERT failure'); END"
+    )
+    sqlite3.Connection.commit(store.conn)
+    names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
+             "_unsafe_pending_overlay_identities")
+    before = {name: deepcopy(getattr(store, name)) for name in names}
+
+    with pytest.raises(Exception) as caught:
+        if route == "collected":
+            persist_collected("hsbc", _hsbc_card_payload(), store)
+        else:
+            persist_hsbc(_hsbc_card_payload(), store, commit=route != "direct_commit_false")
+
+    assert caught.value is store.conn.operation_error
+    assert type(caught.value) is sqlite3.IntegrityError
+    assert str(caught.value) == "synthetic native INSERT failure"
+    assert exception_error_id(caught.value, bank="hsbc") == "SYS-08-165-001"
+    assert store.conn.commit_calls == 0
+    assert store.conn.rollback_calls == (0 if route == "direct_commit_false" else 1)
+    assert {name: getattr(store, name) for name in names} == before
+    if route == "direct_commit_false" or rollback_fault == "before":
+        # No successful rollback is claimed when cleanup failed before SQLite ran.
+        assert store.conn.in_transaction
+        assert store.conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
+        sqlite3.Connection.rollback(store.conn)
+    else:
+        assert not store.conn.in_transaction
+    for table in ("cards", "card_billed_txns", "card_pending_txns", "daily_metrics", "sync_log"):
+        assert store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert store.latest_card_transaction_dates() == {}
 
 
 def test_hsbc_collector_requires_complete_per_card_coverage():

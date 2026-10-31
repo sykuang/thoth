@@ -18,6 +18,13 @@ from backend.core.store import BankStore, _pending_billed_identity, _rescale_spl
 
 PEND = {"card_no": "****1234", "date": "2026-07-01", "desc": "AMAZON JP",
         "amount": 1000, "currency": "TWD"}
+OVERLAY_FIELDS = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                  "auto_excluded", "splits_overwrite")
+
+
+def _overlay_snapshot(st, table="card_pending_txns"):
+    return {r["description"]: tuple(r[f] for f in OVERLAY_FIELDS)
+            for r in st.conn.execute(f"SELECT * FROM {table}")}
 
 
 @pytest.fixture
@@ -49,6 +56,173 @@ def _billed(st):
 def _pending_count(st):
     return st.conn.execute(
         "SELECT COUNT(*) c FROM card_pending_txns").fetchone()["c"]
+
+
+@pytest.mark.parametrize("kind", ["native", "mixed-fx"])
+@pytest.mark.parametrize("first_scope", ["unbilled", "current"])
+@pytest.mark.parametrize("reverse_seed", [False, True])
+@pytest.mark.parametrize("sibling_edits", ["blank", "same", "conflicting"])
+@pytest.mark.parametrize(("mode", "second_entry"), [
+    ("statement", "vanished"), ("statement", "promotion"), ("pending", "vanished"),
+    ("promotion", "vanished"), ("promotion", "promotion"),
+])
+def test_cross_scope_exact_transition_rejects_whole_donor_preimage(
+        store, kind, first_scope, reverse_seed, sibling_edits, mode, second_entry):
+    """The first scope cannot hide a competing donor or enable the second one."""
+    import json
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    st = BankStore("ctbc", user_id=1, source_account_id=101)
+    fields = OVERLAY_FIELDS
+    overlay = ("餐飲", "訂閱", "ONLY A", '["a"]', 1,
+               '[{"amount":40,"category":"餐飲","note":"one","auto_excluded":false},'
+               '{"amount":60,"category":"旅遊","note":"two","auto_excluded":true}]')
+    blank = (None, None, None, None, 0, None)
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    w = {**a, "desc": "W"}
+    if kind == "mixed-fx":
+        a.update(consume_currency="USD", consume_amount=3)
+        w = {**a, "desc": "W", "native_identity": None}
+    safe = {**a, "desc": "SAFE", "date": "2026-07-02",
+            "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "safe"])}
+    second_scope = "current" if first_scope == "unbilled" else "unbilled"
+    try:
+        seeds = [(first_scope, [a]), (second_scope, [w, safe])]
+        for scope, seed in seeds[::-1] if reverse_seed else seeds:
+            st.refresh_card_pending(scope, seed, rules=[])
+        sql = "UPDATE card_pending_txns SET " + ",".join(f"{f}=?" for f in fields) + " WHERE description=?"
+        st.conn.execute(sql, (*overlay, "A"))
+        st.conn.execute(sql, (*overlay, "SAFE"))
+        if sibling_edits == "same":
+            st.conn.execute(sql, (*overlay, "W"))
+        elif sibling_edits == "conflicting":
+            st.conn.execute(sql, ("旅遊", "其他", "ONLY W", '["w"]', 1, overlay[-1], "W"))
+        st.commit()
+        original_w = dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE description='W'").fetchone())
+        original_safe = dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE description='SAFE'").fetchone())
+        statement = {**a, "post_date": "2026-07-03", "bill_date": "2026-07-18"}
+        if kind == "mixed-fx":
+            statement["native_identity"] = None
+        barrier = CardBillWriteBarrier(st)
+        if mode == "statement" and kind == "native":
+            barrier.persist_card_batch([statement], [], scope=first_scope, fetch_ok=True, rules=[])
+        elif mode == "statement":
+            barrier.upsert_card_billed([statement], rules=[])
+            barrier.refresh_card_pending(first_scope, [], fetch_ok=True, rules=[], commit=False)
+        else:
+            source = {**a, "native_identity": statement["native_identity"],
+                      "booking_status": "booked" if mode == "promotion" else None,
+                      "post_date": statement["post_date"] if mode == "promotion" else None}
+            barrier.refresh_card_pending(first_scope, [source], fetch_ok=True, rules=[], commit=False)
+        table = "card_pending_txns" if mode == "pending" else "card_billed_txns"
+        target = dict(st.conn.execute(f"SELECT * FROM {table} WHERE description='A'").fetchone())
+        assert tuple(target[f] for f in fields) == blank
+        assert (target["card_no"], target["consume_date"], target["amount"], target["currency"],
+                target["native_identity"], target["txn_type"]) == (
+                    "****1234", "2026-07-01", 100, "TWD", statement["native_identity"], "spending")
+        assert dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE description='W'").fetchone()) == original_w
+        assert dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE description='SAFE'").fetchone()) == original_safe
+        assert tuple(st.conn.execute("SELECT " + ",".join(fields) +
+                                    " FROM card_pending_txns WHERE description='SAFE'").fetchone()) == overlay
+        incoming = [safe] if second_entry == "vanished" else [{**statement, "booking_status": "booked"}, safe]
+        barrier.refresh_card_pending(second_scope, incoming, fetch_ok=True, rules=[])
+        assert tuple(st.conn.execute("SELECT " + ",".join(fields) +
+                                    f" FROM {table} WHERE description='A'").fetchone()) == blank
+        assert st.conn.execute("SELECT COUNT(*) FROM card_pending_txns WHERE description!='SAFE'").fetchone()[0] == int(mode == "pending")
+        if mode == "pending":
+            barrier.refresh_card_pending(first_scope, [source], fetch_ok=True, rules=[])
+            assert tuple(st.conn.execute("SELECT " + ",".join(fields) +
+                                        " FROM card_pending_txns WHERE description='A'").fetchone()) == blank
+            assert st.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 0
+            return
+        barrier.upsert_card_billed([statement], rules=[])
+        barrier.refresh_card_pending(first_scope, [], fetch_ok=True, rules=[], commit=False)
+        barrier.refresh_card_pending(second_scope, [safe], fetch_ok=True, rules=[])
+        assert tuple(st.conn.execute("SELECT " + ",".join(fields) + " FROM card_billed_txns").fetchone()) == blank
+        assert st.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
+        final = dict(st.conn.execute("SELECT * FROM card_billed_txns").fetchone())
+        assert final["id"] == target["id"]
+        assert (final["post_date"], final["bill_date"], final["consume_currency"], final["consume_amount"]) == (
+            "2026-07-03", "2026-07-18", "USD" if kind == "mixed-fx" else None, 3 if kind == "mixed-fx" else None)
+        assert tuple(st.conn.execute("SELECT " + ",".join(fields) +
+                                    " FROM card_pending_txns WHERE description='SAFE'").fetchone()) == overlay
+        observer = BankStore("ctbc", user_id=1, source_account_id=101)
+        try:
+            for table in ("card_pending_txns", "card_billed_txns"):
+                assert [dict(r) for r in observer.conn.execute(f"SELECT * FROM {table} ORDER BY id")] == [
+                    dict(r) for r in st.conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+        finally:
+            observer.close()
+    finally:
+        st.close()
+
+
+@pytest.mark.parametrize("weak_edited", [False, True])
+def test_mixed_cross_scope_two_pass_cannot_resurrect_rejected_edits(store, weak_edited):
+    import json
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    st = BankStore("ctbc", user_id=1, source_account_id=101)
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "consume_currency": "USD", "consume_amount": 3,
+         "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    w = {**a, "native_identity": None, "desc": "W"}
+    overlay = ("餐飲", "訂閱", "A NOTE", '["a"]', 1,
+               '[{"amount":40,"category":"餐飲"},{"amount":60,"category":"旅遊"}]')
+    blank = (None, None, None, None, 0, None)
+    try:
+        st.refresh_card_pending("unbilled", [a], rules=[])
+        st.refresh_card_pending("current", [w], rules=[])
+        sql = "UPDATE card_pending_txns SET " + ",".join(f"{f}=?" for f in OVERLAY_FIELDS) + " WHERE scope=?"
+        st.conn.execute(sql, (*overlay, "unbilled"))
+        if weak_edited:
+            st.conn.execute(sql, ("旅遊", "其他", "W NOTE", '["w"]', 1, overlay[-1], "current"))
+        st.commit()
+        original_w = dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE scope='current'").fetchone())
+        barrier = CardBillWriteBarrier(st)
+        barrier.upsert_card_billed([{**a, "native_identity": None,
+                                    "post_date": "2026-07-03", "bill_date": "2026-07-18"}], rules=[])
+        barrier.refresh_card_pending("unbilled", [], fetch_ok=True, rules=[], commit=False)
+        first = tuple(st.conn.execute("SELECT " + ",".join(OVERLAY_FIELDS) + " FROM card_billed_txns").fetchone())
+        assert dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE scope='current'").fetchone()) == original_w
+        assert st.conn.execute("SELECT COUNT(*) FROM card_pending_txns WHERE scope='unbilled'").fetchone()[0] == 0
+        # Always execute the second scope before evaluating the billed oracle.
+        barrier.refresh_card_pending("current", [], fetch_ok=True, rules=[])
+        second = tuple(st.conn.execute("SELECT " + ",".join(OVERLAY_FIELDS) + " FROM card_billed_txns").fetchone())
+        assert (first, second) == (blank, blank)
+        assert st.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()[0] == 1
+        assert _pending_count(st) == 0
+    finally:
+        st.close()
+
+
+def test_rejected_cross_scope_target_cannot_prune_an_unpaired_exact_snapshot(store):
+    import json
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    st = BankStore("ctbc", user_id=1, source_account_id=101)
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "consume_currency": "USD", "consume_amount": 3,
+         "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    w = {**a, "native_identity": None, "desc": "W"}
+    try:
+        st.refresh_card_pending("unbilled", [a], rules=[])
+        st.refresh_card_pending("current", [w], rules=[])
+        st.conn.execute("UPDATE card_pending_txns SET description_overwrite='A NOTE' WHERE scope='unbilled'")
+        st.commit()
+        original = dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE scope='unbilled'").fetchone())
+        barrier = CardBillWriteBarrier(st)
+        barrier.upsert_card_billed([{**w, "post_date": "2026-07-03", "bill_date": "2026-07-18"}], rules=[])
+        assert barrier.refresh_card_pending("unbilled", [w], fetch_ok=True, rules=[]) == 1
+        actual = dict(st.conn.execute("SELECT * FROM card_pending_txns WHERE scope='unbilled'").fetchone())
+        assert actual["description"] == "W" and actual["amount"] == original["amount"]
+        assert tuple(actual[f] for f in OVERLAY_FIELDS) == (None, None, None, None, 0, None)
+    finally:
+        st.close()
 
 
 def test_rescale_rejects_invalid_splits_even_when_total_already_matches():
@@ -215,6 +389,9 @@ def test_pending_fx_exact_mapping_is_reserved_before_renamed_fallback(store):
         "UPDATE card_pending_txns SET category='旅遊' WHERE id=?", (by_desc["OLD"],))
     store.conn.commit()
 
+    before = _overlay_snapshot(store)
+    assert before["EXACT"] == ("餐飲", None, None, None, 0, None)
+
     store.refresh_card_pending(
         "unbilled", [{**base, "desc": "RENAMED"}, {**base, "desc": "EXACT"}],
         rules=[], fetch_ok=True)
@@ -223,8 +400,18 @@ def test_pending_fx_exact_mapping_is_reserved_before_renamed_fallback(store):
         "SELECT description, category FROM card_pending_txns ORDER BY description"
     ).fetchall()
     assert [(row["description"], row["category"]) for row in rows] == [
-        ("EXACT", "餐飲"), ("RENAMED", "旅遊"),
+        ("EXACT", "餐飲"), ("RENAMED", None),
     ]
+    expected = {"EXACT": before["EXACT"], "RENAMED": (None, None, None, None, 0, None)}
+    assert _overlay_snapshot(store) == expected
+    store.refresh_card_pending("unbilled", [{**base, "desc": "RENAMED"}, {**base, "desc": "EXACT"}],
+                               rules=[], fetch_ok=True)
+    assert _overlay_snapshot(store) == expected
+    observer = BankStore("testbank", user_id=1)
+    try:
+        assert _overlay_snapshot(observer) == expected
+    finally:
+        observer.close()
 
 
 @pytest.mark.parametrize("edited_exact", [False, True])
@@ -243,6 +430,8 @@ def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store, edited_ex
     store.conn.execute(
         "UPDATE card_pending_txns SET category='旅遊' WHERE id=?", (by_desc["OLD"],))
     store.conn.commit()
+    before = _overlay_snapshot(store)
+    assert before["EXACT"] == ("餐飲" if edited_exact else None, None, None, None, 0, None)
     store.upsert_card_billed([
         {**base, "desc": "EXACT", "bill_date": "2026-07-20"}
     ], rules=[])
@@ -256,7 +445,23 @@ def test_exact_billed_merge_reserves_overlay_before_fx_fallback(store, edited_ex
         "SELECT description, category FROM card_pending_txns"
     ).fetchone()
     assert pending is not None
-    assert (pending["description"], pending["category"]) == ("RENAMED", "旅遊")
+    # Consuming EXACT cannot turn the originally ambiguous FX remainder into proof.
+    assert (pending["description"], pending["category"]) == ("RENAMED", None)
+    assert _overlay_snapshot(store, "card_billed_txns") == {"EXACT": before["EXACT"]}
+    blank = {"RENAMED": (None, None, None, None, 0, None)}
+    assert _overlay_snapshot(store) == blank
+    store._new_billed_ids.clear()
+    store._current_billed_ids.clear()
+    store.upsert_card_billed([{**base, "desc": "EXACT", "bill_date": "2026-07-20"}], rules=[])
+    store.refresh_card_pending("unbilled", [{**base, "desc": "RENAMED"}], rules=[], fetch_ok=True)
+    assert _overlay_snapshot(store, "card_billed_txns") == {"EXACT": before["EXACT"]}
+    assert _overlay_snapshot(store) == blank
+    observer = BankStore("testbank", user_id=1)
+    try:
+        assert _overlay_snapshot(observer, "card_billed_txns") == {"EXACT": before["EXACT"]}
+        assert _overlay_snapshot(observer) == blank
+    finally:
+        observer.close()
 
 
 def test_upsert_billed_count_uses_returned_ids_not_total_changes(store):
@@ -530,6 +735,9 @@ def test_ambiguous_exact_occurrences_do_not_merge(store):
     store.conn.execute("UPDATE card_pending_txns SET category='餐飲' WHERE id=?", (ids[0],))
     store.conn.execute("UPDATE card_pending_txns SET category='旅遊' WHERE id=?", (ids[1],))
     store.conn.commit()
+    before = [tuple(r[f] for f in OVERLAY_FIELDS) for r in store.conn.execute(
+        "SELECT * FROM card_pending_txns ORDER BY id")]
+    assert before == [("餐飲", None, None, None, 0, None), ("旅遊", None, None, None, 0, None)]
     store.upsert_card_billed([{**PEND, "bill_date": "2026-07-20"}], rules=[])
 
     assert store.refresh_card_pending(
@@ -537,7 +745,8 @@ def test_ambiguous_exact_occurrences_do_not_merge(store):
     ) == 2
 
     rows = store.conn.execute("SELECT category FROM card_pending_txns").fetchall()
-    assert {row["category"] for row in rows} == {"餐飲", "旅遊"}
+    # Conflicting identical raw occurrences have no reliable individual assignment.
+    assert len(rows) == 2 and {row["category"] for row in rows} == {None}
 
     store._new_billed_ids.clear()
     store._current_billed_ids.clear()
@@ -545,6 +754,19 @@ def test_ambiguous_exact_occurrences_do_not_merge(store):
     assert store.refresh_card_pending(
         "unbilled", [PEND, PEND], rules=[], fetch_ok=True
     ) == 2
+    actual = [dict(r) for r in store.conn.execute("SELECT * FROM card_pending_txns")]
+    assert len(actual) == 2
+    assert [tuple(r[f] for f in OVERLAY_FIELDS) for r in actual] == [(None, None, None, None, 0, None)] * 2
+    assert [(r["card_no"], r["consume_date"], r["amount"], r["currency"], r["description"])
+            for r in actual] == [(PEND["card_no"], PEND["date"], 1000, "TWD", PEND["desc"])] * 2
+    assert _overlay_snapshot(store, "card_billed_txns") == {PEND["desc"]: (None, None, None, None, 0, None)}
+    observer = BankStore("testbank", user_id=1)
+    try:
+        observed = [dict(r) for r in observer.conn.execute("SELECT * FROM card_pending_txns")]
+        assert observed == actual
+        assert _overlay_snapshot(observer, "card_billed_txns") == _overlay_snapshot(store, "card_billed_txns")
+    finally:
+        observer.close()
 
 
 def test_refresh_exact_key_conflicting_occurrence_rebuilds_authoritative_count(store):
@@ -1013,6 +1235,8 @@ def test_exact_and_fx_fallback_share_one_occurrence_ledger(store):
         (a_id,),
     )
     store.conn.commit()
+    before = _overlay_snapshot(store)
+    assert before["EXACT A"] == ("旅遊", None, "ONLY A", None, 0, None)
     store.refresh_card_pending(
         "unbilled", [a, {**b, "desc": "NEW B"}], rules=[], fetch_ok=True)
 
@@ -1024,6 +1248,15 @@ def test_exact_and_fx_fallback_share_one_occurrence_ledger(store):
     assert by_desc["EXACT A"]["description_overwrite"] == "ONLY A"
     assert by_desc["NEW B"]["category"] is None
     assert by_desc["NEW B"]["description_overwrite"] is None
+    expected = {"EXACT A": before["EXACT A"], "NEW B": (None, None, None, None, 0, None)}
+    assert _overlay_snapshot(store) == expected
+    store.refresh_card_pending("unbilled", [a, {**b, "desc": "NEW B"}], rules=[], fetch_ok=True)
+    assert _overlay_snapshot(store) == expected
+    observer = BankStore("testbank", user_id=1)
+    try:
+        assert _overlay_snapshot(observer) == expected
+    finally:
+        observer.close()
 
 
 def test_subcategory_only_twd_renamed_overlay_is_not_guessed(store):
@@ -1151,3 +1384,82 @@ def test_pending_without_user_edits_not_adopted(store):
     b = _billed(store)
     assert b[0]["category"] is None
     assert b[0]["description_overwrite"] is None
+
+
+@pytest.mark.parametrize("mode", ["pending", "booked", "statement"])
+@pytest.mark.parametrize("edited_sibling", [False, True])
+@pytest.mark.parametrize("reverse_seed", [False, True])
+@pytest.mark.parametrize("reverse_incoming", [False, True])
+def test_unique_raw_exact_with_fx_tie_preserves_only_proven_overlay(
+        store, mode, edited_sibling, reverse_seed, reverse_incoming):
+    """Raw exact separates admissible FX ties, never an ambiguous leftover."""
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+              "auto_excluded", "splits_overwrite")
+    overlay = ("餐飲", "訂閱", "ONLY EXACT", '["exact"]', 1,
+               '[{"amount":1200,"category":"餐飲","note":"one","auto_excluded":false},'
+               '{"amount":2000,"category":"旅遊","note":"two","auto_excluded":true}]')
+    blank = (None, None, None, None, 0, None)
+    exact = {**PEND, "desc": "EXACT", "amount": 3200,
+             "consume_currency": "USD", "consume_amount": 100.2}
+    sibling = {**exact, "desc": "OLD"}
+    seed = [exact, sibling]
+    store.refresh_card_pending("unbilled", seed[::-1] if reverse_seed else seed, rules=[])
+    sql = "UPDATE card_pending_txns SET " + ",".join(f"{f}=?" for f in fields) + " WHERE description=?"
+    store.conn.execute(sql, (*overlay, "EXACT"))
+    if edited_sibling:
+        store.conn.execute(sql, ("旅遊", "其他", "ONLY OLD", '["old"]', 1, overlay[-1], "OLD"))
+    store.commit()
+    # Immutable oracle predates the first promotion/refresh effect.
+    before = tuple(store.conn.execute(
+        "SELECT " + ",".join(fields) + " FROM card_pending_txns WHERE description='EXACT'"
+    ).fetchone())
+    assert before == overlay
+    renamed = {**sibling, "desc": "RENAMED"}
+    booked = {**exact, "post_date": "2026-07-10", "booking_status": "booked"}
+    statement = {**exact, "post_date": "2026-07-10", "bill_date": "2026-07-20"}
+    barrier = CardBillWriteBarrier(store)
+
+    def publish():
+        if mode == "statement":
+            barrier.upsert_card_billed([statement], rules=[])
+            barrier.refresh_card_pending("unbilled", [renamed], rules=[], fetch_ok=True)
+        else:
+            incoming = [booked if mode == "booked" else exact, renamed]
+            barrier.refresh_card_pending("unbilled", incoming[::-1] if reverse_incoming else incoming,
+                                         rules=[], fetch_ok=True)
+
+    def snapshot(st):
+        return {table: [dict(r) for r in st.conn.execute(
+            "SELECT card_no, consume_date, post_date, description, amount, currency, "
+            "consume_currency, consume_amount, native_identity, txn_type, flow_type, "
+            "income_category, is_subscription," + ",".join(fields) +
+            f" FROM {table} ORDER BY description")]
+                for table in ("card_pending_txns", "card_billed_txns")}
+
+    publish()
+    result = snapshot(store)
+    table = "card_pending_txns" if mode == "pending" else "card_billed_txns"
+    proven = next(r for r in result[table] if r["description"] == "EXACT")
+    assert tuple(proven[f] for f in fields) == before
+    assert proven["amount"] == 3200 and proven["consume_amount"] == 100.2
+    assert proven["currency"] == "TWD" and proven["consume_currency"] == "USD"
+    assert proven["flow_type"] == "expense" and proven["income_category"] is None
+    assert proven["is_subscription"] == 1
+    unknown = next(r for r in result["card_pending_txns"] if r["description"] == "RENAMED")
+    assert tuple(unknown[f] for f in fields) == blank
+    assert unknown["amount"] == 3200 and unknown["consume_amount"] == 100.2
+    assert unknown["is_subscription"] == 0
+    assert len(result["card_pending_txns"]) == (2 if mode == "pending" else 1)
+    assert len(result["card_billed_txns"]) == (0 if mode == "pending" else 1)
+    observer = BankStore("testbank", user_id=1)
+    try:
+        assert snapshot(observer) == result
+        store._new_billed_ids.clear()
+        store._current_billed_ids.clear()
+        publish()
+        assert snapshot(store) == result
+        assert snapshot(observer) == result
+    finally:
+        observer.close()

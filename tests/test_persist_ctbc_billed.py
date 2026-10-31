@@ -229,8 +229,8 @@ def test_ctbc_missing_unbilled_endpoint_preserves_existing_pending_rows(store):
     assert conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()[0] == 3
 
 
-def test_ctbc_legacy_renamed_pending_fails_closed_without_losing_overlay(tmp_path, monkeypatch):
-    """No reference means no renamed match; disappearance must not erase edits."""
+def test_ctbc_legacy_renamed_pending_is_replaced_without_guessing_overlay(tmp_path, monkeypatch):
+    """A successful snapshot discards unmatched legacy edits, not bank rows."""
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     pending_item = {
         "purchaseDt": "20260910", "postingDt": "00000000",
@@ -244,19 +244,22 @@ def test_ctbc_legacy_renamed_pending_fails_closed_without_losing_overlay(tmp_pat
         "merchantChiName": "御膳食堂", "ntAmt": 500, "foreignAmt": "",
         "occCurCode": "", "origCurCode": "N",
     }
+    tags = '["家庭"]'
+    splits = '[{"amount":300,"category":"餐飲"},{"amount":200,"category":"其他"}]'
 
-    first = BankStore("ctbc_lifecycle")
+    first = BankStore("ctbc_lifecycle", user_id=1, source_account_id=101)
     persist_ctbc({
         "card_api_dump": {"/twrbc-card/qu006/011": {"allItems": [pending_item]}},
         "summary": {}, "twd_deposit": {},
     }, first, rules=[])
     first.conn.execute(
-        "UPDATE card_pending_txns SET category='餐飲', description_overwrite='家庭聚餐'"
+        "UPDATE card_pending_txns SET category='餐飲', description_overwrite='家庭聚餐', "
+        "tags_overwrite=?, splits_overwrite=?", (tags, splits),
     )
     first.conn.commit()
     first.close()
 
-    overlap = BankStore("ctbc_lifecycle")
+    overlap = BankStore("ctbc_lifecycle", user_id=1, source_account_id=101)
     persist_ctbc({
         "card_api_dump": {
             "/twrbc-card/qu002/010": {
@@ -267,33 +270,90 @@ def test_ctbc_legacy_renamed_pending_fails_closed_without_losing_overlay(tmp_pat
         },
         "summary": {}, "twd_deposit": {},
     }, overlap, rules=[])
-    billed_count = overlap.conn.execute("SELECT COUNT(*) FROM card_billed_txns").fetchone()
-    pending_count = overlap.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
-    assert billed_count is not None and billed_count[0] == 1
-    assert pending_count is not None and pending_count[0] == 1
+    billed_ids = [r[0] for r in overlap.conn.execute("SELECT id FROM card_billed_txns")]
+    assert len(billed_ids) == 1
+    overlay = overlap.conn.execute(
+        "SELECT id, category, description_overwrite, tags_overwrite, splits_overwrite "
+        "FROM card_pending_txns"
+    ).fetchall()
+    assert [tuple(r)[1:] for r in overlay] == [("餐飲", "家庭聚餐", tags, splits)]
+    old_id = overlay[0][0]
     overlap.close()
 
-    settled = BankStore("ctbc_lifecycle")
-    with pytest.raises(ValueError, match="ambiguous.*native"):
-        persist_ctbc({
-            "card_api_dump": {
-                "/twrbc-card/qu002/010": {
-                    "cardDataList": [],
-                    "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
-                },
-                "/twrbc-card/qu006/011": {"allItems": []},
+    new_pending = {
+        **pending_item, "description": "御膳食堂", "purchaseAmt": 725,
+        "origCurCode": "840", "origCurDesc": "USD", "origCurAmt": 22.5,
+        "countryCode": "US", "acwRefNbr": "synthetic-new-purchase",
+    }
+    payload = {
+        "card_api_dump": {
+            "/twrbc-card/qu002/010": {
+                "cardDataList": [],
+                # Equal descriptions/amounts do not prove either billed occurrence
+                # owns the old pending overlay; preserve bank multiplicity instead.
+                "billData": {"TWD": {"2026/09": {
+                    "summary": {}, "bills": [billed_item, billed_item],
+                }}},
             },
-            "summary": {}, "twd_deposit": {},
-        }, settled, rules=[])
-    row = settled.conn.execute(
-        "SELECT description, category, description_overwrite FROM card_billed_txns"
-    ).fetchone()
-    assert row is not None
-    assert tuple(row) == ("御膳食堂", None, None)
-    pending_count = settled.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
-    assert pending_count is not None and pending_count[0] == 1
-    overlay = settled.conn.execute("SELECT category, description_overwrite FROM card_pending_txns").fetchone()
-    assert tuple(overlay) == ("餐飲", "家庭聚餐")
+            "/twrbc-card/qu006/011": {"allItems": [new_pending]},
+        },
+        "summary": {}, "twd_deposit": {},
+    }
+    settled = BankStore("ctbc_lifecycle", user_id=1, source_account_id=101)
+    # Preserve the original reproduction: one statement, no remaining pending.
+    empty_snapshot = {
+        "card_api_dump": {
+            "/twrbc-card/qu002/010": {
+                "cardDataList": [],
+                "billData": {"TWD": {"2026/09": {"summary": {}, "bills": [billed_item]}}},
+            },
+            "/twrbc-card/qu006/011": {"allItems": []},
+        },
+        "summary": {}, "twd_deposit": {},
+    }
+    for _ in range(2):
+        persist_ctbc(empty_snapshot, settled, rules=[])
+        pending_count = settled.conn.execute("SELECT COUNT(*) FROM card_pending_txns").fetchone()
+        assert pending_count is not None and pending_count[0] == 0
+        original = settled.conn.execute(
+            "SELECT id, description, amount, category, description_overwrite, tags_overwrite, splits_overwrite "
+            "FROM card_billed_txns"
+        ).fetchall()
+        assert [tuple(r) for r in original] == [(billed_ids[0], "御膳食堂", 500, None, None, None, None)]
+    for _ in range(2):
+        persist_ctbc(payload, settled, rules=[])
+        pending = settled.conn.execute(
+            "SELECT user_id, scope, card_no, consume_date, post_date, description, "
+            "amount, currency, consume_country, consume_currency, consume_amount, "
+            "txn_type, native_identity, category, description_overwrite, "
+            "tags_overwrite, splits_overwrite FROM card_pending_txns"
+        ).fetchall()
+        assert [tuple(r) for r in pending] == [(
+            1, "unbilled", "****1234", "2026-09-10", None, "御膳食堂",
+            725, "TWD", "US", "USD", 22.5, "spending",
+            '["ctbc_lifecycle",1,101,"1234_0","synthetic-new-purchase"]',
+            None, None, None, None,
+        )]
+        old_pending_count = settled.conn.execute(
+            "SELECT COUNT(*) FROM card_pending_txns WHERE id=?", (old_id,),
+        ).fetchone()
+        assert old_pending_count is not None and old_pending_count[0] == 0
+        billed = settled.conn.execute(
+            "SELECT user_id, card_no, bill_date, consume_date, post_date, description, "
+            "amount, currency, consume_currency, consume_amount, txn_type, "
+            "native_identity, category, description_overwrite, tags_overwrite, "
+            "splits_overwrite FROM card_billed_txns ORDER BY id"
+        ).fetchall()
+        assert [tuple(r) for r in billed] == [(
+            1, "****1234", "2026-09-01", "2026-09-10", "2026-09-12", "御膳食堂",
+            500, "TWD", None, None, "spending", None, None, None, None, None,
+        )] * 2
+        billed_total = settled.conn.execute("SELECT SUM(amount) FROM card_billed_txns").fetchone()
+        assert billed_total is not None and billed_total[0] == 1000
+        original_billed_count = settled.conn.execute(
+            "SELECT COUNT(*) FROM card_billed_txns WHERE id=?", (billed_ids[0],),
+        ).fetchone()
+        assert original_billed_count is not None and original_billed_count[0] == 1
     settled.close()
 
 

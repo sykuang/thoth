@@ -1,5 +1,6 @@
 """Offline synthetic regressions through the production bill-write barrier."""
 import copy
+import sqlite3
 from datetime import date
 
 import pytest
@@ -47,6 +48,21 @@ def rows(store, table="card_billed_txns"):
 def edit(store, splits=None):
     store.conn.execute("UPDATE card_pending_txns SET description_overwrite='KEEP', splits_overwrite=?", (splits,))
     store.commit()
+
+
+def assert_replacement(row, *, amount, description, consume_currency, consume_amount,
+                       post_date=None, bill_date=None, native_identity='["ctbc",1,101,"1234_0","synthetic-ref"]'):
+    expected = {
+        "user_id": 1, "card_no": "****1234", "consume_date": "2026-09-10",
+        "post_date": post_date, "amount": amount, "description": description,
+        "currency": "TWD", "consume_currency": consume_currency,
+        "consume_amount": consume_amount, "native_identity": native_identity,
+        "txn_type": "spending", "description_overwrite": None, "splits_overwrite": None,
+        "category": None, "subcategory": None, "tags_overwrite": None, "auto_excluded": 0,
+    }
+    assert {field: row[field] for field in expected} == expected
+    if "bill_date" in row:
+        assert row["bill_date"] == bill_date
 
 
 @pytest.mark.parametrize("mode", ["promotion", "reestimate", "statement"])
@@ -169,7 +185,7 @@ def test_all_weak_billed_fallbacks_veto_known_currency_conflicts(store, case):
         assert actual[1]["card_no"] == other["card_no"]
 
 
-@pytest.mark.parametrize("change", [{"txn_type": "payment"}, {"amount": -150},
+@pytest.mark.parametrize("change", [{"txn_type": "payment"},
                                     {"post_date": "2026-09-13"}, {"consume_amount": 4}])
 def test_native_unknown_reestimate_conflicts_fail_closed_without_losing_edit(store, change):
     txn = {"card_no": "****1234", "date": "2026-09-10", "post_date": "2026-09-12",
@@ -181,6 +197,24 @@ def test_native_unknown_reestimate_conflicts_fail_closed_without_losing_edit(sto
     with pytest.raises(ValueError, match="conflict|ambiguous"):
         store.refresh_card_pending("unbilled", [{**txn, **change}], fetch_ok=True)
     assert rows(store, "card_pending_txns") == before
+    assert rows(store) == []
+
+
+def test_native_unknown_reestimate_replaces_unmatchable_old_edit(store):
+    txn = {"card_no": "****1234", "date": "2026-09-10", "post_date": "2026-09-12",
+           "amount": 100, "desc": "SHOP", "currency": "TWD", "consume_currency": "USD",
+           "consume_amount": 3, "native_identity": "synthetic-native", "txn_type": "spending"}
+    store.refresh_card_pending("unbilled", [txn], fetch_ok=True)
+    edit(store, '[{"amount":40},{"amount":60}]')
+    replacement = {**txn, "amount": -150}
+    assert store.refresh_card_pending("unbilled", [replacement], fetch_ok=True) == 1
+    actual = rows(store, "card_pending_txns")
+    assert len(actual) == 1
+    assert_replacement(actual[0], amount=-150, description="SHOP", consume_currency="USD",
+                       consume_amount=3, post_date="2026-09-12", native_identity="synthetic-native")
+    assert actual[0]["scope"] == "unbilled"
+    assert store.refresh_card_pending("unbilled", [replacement], fetch_ok=True) == 1
+    assert len(rows(store, "card_pending_txns")) == 1
     assert rows(store) == []
 
 
@@ -201,16 +235,22 @@ def test_edited_native_null_postdate_cannot_guess_between_distinct_installments(
 @pytest.mark.parametrize("settlement", [{"occCurCode": "EUR", "foreignAmt": "3"},
                                         {"occCurCode": "USD", "foreignAmt": "4"},
                                         {"occCurCode": "TWD", "foreignAmt": "100", "ntAmt": 150}])
-def test_wrapper_statement_disappearance_cannot_erase_conflicting_native_donor(store, settlement):
+def test_wrapper_statement_replaces_unmatchable_native_donor_without_transplanting_edit(store, settlement):
     persist(store, pending=[pending(origCurDesc="USD", origCurAmt=3)])
-    edit(store)
-    before = rows(store, "card_pending_txns")
-    ledgers = {name: copy.deepcopy(getattr(store, name)) for name in LEDGERS}
-    with pytest.raises(ValueError, match="conflict|ambiguous"):
-        persist(store, billed=[statement(**settlement)])
-    assert rows(store, "card_pending_txns") == before
-    assert rows(store) == []
-    assert {name: getattr(store, name) for name in LEDGERS} == ledgers
+    edit(store, '[{"amount":40},{"amount":60}]')
+    persist(store, billed=[statement(**settlement)])
+    actual = rows(store)
+    assert len(actual) == 1
+    is_fx = settlement["occCurCode"] != "TWD"
+    assert_replacement(actual[0], amount=settlement.get("ntAmt", 100), description="SHOP",
+                       consume_currency=settlement["occCurCode"] if is_fx else None,
+                       consume_amount=float(settlement["foreignAmt"]) if is_fx else None,
+                       post_date="2026-09-12", bill_date="2026-09-01")
+    assert rows(store, "card_pending_txns") == []
+    assert store.latest_card_transaction_dates() == {"****1234": date(2026, 9, 12)}
+    persist(store, billed=[statement(**settlement)])
+    assert rows(store) == actual
+    assert rows(store, "card_pending_txns") == []
 
 
 def test_native_undated_replay_after_enrichment_does_not_duplicate_or_erase_postdate(store):
@@ -226,14 +266,27 @@ def test_native_undated_replay_after_enrichment_does_not_duplicate_or_erase_post
 
 
 @pytest.mark.parametrize("old_count,new_count", [(1, 2), (2, 1), (2, 2)])
-def test_wrapper_native_fx_reestimate_cannot_guess_edited_repeated_occurrences(store, old_count, new_count):
+def test_wrapper_native_fx_reestimate_replaces_edited_repeated_occurrences(store, old_count, new_count):
     txn = pending(origCurDesc="USD", origCurAmt=3)
     persist(store, pending=[txn] * old_count)
-    edit(store)
-    before = rows(store, "card_pending_txns")
-    with pytest.raises(ValueError, match="ambiguous"):
-        persist(store, pending=[{**txn, "purchaseAmt": 150, "description": "RENAMED"}] * new_count)
-    assert rows(store, "card_pending_txns") == before
+    edit(store, '[{"amount":40},{"amount":60}]')
+    replacement = [{**txn, "purchaseAmt": 150, "description": "RENAMED"}] * new_count
+    persist(store, pending=replacement)
+    actual = rows(store, "card_pending_txns")
+    assert len(actual) == new_count
+    for row in actual:
+        assert_replacement(row, amount=150, description="RENAMED",
+                           consume_currency="USD", consume_amount=3)
+        assert row["scope"] == "unbilled"
+    assert len({row["id"] for row in actual}) == new_count
+    persist(store, pending=replacement)
+    replayed = rows(store, "card_pending_txns")
+    assert len(replayed) == new_count
+    for row in replayed:
+        assert_replacement(row, amount=150, description="RENAMED",
+                           consume_currency="USD", consume_amount=3)
+        assert row["scope"] == "unbilled"
+    assert store.latest_card_transaction_dates() == {}
     assert rows(store) == []
 
 
@@ -277,27 +330,53 @@ LEDGERS = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys"
            "_unsafe_pending_overlay_identities")
 
 
-def test_wrapper_legacy_rename_cannot_discard_edit(store):
+def test_wrapper_legacy_rename_replaces_unmatchable_edit(store):
     persist(store, pending=[pending(acwRefNbr=None)])
-    edit(store)
-    before = rows(store, "card_pending_txns")
-    with pytest.raises(ValueError, match="ambiguous"):
-        persist(store, billed=[statement()])
-    assert rows(store) == []
-    assert rows(store, "card_pending_txns") == before
+    edit(store, '[{"amount":40},{"amount":60}]')
+    persist(store, billed=[statement()])
+    actual = rows(store)
+    assert len(actual) == 1
+    assert_replacement(actual[0], amount=100, description="SHOP", consume_currency=None,
+                       consume_amount=None, post_date="2026-09-12", bill_date="2026-09-01")
+    assert rows(store, "card_pending_txns") == []
+    persist(store, billed=[statement()])
+    assert rows(store) == actual
+    assert rows(store, "card_pending_txns") == []
 
 
 def test_wrapper_card_batch_restores_all_ledgers_and_sql_on_failure(store):
     persist(store, pending=[pending()])
-    edit(store, "bad")
+    edit(store, '[{"amount":40},{"amount":60}]')
+    store.conn.execute("CREATE TRIGGER fail_card_insert BEFORE INSERT ON card_billed_txns "
+                       "WHEN NEW.description = 'FAIL SQL' BEGIN "
+                       "SELECT RAISE(ABORT, 'injected card INSERT failure'); END")
+    store.commit()
     before = {name: copy.deepcopy(getattr(store, name)) for name in LEDGERS}
     pending_before = rows(store, "card_pending_txns")
-    with pytest.raises(ValueError, match="split"):
-        persist(store, billed=[statement()])
+    billed_before = rows(store)
+    incoming = [statement(), statement(acwRefNbr="second-ref", merchantChiName="FAIL SQL")]
+    with pytest.raises(sqlite3.IntegrityError, match="injected card INSERT failure"):
+        persist(store, billed=incoming)
     assert {name: getattr(store, name) for name in LEDGERS} == before
-    assert rows(store) == []
+    assert rows(store) == billed_before
     assert rows(store, "card_pending_txns") == pending_before
-    edit(store, '[{"amount":40},{"amount":60}]')
-    persist(store, billed=[statement()])
+    assert pending_before[0]["description_overwrite"] == "KEEP"
+    assert pending_before[0]["splits_overwrite"] == '[{"amount":40},{"amount":60}]'
+    store.conn.execute("DROP TRIGGER fail_card_insert")
+    store.commit()
+    persist(store, billed=incoming)
+    assert len(rows(store)) == 2
     assert rows(store)[0]["description_overwrite"] == "KEEP"
+    assert rows(store)[0]["splits_overwrite"] == '[{"amount":40},{"amount":60}]'
+    assert rows(store, "card_pending_txns") == []
+
+
+def test_wrapper_invalid_old_splits_do_not_refuse_current_statement(store):
+    persist(store, pending=[pending()])
+    edit(store, "bad")
+    persist(store, billed=[statement()])
+    actual = rows(store)
+    assert len(actual) == 1
+    assert_replacement(actual[0], amount=100, description="SHOP", consume_currency=None,
+                       consume_amount=None, post_date="2026-09-12", bill_date="2026-09-01")
     assert rows(store, "card_pending_txns") == []

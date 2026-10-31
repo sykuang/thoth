@@ -270,7 +270,10 @@ def persist_rakuten(
             with error_step('RAKUTEN-08-009-002'):
                 store.commit()
         return delta
-    except Exception:
-        with error_step('RAKUTEN-08-009-003'):
-            store.conn.rollback()
+    except Exception as error:
+        try:
+            with error_step('RAKUTEN-08-009-003'):
+                store.conn.rollback()
+        except Exception:
+            raise error  # Cleanup must not replace the operation failure.
         raise

@@ -7,10 +7,35 @@ from __future__ import annotations
 
 from backend.core.error_codes import error_step, with_error_code
 from datetime import datetime
-
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 
 from backend.core.money import MAX_SAFE_INTEGER, native_money
+
+
+def _snapshot_occurrence_ledgers(store) -> dict:
+    """Snapshot existing RAM ledgers at the caller's owned rollback boundary."""
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    if isinstance(store, CardBillWriteBarrier):
+        store = store._store
+    names = ("_new_billed_ids", "_current_billed_ids", "_adopted_pending_raw_keys",
+             "_unsafe_pending_overlay_identities", "_billed_source_rows")
+    try:
+        owned = object.__getattribute__(store, "__dict__")
+    except AttributeError:
+        return {}
+    # Readable compatibility attributes are not owned mutable RAM.
+    return {name: deepcopy(owned[name]) for name in names if name in owned}
+
+
+def _restore_occurrence_ledgers(store, before: dict) -> None:
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    if isinstance(store, CardBillWriteBarrier):
+        store = store._store
+    for name, value in before.items():
+        setattr(store, name, value)
 
 
 def _num(s, *, _codes: tuple[str, ...] | None = None) -> int | None:

@@ -13,11 +13,417 @@ from tests.test_card_booking_core_regressions import (
 store = _store_fixture
 
 
+def test_occurrence_source_snapshot_restores_actual_barrier_owner_without_shadow_state(store):
+    from backend.core.card_bills import CardBillWriteBarrier
+    from backend.core.persist._common import _snapshot_occurrence_ledgers, _restore_occurrence_ledgers
+
+    store.upsert_card_billed([{"card_no": "****1234", "date": "2026-07-01", "desc": "SOURCE",
+                              "amount": 100, "currency": "TWD", "post_date": "2026-07-03"}])
+    barrier = CardBillWriteBarrier(store)
+    before = _snapshot_occurrence_ledgers(barrier)
+    assert before["_billed_source_rows"]
+    store._billed_source_rows.clear()
+    store._current_billed_ids.clear()
+    _restore_occurrence_ledgers(barrier, before)
+    assert _snapshot_occurrence_ledgers(store) == before
+    assert vars(barrier) == {"_store": store}
+
+
+@pytest.mark.parametrize("entry", ["batch", "promotion", "pending"])
+@pytest.mark.parametrize("commit", [False, True])
+def test_authentic_source_ledger_rolls_back_at_each_owned_late_insert_failure(store, entry, commit):
+    from backend.core.card_bills import CardBillWriteBarrier
+    from backend.core.error_codes import exception_error_id
+    from backend.core.persist._common import _snapshot_occurrence_ledgers
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    store.refresh_card_pending("unbilled", [a], fetch_ok=None)
+    store.refresh_card_pending("current", [{**a, "desc": "OTHER"}], fetch_ok=None)
+    annotate(store)
+    original = rows(store, "card_pending_txns")
+    assert [tuple(row[f] for f in FIELDS) for row in original] == [OVERLAY] * 2
+    source = {**a, "post_date": "2026-07-03", "bill_date": "2026-07-18"}
+    incoming = {**a, "date": "2026-07-02", "desc": "INCOMING", "native_identity": None,
+                "booking_status": None}
+    barrier = CardBillWriteBarrier(store)
+    if entry == "pending":
+        barrier.upsert_card_billed([source])
+        if commit:
+            store.commit()
+    if not commit:
+        store.conn.execute("UPDATE card_pending_txns SET refreshed_at='caller-prefix' WHERE scope='current'")
+    before_sql = (rows(store), rows(store, "card_pending_txns"))
+    before = _snapshot_occurrence_ledgers(store)
+    assert "_billed_source_rows" in before
+    observed = []
+    store.conn.execute("CREATE TEMP TRIGGER fail_actual_source_insert BEFORE INSERT ON card_pending_txns "
+                       "BEGIN SELECT RAISE(ABORT, 'actual source late insert'); END")
+
+    def observe(sql):
+        if "INSERT INTO card_pending_txns" in sql:
+            observed.append((_snapshot_occurrence_ledgers(store),
+                             rows(store, "card_pending_txns")))
+
+    store.conn.set_trace_callback(observe)
+    with pytest.raises(Exception, match="actual source late insert") as failure:
+        if entry == "batch":
+            barrier.persist_card_batch([source], [incoming], scope="unbilled", fetch_ok=True, commit=commit)
+        else:
+            barrier.refresh_card_pending("unbilled", [{**source, "booking_status": "booked"}, incoming]
+                                         if entry == "promotion" else [incoming], fetch_ok=True, commit=commit)
+    store.conn.set_trace_callback(None)
+    assert exception_error_id(failure.value) == "SYS-08-155-025"
+    assert observed
+    partial, pending_at_insert = observed[0]
+    assert partial["_billed_source_rows"]
+    assert any(marker[0] == "booked" for marker in partial["_unsafe_pending_overlay_identities"])
+    assert not any(row["scope"] == "unbilled" for row in pending_at_insert)
+    assert _snapshot_occurrence_ledgers(store) == before
+    # Caller-owned prefix remains provisional; Store-owned failure rolls it back.
+    assert (rows(store), rows(store, "card_pending_txns")) == (before_sql if not commit else
+        (before_sql[0] if entry == "pending" else [], original))
+    store.conn.execute("DROP TRIGGER fail_actual_source_insert")
+    if not commit:
+        assert store.conn.in_transaction
+        store.rollback()
+
+
+@pytest.mark.parametrize("first_scope", ["unbilled", "current"])
+@pytest.mark.parametrize("first_entry", ["statement", "promotion"])
+def test_missing_source_proof_does_not_poison_later_unique_other_scope_source(store, first_scope, first_entry):
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "NEW", "amount": 100,
+         "currency": "TWD", "post_date": "2026-07-03", "bill_date": "2026-07-18",
+         "txn_type": "spending", "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    store.upsert_card_billed([a])
+    store.commit()
+    original = rows(store)[0]
+    second_scope = "current" if first_scope == "unbilled" else "unbilled"
+    for scope in (first_scope, second_scope):
+        store.refresh_card_pending(scope, [{**a, "desc": "OLD", "post_date": None}], fetch_ok=None)
+    annotate(store)
+    original_pending = rows(store, "card_pending_txns")
+    assert [tuple(row[f] for f in FIELDS) for row in original_pending] == [OVERLAY] * 2
+    remaining = next(row for row in original_pending if row["scope"] == second_scope)
+    barrier = CardBillWriteBarrier(store)
+    weak = {**a, "native_identity": None}
+    if first_entry == "statement":
+        barrier.persist_card_batch([weak], [], scope=first_scope, fetch_ok=True, commit=False)
+    else:
+        barrier.refresh_card_pending(first_scope, [{**weak, "booking_status": "booked"}],
+                                     fetch_ok=True, commit=False)
+    assert rows(store) == [original]
+    assert rows(store, "card_pending_txns") == [remaining]
+    assert ("booked", original["id"]) not in store._unsafe_pending_overlay_identities
+    assert barrier.refresh_card_pending(second_scope, [{**a, "booking_status": "booked"}], fetch_ok=True) == 0
+    actual = rows(store)
+    assert len(actual) == 1 and actual[0]["id"] == original["id"]
+    assert tuple(actual[0][f] for f in FIELDS) == OVERLAY
+    assert rows(store, "card_pending_txns") == []
+
+
+def test_sequential_promotion_remembers_two_actual_booked_sources(store):
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    for scope in ("unbilled", "current"):
+        store.refresh_card_pending(scope, [a], fetch_ok=None, rules=[])
+    annotate(store)
+    original = rows(store, "card_pending_txns")
+    original_current = next(row for row in original if row["scope"] == "current")
+    assert [tuple(row[field] for field in FIELDS) for row in original] == [OVERLAY] * 2
+    b = {**a, "booking_status": "booked", "post_date": "2026-07-03"}
+    barrier = CardBillWriteBarrier(store)
+    assert barrier.refresh_card_pending("unbilled", [b, b], fetch_ok=True, commit=False, rules=[]) == 0
+    first = rows(store)
+    assert len(first) == 2
+    assert [tuple(row[field] for field in FIELDS) for row in first] == [(None, None, None, None, 0, None)] * 2
+    assert rows(store, "card_pending_txns") == [original_current]
+    assert barrier.refresh_card_pending("current", [b], fetch_ok=True, rules=[]) == 0
+    assert rows(store) == first
+    assert rows(store, "card_pending_txns") == []
+    assert store.latest_card_transaction_dates() == {}
+    assert_durable(store, first, [])
+
+
+@pytest.mark.parametrize("kind", ["native", "fx", "local"])
+@pytest.mark.parametrize("first_scope", ["unbilled", "current"])
+@pytest.mark.parametrize("reverse_seed", [False, True])
+@pytest.mark.parametrize("sibling_edits", ["blank", "same"])
+@pytest.mark.parametrize("source_count", [1, 2])
+@pytest.mark.parametrize("second_entry", ["promotion", "vanished"])
+def test_sequential_source_preimage_rejection_keeps_independent_edits(
+        store, kind, first_scope, reverse_seed, sibling_edits, source_count, second_entry):
+    from datetime import date
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    if kind != "native":
+        a["native_identity"] = None
+    if kind == "fx":
+        a.update(consume_currency="USD", consume_amount=3)
+    safe = {**a, "date": "2026-07-02", "desc": "SAFE",
+            "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "safe"])}
+    second_scope = "current" if first_scope == "unbilled" else "unbilled"
+    seeds = [(first_scope, [a]), (second_scope, [a, safe])]
+    for scope, txns in seeds[::-1] if reverse_seed else seeds:
+        store.refresh_card_pending(scope, txns, fetch_ok=None, rules=[])
+    annotate(store)
+    if sibling_edits == "blank":
+        store.conn.execute("UPDATE card_pending_txns SET " + ",".join(f"{f}=?" for f in FIELDS)
+                           + " WHERE scope=? AND description='A'",
+                           (None, None, None, None, 0, None, second_scope))
+        store.commit()
+    original_other = rows(store, "card_pending_txns")
+    original_other = [row for row in original_other if row["scope"] == second_scope]
+    original_safe = next(row for row in original_other if row["description"] == "SAFE")
+    assert tuple(original_safe[f] for f in FIELDS) == OVERLAY
+    b = {**a, "booking_status": "booked", "post_date": "2026-07-03"}
+    barrier = CardBillWriteBarrier(store)
+    assert barrier.refresh_card_pending(first_scope, [b] * source_count,
+                                        fetch_ok=True, commit=False, rules=[]) == 0
+    first = rows(store)
+    expected = OVERLAY if source_count == 1 and sibling_edits == "same" else (None, None, None, None, 0, None)
+    assert len(first) == source_count
+    assert [tuple(row[f] for f in FIELDS) for row in first] == [expected] * source_count
+    assert rows(store, "card_pending_txns") == original_other
+    if second_entry == "vanished":
+        barrier.upsert_card_billed([b], rules=[])
+    safe_booked = {**safe, "booking_status": "booked", "post_date": "2026-07-03"}
+    incoming = [safe_booked] if second_entry == "vanished" else [b, safe_booked]
+    assert barrier.refresh_card_pending(second_scope, incoming, fetch_ok=True, rules=[]) == 0
+    billed = rows(store)
+    assert [row for row in billed if row["description"] == "A"] == first
+    assert rows(store, "card_pending_txns") == []
+    kept_safe = next(row for row in billed if row["description"] == "SAFE")
+    assert tuple(kept_safe[f] for f in FIELDS) == OVERLAY
+    assert len(billed) == source_count + 1
+    assert [(row["amount"], row["currency"], row["native_identity"], row["txn_type"])
+            for row in first] == [(100, "TWD", a["native_identity"], "spending")] * source_count
+    assert store.latest_card_transaction_dates() == (
+        {"****1234": date(2026, 7, 3)} if second_entry == "vanished" else {})
+    assert_durable(store, billed, [])
+
+
+@pytest.mark.parametrize("first_scope", ["unbilled", "current"])
+@pytest.mark.parametrize("source_count", [1, 2])
+def test_statement_source_preimage_rejection_survives_later_explicit_promotion(
+        store, first_scope, source_count):
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    second_scope = "current" if first_scope == "unbilled" else "unbilled"
+    for scope in (first_scope, second_scope):
+        store.refresh_card_pending(scope, [a], fetch_ok=None, rules=[])
+    annotate(store)
+    original_other = next(row for row in rows(store, "card_pending_txns") if row["scope"] == second_scope)
+    b = {**a, "post_date": "2026-07-03", "booking_status": "booked"}
+    barrier = CardBillWriteBarrier(store)
+    barrier.upsert_card_billed([b] * source_count, rules=[])
+    assert barrier.refresh_card_pending(first_scope, [], fetch_ok=True, commit=False, rules=[]) == 0
+    first = rows(store)
+    expected = OVERLAY if source_count == 1 else (None, None, None, None, 0, None)
+    assert [tuple(row[f] for f in FIELDS) for row in first] == [expected] * source_count
+    assert rows(store, "card_pending_txns") == [original_other]
+    assert barrier.refresh_card_pending(second_scope, [b], fetch_ok=True, rules=[]) == 0
+    assert rows(store) == first and rows(store, "card_pending_txns") == []
+    assert_durable(store, first, [])
+
+
+@pytest.mark.parametrize("kind", ["native", "fx", "local"])
+@pytest.mark.parametrize("first_scope", ["unbilled", "current"])
+@pytest.mark.parametrize("reverse_sources", [False, True])
+def test_booked_and_pending_source_preimage_remains_ambiguous_after_scope_consumption(
+        store, kind, first_scope, reverse_sources):
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"]) if kind == "native" else None}
+    if kind == "fx":
+        a.update(consume_currency="USD", consume_amount=3)
+    second_scope = "current" if first_scope == "unbilled" else "unbilled"
+    for scope in (first_scope, second_scope):
+        store.refresh_card_pending(scope, [a], fetch_ok=None, rules=[])
+    annotate(store)
+    original_other = next(row for row in rows(store, "card_pending_txns") if row["scope"] == second_scope)
+    assert tuple(original_other[f] for f in FIELDS) == OVERLAY
+    b = {**a, "booking_status": "booked", "post_date": "2026-07-03"}
+    unknown = {**a, "booking_status": None}
+    sources = [b, unknown]
+    barrier = CardBillWriteBarrier(store)
+    assert barrier.refresh_card_pending(first_scope, sources[::-1] if reverse_sources else sources,
+                                        fetch_ok=True, rules=[], commit=False) == 1
+    first = rows(store)
+    assert len(first) == 1 and not any(first[0][f] for f in FIELDS)
+    pending_rows = rows(store, "card_pending_txns")
+    assert next(row for row in pending_rows if row["scope"] == second_scope) == original_other
+    assert not any(next(row for row in pending_rows if row["scope"] == first_scope)[f] for f in FIELDS)
+    assert barrier.refresh_card_pending(second_scope, [b], fetch_ok=True, rules=[]) == 0
+    assert rows(store) == first
+    assert barrier.refresh_card_pending(first_scope, [], fetch_ok=True, rules=[]) == 0
+    assert rows(store) == first and rows(store, "card_pending_txns") == []
+    assert_durable(store, first, [])
+
+
+def test_source_rejection_ledger_resets_only_at_new_card_batch(store):
+    from backend.core.card_bills import CardBillWriteBarrier
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    for scope in ("unbilled", "current"):
+        store.refresh_card_pending(scope, [a], fetch_ok=None, rules=[])
+    annotate(store)
+    b = {**a, "booking_status": "booked", "post_date": "2026-07-03"}
+    barrier = CardBillWriteBarrier(store)
+    barrier.refresh_card_pending("unbilled", [b, b], fetch_ok=True, rules=[], commit=False)
+    target_ids = [row["id"] for row in rows(store)]
+    assert len(target_ids) == 2
+    rejected = {("booked", target_id) for target_id in target_ids}
+    assert rejected <= store._unsafe_pending_overlay_identities
+    barrier.refresh_card_pending("realtime", [], fetch_ok=False, rules=[], commit=False)
+    assert rejected <= store._unsafe_pending_overlay_identities
+    assert barrier.persist_card_batch([], [], scope="realtime", fetch_ok=True, rules=[]) == (0, 0)
+    assert store._unsafe_pending_overlay_identities == set()
+    assert barrier.refresh_card_pending("current", [b], fetch_ok=True, rules=[]) == 0
+    assert [row["id"] for row in rows(store)] == target_ids
+    assert [tuple(row[f] for f in FIELDS) for row in rows(store)] == [OVERLAY, (None, None, None, None, 0, None)]
+    assert rows(store, "card_pending_txns") == []
+    assert_durable(store, rows(store), [])
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_source_multiplicity_marker_precedes_delete_and_late_sql_failure_restores_preimage(
+        store, monkeypatch, commit):
+    import sqlite3
+    from backend.core.card_bills import CardBillWriteBarrier
+    from backend.core.error_codes import exception_error_id
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    for scope in ("unbilled", "current"):
+        store.refresh_card_pending(scope, [a], fetch_ok=None, rules=[])
+    annotate(store)
+    before_ram = seed_ledgers(store)
+    real = store.conn
+    real.execute("CREATE TRIGGER reject_source_insert BEFORE INSERT ON card_pending_txns "
+                 "BEGIN SELECT RAISE(ABORT, 'synthetic source multiplicity late failure'); END")
+    real.commit()
+    before_sql = list(real.iterdump())
+    real.execute("BEGIN")
+    seen = []
+    deletes = []
+
+    class ObserveConnection:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("DELETE FROM card_pending_txns"):
+                target_ids = [row[0] for row in real.execute("SELECT id FROM card_billed_txns")]
+                assert len(target_ids) == 2
+                assert all(("booked", target_id) in store._unsafe_pending_overlay_identities
+                           for target_id in target_ids)
+                deletes.append(sql)
+            if sql.lstrip().startswith("INSERT INTO card_pending_txns"):
+                assert deletes
+                assert real.execute("SELECT COUNT(*) FROM card_pending_txns WHERE scope='unbilled'").fetchone()[0] == 0
+            try:
+                return real.execute(sql, *args)
+            except sqlite3.IntegrityError as error:
+                seen.append(error)
+                raise
+
+    monkeypatch.setattr(store, "conn", ObserveConnection())
+    b = {**a, "booking_status": "booked", "post_date": "2026-07-03"}
+    safe = {**a, "date": "2026-07-02", "desc": "SAFE", "booking_status": None,
+            "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "safe"])}
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic source multiplicity late failure") as caught:
+        CardBillWriteBarrier(store).refresh_card_pending("unbilled", [b, b, safe], fetch_ok=True,
+                                                        rules=[], commit=commit)
+    assert caught.value is seen[0]
+    assert exception_error_id(caught.value) == "SYS-08-155-025"
+    assert list(real.iterdump()) == before_sql
+    assert {name: getattr(store, name) for name in LEDGERS} == before_ram
+    real.rollback()
+    real.execute("DROP TRIGGER reject_source_insert")
+    real.commit()
+
+
 FIELDS = ("category", "subcategory", "description_overwrite", "tags_overwrite",
           "auto_excluded", "splits_overwrite")
 OVERLAY = ("購物", "訂閱", "KEEP", '["synthetic"]', 1,
            '[{"amount":40,"category":"餐飲","note":"one","auto_excluded":false},'
            '{"amount":60,"category":"交通","note":"two","auto_excluded":true}]')
+
+
+@pytest.mark.parametrize("kind", ["native", "mixed-fx"])
+@pytest.mark.parametrize("commit", [False, True])
+def test_cross_scope_rejected_target_late_insert_failure_restores_sql_and_four_ledgers(
+        store, monkeypatch, kind, commit):
+    import sqlite3
+    from backend.core.card_bills import CardBillWriteBarrier
+    from backend.core.error_codes import exception_error_id
+
+    a = {"card_no": "****1234", "date": "2026-07-01", "desc": "A", "amount": 100,
+         "currency": "TWD", "post_date": None, "txn_type": "spending",
+         "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "a"])}
+    w = {**a, "desc": "W"}
+    if kind == "mixed-fx":
+        a.update(consume_currency="USD", consume_amount=3)
+        w = {**a, "desc": "W", "native_identity": None}
+    safe = {**a, "date": "2026-07-02", "desc": "SAFE",
+            "native_identity": json.dumps(["ctbc", 1, 101, "1234_0", "safe"])}
+    store.refresh_card_pending("unbilled", [a, safe], rules=[])
+    store.refresh_card_pending("current", [w], rules=[])
+    annotate(store)
+    before_ram = seed_ledgers(store)
+    real = store.conn
+    real.execute("CREATE TRIGGER reject_cross_scope_insert BEFORE INSERT ON card_pending_txns "
+                 "BEGIN SELECT RAISE(ABORT, 'synthetic cross-scope late failure'); END")
+    real.commit()
+    before_sql = list(real.iterdump())
+    statement_row = {**a, "post_date": "2026-07-03", "bill_date": "2026-07-18",
+                     "native_identity": None if kind == "mixed-fx" else a["native_identity"]}
+    seen = []
+
+    class ObserveConnection:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("INSERT INTO card_pending_txns"):
+                target_id = real.execute("SELECT id FROM card_billed_txns").fetchone()[0]
+                assert ("booked", target_id) in store._unsafe_pending_overlay_identities
+                assert real.execute("SELECT COUNT(*) FROM card_pending_txns WHERE scope='unbilled'").fetchone()[0] == 0
+            try:
+                return real.execute(sql, *args)
+            except sqlite3.IntegrityError as error:
+                seen.append(error)
+                raise
+
+    monkeypatch.setattr(store, "conn", ObserveConnection())
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic cross-scope late failure") as caught:
+        CardBillWriteBarrier(store).persist_card_batch([statement_row], [safe], scope="unbilled",
+                                                      fetch_ok=True, rules=[], commit=commit)
+    assert caught.value is seen[0]
+    assert exception_error_id(caught.value) == "SYS-08-155-025"
+    assert list(real.iterdump()) == before_sql
+    assert {name: getattr(store, name) for name in LEDGERS} == before_ram
+    real.rollback()
+    real.execute("DROP TRIGGER reject_cross_scope_insert")
+    real.commit()
 
 
 def annotate(store, table="card_pending_txns"):
@@ -44,25 +450,38 @@ def assert_durable(store, billed, pending_rows):
 
 @pytest.mark.parametrize("old_ref,new_ref", [(None, "synthetic-ref"), ("synthetic-ref", None), (None, None)])
 @pytest.mark.parametrize("fx", [False, True])
-def test_wrapper_unknown_missing_reference_rename_fails_closed(store, old_ref, new_ref, fx):
+def test_wrapper_unknown_missing_reference_rename_rebuilds_without_guessed_edits(store, old_ref, new_ref, fx):
     original = pending(acwRefNbr=old_ref, **({"origCurDesc": "USD", "origCurAmt": 3} if fx else {}))
     persist(store, pending=[original])
     annotate(store)
-    before = rows(store, "card_pending_txns")
-    ledgers = seed_ledgers(store)
-    if fx and old_ref is None and new_ref is None:
-        persist(store, pending=[{**original, "description": "RENAMED"}])
-        assert tuple(rows(store, "card_pending_txns")[0][field] for field in FIELDS) == OVERLAY
-        return  # Existing exact original-FX legacy fallback is admissible.
-    with pytest.raises(ValueError, match="ambiguous"):
-        persist(store, pending=[{**original, "acwRefNbr": new_ref, "description": "RENAMED"}])
-    assert rows(store, "card_pending_txns") == before
-    assert rows(store) == []
-    assert {name: getattr(store, name) for name in LEDGERS} == ledgers
-    assert_durable(store, [], before)
-    # A repaired exact snapshot can be retried without leaking a failed mapping.
-    persist(store, pending=[original])
-    assert tuple(rows(store, "card_pending_txns")[0][field] for field in FIELDS) == OVERLAY
+    seed_ledgers(store)
+    incoming = {**original, "acwRefNbr": new_ref, "description": "RENAMED"}
+    expected_overlay = OVERLAY if fx else (None, None, None, None, 0, None)
+    persist(store, pending=[incoming])
+    actual = rows(store, "card_pending_txns")
+    assert rows(store) == [] and len(actual) == 1
+    row = actual[0]
+    assert (row["card_no"], row["consume_date"], row["post_date"], row["description"],
+            row["amount"], row["currency"], row["consume_currency"], row["consume_amount"],
+            row["txn_type"]) == ("****1234", "2026-09-10", None, "RENAMED", 100, "TWD",
+                                 "USD" if fx else None, 3 if fx else None, "spending")
+    if new_ref is None:
+        assert row["native_identity"] is None
+    else:
+        assert json.loads(row["native_identity"]) == ["ctbc", 1, 101, "1234_0", new_ref]
+    # Unique exact original-FX legacy evidence remains an admissible matched control.
+    matched = fx
+    assert tuple(row[field] for field in FIELDS) == expected_overlay
+    assert row["flow_type"] == "expense" and row["income_category"] is None
+    assert row["is_subscription"] == int(matched)
+    assert_durable(store, [], actual)
+    # Replaying the new bank occurrence must not resurrect an unmatchable old edit.
+    persist(store, pending=[incoming])
+    replay = rows(store, "card_pending_txns")
+    assert len(replay) == 1 and rows(store) == []
+    assert tuple(replay[0][field] for field in FIELDS) == tuple(row[field] for field in FIELDS)
+    assert replay[0]["native_identity"] == row["native_identity"]
+    assert_durable(store, [], replay)
 
 
 @pytest.mark.parametrize("change", [
@@ -81,23 +500,35 @@ def test_wrapper_unrelated_purchase_is_not_a_legacy_ambiguity(store, change):
 
 @pytest.mark.parametrize("amount", [100, 150])
 @pytest.mark.parametrize("rename", [False, True])
-def test_wrapper_legacy_fx_disappearance_preserves_sql_and_all_ledgers(store, amount, rename):
+def test_wrapper_legacy_fx_disappearance_publishes_bank_rows_without_guessed_edits(store, amount, rename):
     persist(store, pending=[pending(acwRefNbr=None, origCurDesc="USD", origCurAmt=3)])
     annotate(store)
-    before = rows(store, "card_pending_txns")
-    ledgers = seed_ledgers(store)
-    if not rename and amount == 100:
-        persist(store, billed=[statement(ntAmt=amount, occCurCode="USD", foreignAmt="3",
-                                        merchantChiName="SHOP CITY")])
-        assert tuple(rows(store)[0][field] for field in FIELDS) == OVERLAY
-        return  # Exact raw evidence plus non-conflicting money remains admissible.
-    with pytest.raises(ValueError, match="ambiguous"):
-        persist(store, billed=[statement(ntAmt=amount, occCurCode="USD", foreignAmt="3",
-                                        merchantChiName="SHOP" if rename else "SHOP CITY")])
-    assert rows(store) == []
-    assert rows(store, "card_pending_txns") == before
-    assert {name: getattr(store, name) for name in LEDGERS} == ledgers
-    assert_durable(store, [], before)
+    seed_ledgers(store)
+    description = "SHOP" if rename else "SHOP CITY"
+    incoming = statement(ntAmt=amount, occCurCode="USD", foreignAmt="3", merchantChiName=description)
+    expected_splits = json.loads(OVERLAY[-1])
+    if amount == 150:
+        expected_splits[0]["amount"], expected_splits[1]["amount"] = 60, 90
+    expected_overlay = OVERLAY[:-1]
+    persist(store, billed=[incoming])
+    actual = rows(store)
+    assert len(actual) == 1 and rows(store, "card_pending_txns") == []
+    row = actual[0]
+    assert (row["card_no"], row["consume_date"], row["post_date"], row["bill_date"],
+            row["description"], row["amount"], row["currency"], row["consume_currency"],
+            row["consume_amount"], row["txn_type"]) == (
+                "****1234", "2026-09-10", "2026-09-12", "2026-09-01", description,
+                amount, "TWD", "USD", 3, "spending")
+    assert json.loads(row["native_identity"]) == ["ctbc", 1, 101, "1234_0", "synthetic-ref"]
+    # Unique original FX proves this occurrence despite rename/reference enrichment.
+    assert tuple(row[field] for field in FIELDS[:-1]) == expected_overlay
+    assert json.loads(row["splits_overwrite"]) == expected_splits
+    assert row["flow_type"] == "expense" and row["income_category"] is None
+    assert row["is_subscription"] == 1
+    assert_durable(store, actual, [])
+    persist(store, billed=[incoming])
+    assert rows(store) == actual and rows(store, "card_pending_txns") == []
+    assert_durable(store, actual, [])
 
 
 @pytest.mark.parametrize("snapshot_date", ["20260912", "00000000"])
@@ -278,18 +709,30 @@ def test_barrier_already_booked_fx_commit_false_close_reopen_and_retry(store):
         reopened.close()
 
 
-def test_wrapper_conflicting_native_exact_occurrence_shrink_fails_closed(store):
+def test_wrapper_conflicting_native_exact_occurrence_shrink_keeps_bank_count_without_guessed_edits(store):
     persist(store, pending=[pending()] * 2)
     annotate(store)
     store.conn.execute("UPDATE card_pending_txns SET description_overwrite='OTHER' WHERE id=(SELECT MAX(id) FROM card_pending_txns)")
     store.commit()
-    before = rows(store, "card_pending_txns")
-    ledgers = seed_ledgers(store)
-    with pytest.raises(ValueError, match="ambiguous"):
-        persist(store, pending=[pending()])
-    assert rows(store, "card_pending_txns") == before
-    assert {name: getattr(store, name) for name in LEDGERS} == ledgers
-    assert_durable(store, [], before)
+    seed_ledgers(store)
+    persist(store, pending=[pending()])
+    actual = rows(store, "card_pending_txns")
+    assert len(actual) == 1 and rows(store) == []
+    row = actual[0]
+    assert (row["card_no"], row["consume_date"], row["post_date"], row["description"],
+            row["amount"], row["currency"], row["consume_currency"], row["consume_amount"],
+            row["txn_type"]) == ("****1234", "2026-09-10", None, "SHOP CITY", 100, "TWD", None, None, "spending")
+    assert json.loads(row["native_identity"]) == ["ctbc", 1, 101, "1234_0", "synthetic-ref"]
+    assert tuple(row[field] for field in FIELDS) == (None, None, None, None, 0, None)
+    assert row["flow_type"] == "expense" and row["income_category"] is None
+    assert row["is_subscription"] == 0
+    assert_durable(store, [], actual)
+    persist(store, pending=[pending()])
+    replay = rows(store, "card_pending_txns")
+    assert len(replay) == 1 and rows(store) == []
+    assert tuple(replay[0][field] for field in FIELDS) == (None, None, None, None, 0, None)
+    assert replay[0]["native_identity"] == row["native_identity"]
+    assert_durable(store, [], replay)
 
 
 @pytest.mark.parametrize("mode", ["unknown", "promotion", "statement"])

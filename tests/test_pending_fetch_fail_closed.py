@@ -1,7 +1,7 @@
 """各銀行 pending fetch 失敗／部分成功時必須 fail-closed。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -28,6 +28,23 @@ STALE_ERROR_MESSAGES = (
     "Please log in again",
     "An unexpected error occurred",
 )
+
+
+@pytest.fixture(autouse=True)
+def _freeze_taishin_history_clock(monkeypatch):
+    from backend.core.persist import taishin
+    from tests import taishin_fixtures
+
+    class ReceiptDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz.key == "Asia/Taipei"
+            return cls(2026, 11, 1, 0, 1, tzinfo=tz)
+
+    # One execution-time clock for both attestation fixture and real validator.
+    monkeypatch.setattr(taishin_fixtures, "datetime", ReceiptDatetime)
+    monkeypatch.setattr(taishin, "datetime", ReceiptDatetime)
+    return date(2026, 11, 1)
 
 
 @pytest.fixture(autouse=True)
@@ -116,15 +133,28 @@ def _assert_kept(store):
     (persist_ubot, _ubot_with_history({"card_unbilled": {
         "error": "session expired", "CardList": [],
     }})),
-    (persist_taishin, with_taishin_history({"credit_card_parsed": None})),
-    (persist_taishin, with_taishin_history({"credit_card_parsed": {"pending_txns": []}})),
+    (persist_taishin, {"credit_card_parsed": None}),
+    (persist_taishin, {"credit_card_parsed": {"pending_txns": []}}),
     (persist_sinopac, {"card_unbilled": {"latest_tx": {
         "ResultCode": "99", "Error": {"message": "auth failed"},
         "Result": {"Items": []},
     }}}),
 ])
 def test_untrusted_structured_payload_never_clears_pending(store, persist, data):
+    if persist is persist_taishin:
+        data = with_taishin_history(data)
     persist(data, store, rules=[])
+    _assert_kept(store)
+
+
+def test_taishin_previous_day_history_still_refused(store, _freeze_taishin_history_clock):
+    from backend.core.error_codes import exception_error_id
+
+    data = with_taishin_history({"credit_card_parsed": {"pending_txns": []}},
+                               as_of=_freeze_taishin_history_clock - timedelta(days=1))
+    with pytest.raises(ValueError, match="^invalid Taishin history$") as raised:
+        persist_taishin(data, store, rules=[])
+    assert exception_error_id(raised.value) == "TAISHIN-08-001-018"
     _assert_kept(store)
 
 

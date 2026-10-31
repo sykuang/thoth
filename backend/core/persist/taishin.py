@@ -13,7 +13,9 @@ from zoneinfo import ZoneInfo
 from backend.core import account_classify, classify
 from backend.core.base import validate_history_coverage
 from backend.core.store import BankStore
-from backend.core.persist._common import _num, _num_real, _num_to_float, _slash_date_to_iso
+from backend.core.persist._common import (
+    _num, _num_real, _num_to_float, _slash_date_to_iso, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers,
+)
 
 
 def _validated_attested_twd_rows(data: dict, store: BankStore) -> list[dict]:
@@ -494,14 +496,19 @@ def persist_taishin(
     commit: bool = True,
 ) -> dict:
     """Validate and persist one Taishin payload atomically."""
+    before = _snapshot_occurrence_ledgers(store) if commit else {}
     try:
         delta = _persist_taishin(data, store, rules, commit=False)
         if commit:
             with error_step('TAISHIN-08-004-001'):
                 store.commit()
         return delta
-    except Exception:
+    except Exception as error:
         if commit:
-            with error_step('TAISHIN-08-004-002'):
-                store.rollback()
+            _restore_occurrence_ledgers(store, before)
+            try:
+                with error_step('TAISHIN-08-004-002'):
+                    store.rollback()
+            except Exception:
+                raise error  # Cleanup must not replace the operation failure.
         raise

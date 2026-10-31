@@ -17,7 +17,9 @@ from backend.core import account_classify, classify
 from backend.core.base import validate_history_coverage
 from backend.core.money import native_money
 from backend.core.store import BankStore
-from backend.core.persist._common import _num, _num_real, _num_to_float
+from backend.core.persist._common import (
+    _num, _num_real, _num_to_float, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers,
+)
 
 
 def _native_amount(
@@ -1006,12 +1008,17 @@ def persist_sinopac(
         as_of = _validate_sinopac_history(data, store)
     if not commit:
         return _persist_sinopac(data, store, rules=rules, as_of=as_of)
+    before = _snapshot_occurrence_ledgers(store)
     try:
         delta = _persist_sinopac(data, store, rules=rules, as_of=as_of)
         with error_step('SINOPAC-08-016-002'):
             store.commit()
         return delta
-    except Exception:
-        with error_step('SINOPAC-08-016-003'):
-            store.conn.rollback()
+    except Exception as error:
+        _restore_occurrence_ledgers(store, before)
+        try:
+            with error_step('SINOPAC-08-016-003'):
+                store.conn.rollback()
+        except Exception:
+            raise error  # Cleanup must not replace the operation failure.
         raise
