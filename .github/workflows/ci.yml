@@ -24,7 +24,8 @@ jobs:
   # ============================================================
   backend:
     name: Backend (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # The locked Patchright installer rejects Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
