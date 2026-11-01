@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, exception_error_id, with_error_code
 import re
 from collections import Counter
 from datetime import date, datetime
@@ -22,20 +23,24 @@ def _strict_fubon_money(value: str, *, optional: bool, non_negative: bool) -> in
     if optional and raw in {"", "-"}:
         return None
     if not _FUBON_MONEY_RE.fullmatch(raw):
-        raise ValueError("invalid Fubon TWD amount")
+        raise with_error_code(ValueError("invalid Fubon TWD amount"), 'FUBON-08-001-006')
     try:
-        amount = Decimal(raw.replace(",", ""))
+        with error_step('FUBON-08-001-009'):
+            amount = Decimal(raw.replace(",", ""))
     except InvalidOperation:
-        raise ValueError("invalid Fubon TWD amount") from None
-    if (
-        not amount.is_finite()
-        or amount != amount.to_integral_value()
-        or amount < Decimal("-2147483648")
-        or amount > Decimal("2147483647")
-        or non_negative and amount < 0
-    ):
-        raise ValueError("invalid Fubon TWD amount")
-    return int(amount)
+        raise with_error_code(ValueError("invalid Fubon TWD amount"), 'FUBON-08-001-007') from None
+    if not amount.is_finite():
+        raise with_error_code(ValueError('invalid Fubon TWD amount'), 'FUBON-08-001-001')
+    elif amount != amount.to_integral_value():
+        raise with_error_code(ValueError('invalid Fubon TWD amount'), 'FUBON-08-001-002')
+    elif amount < Decimal('-2147483648'):
+        raise with_error_code(ValueError('invalid Fubon TWD amount'), 'FUBON-08-001-003')
+    elif amount > Decimal('2147483647'):
+        raise with_error_code(ValueError('invalid Fubon TWD amount'), 'FUBON-08-001-004')
+    elif non_negative and amount < 0:
+        raise with_error_code(ValueError('invalid Fubon TWD amount'), 'FUBON-08-001-005')
+    with error_step('FUBON-08-001-008'):
+        return int(amount)
 
 
 def _fubon_date(value: str | None) -> str | None:
@@ -139,7 +144,8 @@ def _parse_fubon_deposit_accounts(deposit_text: str) -> list[dict]:
                 currency = CURRENCY_MAP[c]
             elif raw_balance is None and NUM_RE.match(c):
                 # 「即時餘額」是第一個出現的數字 (usable 排第二)
-                raw_balance = _num_to_float(c)
+                with error_step('FUBON-08-003-001'):
+                    raw_balance = _num_to_float(c, _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-830-008', 'FUBON-08-830-009', 'FUBON-08-830-010'))
             elif nickname is None and len(c) <= 20 and not NUM_RE.match(c):
                 # 暫存可能的 nickname (排除已 matched 的)
                 if c != acct_type and c != branch and not BRANCH_KW.search(c):
@@ -185,31 +191,41 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
         snapshot = result.get("snapshot")
         if isinstance(snapshot, dict) and "gridRows" in snapshot:
             grid_rows = snapshot.get("gridRows")
-            if not isinstance(grid_rows, list) or any(
-                not isinstance(cells, list)
-                or any(not isinstance(cell, str) for cell in cells)
-                for cells in grid_rows
-            ):
-                raise ValueError("invalid Fubon TWD structured rows")
+            if not isinstance(grid_rows, list):
+                raise with_error_code(ValueError('invalid Fubon TWD structured rows'), 'FUBON-08-004-001')
+            else:
+                for _error_leaf_1_cells in grid_rows:
+                    if not isinstance(_error_leaf_1_cells, list):
+                        raise with_error_code(ValueError('invalid Fubon TWD structured rows'), 'FUBON-08-004-021')
+                    else:
+                        for _error_leaf_2_cell in _error_leaf_1_cells:
+                            if not isinstance(_error_leaf_2_cell, str):
+                                raise with_error_code(ValueError('invalid Fubon TWD structured rows'), 'FUBON-08-004-020')
             for cells in grid_rows:
                 if len(cells) != 7:
-                    raise ValueError("invalid Fubon TWD structured row")
-                account_date = _slash_date_to_iso(cells[0].lstrip("*"))
+                    raise with_error_code(ValueError("invalid Fubon TWD structured row"), 'FUBON-08-004-007')
+                with error_step('FUBON-08-004-010'):
+                    account_date = _slash_date_to_iso(cells[0].lstrip("*"))
                 try:
-                    txn_datetime = datetime.strptime(cells[1], "%Y/%m/%d %H:%M:%S")
+                    with error_step('FUBON-08-004-018'):
+                        txn_datetime = datetime.strptime(cells[1], "%Y/%m/%d %H:%M:%S")
                 except ValueError:
-                    raise ValueError("invalid Fubon TWD structured row") from None
+                    raise with_error_code(ValueError("invalid Fubon TWD structured row"), 'FUBON-08-004-008') from None
                 desc = cells[2].strip()
-                expend = _strict_fubon_money(cells[3], optional=True, non_negative=True)
-                income = _strict_fubon_money(cells[4], optional=True, non_negative=True)
-                balance = _strict_fubon_money(cells[5], optional=False, non_negative=False)
-                if (
-                    account_date is None
-                    or not desc
-                    or (expend is None) == (income is None)
-                    or any(not isinstance(cell, str) for cell in cells[6:])
-                ):
-                    raise ValueError("invalid Fubon TWD structured row")
+                with error_step('FUBON-08-004-011'):
+                    expend = _strict_fubon_money(cells[3], optional=True, non_negative=True)
+                with error_step('FUBON-08-004-012'):
+                    income = _strict_fubon_money(cells[4], optional=True, non_negative=True)
+                with error_step('FUBON-08-004-013'):
+                    balance = _strict_fubon_money(cells[5], optional=False, non_negative=False)
+                if account_date is None:
+                    raise with_error_code(ValueError('invalid Fubon TWD structured row'), 'FUBON-08-004-003')
+                elif not desc:
+                    raise with_error_code(ValueError('invalid Fubon TWD structured row'), 'FUBON-08-004-004')
+                elif (expend is None) == (income is None):
+                    raise with_error_code(ValueError('invalid Fubon TWD structured row'), 'FUBON-08-004-005')
+                elif any((not isinstance(cell, str) for cell in cells[6:])):
+                    raise with_error_code(ValueError('invalid Fubon TWD structured row'), 'FUBON-08-004-006')
                 memo = cells[6].strip() if len(cells) > 6 and cells[6].strip() else None
                 rows.append({
                     "account_no": result.get("account_no"),
@@ -244,12 +260,16 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
                 and re.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", raw_cells[0] or "")
                 and re.match(r"\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}", raw_cells[1] or "")
             ):
-                date_iso = _slash_date_to_iso(raw_cells[0])
+                with error_step('FUBON-08-004-014'):
+                    date_iso = _slash_date_to_iso(raw_cells[0])
                 txn_dt = raw_cells[1].replace("/", "-")
                 desc = raw_cells[2] or None
-                expend = _num_to_float(raw_cells[3])
-                income = _num_to_float(raw_cells[4])
-                balance = _num_to_float(raw_cells[5])
+                with error_step('FUBON-08-004-015'):
+                    expend = _num_to_float(raw_cells[3], _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-831-008', 'FUBON-08-831-009', 'FUBON-08-831-010'))
+                with error_step('FUBON-08-004-016'):
+                    income = _num_to_float(raw_cells[4], _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-832-008', 'FUBON-08-832-009', 'FUBON-08-832-010'))
+                with error_step('FUBON-08-004-017'):
+                    balance = _num_to_float(raw_cells[5], _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-833-008', 'FUBON-08-833-009', 'FUBON-08-833-010'))
                 memo = raw_cells[6] if len(raw_cells) > 6 and raw_cells[6] else None
                 if date_iso and desc:
                     rows.append({
@@ -272,7 +292,8 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
             m = re.match(r"^(\d{4}/\d{1,2}/\d{1,2})(?:\s+|\t+)(.+)$", line)
             if not m:
                 continue
-            date_iso = _slash_date_to_iso(m.group(1))
+            with error_step('FUBON-08-004-009'):
+                date_iso = _slash_date_to_iso(m.group(1))
             rest = m.group(2).strip()
             if not date_iso or any(k in rest for k in ["開始查詢", "自訂查詢", "快速查詢"]):
                 continue
@@ -284,7 +305,8 @@ def _parse_fubon_deposit_txn_results(results: list[dict]) -> list[dict]:
             for idx, cell in enumerate(cells):
                 normalized = cell.replace(",", "").replace(" ", "")
                 if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
-                    val = _num_to_float(cell)
+                    with error_step('FUBON-08-004-019'):
+                        val = _num_to_float(cell, _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-834-008', 'FUBON-08-834-009', 'FUBON-08-834-010'))
                     if val is not None:
                         num_cells.append((idx, val))
             if not num_cells:
@@ -334,49 +356,62 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
     if coverage is None:
         return None
     domains = coverage.get("domains")
-    if not isinstance(domains, list) or len(domains) != 1:
-        raise ValueError("invalid Fubon TWD history coverage")
+    if not isinstance(domains, list):
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-001')
+    elif len(domains) != 1:
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-002')
     domain = domains[0]
-    if not isinstance(domain, dict) or domain.get("domain") != "twd_transactions":
-        raise ValueError("invalid Fubon TWD history coverage")
+    if not isinstance(domain, dict):
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-003')
+    elif domain.get('domain') != 'twd_transactions':
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-004')
     expected = domain.get("expected")
     windows = domain.get("windows")
     results = data.get("deposit_txn_results")
-    if (
-        not isinstance(expected, list)
-        or not isinstance(windows, list)
-        or not isinstance(results, list)
-    ):
-        raise ValueError("invalid Fubon TWD history coverage")
+    if not isinstance(expected, list):
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-005')
+    elif not isinstance(windows, list):
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-006')
+    elif not isinstance(results, list):
+        raise with_error_code(ValueError('invalid Fubon TWD history coverage'), 'FUBON-08-005-007')
     expected_ids = [item.get("identity") for item in expected if isinstance(item, dict)]
-    if not expected or len(expected_ids) != len(expected) or len(set(expected_ids)) != len(expected_ids):
-        raise ValueError("invalid Fubon TWD history identities")
+    if not expected:
+        raise with_error_code(ValueError('invalid Fubon TWD history identities'), 'FUBON-08-005-008')
+    elif len(expected_ids) != len(expected):
+        raise with_error_code(ValueError('invalid Fubon TWD history identities'), 'FUBON-08-005-009')
+    elif len(set(expected_ids)) != len(expected_ids):
+        raise with_error_code(ValueError('invalid Fubon TWD history identities'), 'FUBON-08-005-010')
     accounts = data.get("accounts")
     if not isinstance(accounts, list):
-        raise ValueError("invalid Fubon TWD inventory")
+        raise with_error_code(ValueError("invalid Fubon TWD inventory"), 'FUBON-08-005-021')
     account_ids = set()
     for account in accounts:
-        if (
-            not isinstance(account, dict)
-            or set(account) != {"account_no", "currency", "type", "name"}
-            or not isinstance(account.get("account_no"), str)
-            or not re.fullmatch(r"\d{14}", account["account_no"])
-            or account.get("currency") != "TWD"
-            or account.get("type") != "deposit"
-            or account.get("name") != "台幣存款"
-            or account["account_no"] in account_ids
-        ):
-            raise ValueError("invalid Fubon TWD inventory")
+        if not isinstance(account, dict):
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-011')
+        elif set(account) != {'account_no', 'currency', 'type', 'name'}:
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-012')
+        elif not isinstance(account.get('account_no'), str):
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-013')
+        elif not re.fullmatch('\\d{14}', account['account_no']):
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-014')
+        elif account.get('currency') != 'TWD':
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-015')
+        elif account.get('type') != 'deposit':
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-016')
+        elif account.get('name') != '台幣存款':
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-017')
+        elif account['account_no'] in account_ids:
+            raise with_error_code(ValueError('invalid Fubon TWD inventory'), 'FUBON-08-005-018')
         account_ids.add(account["account_no"])
     if account_ids != set(expected_ids):
-        raise ValueError("Fubon TWD inventory does not match coverage")
+        raise with_error_code(ValueError("Fubon TWD inventory does not match coverage"), 'FUBON-08-005-022')
     result_by_key = {}
     for result in results:
         if not isinstance(result, dict):
-            raise ValueError("invalid Fubon TWD history result")
+            raise with_error_code(ValueError("invalid Fubon TWD history result"), 'FUBON-08-005-023')
         key = (result.get("account_no"), result.get("start"), result.get("end"))
         if key in result_by_key:
-            raise ValueError("duplicate Fubon TWD history result")
+            raise with_error_code(ValueError("duplicate Fubon TWD history result"), 'FUBON-08-005-024')
         result_by_key[key] = result
     window_keys = []
     parsed = []
@@ -385,23 +420,25 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
 
     for window in windows:
         if not isinstance(window, dict):
-            raise ValueError("invalid Fubon TWD history window")
+            raise with_error_code(ValueError("invalid Fubon TWD history window"), 'FUBON-08-005-025')
         key = (window.get("identity"), window.get("start"), window.get("end"))
         window_keys.append(key)
         result = result_by_key.get(key)
         if result is None:
-            raise ValueError("missing Fubon TWD history result")
+            raise with_error_code(ValueError("missing Fubon TWD history result"), 'FUBON-08-005-026')
         try:
-            receipt = FubonCrawler._validated_twd_history_result(result)
-        except RuntimeError:
-            raise ValueError("invalid Fubon TWD history result") from None
+            with error_step('FUBON-08-005-035'):
+                receipt = FubonCrawler._validated_twd_history_result(result)
+        except RuntimeError as source:
+            raise with_error_code(ValueError("invalid Fubon TWD history result"), exception_error_id(source, bank="fubon") or 'FUBON-08-005-027') from None
         if receipt != window:
-            raise ValueError("Fubon TWD result does not match coverage")
-        rows = _parse_fubon_deposit_txn_results([result])
+            raise with_error_code(ValueError("Fubon TWD result does not match coverage"), 'FUBON-08-005-028')
+        with error_step('FUBON-08-005-034'):
+            rows = _parse_fubon_deposit_txn_results([result])
         if len(rows) != result["snapshot"]["gridRowCount"]:
-            raise ValueError("incomplete Fubon TWD history result")
+            raise with_error_code(ValueError("incomplete Fubon TWD history result"), 'FUBON-08-005-029')
         if any(row.get("account_no") != window["identity"] for row in rows):
-            raise ValueError("invalid Fubon TWD history row provenance")
+            raise with_error_code(ValueError("invalid Fubon TWD history row provenance"), 'FUBON-08-005-030')
         # Native query results can overlap; retain maximum observed multiplicity, not their sum.
         observed = Counter()
         for row in rows:
@@ -410,17 +447,20 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
             if observed[identity] > seen[identity]:
                 parsed.append(row)
                 seen[identity] = observed[identity]
-    if len(window_keys) != len(set(window_keys)) or set(window_keys) != set(result_by_key):
-        raise ValueError("mismatched Fubon TWD history windows")
+    if len(window_keys) != len(set(window_keys)):
+        raise with_error_code(ValueError('mismatched Fubon TWD history windows'), 'FUBON-08-005-019')
+    elif set(window_keys) != set(result_by_key):
+        raise with_error_code(ValueError('mismatched Fubon TWD history windows'), 'FUBON-08-005-020')
     mode = coverage.get("mode")
     for identity in expected_ids:
         identity_keys = sorted(key for key in window_keys if key[0] == identity)
         presets = [result_by_key[key].get("preset") for key in identity_keys]
         if presets == ["rdoDay180_365", "rdoDay180"]:
             try:
-                native = _fubon_history_windows(date.fromisoformat(identity_keys[-1][2]))
+                with error_step('FUBON-08-005-037'):
+                    native = _fubon_history_windows(date.fromisoformat(identity_keys[-1][2]))
             except (TypeError, ValueError):
-                raise ValueError("invalid Fubon TWD native windows") from None
+                raise with_error_code(ValueError("invalid Fubon TWD native windows"), 'FUBON-08-005-031') from None
             if [
                 (item["start"], item["end"], item["preset"])
                 for item in native
@@ -428,13 +468,14 @@ def _validated_fubon_twd_results_for_coverage(data: dict) -> list[dict] | None:
                 (key[1], key[2], result_by_key[key].get("preset"))
                 for key in identity_keys
             ]:
-                raise ValueError("invalid Fubon TWD native windows")
+                raise with_error_code(ValueError("invalid Fubon TWD native windows"), 'FUBON-08-005-032')
             continue
         if mode == "incremental" and presets == ["rdoDay180"]:
-            native = _fubon_history_windows(date.fromisoformat(identity_keys[0][2]))[1]
+            with error_step('FUBON-08-005-036'):
+                native = _fubon_history_windows(date.fromisoformat(identity_keys[0][2]))[1]
             if (identity_keys[0][1], identity_keys[0][2]) == (native["start"], native["end"]):
                 continue
-        raise ValueError("Fubon TWD presets do not match coverage")
+        raise with_error_code(ValueError("Fubon TWD presets do not match coverage"), 'FUBON-08-005-033')
     return parsed
 
 
@@ -514,20 +555,25 @@ def _parse_fubon_credit_card(data: dict) -> dict:
         # 「正卡人信用額度\t80,000」
         m = re.search(r"正卡人信用額度\s*\t\s*([\d,]+)", amount_text)
         if m:
-            limits["credit_limit"] = int(m.group(1).replace(",", ""))
+            with error_step('FUBON-08-006-001'):
+                limits["credit_limit"] = int(m.group(1).replace(",", ""))
         m = re.search(r"正卡人可用額度\s*\t\s*([\d,]+)", amount_text)
         if m:
-            limits["available_credit"] = int(m.group(1).replace(",", ""))
+            with error_step('FUBON-08-006-002'):
+                limits["available_credit"] = int(m.group(1).replace(",", ""))
         m = re.search(r"國內預借現金信用額度\s*\t\s*([\d,]+)", amount_text)
         if m:
-            limits["cash_advance_limit"] = int(m.group(1).replace(",", ""))
+            with error_step('FUBON-08-006-003'):
+                limits["cash_advance_limit"] = int(m.group(1).replace(",", ""))
         m = re.search(r"國內預借現金可用額度\s*\t\s*([\d,]+)", amount_text)
         if m:
-            limits["cash_advance_available"] = int(m.group(1).replace(",", ""))
+            with error_step('FUBON-08-006-004'):
+                limits["cash_advance_available"] = int(m.group(1).replace(",", ""))
         # 本期循環利率
         m = re.search(r"本期循環利率\s*\t\s*([\d.]+)%", amount_text)
         if m:
-            limits["revolving_rate_percent"] = float(m.group(1))
+            with error_step('FUBON-08-006-005'):
+                limits["revolving_rate_percent"] = float(m.group(1))
     out["limits"] = limits
 
     # 本期帳單表 (從 amount_text 抓)
@@ -540,12 +586,16 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             amount_text,
         )
         if m:
-            billing_summary["bill_date"] = _norm_west_date(m.group(1))
-            billing_summary["total_due"] = int(m.group(2).replace(",", ""))
-            billing_summary["min_due"] = int(m.group(3).replace(",", ""))
+            with error_step('FUBON-08-006-006'):
+                billing_summary["bill_date"] = _norm_west_date(m.group(1))
+            with error_step('FUBON-08-006-007'):
+                billing_summary["total_due"] = int(m.group(2).replace(",", ""))
+            with error_step('FUBON-08-006-008'):
+                billing_summary["min_due"] = int(m.group(3).replace(",", ""))
             # Normalize at the source layer: downstream cards.payment_due_date
             # must be ISO-ish YYYY-MM-DD, not bank-native YYYY/MM/DD.
-            billing_summary["payment_due"] = _norm_west_date(m.group(4).strip())
+            with error_step('FUBON-08-006-009'):
+                billing_summary["payment_due"] = _norm_west_date(m.group(4).strip())
         # 「無需繳款\t2026/05/05\t0\t0\t台北富邦900047****7012」
         m = re.search(
             r"繳款狀態.*?自動扣繳帳號.*?\n"
@@ -554,9 +604,12 @@ def _parse_fubon_credit_card(data: dict) -> dict:
         )
         if m:
             billing_summary["payment_status"] = m.group(1).strip()
-            billing_summary["last_payment_date"] = _norm_west_date(m.group(2))
-            billing_summary["paid_amount"] = int(m.group(3).replace(",", ""))
-            billing_summary["remaining_due"] = int(m.group(4).replace(",", ""))
+            with error_step('FUBON-08-006-010'):
+                billing_summary["last_payment_date"] = _norm_west_date(m.group(2))
+            with error_step('FUBON-08-006-011'):
+                billing_summary["paid_amount"] = int(m.group(3).replace(",", ""))
+            with error_step('FUBON-08-006-012'):
+                billing_summary["remaining_due"] = int(m.group(4).replace(",", ""))
             billing_summary["autopay_account"] = m.group(5).strip()
 
     # === C. billed_page: 帳單期間 + 逐筆已出帳 ===
@@ -571,7 +624,8 @@ def _parse_fubon_credit_card(data: dict) -> dict:
         if m:
             billing_summary["bill_month_roc"] = m.group(1)
             billing_summary["statement_date_roc"] = m.group(4)
-            billing_summary["statement_date"] = _fubon_date(m.group(4))
+            with error_step('FUBON-08-006-013'):
+                billing_summary["statement_date"] = _fubon_date(m.group(4))
             if not billing_summary.get("bill_date"):
                 billing_summary["bill_date"] = billing_summary["statement_date"]
 
@@ -581,13 +635,20 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             billed_text,
         )
         if m:
-            billing_summary["previous_balance"] = int(m.group(1).replace(",", ""))
-            billing_summary["payment"] = int(m.group(2).replace(",", ""))
-            billing_summary["adjustment"] = int(m.group(3).replace(",", ""))
-            billing_summary["current_charge"] = int(m.group(4).replace(",", ""))
-            billing_summary["current_due"] = int(m.group(5).replace(",", ""))
-            billing_summary["min_due_billed"] = int(m.group(6).replace(",", ""))
-            billing_summary["revolving_principal"] = int(m.group(7).replace(",", ""))
+            with error_step('FUBON-08-006-014'):
+                billing_summary["previous_balance"] = int(m.group(1).replace(",", ""))
+            with error_step('FUBON-08-006-015'):
+                billing_summary["payment"] = int(m.group(2).replace(",", ""))
+            with error_step('FUBON-08-006-016'):
+                billing_summary["adjustment"] = int(m.group(3).replace(",", ""))
+            with error_step('FUBON-08-006-017'):
+                billing_summary["current_charge"] = int(m.group(4).replace(",", ""))
+            with error_step('FUBON-08-006-018'):
+                billing_summary["current_due"] = int(m.group(5).replace(",", ""))
+            with error_step('FUBON-08-006-019'):
+                billing_summary["min_due_billed"] = int(m.group(6).replace(",", ""))
+            with error_step('FUBON-08-006-020'):
+                billing_summary["revolving_principal"] = int(m.group(7).replace(",", ""))
 
         # 逐筆交易：「消費日期\t消費說明\t入帳日期\t外幣折算日/幣別\t外幣金額/消費地\t臺幣金額」
         # 行格式：「115/05/05\t自動扣繳\t115/05/06\t　\t　\t-7,271」
@@ -596,16 +657,19 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             r"(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]+?)\s*\t\s*(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*(-?[\d,]+(?:\.\d+)?)",
             billed_text,
         ):
-            consume_date = _fubon_date(tm.group(1))
+            with error_step('FUBON-08-006-021'):
+                consume_date = _fubon_date(tm.group(1))
             desc = tm.group(2).strip()
-            post_date = _fubon_date(tm.group(3))
+            with error_step('FUBON-08-006-022'):
+                post_date = _fubon_date(tm.group(3))
             fx_part = tm.group(5).strip()
             amount_str = tm.group(6).replace(",", "")
             # 跳過聚合行（desc 含「前期應繳/本期應繳/最低應繳」）
             if any(k in desc for k in ["應繳總額", "最低應繳", "本期調整"]):
                 continue
             try:
-                amount = float(amount_str)
+                with error_step('FUBON-08-006-026'):
+                    amount = float(amount_str)
             except ValueError:
                 continue
             billed_txns.append({
@@ -628,12 +692,15 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             r"(\d{2,3}/\d{1,2}/\d{1,2})\s*\t\s*([^\t\n]+?)\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*([^\t\n]*?)\s*\t\s*(-?[\d,]+(?:\.\d+)?)",
             pending_text,
         ):
-            consume_date = _fubon_date(tm.group(1))
+            with error_step('FUBON-08-006-023'):
+                consume_date = _fubon_date(tm.group(1))
             desc = tm.group(2).strip()
-            post_date = _fubon_date(tm.group(3).strip())
+            with error_step('FUBON-08-006-024'):
+                post_date = _fubon_date(tm.group(3).strip())
             amount_str = tm.group(6).replace(",", "")
             try:
-                amount = float(amount_str)
+                with error_step('FUBON-08-006-027'):
+                    amount = float(amount_str)
             except ValueError:
                 continue
             if any(k in desc for k in ["應繳", "最低", "調整"]):
@@ -672,15 +739,16 @@ def _parse_fubon_credit_card(data: dict) -> dict:
             billed_text,
         )
         if m:
-            points[m.group(1)] = {
-                "previous": int(m.group(2).replace(",", "")),
-                "used": int(m.group(3).replace(",", "")),
-                "earned": int(m.group(4).replace(",", "")),
-                "adjustment": int(m.group(5).replace(",", "")),
-                "balance": int(m.group(6).replace(",", "")),
-                "expiring": int(m.group(7).replace(",", "")),
-                "expiry_date": _fubon_date(m.group(8)),
-            }
+            with error_step('FUBON-08-006-025'):
+                points[m.group(1)] = {
+                    "previous": int(m.group(2).replace(",", "")),
+                    "used": int(m.group(3).replace(",", "")),
+                    "earned": int(m.group(4).replace(",", "")),
+                    "adjustment": int(m.group(5).replace(",", "")),
+                    "balance": int(m.group(6).replace(",", "")),
+                    "expiring": int(m.group(7).replace(",", "")),
+                    "expiry_date": _fubon_date(m.group(8)),
+                }
     out["points"] = points
 
     return out
@@ -691,7 +759,8 @@ def _norm_west_date(s: str | None) -> str | None:
         return None
     try:
         y, mo, d = s.replace("-", "/").strip().split("/")
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        with error_step('FUBON-08-007-001'):
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
     except Exception:
         return s.replace("/", "-")
 
@@ -706,7 +775,8 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         card_pending_txns (未出帳單消費明細, scope='realtime')
         daily_metrics × 4 (limits/billing_summary/points/endpoints)
     """
-    validated_twd_rows = _validated_fubon_twd_results_for_coverage(data)
+    with error_step('FUBON-08-008-001'):
+        validated_twd_rows = _validated_fubon_twd_results_for_coverage(data)
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {"bank": "fubon", "scope": "structured"}
 
@@ -724,7 +794,8 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
     # Step 7 (2026-06-18): parse 我的存款 (CBOQU003_Home.faces) 帳戶 row → accounts.
     # 之前 collector 完全沒走 deposit path, accounts:0 是 by-design gap.
     # 修法 commit 後 collect Step 7 dump deposit_page_text, 這裡 parse 後 upsert.
-    deposit_accounts = _parse_fubon_deposit_accounts(data.get("deposit_page_text") or "")
+    with error_step('FUBON-08-008-002'):
+        deposit_accounts = _parse_fubon_deposit_accounts(data.get("deposit_page_text") or "")
     if validated_twd_rows is not None:
         authoritative = {item["account_no"]: item for item in data["accounts"]}
         parsed_by_number = {
@@ -749,10 +820,12 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         from backend.core import account_classify
         for a in deposit_accounts:
             a["product_type"] = account_classify.classify_account("fubon", a)
-        store.upsert_accounts(deposit_accounts)
+        with error_step('FUBON-08-008-012'):
+            store.upsert_accounts(deposit_accounts)
     delta["accounts_new"] = len(deposit_accounts)
 
-    parsed = _parse_fubon_credit_card(data)
+    with error_step('FUBON-08-008-003'):
+        parsed = _parse_fubon_credit_card(data)
 
     cc_new = 0
     cc_pending_n = 0
@@ -763,9 +836,11 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
     # parsed 已把 limits/billing_summary 解出來, 直接從 amount_page_text 拿.
     limits_for_card = parsed.get("limits") or {}
     summary_for_card = parsed.get("billing_summary") or {}
-    fubon_credit_limit = _num_to_float(limits_for_card.get("credit_limit"))
+    with error_step('FUBON-08-008-004'):
+        fubon_credit_limit = _num_to_float(limits_for_card.get("credit_limit"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-835-008', 'FUBON-08-835-009', 'FUBON-08-835-010'))
     # used = credit_limit - available_credit (整戶層已用額度)
-    avail = _num_to_float(limits_for_card.get("available_credit"))
+    with error_step('FUBON-08-008-005'):
+        avail = _num_to_float(limits_for_card.get("available_credit"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-836-008', 'FUBON-08-836-009', 'FUBON-08-836-010'))
     fubon_used = (fubon_credit_limit - avail) if (fubon_credit_limit is not None and avail is not None) else None
     # billing_summary.bill_date 已是 '2026-05-16' ISO (parsed _norm_west_date 轉過)
     fubon_stmt = summary_for_card.get("bill_date") or summary_for_card.get("statement_date")
@@ -775,8 +850,10 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
     # 2026-06-22 (audit findings): billing_summary 已 parse 出 total_due (本期應繳)、
     # paid_amount (上期已繳金額)、last_payment_date 三欄,只是沒寫到 cards 表. 補上.
     # 整戶層 by-design (富邦正卡人 + 附卡共用帳單), 跟 ubot/sinopac/cathay 同 pattern.
-    fubon_bill_due = _num_to_float(summary_for_card.get("total_due"))
-    fubon_last_pay_amt = _num_to_float(summary_for_card.get("paid_amount"))
+    with error_step('FUBON-08-008-006'):
+        fubon_bill_due = _num_to_float(summary_for_card.get("total_due"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-837-008', 'FUBON-08-837-009', 'FUBON-08-837-010'))
+    with error_step('FUBON-08-008-007'):
+        fubon_last_pay_amt = _num_to_float(summary_for_card.get("paid_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'FUBON-08-838-008', 'FUBON-08-838-009', 'FUBON-08-838-010'))
     fubon_last_pay_date = summary_for_card.get("last_payment_date")
     # Sentinel: 若 last_payment_date 沒抓到 (regex 沒命中) → 兩欄都 None
     if fubon_last_pay_date is None:
@@ -792,7 +869,8 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
         card["last_payment_amount"] = fubon_last_pay_amt
         card["last_payment_date"] = fubon_last_pay_date
     if cards:
-        store.upsert_cards(cards)
+        with error_step('FUBON-08-008-013'):
+            store.upsert_cards(cards)
 
     # bill_date 統一從 billing_summary 取
     summary = parsed.get("billing_summary") or {}
@@ -820,7 +898,8 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
             "txn_type": classify.classify_by_desc_and_sign(desc, amt),
         })
     if billed_payload:
-        cc_new = store.upsert_card_billed(billed_payload, rules=rules) or 0
+        with error_step('FUBON-08-008-014'):
+            cc_new = store.upsert_card_billed(billed_payload, rules=rules) or 0
 
     # pending_txns 入庫 (scope='realtime')
     pending_payload = []
@@ -840,39 +919,47 @@ def persist_fubon(data: dict, store: BankStore, rules: list[dict] | None = None)
     # fetch_ok: 未出帳頁真的抓到文字才算可信 (含「查無相關資料」= 確實沒有未出帳)。
     # 頁面沒抓到 (登入失敗/timeout) 時 pending_payload 空是「假消失」, 不可比對。
     # 必須無條件 call: 空 payload 時仍要 refresh 才能 sweep 掉已入帳的殘留 row。
-    cc_pending_n = store.refresh_card_pending(
-        "realtime", pending_payload, rules=rules,
-        fetch_ok=bool(parsed.get("pending_page_ok")))
+    with error_step('FUBON-08-008-008'):
+        cc_pending_n = store.refresh_card_pending(
+            "realtime", pending_payload, rules=rules,
+            fetch_ok=bool(parsed.get("pending_page_ok")))
 
     # 富邦存款交易明細（CDSQU001）— collector 對每個帳戶送近 1 個月查詢。
-    twd_txn_rows = (
-        validated_twd_rows
-        if validated_twd_rows is not None
-        else _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])
-    )
-    twd_new = store.upsert_twd_txns(
-        twd_txn_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
-    ) if twd_txn_rows else 0
+    with error_step('FUBON-08-008-009'):
+        twd_txn_rows = (
+            validated_twd_rows
+            if validated_twd_rows is not None
+            else _parse_fubon_deposit_txn_results(data.get("deposit_txn_results") or [])
+        )
+    with error_step('FUBON-08-008-010'):
+        twd_new = store.upsert_twd_txns(
+            twd_txn_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+        ) if twd_txn_rows else 0
 
     # daily_metrics 多段
     limits = parsed.get("limits") or {}
     if limits:
-        store.put_daily_metric("fubon_card_limits", limits, today)
+        with error_step('FUBON-08-008-015'):
+            store.put_daily_metric("fubon_card_limits", limits, today)
     if summary:
-        store.put_daily_metric("fubon_card_billing_summary", summary, today)
+        with error_step('FUBON-08-008-016'):
+            store.put_daily_metric("fubon_card_billing_summary", summary, today)
     points = parsed.get("points") or {}
     if points:
-        store.put_daily_metric("fubon_card_points", points, today)
+        with error_step('FUBON-08-008-017'):
+            store.put_daily_metric("fubon_card_points", points, today)
 
     # endpoints dump
     eps = data.get("_all_endpoints") or []
     if eps:
-        store.put_daily_metric("fubon_endpoints", {"endpoints": eps}, today)
+        with error_step('FUBON-08-008-018'):
+            store.put_daily_metric("fubon_endpoints", {"endpoints": eps}, today)
 
     delta["balance_days"] = 0
     delta["twd_txn_new"] = twd_new
     delta["card_billed_new"] = cc_new
     delta["card_unbilled"] = 0
     delta["card_current"] = cc_pending_n
-    store.log_sync(delta)
+    with error_step('FUBON-08-008-011'):
+        store.log_sync(delta)
     return delta

@@ -248,7 +248,7 @@ def test_second_window_preflight_never_keeps_previous_phase(inventory_product, m
         return following
 
     def fail_next_timeline(expression, arg=None):
-        if following_windows and expression == collection.TIMELINE:
+        if following_windows and expression == collection.TIMELINE_REASON:
             raise ValueError("synthetic private next-window detail")
         return evaluate(expression, arg)
 

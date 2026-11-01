@@ -178,11 +178,13 @@ def test_cli_persist_dispatch_aligns_with_server_persist_dispatch():
 
 
 def test_cli_crawler_imports_align_with_sync_runner_crawler_map():
-    """CLI 的 from backend.banks.X import XCrawler 必須跟 sync_runner crawler_module_map 對映一致."""
-    cli_imports = _extract_bank_imports(_parse(CLI))
-    sr_crawler = _extract_crawler_module_map(_parse(SYNC_RUNNER))
+    """Exercise the lazy CLI resolver against every server module/class pair."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
 
-    cli_banks = set(cli_imports)
+    tree = _parse(CLI)
+    cli_banks = _extract_set_literal(tree, "BANKS")
+    sr_crawler = _extract_crawler_module_map(_parse(SYNC_RUNNER))
     sr_banks = set(sr_crawler)
 
     assert cli_banks == sr_banks, (
@@ -191,12 +193,28 @@ def test_cli_crawler_imports_align_with_sync_runner_crawler_map():
         f"  only in sr:  {sr_banks - cli_banks}"
     )
 
-    for bank in sr_banks:
-        sr_cls = sr_crawler[bank][1]
-        cli_classes = [n for n in cli_imports[bank] if "Crawler" in n]
-        assert sr_cls in cli_classes, (
-            f"bank={bank} sync_runner 用 {sr_cls}, 但 cli 沒 import 它 (cli imports: {cli_imports[bank]})"
-        )
+    resolver = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_get_crawler")
+    assert len(sr_banks) == 13
+    for bank, (module_name, class_name) in sr_crawler.items():
+        instance = object()
+        calls = []
+        def constructor():
+            calls.append("construct")
+            return instance
+        def lazy_import(name, *, fromlist):
+            calls.append((name, fromlist))
+            assert name == module_name
+            assert fromlist == [class_name, "BASE"]
+            return SimpleNamespace(**{class_name: constructor}, BASE="https://synthetic.invalid")
+        namespace = {"BANKS": cli_banks, "__import__": lazy_import,
+                     "error_step": lambda _: nullcontext(),
+                     "bank_error_id": lambda *_: "synthetic"}
+        exec(compile(ast.Module(body=[resolver], type_ignores=[]), str(CLI), "exec"), namespace)
+        crawler, url = namespace["_get_crawler"](bank)
+        assert crawler is instance
+        assert url == "https://synthetic.invalid" + ("/mybank/" if bank == "cathay" else "")
+        assert calls == [(module_name, [class_name, "BASE"]), "construct"]
 
 
 def test_all_supported_banks_have_persist_function():

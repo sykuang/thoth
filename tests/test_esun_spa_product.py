@@ -15,6 +15,7 @@ from patchright.sync_api import sync_playwright
 
 from backend.banks.esun import EsunCrawler
 from backend.core.base import BankCollectResult
+from backend.core.error_codes import format_error_id
 from backend.core.creds import EsunCreds
 
 PATHS = (
@@ -253,7 +254,9 @@ def test_spa_failure_reports_navigation_phase(product, monkeypatch):
     monkeypatch.setattr(collection, 'build_menu_plan', fail_plan)
     result = crawler.run(origin + '/synthetic', headless=True)
     assert not captured
-    assert 'data' not in result and result['error'].startswith('collect_failed: ValueError: code=')
+    assert 'data' not in result
+    assert result['collect_diagnostics']['error_id'] == 'ESUN-05-608-001'
+    assert result['error'] == format_error_id('ESUN-05-608-001', bank='esun') + ' | collect_failed: ValueError: code=collect_adapter: phase=menu_plan'
     assert crawler._diagnostic_stage == 'collect_navigation'
     assert 'phase=menu_plan' in result['error']
     assert 'synthetic navigation failure' not in repr(result)
@@ -312,7 +315,8 @@ def test_spa_transaction_form_failure_keeps_closed_phase(product, monkeypatch):
     monkeypatch.setattr(query, 'query_twd', fail_form)
     result = crawler.run(origin + '/synthetic', headless=True)
     assert not captured and 'data' not in result
-    assert result['error'].startswith('collect_failed: ValueError: code=')
+    assert result['collect_diagnostics']['error_id'] == 'ESUN-05-608-001'
+    assert result['error'] == format_error_id('ESUN-05-608-001', bank='esun') + ' | collect_failed: ValueError: code=collect_adapter: phase=transaction_form'
     assert crawler._diagnostic_stage == 'collect_transactions'
     assert crawler._esun_spa_phase == 'transaction_form'
     assert 'phase=transaction_form' in result['error']
@@ -397,7 +401,8 @@ def test_spa_continuation_action_failure_reports_subphase(product, monkeypatch):
     monkeypatch.setattr(page.mouse, 'wheel', fail_wheel)
     result = crawler.run(origin + '/synthetic', headless=True)
     assert not captured and 'data' not in result
-    assert result['error'].startswith('collect_failed: ValueError: code=')
+    assert result['collect_diagnostics']['error_id'] == 'ESUN-05-776-001'
+    assert result['error'] == format_error_id('ESUN-05-776-001', bank='esun') + ' | collect_failed: ValueError: code=collect_adapter: phase=continuation_action'
     assert crawler._diagnostic_stage == 'collect_transactions'
     assert crawler._esun_spa_phase == 'continuation_action'
     assert 'phase=continuation_action' in result['error']
@@ -432,7 +437,7 @@ def test_spa_collection_updates_diagnostic_stage_per_owned_phase(product, monkey
     assert account_phases[0] == 'prequery_response'
     assert 'account_validation' in account_phases
     assert len(captured) == 1 and captured[0].error == 'spa_collection_incomplete'
-    assert 'data' not in result and result['error'] == 'collect_failed: ValueError: code=collect_contract: phase=incomplete_result'
+    assert 'data' not in result and result['error'] == format_error_id('ESUN-07-900-002', bank='esun') + ' | collect_failed: ValueError: code=collect_contract: phase=incomplete_result'
     assert crawler._diagnostic_stage == 'collect_validation'
     assert crawler._esun_spa_phase == 'incomplete_result'
 
@@ -501,7 +506,7 @@ def test_calendar_admission_runs_after_proxy_guard():
             raise stop
 
     native = Mock()
-    scope: dict[str, Any] = dict(checkpoint=lambda: None, owner=lambda: None, one=lambda x: x,
+    scope: dict[str, Any] = dict(checkpoint=lambda codes: None, owner=lambda: None, one=lambda x: x,
                  reserve_action=lambda: actions.append(True), before_action=admission,
                  _OriginGuardProxy=_OriginGuardProxy, TIMEOUT=1, contextmanager=contextmanager, on_failure=None)
     exec(compile(ast.Module(body=[site, click], type_ignores=[]), '<real-query-click>', 'exec'), scope)
@@ -590,7 +595,7 @@ def test_run_collects_native_continuation_but_keeps_error_barrier(product):
     assert hits[-1][1]["requestBody"]["startIndex"] == 107
     assert hits[-1][1]["requestBody"]["count"] == 100
     assert crawler._spa_login_baseline["counts"][PATHS[0]] == 0
-    assert "data" not in result and result["error"] == "collect_failed: ValueError: code=collect_contract: phase=incomplete_result"
+    assert "data" not in result and result["error"] == format_error_id("ESUN-07-900-002", bank="esun") + " | collect_failed: ValueError: code=collect_contract: phase=incomplete_result"
     assert crawler._diagnostic_stage == "collect_validation"
     assert not external
     assert not any(value in json.dumps(result) for value in ("TEST-", "SYNTHETIC-", "0000000000001"))

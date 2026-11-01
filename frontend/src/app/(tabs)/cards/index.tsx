@@ -1030,7 +1030,7 @@ function BankGroupCard({
           </Text>
           {/* 同步狀態 — 失敗紅色,完成 X 分鐘前,進行中 spinner */}
           {isFailed ? (
-            <Text className="text-red-600 dark:text-red-400 text-micro mt-0.5" numberOfLines={1}>
+            <Text className="text-red-600 dark:text-red-400 text-micro mt-0.5" selectable>
               ⚠️ 上次同步失敗{lastJob?.error_msg ? ` — ${lastJob.error_msg}` : ''}
             </Text>
           ) : isSyncing ? (
@@ -1212,26 +1212,26 @@ function PendingBankAccountRow({
   syncBusy: boolean;
 }) {
   const completedAt = lastJob?.status === 'done' && lastJob.finished_at ? lastJob.finished_at : null;
-  const failedAt = lastJob?.status === 'failed' && lastJob.finished_at ? lastJob.finished_at : null;
+  const isFailed = lastJob?.status === 'failed';
   const statusTone = completedAt
     ? 'bg-brand-50 dark:bg-brand-950'
-    : failedAt
+    : isFailed
       ? 'bg-red-50 dark:bg-red-950'
       : 'bg-amber-50 dark:bg-amber-950';
   const badgeTone = completedAt
     ? 'bg-brand-100 dark:bg-brand-900'
-    : failedAt
+    : isFailed
       ? 'bg-red-100 dark:bg-red-900'
       : 'bg-amber-100 dark:bg-amber-950';
-  const badgeText = completedAt ? '已同步' : failedAt ? '同步失敗' : '未同步';
+  const badgeText = completedAt ? '已同步' : isFailed ? '同步失敗' : '未同步';
   const badgeTextTone = completedAt
     ? 'text-brand-700 dark:text-brand-300'
-    : failedAt
+    : isFailed
       ? 'text-red-700 dark:text-red-300'
       : 'text-amber-700 dark:text-amber-400';
   const hint = completedAt
     ? `已於 ${formatRelativeTime(completedAt)} 同步，帳戶資料稍後會出現`
-    : failedAt
+    : isFailed
       ? `上次同步失敗${lastJob?.error_msg ? ` — ${lastJob.error_msg}` : ''}`
       : account.has_creds
         ? '已設定登入 — 按右側按鈕初次同步抓帳'
@@ -1253,7 +1253,7 @@ function PendingBankAccountRow({
             <Text className={`${badgeTextTone} text-micro`}>{badgeText}</Text>
           </View>
         </View>
-        <Text className="text-ink-500 dark:text-ink-400 text-micro">
+        <Text className="text-ink-500 dark:text-ink-400 text-micro" selectable>
           {hint}
         </Text>
       </View>

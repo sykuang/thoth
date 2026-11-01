@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, with_error_code
 from datetime import datetime
 import json
 
@@ -20,8 +21,10 @@ def _to_num(s):
         return s
     t = str(s).replace(",", "").strip()
     try:
-        v = float(t)
-        return int(v) if v == int(v) else v
+        with error_step('CTBC-08-001-001'):
+            v = float(t)
+        with error_step('CTBC-08-001-002'):
+            return int(v) if v == int(v) else v
     except (ValueError, TypeError):
         return None
 
@@ -35,7 +38,8 @@ def _bill_cycle_to_latest_stmt_date(cycle_day, today: datetime | None = None) ->
     if cycle_day is None or cycle_day == "":
         return None
     try:
-        day = int(cycle_day)
+        with error_step('CTBC-08-002-001'):
+            day = int(cycle_day)
         if not 1 <= day <= 31:
             return None
     except (ValueError, TypeError):
@@ -85,7 +89,8 @@ def _ctbc_yyyymmdd_to_iso(value: str | None) -> str | None:
     if len(text) != 8 or not text.isdigit() or text == "00000000":
         return None
     try:
-        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+        with error_step('CTBC-08-004-001'):
+            return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
     except ValueError:
         return None
 
@@ -99,12 +104,15 @@ def _ctbc_native_identity(row: dict, card: str, store: BankStore) -> str | None:
     ref = row.get("acwRefNbr")
     if ref is None or (isinstance(ref, str) and not ref.strip()):
         return None
-    if not isinstance(ref, str) or ref != ref.strip():
-        raise ValueError("invalid CTBC native reference")
+    if not isinstance(ref, str):
+        raise with_error_code(ValueError('invalid CTBC native reference'), 'CTBC-08-005-001')
+    elif ref != ref.strip():
+        raise with_error_code(ValueError('invalid CTBC native reference'), 'CTBC-08-005-002')
     if not card:
-        raise ValueError("missing CTBC native card identity")
-    return json.dumps([store.bank, store.user_id, store.source_account_id or 0, card, ref],
-                      ensure_ascii=False, separators=(",", ":"))
+        raise with_error_code(ValueError("missing CTBC native card identity"), 'CTBC-08-005-003')
+    with error_step('CTBC-08-005-004'):
+        return json.dumps([store.bank, store.user_id, store.source_account_id or 0, card, ref],
+                          ensure_ascii=False, separators=(",", ":"))
 
 
 def _parse_ctbc_twd_history(twd_history: list) -> list[dict]:
@@ -145,18 +153,19 @@ def _parse_ctbc_twd_history(twd_history: list) -> list[dict]:
                 # 一定有 actDtTm. _normalize_ctbc_datetime 對合法格式 return str,
                 # 對極罕見的 format anomaly fall back None — 那種 case 是真 raw 病
                 # (不只是缺欄), 讓 PG NOT NULL 炸出來 caller 才會被 alert 去查.
-                rows.append({
-                    "account_no": account_no,
-                    "datetime": _normalize_ctbc_datetime(d.get("actDtTm") or ""),
-                    "account_date": _ctbc_yyyymmdd_to_iso(d.get("trnDtRaw") or ""),
-                    "desc": desc,
-                    "expend": _to_num(d.get("dbAmt")),
-                    "income": _to_num(d.get("crAmt")),
-                    "balance": _to_num(d.get("balanceAmt")),
-                    "counterparty_bank": (d.get("bankId") or "").strip() or None,
-                    "counterparty_acct": (d.get("trfAcct") or "").strip() or None,
-                    "memo": (d.get("memoCode") or "").strip() or None,
-                })
+                with error_step('CTBC-08-006-001'):
+                    rows.append({
+                        "account_no": account_no,
+                        "datetime": _normalize_ctbc_datetime(d.get("actDtTm") or ""),
+                        "account_date": _ctbc_yyyymmdd_to_iso(d.get("trnDtRaw") or ""),
+                        "desc": desc,
+                        "expend": _to_num(d.get("dbAmt")),
+                        "income": _to_num(d.get("crAmt")),
+                        "balance": _to_num(d.get("balanceAmt")),
+                        "counterparty_bank": (d.get("bankId") or "").strip() or None,
+                        "counterparty_acct": (d.get("trfAcct") or "").strip() or None,
+                        "memo": (d.get("memoCode") or "").strip() or None,
+                    })
     return rows
 
 
@@ -183,15 +192,16 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         # 中信 raw 只有 acctType code（'00'）難 keyword，所以在 raw 餵 type=活期存款
         # 讓 classifier 命中 keyword → deposit
         raw = {**a, "type": "活期存款", "currency": "TWD"}
-        acct_rows.append({
-            "account_no": a.get("accountId", ""),
-            "currency": "TWD",
-            "type": "活期存款",
-            "product_type": account_classify.classify_account("ctbc", raw),
-            "nickname": a.get("accountNickName") or None,
-            "raw_balance": _num_real(a.get("balance")),
-            "raw_balance_date": today,
-        })
+        with error_step('CTBC-08-007-010'):
+            acct_rows.append({
+                "account_no": a.get("accountId", ""),
+                "currency": "TWD",
+                "type": "活期存款",
+                "product_type": account_classify.classify_account("ctbc", raw),
+                "nickname": a.get("accountNickName") or None,
+                "raw_balance": _num_real(a.get("balance"), _codes=('SYS-08-001-001', 'CTBC-08-830-002', 'SYS-08-001-003', 'CTBC-08-830-004', 'CTBC-08-830-005', 'CTBC-08-830-006', 'SYS-08-001-007', 'CTBC-08-830-008', 'CTBC-08-830-009', 'CTBC-08-830-010')),
+                "raw_balance_date": today,
+            })
     # 信貸帳戶（loanCreditSummary）：拔除 — extraAmt 是「可動用上限」(quota)
     # 不是「已動用金額」，homepage ebmwResource 無 used/drawn endpoint，
     # 真正 endpoint 在 mega-menu hover 進信貸頁但 headless 失敗（probe v1+v2 兩次
@@ -199,32 +209,37 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # 實未動用），不該為了「結構完整」造視覺垃圾 row 給使用者看。
     # 若使用者未來真的動用信貸 → 重新規劃 collector 進信貸頁抓 used，再回來加 row。
     if acct_rows:
-        store.upsert_accounts(acct_rows)
+        with error_step('CTBC-08-007-011'):
+            store.upsert_accounts(acct_rows)
     delta["accounts"] = len([a for a in acct_rows if a.get("account_no")])
 
     # 台幣已過帳交易（append-only, 回真正新增筆數）
     # 2026-06-20: 補上 known TODO. collect() 抓近 6 個月 detailList 進 twd_history.
     # _parse_ctbc_twd_history 拍平成 store schema dict, upsert_twd_txns 用 dedup_key 去重.
-    twd_history_rows = _parse_ctbc_twd_history(data.get("twd_history") or [])
-    twd_new = store.upsert_twd_txns(
-        twd_history_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
-    ) if twd_history_rows else 0
+    with error_step('CTBC-08-007-001'):
+        twd_history_rows = _parse_ctbc_twd_history(data.get("twd_history") or [])
+    with error_step('CTBC-08-007-002'):
+        twd_new = store.upsert_twd_txns(
+            twd_history_rows, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+        ) if twd_history_rows else 0
     delta["twd_txn_new"] = twd_new
 
     # 餘額快照（每日 metric）——含各帳號餘額（accounts 表不存餘額）
     twd = summary.get("twdDepositSummary") or {}
     if twd or info_list:
-        store.put_daily_metric("balance_latest", {
-            "twd": _to_num(twd.get("totalCurrentBal")) if twd else None,
-            "accounts": [{"account_no": a.get("accountId"), "balance": _to_num(a.get("balance")),
-                          "available": _to_num(a.get("availableBalance"))} for a in info_list],
-        }, today)
+        with error_step('CTBC-08-007-012'):
+            store.put_daily_metric("balance_latest", {
+                "twd": _to_num(twd.get("totalCurrentBal")) if twd else None,
+                "accounts": [{"account_no": a.get("accountId"), "balance": _to_num(a.get("balance")),
+                              "available": _to_num(a.get("availableBalance"))} for a in info_list],
+            }, today)
     cc = summary.get("creditCardSummary") or {}
     if cc:
-        store.put_daily_metric("card_limit", {
-            "quota": _to_num(cc.get("quota")), "available": _to_num(cc.get("availBal")),
-            "unpaid": _to_num(cc.get("unpaidStmt")), "due_date": cc.get("pmtExpDt"),
-        }, today)
+        with error_step('CTBC-08-007-013'):
+            store.put_daily_metric("card_limit", {
+                "quota": _to_num(cc.get("quota")), "available": _to_num(cc.get("availBal")),
+                "unpaid": _to_num(cc.get("unpaidStmt")), "due_date": cc.get("pmtExpDt"),
+            }, today)
     # daily_metric loan_credit 也拔除：quota 沒實質意義（不影響淨資產也不影響支出），
     # 每天記只會把 daily_metrics 表越塞越大。若未來真要追蹤可動用額度變化再加回。
     delta["balance_days"] = 1
@@ -255,21 +270,26 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     #   used_credit 改用 quota（本期應繳）— 比 unpaidStmt=0 準確
     #   (unpaidStmt=0 是「循環信用未結清」即上期未繳, 0 表示有按時繳;
     #    quota=本期應繳=本期已花已出帳金額, 才是真正的 used)
-    ctbc_quota = _num_to_float(cc_summary.get("quota"))  # 本期應繳
-    ctbc_avail = _num_to_float(cc_summary.get("availBal"))  # 可用餘額
+    with error_step('CTBC-08-007-003'):
+        ctbc_quota = _num_to_float(cc_summary.get("quota"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CTBC-08-007-003', 'CTBC-08-831-009', 'CTBC-08-831-010'))  # 本期應繳
+    with error_step('CTBC-08-007-004'):
+        ctbc_avail = _num_to_float(cc_summary.get("availBal"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CTBC-08-007-004', 'CTBC-08-832-009', 'CTBC-08-832-010'))  # 可用餘額
     ctbc_credit_limit = (
         (ctbc_quota + ctbc_avail) if (ctbc_quota is not None and ctbc_avail is not None) else None
     )
     ctbc_used = ctbc_quota  # 本期應繳 = used_credit
-    ctbc_due = _slash_date_to_iso(cc_summary.get("pmtExpDt"))
+    with error_step('CTBC-08-007-005'):
+        ctbc_due = _slash_date_to_iso(cc_summary.get("pmtExpDt"))
     # 結帳日: billCycle='17' 是每月結帳日 day-of-month, 推算最近一次已結帳的日期
-    ctbc_stmt = _bill_cycle_to_latest_stmt_date(card_api.get("/twrbc-card/qu002/010", {}).get("billCycle"))
+    with error_step('CTBC-08-007-006'):
+        ctbc_stmt = _bill_cycle_to_latest_stmt_date(card_api.get("/twrbc-card/qu002/010", {}).get("billCycle"))
 
     # 2026-07-02: CTBC 真實繳款紀錄在 mega menu「信用卡繳款記錄」
     # `/twrbc-card/qu038/011.rsData.billDataTWD[]`：payDt=繳款日、postingDt=入帳日、
     # amt=繳款金額、merchantChiName=本行扣繳。舊邏輯用 qu002 billData.summary.pmtAmt
     # + billDt 只是帳單 summary / 統計日 approximate，不可再當 last_payment source。
-    ctbc_bill_due = _num_to_float(cc_summary.get("unpaidStmt"))
+    with error_step('CTBC-08-007-007'):
+        ctbc_bill_due = _num_to_float(cc_summary.get("unpaidStmt"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CTBC-08-833-008', 'CTBC-08-833-009', 'CTBC-08-833-010'))
     ctbc_last_pay_amt = None
     ctbc_last_pay_date = None
     qu038_for_pay = card_api.get("/twrbc-card/qu038/011") or {}
@@ -281,8 +301,10 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                pay_date = _slash_date_to_iso(row.get("payDt"))
-                amt = _num_to_float(row.get("amt"))
+                with error_step('CTBC-08-007-019'):
+                    pay_date = _slash_date_to_iso(row.get("payDt"))
+                with error_step('CTBC-08-007-020'):
+                    amt = _num_to_float(row.get("amt"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CTBC-08-834-008', 'CTBC-08-834-009', 'CTBC-08-834-010'))
                 desc = str(row.get("merchantChiName") or "")
                 if not pay_date or amt is None:
                     continue
@@ -402,24 +424,26 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
                     if orig_cur and len(orig_cur) >= 2 and orig_cur != "TWD":
                         consume_currency = orig_cur
                         try:
-                            fx_amount = float(str(foreign_amt_str).replace(",", "")) if foreign_amt_str else None
+                            with error_step('CTBC-08-007-022'):
+                                fx_amount = float(str(foreign_amt_str).replace(",", "")) if foreign_amt_str else None
                         except (ValueError, TypeError):
                             fx_amount = None
                     desc = (t.get("merchantChiName") or "").strip()
                     amt_signed = _to_num(t.get("ntAmt"))
-                    billed_rows.append({
-                        "native_identity": _ctbc_native_identity(t, (t.get("cardNo") or "").strip(), store),
-                        "card_no": f"****{last4}" if last4 else None,
-                        "bill_date": bill_date,
-                        "date": consume_date,
-                        "post_date": post_date,  # CTBC postingDt (raw API 有此欄位)
-                        "desc": desc,
-                        "amount": amt_signed,  # 台幣入帳金額（可正可負，扣繳會是負）
-                        "currency": "TWD",
-                        "consume_currency": consume_currency,
-                        "consume_amount": fx_amount,
-                        "txn_type": classify.classify_ctbc(t.get("txCode"), desc, amt_signed),
-                    })
+                    with error_step('CTBC-08-007-021'):
+                        billed_rows.append({
+                            "native_identity": _ctbc_native_identity(t, (t.get("cardNo") or "").strip(), store),
+                            "card_no": f"****{last4}" if last4 else None,
+                            "bill_date": bill_date,
+                            "date": consume_date,
+                            "post_date": post_date,  # CTBC postingDt (raw API 有此欄位)
+                            "desc": desc,
+                            "amount": amt_signed,  # 台幣入帳金額（可正可負，扣繳會是負）
+                            "currency": "TWD",
+                            "consume_currency": consume_currency,
+                            "consume_amount": fx_amount,
+                            "txn_type": classify.classify_ctbc(t.get("txCode"), desc, amt_signed),
+                        })
 
     # --- 3) pending: 抓 qu006/011 未出帳單, 但仍不抓 qu041/010 即時授權 ---
     # 2026-06-19: qu041/010 即時消費 API 給的是授權 placeholder 視角, 跟 billed
@@ -446,24 +470,26 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
         if not last4 or not desc or amt is None:
             continue
         orig_desc = (t.get("origCurDesc") or "").strip()
-        orig_amt = _num_to_float(t.get("origCurAmt"))
+        with error_step('CTBC-08-007-014'):
+            orig_amt = _num_to_float(t.get("origCurAmt"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'CTBC-08-835-008', 'CTBC-08-835-009', 'CTBC-08-835-010'))
         consume_currency = orig_desc if orig_desc and orig_desc != "TWD" else None
         consume_amount = orig_amt if consume_currency else None
         post_date = _ctbc_yyyymmdd_to_iso(t.get("postingDt"))
-        pending_rows.append({
-            "native_identity": _ctbc_native_identity(t, suffix_raw, store),
-            "card_no": f"****{last4}",
-            "date": consume_date,
-            "post_date": post_date,
-            "booking_status": "booked" if post_date else None,
-            "desc": desc,
-            "amount": amt,
-            "currency": "TWD",
-            "consume_country": (t.get("countryCode") or "").strip() or None,
-            "consume_currency": consume_currency,
-            "consume_amount": consume_amount,
-            "txn_type": classify.classify_ctbc(t.get("txCode"), desc, amt),
-        })
+        with error_step('CTBC-08-007-015'):
+            pending_rows.append({
+                "native_identity": _ctbc_native_identity(t, suffix_raw, store),
+                "card_no": f"****{last4}",
+                "date": consume_date,
+                "post_date": post_date,
+                "booking_status": "booked" if post_date else None,
+                "desc": desc,
+                "amount": amt,
+                "currency": "TWD",
+                "consume_country": (t.get("countryCode") or "").strip() or None,
+                "consume_currency": consume_currency,
+                "consume_amount": consume_amount,
+                "txn_type": classify.classify_ctbc(t.get("txCode"), desc, amt),
+            })
 
     # --- 4) 把 cards 從 qu041 也補進去（萬一 qu002 沒給但 qu041 有出現的卡）---
     # 雖然不再抓 pending txn, 但 qu041 仍可能是 cards 唯一來源 (邊緣卡未在帳單期).
@@ -492,29 +518,34 @@ def persist_ctbc(data: dict, store: BankStore, rules: list[dict] | None = None) 
     # --- 寫入 store ---
     cards_n = 0
     if seen_cards:
-        store.upsert_cards(list(seen_cards.values()))
+        with error_step('CTBC-08-007-016'):
+            store.upsert_cards(list(seen_cards.values()))
         cards_n = len(seen_cards)
 
     qu006_ok = (isinstance(qu006_raw, dict)
                 and not any(qu006_raw.get(key) for key in ("error", "Error", "errorMessage"))
                 and isinstance(qu006_raw.get("allItems"), list))
-    billed_n, pending_n = store.persist_card_batch(
-        billed_rows, pending_rows, scope="unbilled", fetch_ok=qu006_ok, rules=rules,
-    )
+    with error_step('CTBC-08-007-008'):
+        billed_n, pending_n = store.persist_card_batch(
+            billed_rows, pending_rows, scope="unbilled", fetch_ok=qu006_ok, rules=rules,
+        )
 
     if months_summary:
-        store.put_daily_metric("ctbc_bill_months_summary", months_summary, today)
+        with error_step('CTBC-08-007-017'):
+            store.put_daily_metric("ctbc_bill_months_summary", months_summary, today)
 
     # 2026-06-22 (mega menu probe raw 留底, 明早 sync 後從 PG 撈出來看 menu 全 list,
     # 找「繳款紀錄」類 menu, ship 0.3.32 hard-code 進 card_targets).
     mega_menu = data.get("card_mega_menu_dump")
     if mega_menu:
-        store.put_daily_metric("ctbc_card_mega_menu_dump", mega_menu, today)
+        with error_step('CTBC-08-007-018'):
+            store.put_daily_metric("ctbc_card_mega_menu_dump", mega_menu, today)
 
     delta["cards"] = cards_n
     delta["card_billed_new"] = billed_n
     delta["card_unbilled"] = pending_n
     delta["bill_months"] = len(months_summary)
 
-    store.log_sync(delta)
+    with error_step('CTBC-08-007-009'):
+        store.log_sync(delta)
     return delta

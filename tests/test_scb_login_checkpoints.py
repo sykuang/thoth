@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 import base64
-import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -715,9 +713,6 @@ def test_legacy_login_debug_and_synthetic_actions_are_absent() -> None:
 
 
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
-    tree = ast.parse(Path(scb_module.__file__).read_text())
-    crawler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ScbCrawler")
-    start = next(i for i, node in enumerate(crawler.body) if isinstance(node, ast.FunctionDef) and node.name == "collect")
-    payload = "\n".join(ast.dump(node, include_attributes=False) for node in crawler.body[start:])
-    # 2026-10-03 live: collect reads deposit accounts from the 帳戶綜覽 page.
-    assert hashlib.sha256(payload.encode()).hexdigest() == "c3e555032aa2bef7d824d1b59879bc8143c9b4587d51186efd49bb4be6cc31b3"
+    from tests.test_protected_ast import assert_protected_source
+
+    assert_protected_source(Path(scb_module.__file__).read_text(), "scb")

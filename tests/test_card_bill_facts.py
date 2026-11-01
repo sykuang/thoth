@@ -192,6 +192,7 @@ def test_postgres_accepts_card_bill_fact_without_cycle_or_payment_dates():
             pass
 
     store: Any = object.__new__(BankStore)
+    store.bank = "ctbc"  # Match the bank identity established by BankStore.__init__.
     store.user_id = 1
     store.conn = PgTypeCheckingConnection()
 

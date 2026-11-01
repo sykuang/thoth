@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ from backend.server import (
     user_sync_pref_repo,
 )
 from backend.server.creds_store import AccountsRepo, LocalFernetBackend
+from backend.core.sync_errors import safe_failure_message
 
 dispatch_daily_payment_reminders_for_all_users = (
     payment_reminder_notifications.dispatch_daily_payment_reminders_for_all_users
@@ -24,6 +26,7 @@ dispatch_daily_payment_reminders_for_all_users = (
 
 
 def run_queued_jobs() -> dict[str, int]:
+    """Count jobs executed here; swept jobs retain diagnostics in their DB rows."""
     for swept in (
         sync_jobs_repo.sweep_stale_queued(),
         sync_jobs_repo.sweep_stale_scheduled_queued(),
@@ -103,12 +106,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("queued", "scheduled", "reminders"))
     args = parser.parse_args(argv)
-    if args.mode == "queued":
-        result = run_queued_jobs()
-    elif args.mode == "scheduled":
-        result = run_scheduled_slot()
-    else:
-        result = run_payment_reminders()
+    try:
+        if args.mode == "queued":
+            result = run_queued_jobs()
+        elif args.mode == "scheduled":
+            result = run_scheduled_slot()
+        else:
+            result = run_payment_reminders()
+    except Exception as exc:
+        print(safe_failure_message(exc, None), file=sys.stderr)
+        return 1  # Storage unavailable is not a fabricated terminal row/count.
     print(json.dumps(result, sort_keys=True))
     return 1 if result.get("failed", 0) else 0
 

@@ -46,6 +46,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import publish_card_bill_facts
+from backend.core.error_codes import error_step, with_error_code, exception_error_id, format_error_id
 from backend.core.creds import LinebankCreds
 from backend.core.login_checkpoints import (
     CheckpointKind,
@@ -75,7 +76,7 @@ class LinebankCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "linebank.com.tw"
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
         """W (2026-06-17): positive signal 4 條件 AND（純 SPA，對齊 SCSB 鐵律）
 
         1) urlOk: linebank.com.tw 域內 + 不在 /login
@@ -83,6 +84,8 @@ class LinebankCrawler(BankCrawler):
         3) lenOk: body innerText >= 500
         4) kw >= 2: 內銀區關鍵字命中 ≥ 2 個
         """
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             current = urlparse(page.url or "")
             if (
@@ -98,7 +101,8 @@ class LinebankCrawler(BankCrawler):
             if path_tail == "login":
                 return False
 
-            ok = page.evaluate("""
+            with error_step('LINEBANK-03-008-001'):
+                ok = page.evaluate("""
                 () => {
                   const visible = (e) => {
                     if (!e) return false;
@@ -120,17 +124,26 @@ class LinebankCrawler(BankCrawler):
                 }
             """)
             return bool(ok)
-        except Exception:
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='linebank')
+                if error_id in ('LINEBANK-03-008-001',):
+                    _auth_probe_ids[:] = [error_id]
             return False
 
     def login(self, page) -> bool:
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(6000)
+        with error_step('LINEBANK-01-001-001'):
+            page.wait_for_timeout(6000)
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -138,6 +151,7 @@ class LinebankCrawler(BankCrawler):
         return (
             LoginCheckpointRule(
                 name="linebank-otp-required",
+                error_id='LINEBANK-03-050-001',
                 bank="linebank",
                 phases=all_phases,
                 kind=CheckpointKind.OTP_REQUIRED,
@@ -149,6 +163,7 @@ class LinebankCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="linebank-login-success-notice",
+                error_id='LINEBANK-03-800-001',
                 bank="linebank",
                 phases=post,
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
@@ -159,6 +174,7 @@ class LinebankCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="linebank-unknown-modal",
+                error_id='LINEBANK-03-055-001',
                 bank="linebank",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -166,6 +182,7 @@ class LinebankCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="linebank-login-form-still-visible",
+                error_id='LINEBANK-03-060-001',
                 bank="linebank",
                 phases=post,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -181,64 +198,91 @@ class LinebankCrawler(BankCrawler):
         )
         try:
             for selector, _value, timeout in fields:
-                page.wait_for_selector(selector, state="visible", timeout=timeout)
+                with error_step({'#nationalId': 'LINEBANK-02-009-001', '#userId': 'LINEBANK-02-023-001', '#pw': 'LINEBANK-02-037-001'}[selector]):
+                    page.wait_for_selector(selector, state="visible", timeout=timeout)
 
             for selector, value, _timeout in fields:
-                locator = page.locator(selector)
-                if locator.count() != 1:
-                    raise LinebankLoginError("登入欄位無法安全填寫；未送出登入")
-                locator.click()
-                page.wait_for_timeout(150)
-                locator.click(click_count=3)
-                page.wait_for_timeout(100)
-                page.keyboard.press("Backspace")
-                page.wait_for_timeout(100)
-                page.keyboard.type(value, delay=60)
-                page.wait_for_timeout(250)
-                if len(locator.input_value()) != len(value):
-                    raise LinebankLoginError("登入欄位輸入長度不符；未送出登入")
+                with error_step({'#nationalId': 'LINEBANK-02-010-001', '#userId': 'LINEBANK-02-024-001', '#pw': 'LINEBANK-02-038-001'}[selector]):
+                    locator = page.locator(selector)
+                with error_step({'#nationalId': 'LINEBANK-02-011-001', '#userId': 'LINEBANK-02-025-001', '#pw': 'LINEBANK-02-039-001'}[selector]):
+                    if locator.count() != 1:
+                        raise with_error_code(LinebankLoginError('登入欄位無法安全填寫；未送出登入'), {'#nationalId': 'LINEBANK-02-012-001', '#userId': 'LINEBANK-02-026-001', '#pw': 'LINEBANK-02-040-001'}[selector])
+                with error_step({'#nationalId': 'LINEBANK-02-013-001', '#userId': 'LINEBANK-02-027-001', '#pw': 'LINEBANK-02-041-001'}[selector]):
+                    locator.click()
+                with error_step({'#nationalId': 'LINEBANK-02-014-001', '#userId': 'LINEBANK-02-028-001', '#pw': 'LINEBANK-02-042-001'}[selector]):
+                    page.wait_for_timeout(150)
+                with error_step({'#nationalId': 'LINEBANK-02-015-001', '#userId': 'LINEBANK-02-029-001', '#pw': 'LINEBANK-02-043-001'}[selector]):
+                    locator.click(click_count=3)
+                with error_step({'#nationalId': 'LINEBANK-02-016-001', '#userId': 'LINEBANK-02-030-001', '#pw': 'LINEBANK-02-044-001'}[selector]):
+                    page.wait_for_timeout(100)
+                with error_step({'#nationalId': 'LINEBANK-02-017-001', '#userId': 'LINEBANK-02-031-001', '#pw': 'LINEBANK-02-045-001'}[selector]):
+                    page.keyboard.press("Backspace")
+                with error_step({'#nationalId': 'LINEBANK-02-018-001', '#userId': 'LINEBANK-02-032-001', '#pw': 'LINEBANK-02-046-001'}[selector]):
+                    page.wait_for_timeout(100)
+                with error_step({'#nationalId': 'LINEBANK-02-019-001', '#userId': 'LINEBANK-02-033-001', '#pw': 'LINEBANK-02-047-001'}[selector]):
+                    page.keyboard.type(value, delay=60)
+                with error_step({'#nationalId': 'LINEBANK-02-020-001', '#userId': 'LINEBANK-02-034-001', '#pw': 'LINEBANK-02-048-001'}[selector]):
+                    page.wait_for_timeout(250)
+                with error_step({'#nationalId': 'LINEBANK-02-021-001', '#userId': 'LINEBANK-02-035-001', '#pw': 'LINEBANK-02-049-001'}[selector]):
+                    if len(locator.input_value()) != len(value):
+                        raise with_error_code(LinebankLoginError('登入欄位輸入長度不符；未送出登入'), {'#nationalId': 'LINEBANK-02-022-001', '#userId': 'LINEBANK-02-036-001', '#pw': 'LINEBANK-02-050-001'}[selector])
         except LinebankLoginError:
             raise
-        except Exception:
-            raise LinebankLoginError("登入欄位無法安全填寫；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(LinebankLoginError('登入欄位無法安全填寫；未送出登入'), exception_error_id(error, bank="linebank") or 'LINEBANK-02-001-001') from None
 
         try:
-            buttons = page.locator("button")
+            with error_step('LINEBANK-02-002-001'):
+                buttons = page.locator("button")
             matches = []
-            for index in range(buttons.count()):
-                button = buttons.nth(index)
-                if not button.is_visible() or not button.is_enabled():
-                    continue
-                text = " ".join(button.inner_text().split())
-                aria_label = button.get_attribute("aria-label")
-                if text in {"登入", "登入友善網路銀行"} or aria_label == "登入友善網路銀行":
-                    matches.append(button)
-        except Exception:
-            raise LinebankLoginError("無法安全確認登入按鈕；未送出登入") from None
+            with error_step('LINEBANK-02-051-001'):
+                for index in range(buttons.count()):
+                    with error_step('LINEBANK-02-003-001'):
+                        button = buttons.nth(index)
+                    with error_step('LINEBANK-02-004-001'):
+                        if not error_step('LINEBANK-02-700-001')(lambda: button.is_visible())() or not error_step('LINEBANK-02-701-001')(lambda: button.is_enabled())():
+                            continue
+                    with error_step('LINEBANK-02-053-001'):
+                        text = " ".join(button.inner_text().split())
+                    with error_step('LINEBANK-02-052-001'):
+                        aria_label = button.get_attribute("aria-label")
+                    if text in {"登入", "登入友善網路銀行"} or aria_label == "登入友善網路銀行":
+                        matches.append(button)
+        except Exception as error:
+            raise with_error_code(LinebankLoginError('無法安全確認登入按鈕；未送出登入'), exception_error_id(error, bank="linebank") or 'LINEBANK-02-005-001') from None
         if len(matches) != 1:
-            raise LinebankLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            raise with_error_code(LinebankLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'LINEBANK-02-006-001')
 
         try:
-            matches[0].click(timeout=8000)
-        except Exception:
-            raise LinebankLoginError("登入送出狀態不明；禁止自動重試") from None
+            with error_step('LINEBANK-02-007-001'):
+                matches[0].click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(LinebankLoginError('登入送出狀態不明；禁止自動重試'), exception_error_id(error, bank="linebank") or 'LINEBANK-02-008-001') from None
 
         try:
-            page.wait_for_timeout(10000)
+            with error_step('LINEBANK-03-001-001'):
+                page.wait_for_timeout(10000)
             for _ in range(20):
-                page.wait_for_timeout(1000)
+                with error_step('LINEBANK-03-002-001'):
+                    page.wait_for_timeout(1000)
                 if self._logged_in(page):
                     return
-                modals = page.locator(".modal.show")
-                if any(modals.nth(index).is_visible() for index in range(modals.count())):
-                    return
-                login_fields = page.locator("#nationalId")
-                if any(
-                    login_fields.nth(index).is_visible()
-                    for index in range(login_fields.count())
-                ):
-                    return
-        except Exception:
+                with error_step('LINEBANK-03-003-001'):
+                    modals = page.locator(".modal.show")
+                with error_step('LINEBANK-03-004-001'):
+                    if any(error_step('LINEBANK-03-702-001')(lambda: error_step('LINEBANK-03-703-001')(lambda: modals.nth(index))().is_visible())() for index in range(error_step('LINEBANK-03-704-001')(lambda: modals.count())())):
+                        return
+                with error_step('LINEBANK-03-005-001'):
+                    login_fields = page.locator("#nationalId")
+                with error_step('LINEBANK-03-006-001'):
+                    if any(
+                        error_step('LINEBANK-03-705-001')(lambda: error_step('LINEBANK-03-706-001')(lambda: login_fields.nth(index))().is_visible())()
+                        for index in range(error_step('LINEBANK-03-707-001')(lambda: login_fields.count())())
+                    ):
+                        return
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="linebank") or 'LINEBANK-03-007-001', bank="linebank"))
             return
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
@@ -255,7 +299,8 @@ class LinebankCrawler(BankCrawler):
         LINE Bank 無信用卡產品，跳過 credit card。
         """
         out: dict = {}
-        page.wait_for_timeout(4000)
+        with error_step('LINEBANK-04-001-001'):
+            page.wait_for_timeout(4000)
         debug_dir = _debug_dir()
 
         with contextlib.suppress(Exception):
@@ -263,20 +308,27 @@ class LinebankCrawler(BankCrawler):
 
         out["initial_url"] = page.url
         try:
-            out["title"] = page.title()
-        except Exception:
+            with error_step('LINEBANK-04-002-001'):
+                out["title"] = page.title()
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="linebank") or 'LINEBANK-07-001-001', bank="linebank"))
             out["title"] = ""
 
         try:
-            txt = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
-        except Exception:
+            with error_step('LINEBANK-04-003-001'):
+                txt = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="linebank") or 'LINEBANK-07-002-001', bank="linebank"))
             txt = ""
         out["home_text"] = txt
         _log(f"[linebank][collect] home text_len={len(txt)}")
 
         # dump 主 page 內所有可見 nav 元素（找選單）
         try:
-            nav_items = page.evaluate("""() => {
+            with error_step('LINEBANK-04-004-001'):
+                nav_items = page.evaluate("""() => {
                 const out = [];
                 for (const el of document.querySelectorAll('a, button, [role=button], [role=link]')) {
                     if (el.offsetParent === null) continue;
@@ -290,7 +342,9 @@ class LinebankCrawler(BankCrawler):
                 }
                 return out;
             }""")
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="linebank") or 'LINEBANK-07-003-001', bank="linebank"))
             nav_items = []
         out["nav_items"] = nav_items[:80]
         _log(f"[linebank][collect] nav items: {len(nav_items)}（含 menu/button）")
@@ -299,9 +353,13 @@ class LinebankCrawler(BankCrawler):
         # 無障礙版本要點 menu link, SPA 內部 routing
         _log("[linebank][collect] → goto /transaction（帳戶交易明細查詢）")
         try:
-            page.goto("https://accessibility.linebank.com.tw/transaction", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(6000)  # 等 SPA fetch
+            with error_step('LINEBANK-04-005-001'):
+                page.goto("https://accessibility.linebank.com.tw/transaction", wait_until="domcontentloaded", timeout=30000)
+            with error_step('LINEBANK-05-001-001'):
+                page.wait_for_timeout(6000)  # 等 SPA fetch
         except Exception as e:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(e, bank="linebank") or 'LINEBANK-07-004-001', bank="linebank"))
             _log(f"[linebank][collect] goto /transaction 失敗: {type(e).__name__}")
 
         with contextlib.suppress(Exception):
@@ -309,8 +367,11 @@ class LinebankCrawler(BankCrawler):
 
         try:
             txn_url = page.url
-            txn_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
-        except Exception:
+            with error_step('LINEBANK-04-006-001'):
+                txn_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="linebank") or 'LINEBANK-07-005-001', bank="linebank"))
             txn_url, txn_text = "", ""
         out["transaction_url"] = txn_url
         out["transaction_text"] = txn_text
@@ -320,7 +381,8 @@ class LinebankCrawler(BankCrawler):
         # 無障礙版必須先在 dropdown 選一個帳戶, 點「查詢」才會 fetch 該帳戶餘額 + 交易
         accounts_queried: list[dict] = []
         try:
-            select_info = page.evaluate("""() => {
+            with error_step('LINEBANK-05-002-001'):
+                select_info = page.evaluate("""() => {
                 const sel = document.querySelector('select');
                 if (!sel) return {error: 'no_select_found'};
                 const opts = [];
@@ -334,6 +396,8 @@ class LinebankCrawler(BankCrawler):
                 return {opts};
             }""")
         except Exception as e:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(e, bank="linebank") or 'LINEBANK-07-006-001', bank="linebank"))
             select_info = {"error": type(e).__name__}
             _log(f"[linebank][collect] 讀 select 失敗: {type(e).__name__}")
 
@@ -348,7 +412,8 @@ class LinebankCrawler(BankCrawler):
             _log(f"[linebank][collect] → 查詢帳戶 [{i+1}/{len(opts)}]")
             try:
                 # 用 JS 直接 set <select>.value 並 dispatch change/input（React onChange 認得）
-                page.evaluate("""(value) => {
+                with error_step('LINEBANK-05-003-001'):
+                    page.evaluate("""(value) => {
                     const sel = document.querySelector('select');
                     if (!sel) return false;
                     sel.value = value;
@@ -356,10 +421,12 @@ class LinebankCrawler(BankCrawler):
                     sel.dispatchEvent(new Event('input',  {bubbles: true}));
                     return true;
                 }""", opt_value)
-                page.wait_for_timeout(500)
+                with error_step('LINEBANK-05-004-001'):
+                    page.wait_for_timeout(500)
 
                 # 點「查詢」按鈕
-                clicked = page.evaluate("""() => {
+                with error_step('LINEBANK-05-005-001'):
+                    clicked = page.evaluate("""() => {
                     for (const b of document.querySelectorAll('button')) {
                         if (b.offsetParent === null) continue;
                         const t = (b.textContent || '').trim();
@@ -370,7 +437,8 @@ class LinebankCrawler(BankCrawler):
                 if not clicked:
                     _log(f"[linebank][collect] ⚠️ 帳戶#{i+1} 沒找到「查詢」按鈕")
                     continue
-                page.wait_for_timeout(6000)  # 等 API + 表格 render
+                with error_step('LINEBANK-05-006-001'):
+                    page.wait_for_timeout(6000)  # 等 API + 表格 render
 
                 with contextlib.suppress(Exception):
                     page.screenshot(
@@ -378,7 +446,8 @@ class LinebankCrawler(BankCrawler):
                         full_page=True,
                     )
 
-                acct_text = page.evaluate("() => (document.body.innerText || '').slice(0, 25000)") or ""
+                with error_step('LINEBANK-05-007-001'):
+                    acct_text = page.evaluate("() => (document.body.innerText || '').slice(0, 25000)") or ""
                 accounts_queried.append({
                     "option": opt,
                     "url": page.url,
@@ -386,6 +455,8 @@ class LinebankCrawler(BankCrawler):
                 })
                 _log(f"[linebank][collect] 帳戶#{i+1} 查詢後 text_len={len(acct_text)}")
             except Exception as e:
+                with contextlib.suppress(Exception):
+                    _log(format_error_id(exception_error_id(e, bank="linebank") or 'LINEBANK-07-007-001', bank="linebank"))
                 _log(f"[linebank][collect] 查詢帳戶#{i+1} 失敗: {type(e).__name__}")
 
         out["accounts_queried"] = accounts_queried
@@ -403,7 +474,8 @@ class LinebankCrawler(BankCrawler):
                 "resp": h.resp_json, "req_body": h.req_body,
             })
         out["api_responses"] = api_responses
-        publish_card_bill_facts(out, [])
+        with error_step('LINEBANK-07-008-001'):
+            publish_card_bill_facts(out, [])
         _log(f"[linebank][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
         _log(f"[linebank][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
         return BankCollectResult(**out)

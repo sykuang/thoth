@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import bank_error_id, error_step
 from datetime import datetime
 
 from backend.core.store import BankStore
@@ -27,17 +28,22 @@ def persist_generic_dump(bank: str, data: dict, store: BankStore, rules: list[di
     }
 
     if data.get("final_url"):
-        store.put_daily_metric(f"{bank}_final_url", {"url": data["final_url"]}, today)
+        with error_step(bank_error_id(bank, '08-801-002')):
+            store.put_daily_metric(f"{bank}_final_url", {"url": data["final_url"]}, today)
     if data.get("main_text"):
-        store.put_daily_metric(f"{bank}_main_text_preview",
-                                {"text": data["main_text"][:2000]}, today)
+        with error_step(bank_error_id(bank, '08-801-003')):
+            store.put_daily_metric(f"{bank}_main_text_preview",
+                                    {"text": data["main_text"][:2000]}, today)
     if data.get("frames"):
-        store.put_daily_metric(f"{bank}_frames",
-                                {"count": len(data["frames"]),
-                                 "frames": [{"url": f.get("url"), "preview": (f.get("text_preview") or "")[:500]}
-                                            for f in data["frames"][:5]]}, today)
+        with error_step(bank_error_id(bank, '08-801-004')):
+            store.put_daily_metric(f"{bank}_frames",
+                                    {"count": len(data["frames"]),
+                                     "frames": [{"url": f.get("url"), "preview": (f.get("text_preview") or "")[:500]}
+                                                for f in data["frames"][:5]]}, today)
     if data.get("_all_endpoints"):
-        store.put_daily_metric(f"{bank}_endpoints",
-                                {"endpoints": data["_all_endpoints"]}, today)
-    store.log_sync(delta)
+        with error_step(bank_error_id(bank, '08-801-005')):
+            store.put_daily_metric(f"{bank}_endpoints",
+                                    {"endpoints": data["_all_endpoints"]}, today)
+    with error_step(bank_error_id(bank, '08-801-001')):
+        store.log_sync(delta)
     return delta

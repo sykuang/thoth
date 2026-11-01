@@ -6,7 +6,7 @@ import pytest
 from patchright.sync_api import Locator, TimeoutError
 
 from tests.test_esun_spa_product import PATHS, browser as browser, product as product
-from tests.test_esun_spa_query_failure_sites import stored_job as stored_job
+from tests.test_esun_spa_query_failure_sites import stored_job as stored_job, form_diagnostic
 
 
 @pytest.fixture(autouse=True)
@@ -81,7 +81,11 @@ def test_primary_action_timeout_keeps_run_diagnostics(product, stored_job, monke
     assert diagnostics["phase"] == phase
     gate = "native_action" if action == "calendar" else "query_submit" if action == "submit" else None
     assert diagnostics.get("gate") == gate and crawler._esun_spa_gate == gate
-    assert result["error"].startswith("collect_failed: TimeoutError: code=")
+    error_id = {"header": "ESUN-04-700-001", "leaf": "ESUN-04-710-001",
+                "calendar": "ESUN-05-802-001", "submit": "ESUN-05-774-001"}[action]
+    code = "collect_contract" if action in ("header", "leaf") else "collect_navigation"
+    expected = f"collect_failed: TimeoutError: code={code}: phase={phase}" + (f": gate={gate}" if gate else "")
+    assert form_diagnostic(result, stored_error, error_id)[1] == expected
     assert f"phase={phase}" in result["error"]
     assert result["error"] == stored_error
     assert (f"gate={gate}" in stored_error) if gate else ("gate=" not in stored_error)

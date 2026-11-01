@@ -35,6 +35,7 @@ from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector,
 from backend.core.card_bills import publish_card_bill_facts
 from backend.core.captcha import ocr_bytes
 from backend.core.creds import ScsbCreds
+from backend.core.error_codes import error_step, exception_error_id, with_error_code
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
@@ -99,7 +100,7 @@ class ScsbCrawler(BankCrawler):
         self._cleanup_private_artifacts()
         history_mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
         if history_mode not in {"full", "incremental"}:
-            raise ValueError(f"invalid BANK_CRAWLER_HISTORY_MODE: {history_mode!r}")
+            raise with_error_code(ValueError(f'invalid BANK_CRAWLER_HISTORY_MODE: {history_mode!r}'), 'SCSB-07-300-001')
         self.full_history = history_mode == "full"
         self.creds = ScsbCreds.load()
 
@@ -108,10 +109,12 @@ class ScsbCrawler(BankCrawler):
         from backend.core.store import _data_root
 
         debug_dir = _data_root() / "scsb_collect"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        (Path(__file__).resolve().parents[1] / "data" / "scsb_collected.json").unlink(
-            missing_ok=True,
-        )
+        with error_step('SCSB-07-301-001'):
+            debug_dir.mkdir(parents=True, exist_ok=True)
+        with error_step('SCSB-07-302-001'):
+            (Path(__file__).resolve().parents[1] / "data" / "scsb_collected.json").unlink(
+                missing_ok=True,
+            )
         for legacy_name in (
             "overview.png", "card.png", "twd.png", "twd_inquiry.png",
             "twd_inquiry_form.png", "twd_inquiry_results.png",
@@ -119,13 +122,16 @@ class ScsbCrawler(BankCrawler):
             "card_inq_current.png", "card_inq_current_results.png",
             "card_inq_statement.png", "card_inq_statement_results.png",
         ):
-            (debug_dir / legacy_name).unlink(missing_ok=True)
+            with error_step('SCSB-07-303-001'):
+                (debug_dir / legacy_name).unlink(missing_ok=True)
 
     def _host_filter(self) -> str:
         return "scsb.com"
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
         """Pure one-shot positive check; the shared lifecycle owns waiting."""
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             current = urlparse(page.url or "")
             path = current.path.lower()
@@ -136,16 +142,24 @@ class ScsbCrawler(BankCrawler):
                 or not path.startswith(("/aply/", "/ibhm/"))
             ):
                 return False
-            controls = page.locator(
-                "#userId, #idNumber, #pppd, #verified, .ved_img"
-            )
-            if any(
-                controls.nth(index).is_visible()
-                for index in range(controls.count())
-            ):
-                return False
-            body = page.locator("body").inner_text()
-        except Exception:
+            with error_step('SCSB-03-500-001'):
+                controls = page.locator(
+                    "#userId, #idNumber, #pppd, #verified, .ved_img"
+                )
+            with error_step('SCSB-03-301-001'):
+                if any(
+                    error_step('SCSB-03-500-004')(lambda: error_step('SCSB-03-500-003')(lambda: controls.nth(index))().is_visible())()
+                    for index in range(error_step('SCSB-03-500-002')(lambda: controls.count())())
+                ):
+                    return False
+            with error_step('SCSB-03-302-001'):
+                body = error_step('SCSB-03-540-002')(lambda: error_step('SCSB-03-540-001')(lambda: page.locator("body"))().inner_text())()
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='scsb')
+                if error_id in ('SCSB-03-500-001', 'SCSB-03-500-002', 'SCSB-03-500-003', 'SCSB-03-500-004',
+                 'SCSB-03-540-001', 'SCSB-03-540-002'):
+                    _auth_probe_ids[:] = [error_id]
             return False
         identities = ("Hello", "Last Login", "登出", "Logout")
         menus = (
@@ -166,10 +180,15 @@ class ScsbCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(9000)
+        with error_step('SCSB-01-300-001'):
+            page.wait_for_timeout(9000)
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -208,6 +227,7 @@ class ScsbCrawler(BankCrawler):
         )
         intro = LoginCheckpointRule(
             name="scsb-intro-notice",
+            error_id='SCSB-03-800-001',
             bank="scsb",
             phases=(CheckpointPhase.PRE_SUBMIT,),
             kind=CheckpointKind.DISMISSIBLE_NOTICE,
@@ -217,6 +237,7 @@ class ScsbCrawler(BankCrawler):
         )
         fraud_notice = LoginCheckpointRule(
             name="scsb-fraud-notice",
+            error_id='SCSB-03-805-001',
             bank="scsb",
             phases=(CheckpointPhase.PRE_SUBMIT,),
             kind=CheckpointKind.DISMISSIBLE_NOTICE,
@@ -231,6 +252,7 @@ class ScsbCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"scsb-otp-required-{suffix}",
+                    error_id={'modal': 'SCSB-03-050-001', 'dialog': 'SCSB-03-055-001', 'intro': 'SCSB-03-060-001'}[suffix],
                     bank="scsb",
                     phases=all_phases,
                     kind=CheckpointKind.OTP_REQUIRED,
@@ -242,6 +264,7 @@ class ScsbCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"scsb-password-change-required-{suffix}",
+                    error_id={'modal': 'SCSB-03-065-001', 'dialog': 'SCSB-03-070-001', 'intro': 'SCSB-03-075-001'}[suffix],
                     bank="scsb",
                     phases=all_phases,
                     kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
@@ -253,6 +276,7 @@ class ScsbCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"scsb-explicit-login-error-{suffix}",
+                    error_id={'error': 'SCSB-03-080-001', 'alert': 'SCSB-03-085-001', 'role-alert': 'SCSB-03-090-001'}[suffix],
                     bank="scsb",
                     phases=post,
                     kind=CheckpointKind.EXPLICIT_LOGIN_ERROR,
@@ -265,6 +289,7 @@ class ScsbCrawler(BankCrawler):
             fraud_notice,
             LoginCheckpointRule(
                 name="scsb-unknown-custom-modal",
+                error_id='SCSB-03-095-001',
                 bank="scsb",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -272,6 +297,7 @@ class ScsbCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="scsb-unknown-modal",
+                error_id='SCSB-03-100-001',
                 bank="scsb",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -279,6 +305,7 @@ class ScsbCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="scsb-unknown-dialog",
+                error_id='SCSB-03-105-001',
                 bank="scsb",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -286,6 +313,7 @@ class ScsbCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="scsb-login-form-still-visible",
+                error_id='SCSB-03-110-001',
                 bank="scsb",
                 phases=post,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -294,63 +322,92 @@ class ScsbCrawler(BankCrawler):
         )
 
     @staticmethod
-    def _keyboard_fill(page, field, value: str) -> None:
-        field.click()
-        field.click(click_count=3)
-        page.keyboard.press("Backspace")
-        page.keyboard.type(value, delay=80)
-        if len(field.input_value()) != len(value):
-            raise ScsbLoginError("登入欄位輸入長度不符；未送出登入")
+    def _keyboard_fill(page, field, value: str, *, field_role="user") -> None:
+        with error_step({'identity': 'SCSB-02-020-001', 'user': 'SCSB-02-050-001', 'password': 'SCSB-02-080-001', 'captcha': 'SCSB-02-110-001'}[field_role]):
+            field.click()
+        with error_step({'identity': 'SCSB-02-021-001', 'user': 'SCSB-02-051-001', 'password': 'SCSB-02-081-001', 'captcha': 'SCSB-02-111-001'}[field_role]):
+            field.click(click_count=3)
+        with error_step({'identity': 'SCSB-02-022-001', 'user': 'SCSB-02-052-001', 'password': 'SCSB-02-082-001', 'captcha': 'SCSB-02-112-001'}[field_role]):
+            page.keyboard.press("Backspace")
+        with error_step({'identity': 'SCSB-02-023-001', 'user': 'SCSB-02-053-001', 'password': 'SCSB-02-083-001', 'captcha': 'SCSB-02-113-001'}[field_role]):
+            page.keyboard.type(value, delay=80)
+        with error_step({'identity': 'SCSB-02-024-001', 'user': 'SCSB-02-054-001', 'password': 'SCSB-02-084-001', 'captcha': 'SCSB-02-114-001'}[field_role]):
+            actual_length = len(field.input_value())
+        if actual_length != len(value):
+            raise with_error_code(ScsbLoginError("登入欄位輸入長度不符；未送出登入"), {'identity': 'SCSB-02-025-001', 'user': 'SCSB-02-055-001', 'password': 'SCSB-02-085-001', 'captcha': 'SCSB-02-115-001'}[field_role])
 
     @staticmethod
     def _click_unique_refresh(page) -> bool:
-        refreshes = page.locator(".chg_link")
-        if refreshes.count() != 1:
-            return False
-        refresh = refreshes.nth(0)
-        if not refresh.is_visible() or not refresh.is_enabled():
-            return False
-        label = " ".join(refresh.inner_text().split())
+        with error_step('SCSB-07-304-001'):
+            refreshes = page.locator(".chg_link")
+        with error_step('SCSB-07-305-001'):
+            if refreshes.count() != 1:
+                return False
+        with error_step('SCSB-07-306-001'):
+            refresh = refreshes.nth(0)
+        with error_step('SCSB-07-307-001'):
+            if not refresh.is_visible() or not error_step('SCSB-07-500-001')(lambda: refresh.is_enabled())():
+                return False
+        with error_step('SCSB-07-308-001'):
+            label = " ".join(refresh.inner_text().split())
         if label not in ("", "重新產生", "Refresh"):
             return False
-        refresh.click()
-        page.wait_for_timeout(1500)
+        with error_step('SCSB-07-309-001'):
+            refresh.click()
+        with error_step('SCSB-07-310-001'):
+            page.wait_for_timeout(1500)
         return True
 
-    def _ocr_captcha(self, page, max_attempts=5):
+    def _ocr_captcha(self, page, max_attempts=5, *, diagnostics: list[str] | None = None):
+        diagnostics = [] if diagnostics is None else diagnostics
+        diagnostics.clear()
         attempts = min(max(int(max_attempts), 0), 5)
         for attempt in range(attempts):
+            diagnostics.clear()
             try:
-                images = page.locator(SEL_CAP_IMG)
-                if images.count() != 1:
-                    return None
-                image = images.nth(0)
-                if not image.is_visible():
-                    return None
-                background = image.evaluate("el => getComputedStyle(el).backgroundImage")
+                with error_step('SCSB-02-300-001'):
+                    images = page.locator(SEL_CAP_IMG)
+                with error_step('SCSB-02-301-001'):
+                    if images.count() != 1:
+                        diagnostics[:] = ['SCSB-02-510-001']
+                        return None
+                with error_step('SCSB-02-302-001'):
+                    image = images.nth(0)
+                with error_step('SCSB-02-303-001'):
+                    if not image.is_visible():
+                        diagnostics[:] = ['SCSB-02-510-002']
+                        return None
+                with error_step('SCSB-02-304-001'):
+                    background = image.evaluate("el => getComputedStyle(el).backgroundImage")
                 match = (
                     _CAPTCHA_BACKGROUND.fullmatch(background)
                     if isinstance(background, str)
                     else None
                 )
                 if match is None:
-                    raise ValueError
-                raw = base64.b64decode(match.group("payload"), validate=True)
-                text = ocr_bytes(
-                    raw,
-                    expected_len=5,
-                    alnum_only=True,
-                    min_confidence=0.98,
-                )
+                    raise with_error_code(ValueError(), 'SCSB-02-305-001')
+                with error_step('SCSB-02-510-003'):
+                    raw = base64.b64decode(match.group("payload"), validate=True)
+                with error_step('SCSB-02-510-004'):
+                    text = ocr_bytes(
+                        raw,
+                        expected_len=5,
+                        alnum_only=True,
+                        min_confidence=0.98,
+                    )
                 if isinstance(text, str) and len(text) == 5 and text.isdigit():
+                    diagnostics.clear()
                     return text
-            except Exception:
-                pass
+                diagnostics[:] = ['SCSB-02-510-005' if text is None else 'SCSB-02-510-006']
+            except Exception as error:
+                diagnostics[:] = [exception_error_id(error, bank="scsb") or 'SCSB-02-510-007']
             if attempt < attempts - 1:
                 try:
                     if not self._click_unique_refresh(page):
+                        diagnostics[:] = ['SCSB-02-510-008']
                         return None
-                except Exception:
+                except Exception as error:
+                    diagnostics[:] = [exception_error_id(error, bank="scsb") or 'SCSB-02-510-009']
                     return None
         return None
 
@@ -363,29 +420,41 @@ class ScsbCrawler(BankCrawler):
             ".alert",
             "[role='alert']",
         ):
-            candidates = page.locator(selector)
-            if any(
-                candidates.nth(index).is_visible()
-                for index in range(candidates.count())
-            ):
-                return True
+            with error_step({'.modal.show': 'SCSB-03-550-001', "[role='dialog']": 'SCSB-03-560-001', '.error': 'SCSB-03-570-001', '.alert': 'SCSB-03-580-001', "[role='alert']": 'SCSB-03-590-001'}[selector]):
+                candidates = page.locator(selector)
+            with error_step('SCSB-03-304-001'):
+                if any(
+                    error_step({'.modal.show': 'SCSB-03-550-004', "[role='dialog']": 'SCSB-03-560-004', '.error': 'SCSB-03-570-004', '.alert': 'SCSB-03-580-004', "[role='alert']": 'SCSB-03-590-004'}[selector])(lambda: error_step({'.modal.show': 'SCSB-03-550-003', "[role='dialog']": 'SCSB-03-560-003', '.error': 'SCSB-03-570-003', '.alert': 'SCSB-03-580-003', "[role='alert']": 'SCSB-03-590-003'}[selector])(lambda: candidates.nth(index))().is_visible())()
+                    for index in range(error_step({'.modal.show': 'SCSB-03-550-002', "[role='dialog']": 'SCSB-03-560-002', '.error': 'SCSB-03-570-002', '.alert': 'SCSB-03-580-002', "[role='alert']": 'SCSB-03-590-002'}[selector])(lambda: candidates.count())())
+                ):
+                    return True
         return False
 
     def submit_credentials_once(self, page) -> None:
         try:
-            page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
-            page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
+            with error_step('SCSB-02-306-001'):
+                page.wait_for_selector(SEL_SID, state="visible", timeout=30000)
+            with error_step('SCSB-02-307-001'):
+                page.wait_for_selector(SEL_CAP_IMG, state="visible", timeout=15000)
             fields = []
             for selector in (SEL_SID, SEL_USER, SEL_PWD, SEL_CAP):
-                candidates = page.locator(selector)
-                if candidates.count() != 1:
-                    raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
-                field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
-                    raise ScsbLoginError("登入欄位無法安全確認；未送出登入")
+                with error_step({'#userId': 'SCSB-02-308-001', '#idNumber': 'SCSB-02-309-001', '#pppd': 'SCSB-02-310-001', '#verified': 'SCSB-02-311-001'}[selector]):
+                    candidates = page.locator(selector)
+                with error_step({'#userId': 'SCSB-02-316-001', '#idNumber': 'SCSB-02-317-001', '#pppd': 'SCSB-02-318-001', '#verified': 'SCSB-02-319-001'}[selector]):
+                    if candidates.count() != 1:
+                        raise with_error_code(ScsbLoginError('登入欄位無法安全確認；未送出登入'), {'#userId': 'SCSB-02-312-001', '#idNumber': 'SCSB-02-313-001', '#pppd': 'SCSB-02-314-001', '#verified': 'SCSB-02-315-001'}[selector])
+                with error_step({'#userId': 'SCSB-02-320-001', '#idNumber': 'SCSB-02-321-001', '#pppd': 'SCSB-02-322-001', '#verified': 'SCSB-02-323-001'}[selector]):
+                    field = candidates.nth(0)
+                with error_step({'#userId': 'SCSB-02-324-001', '#idNumber': 'SCSB-02-325-001', '#pppd': 'SCSB-02-326-001', '#verified': 'SCSB-02-327-001'}[selector]):
+                    if not field.is_visible():
+                        raise with_error_code(ScsbLoginError('登入欄位無法安全確認；未送出登入'), {'#userId': 'SCSB-02-324-001', '#idNumber': 'SCSB-02-325-001', '#pppd': 'SCSB-02-326-001', '#verified': 'SCSB-02-327-001'}[selector])
+                with error_step({'#userId': 'SCSB-02-324-002', '#idNumber': 'SCSB-02-325-002', '#pppd': 'SCSB-02-326-002', '#verified': 'SCSB-02-327-002'}[selector]):
+                    if not field.is_enabled():
+                        raise with_error_code(ScsbLoginError('登入欄位無法安全確認；未送出登入'), {'#userId': 'SCSB-02-324-002', '#idNumber': 'SCSB-02-325-002', '#pppd': 'SCSB-02-326-002', '#verified': 'SCSB-02-327-002'}[selector])
                 fields.append(field)
 
-            for field, value in zip(
+            for field_role, field, value in zip(
+                ("identity", "user", "password"),
                 fields[:3],
                 (
                     self.creds.national_id,
@@ -394,53 +463,60 @@ class ScsbCrawler(BankCrawler):
                 ),
                 strict=True,
             ):
-                self._keyboard_fill(page, field, value)
-            captcha = self._ocr_captcha(page, max_attempts=1)
+                self._keyboard_fill(page, field, value, field_role=field_role)
+            diagnostics: list[str] = []
+            captcha = self._ocr_captcha(page, max_attempts=1, diagnostics=diagnostics)
             if not captcha:
-                raise captcha_unreadable(ScsbLoginError("無法安全辨識驗證碼；未送出登入"))
-            self._keyboard_fill(page, fields[3], captcha)
+                raise with_error_code(captcha_unreadable(ScsbLoginError('無法安全辨識驗證碼；未送出登入')), next(iter(diagnostics), 'SCSB-02-328-001'))
+            self._keyboard_fill(page, fields[3], captcha, field_role="captcha")
 
-            candidates = page.locator(
-                "button, input[type='submit'], input[type='button']"
-            )
+            with error_step('SCSB-02-329-001'):
+                candidates = page.locator(
+                    "button, input[type='submit'], input[type='button']"
+                )
             eligible = []
-            for index in range(candidates.count()):
-                candidate = candidates.nth(index)
-                if not candidate.is_visible() or not candidate.is_enabled():
-                    continue
-                label = " ".join(
-                    (
-                        candidate.inner_text()
-                        or candidate.get_attribute("value")
-                        or ""
-                    ).split()
-                )
-                if label in ("Log in", "登入"):
-                    eligible.append(candidate)
+            with error_step('SCSB-02-333-001'):
+                for index in range(candidates.count()):
+                    with error_step('SCSB-02-330-001'):
+                        candidate = candidates.nth(index)
+                    with error_step('SCSB-02-331-001'):
+                        if not candidate.is_visible():
+                            continue
+                    with error_step('SCSB-02-400-001'):
+                        if not candidate.is_enabled():
+                            continue
+                    with error_step('SCSB-02-332-001'):
+                        label = " ".join(
+                            (
+                                candidate.inner_text()
+                                or error_step('SCSB-02-520-001')(lambda: candidate.get_attribute("value"))()
+                                or ""
+                            ).split()
+                        )
+                    if label in ("Log in", "登入"):
+                        eligible.append(candidate)
             if len(eligible) != 1:
-                raise ScsbLoginError(
-                    "找不到唯一且可操作的登入按鈕；未送出登入"
-                )
+                raise with_error_code(ScsbLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'SCSB-02-334-001')
             button = eligible[0]
         except ScsbLoginError:
             raise
-        except Exception:
-            raise ScsbLoginError("登入欄位無法安全填寫；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(ScsbLoginError('登入欄位無法安全填寫；未送出登入'), exception_error_id(error, bank="scsb") or 'SCSB-02-335-001') from None
 
         try:
-            button.click(timeout=8000)
-        except Exception:
-            raise ScsbLoginError("登入送出狀態不明；禁止自動重試") from None
+            with error_step('SCSB-02-336-001'):
+                button.click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(ScsbLoginError('登入送出狀態不明；禁止自動重試'), exception_error_id(error, bank="scsb") or 'SCSB-02-337-001') from None
 
         try:
             for wait_ms in (12000, 5000, 5000, 5000):
-                page.wait_for_timeout(wait_ms)
+                with error_step('SCSB-03-338-001'):
+                    page.wait_for_timeout(wait_ms)
                 if self._logged_in(page) or self._visible_blocker(page):
                     return
-        except Exception:
-            raise ScsbLoginError(
-                "登入送出後狀態無法安全確認；禁止自動重試"
-            ) from None
+        except Exception as error:
+            raise with_error_code(ScsbLoginError('登入送出後狀態無法安全確認；禁止自動重試'), exception_error_id(error, bank="scsb") or 'SCSB-03-339-001') from None
 
     # ---------- 抓取（DOM regex 路線，API 加密暫不解）----------
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
@@ -450,8 +526,10 @@ class ScsbCrawler(BankCrawler):
         必須改 location.hash 設值或 click 左側選單。
         """
         out: dict = {}
-        page.wait_for_timeout(5000)
-        page.wait_for_timeout(2000)
+        with error_step('SCSB-07-311-001'):
+            page.wait_for_timeout(5000)
+        with error_step('SCSB-07-312-001'):
+            page.wait_for_timeout(2000)
 
         # SCSB SPA 菜單是 Vue/React，DOM e.click() 不觸發 vnode handler，
         # 必須用 Playwright 原生 page.click（送真實 mouse event）。
@@ -465,46 +543,72 @@ class ScsbCrawler(BankCrawler):
             "Credit Card": ("信用卡", "Credit Card Services"),
         }
 
+        navigation_error_id = None
+
         def _navigate(label, wait_ms=8000):
             """Click one top-level SCSB accordion/navigation control."""
+            nonlocal navigation_error_id
+            navigation_error_id = None
             spec = menu.get(label)
             if not spec:
                 _log(f"  [nav] ❌ unknown label: {label}")
                 return False
+            action_codes = {'My Overview': ('SCSB-04-700-001', 'SCSB-04-701-001', 'SCSB-04-702-001', 'SCSB-04-703-001', 'SCSB-04-704-001', 'SCSB-04-705-001', 'SCSB-04-706-001', 'SCSB-04-707-001', 'SCSB-04-708-001', 'SCSB-04-709-001'), 'TWD Deposit': ('SCSB-05-700-001', 'SCSB-05-701-001', 'SCSB-05-702-001', 'SCSB-05-703-001', 'SCSB-05-704-001', 'SCSB-05-705-001', 'SCSB-05-706-001', 'SCSB-05-707-001', 'SCSB-05-708-001', 'SCSB-05-709-001'), 'Credit Card': ('SCSB-06-700-001', 'SCSB-06-701-001', 'SCSB-06-702-001', 'SCSB-06-703-001', 'SCSB-06-704-001', 'SCSB-06-705-001', 'SCSB-06-706-001', 'SCSB-06-707-001', 'SCSB-06-708-001', 'SCSB-06-709-001')}[label]
             accordion_zh, en_fallback = spec
             _log(f"[collect] click → {label} (accordion={accordion_zh!r})")
             try:
-                acc_btn = page.query_selector(f"button:has-text({accordion_zh!r})")
-                if not acc_btn or not acc_btn.is_visible():
-                    acc_btn = page.query_selector(f"button:has-text({en_fallback!r})")
-                if not acc_btn or not acc_btn.is_visible():
+                with error_step(action_codes[0]):
+                    acc_btn = page.query_selector(f"button:has-text({accordion_zh!r})")
+                fallback = not acc_btn
+                if not fallback:
+                    with error_step(action_codes[1]):
+                        fallback = not acc_btn.is_visible()
+                if fallback:
+                    with error_step(action_codes[2]):
+                        acc_btn = page.query_selector(f"button:has-text({en_fallback!r})")
+                if not acc_btn:
+                    navigation_error_id = action_codes[8]
                     _log(f"  [nav] ❌ accordion button {accordion_zh!r} 找不到")
                     return False
-                acc_btn.click()
-                page.wait_for_timeout(2000)
-                page.wait_for_timeout(wait_ms - 2000 if wait_ms > 2000 else 1000)
-                page.wait_for_timeout(1500)
+                with error_step(action_codes[3]):
+                    visible = acc_btn.is_visible()
+                if not visible:
+                    navigation_error_id = action_codes[9]
+                    _log(f"  [nav] ❌ accordion button {accordion_zh!r} 找不到")
+                    return False
+                with error_step(action_codes[4]):
+                    acc_btn.click()
+                with error_step(action_codes[5]):
+                    page.wait_for_timeout(2000)
+                with error_step(action_codes[6]):
+                    page.wait_for_timeout(wait_ms - 2000 if wait_ms > 2000 else 1000)
+                with error_step(action_codes[7]):
+                    page.wait_for_timeout(1500)
                 return True
             except Exception as e:
+                navigation_error_id = exception_error_id(e, bank="scsb")
                 _log(f"  [nav] 失敗: {type(e).__name__}")
                 return False
 
         # 1. My Overview / 我的總覽 — accordion 點開 = navigate
         if not _navigate("My Overview", wait_ms=10000):
-            raise RuntimeError("overview-navigation-failed")
+            raise with_error_code(RuntimeError('overview-navigation-failed'), navigation_error_id or 'SCSB-07-331-001')
         # SCSB My Overview 預設眼睛 icon 隱藏餘額，需點開
         try:
-            page.evaluate(
-                "(() => { const eyes=[...document.querySelectorAll('i,button,span,div')]"
-                ".filter(e=>e.offsetParent!==null &&"
-                "  /eye|fa-eye|icon-eye|hide|show/i.test((e.className||'')+(e.getAttribute('title')||'')));"
-                " for(const e of eyes) e.click(); return eyes.length; })()",
-            )
-            page.wait_for_timeout(3000)
+            with error_step('SCSB-07-332-001'):
+                page.evaluate(
+                    "(() => { const eyes=[...document.querySelectorAll('i,button,span,div')]"
+                    ".filter(e=>e.offsetParent!==null &&"
+                    "  /eye|fa-eye|icon-eye|hide|show/i.test((e.className||'')+(e.getAttribute('title')||'')));"
+                    " for(const e of eyes) e.click(); return eyes.length; })()",
+                )
+            with error_step('SCSB-07-333-001'):
+                page.wait_for_timeout(3000)
         except Exception:
             pass
         try:
-            out["overview_text"] = (page.evaluate("document.body.innerText") or "")
+            with error_step('SCSB-07-334-001'):
+                out["overview_text"] = (page.evaluate("document.body.innerText") or "")
         except Exception:
             out["overview_text"] = ""
         _log(f"  overview text len={len(out['overview_text'])}")
@@ -516,14 +620,15 @@ class ScsbCrawler(BankCrawler):
             out["overview_text"],
         )
         if not expected_twd_accounts and not overview_inventory_authoritative:
-            raise RuntimeError("overview-twd-inventory-unavailable")
+            raise with_error_code(RuntimeError('overview-twd-inventory-unavailable'), 'SCSB-07-335-001')
 
         # 2. TWD Deposit / 臺幣存匯 — 獨立 top-level accordion
         if expected_twd_accounts:
             if not _navigate("TWD Deposit", wait_ms=8000):
-                raise RuntimeError("twd-navigation-failed")
+                raise with_error_code(RuntimeError('twd-navigation-failed'), navigation_error_id or 'SCSB-07-336-001')
             try:
-                out["twd_text"] = (page.evaluate("document.body.innerText") or "")
+                with error_step('SCSB-07-337-001'):
+                    out["twd_text"] = (page.evaluate("document.body.innerText") or "")
             except Exception:
                 out["twd_text"] = ""
 
@@ -536,9 +641,10 @@ class ScsbCrawler(BankCrawler):
 
         # 3. Credit Card / 信用卡 — accordion 本身 = navigate
         if not _navigate("Credit Card", wait_ms=8000):
-            raise RuntimeError("card-navigation-failed")
+            raise with_error_code(RuntimeError('card-navigation-failed'), navigation_error_id or 'SCSB-07-338-001')
         try:
-            out["card_text"] = (page.evaluate("document.body.innerText") or "")
+            with error_step('SCSB-07-339-001'):
+                out["card_text"] = (page.evaluate("document.body.innerText") or "")
         except Exception:
             out["card_text"] = ""
 
@@ -702,7 +808,7 @@ class ScsbCrawler(BankCrawler):
                     return true;
                 };
                 let btn1 = byAnyText(['臺幣存匯', '台幣存匯', '臺幣存款', '台幣存款', 'TWD Deposit']);
-                if (!btn1) { log.push('L1 not found'); return {ok: false, log}; }
+                if (!btn1) { log.push('L1 not found'); return {ok: false, log, _diagnostic: 'SCSB-05-610-001'}; }
                 clickIfCollapsed(btn1, 'L1 click');
                 return new Promise(resolve => setTimeout(() => {
                     let btn2 = byAnyText(['帳戶查詢', '存款查詢', 'TWD Account Inquiry']);
@@ -712,7 +818,7 @@ class ScsbCrawler(BankCrawler):
                         if (!leaf) {
                             const dump = allBtns().map(b => norm(b.innerText || b.textContent || '').slice(0, 60));
                             log.push('L3 leaf not found, visible buttons: ' + JSON.stringify(dump));
-                            resolve({ok: false, log});
+                            resolve({ok: false, log, _diagnostic: 'SCSB-05-610-002'});
                             return;
                         }
                         clickIfCollapsed(leaf, 'L3 click');
@@ -754,8 +860,11 @@ class ScsbCrawler(BankCrawler):
             } else if ((!startInput || !endInput) && dateInputs.length === 2) {
                 [startInput, endInput] = dateInputs;
             }
-            if (!custom || !startInput || !endInput || startInput === endInput) {
-                return {ok: false, error: 'custom-period-controls-missing'};
+            const diagnostic = !custom ? 'SCSB-05-616-001' :
+                !startInput ? 'SCSB-05-616-002' : !endInput ? 'SCSB-05-616-003' :
+                startInput === endInput ? 'SCSB-05-616-004' : null;
+            if (diagnostic) {
+                return {ok: false, error: 'custom-period-controls-missing', _diagnostic: diagnostic};
             }
 
             const parseDate = (value) => {
@@ -856,30 +965,39 @@ class ScsbCrawler(BankCrawler):
     def _apply_twd_period_controls(page, period: dict) -> None:
         """用真實 browser actions 更新 react-datepicker state。"""
         if not period.get("ok"):
-            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
-        controls = {
-            role: page.locator(f'[data-thoth-scsb-twd-period="{role}"]')
-            for role in ("custom", "start", "end")
-        }
-        if any(
-            control.count() != 1 or not control.first.is_visible()
-            for control in controls.values()
-        ):
-            raise RuntimeError("lookback-period-control-unavailable")
+            raise with_error_code(RuntimeError(period.get("error") or "lookback-period-unavailable"), {'custom-period-controls-missing': 'SCSB-05-300-002', 'incremental-start-unavailable': 'SCSB-05-300-003', 'invalid-period-limit': 'SCSB-05-300-004'}.get(period.get("error"), "SCSB-05-300-001"))
+        controls = {}
+        for role in ("custom", "start", "end"):
+            with error_step({'custom': 'SCSB-05-100-001', 'start': 'SCSB-05-110-001', 'end': 'SCSB-05-120-001'}[role]):
+                controls[role] = page.locator(f'[data-thoth-scsb-twd-period="{role}"]')
+        for role, control in controls.items():
+            with error_step({'custom': 'SCSB-05-101-001', 'start': 'SCSB-05-111-001', 'end': 'SCSB-05-121-001'}[role]):
+                count = control.count()
+            if count != 1:
+                raise with_error_code(RuntimeError("lookback-period-control-unavailable"), {'custom': 'SCSB-05-102-001', 'start': 'SCSB-05-112-001', 'end': 'SCSB-05-122-001'}[role])
+            with error_step({'custom': 'SCSB-05-103-001', 'start': 'SCSB-05-113-001', 'end': 'SCSB-05-123-001'}[role]):
+                visible = control.first.is_visible()
+            if not visible:
+                raise with_error_code(RuntimeError("lookback-period-control-unavailable"), {'custom': 'SCSB-05-104-001', 'start': 'SCSB-05-114-001', 'end': 'SCSB-05-124-001'}[role])
         _log("[twd_inq] native period controls → custom")
-        controls["custom"].first.check()
+        with error_step('SCSB-05-105-001'):
+            controls["custom"].first.check()
         _log("[twd_inq] native period controls → start")
-        controls["start"].first.fill(period["start"])
+        with error_step('SCSB-05-115-001'):
+            controls["start"].first.fill(period["start"])
         _log("[twd_inq] native period controls → end")
-        controls["end"].first.fill(period["end"])
+        with error_step('SCSB-05-125-001'):
+            controls["end"].first.fill(period["end"])
         _log("[twd_inq] native period controls → done")
 
     @staticmethod
     def _six_month_windows(start: str, end: str) -> list[tuple[str, str]]:
-        start_date = date.fromisoformat(start.replace("/", "-"))
-        end_date = date.fromisoformat(end.replace("/", "-"))
+        with error_step('SCSB-05-130-001'):
+            start_date = date.fromisoformat(start.replace("/", "-"))
+        with error_step('SCSB-05-131-001'):
+            end_date = date.fromisoformat(end.replace("/", "-"))
         if start_date > end_date:
-            raise ValueError("history start is after end")
+            raise with_error_code(ValueError('history start is after end'), 'SCSB-05-307-001')
 
         windows: list[tuple[str, str]] = []
         cursor = start_date
@@ -907,11 +1025,10 @@ class ScsbCrawler(BankCrawler):
             const custom = document.querySelector('[data-thoth-scsb-twd-period="custom"]');
             const start = document.querySelector('[data-thoth-scsb-twd-period="start"]');
             const end = document.querySelector('[data-thoth-scsb-twd-period="end"]');
-            return {
-                ok: !!custom?.checked
-                    && normalize(start?.value) === expected.start
-                    && normalize(end?.value) === expected.end,
-            };
+            const diagnostic = !custom?.checked ? 'SCSB-05-611-001' :
+                normalize(start?.value) !== expected.start ? 'SCSB-05-611-002' :
+                normalize(end?.value) !== expected.end ? 'SCSB-05-611-003' : null;
+            return diagnostic ? {ok: false, _diagnostic: diagnostic} : {ok: true};
         }"""
 
     @staticmethod
@@ -1056,8 +1173,10 @@ class ScsbCrawler(BankCrawler):
             };
             const scope = window.__thothScsbTwdResultScope;
             const result = window.__thothScsbTwdResultElement;
-            if (!visible(scope) || !visible(result) || !scope.contains(result)) {
-                return {ok: false, empty: false, row_count: 0, text: ''};
+            const diagnostic = !visible(scope) ? 'SCSB-05-612-001' : !visible(result) ? 'SCSB-05-612-002' :
+                !scope.contains(result) ? 'SCSB-05-612-003' : null;
+            if (diagnostic) {
+                return {ok: false, empty: false, row_count: 0, text: '', _diagnostic: diagnostic};
             }
             const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
             const empty = emptyPattern.test(result.innerText || '')
@@ -1072,7 +1191,7 @@ class ScsbCrawler(BankCrawler):
                     && exactToken(own, expected.account_no)
                     && ![...el.children].some(child => /查詢條件|Query Criteria/i.test(child.innerText || ''));
             });
-            if (!criteria) return {ok: false, empty: false, row_count: 0, text: ''};
+            if (!criteria) return {ok: false, empty: false, row_count: 0, text: '', _diagnostic: 'SCSB-05-612-004'};
             const tableMatches = __TWD_TABLE_HEADERS__;
             const table = result.tagName === 'TABLE'
                 && tableMatches(result) ? result : null;
@@ -1080,7 +1199,7 @@ class ScsbCrawler(BankCrawler):
                 const rowCount = [...table.rows].filter(row => row.querySelectorAll('td').length).length;
                 return {ok: true, empty: false, row_count: rowCount, text: table.innerText || ''};
             }
-            return {ok: false, empty: false, row_count: 0, text: ''};
+            return {ok: false, empty: false, row_count: 0, text: '', _diagnostic: 'SCSB-05-612-005'};
         }""".replace("__TWD_TABLE_HEADERS__", _TWD_TABLE_HEADERS_JS)
 
     @staticmethod
@@ -1089,38 +1208,48 @@ class ScsbCrawler(BankCrawler):
         return r"""() => {
             const visible = el => el && el.offsetParent !== null;
             const scope = window.__thothScsbTwdResultScope;
-            if (!visible(scope)) return {ok: false};
+            if (!visible(scope)) return {ok: false, _diagnostic: 'SCSB-05-613-001'};
             const emptyPattern = /^\s*很抱歉，\s*您在指定條件內，\s*沒有任何餘額及交易明細的資料。\s*$/;
             const hasEmpty = [scope, ...scope.querySelectorAll('*')].some(el =>
                 visible(el)
                 && emptyPattern.test(el.innerText || '')
                 && ![...el.children].some(child => emptyPattern.test(child.innerText || ''))
             );
-            if (!hasEmpty) return {ok: false};
+            if (!hasEmpty) return {ok: false, _diagnostic: 'SCSB-05-613-002'};
             const closes = [...scope.querySelectorAll('button,a,[role=button]')].filter(el =>
                 visible(el) && /^\s*(?:關閉|Close)\s*$/i.test(el.innerText || '')
             );
-            if (closes.length !== 1) return {ok: false};
+            if (closes.length !== 1) return {ok: false, _diagnostic: 'SCSB-05-613-003'};
             closes[0].dataset.thothScsbTwdEmptyClose = 'true';
             return {ok: true};
         }"""
 
     @classmethod
     def _close_twd_empty_result(cls, page) -> None:
-        tagged = page.evaluate(cls._twd_empty_result_close_script())
-        if not isinstance(tagged, dict) or tagged.get("ok") is not True:
-            raise RuntimeError("empty-result-close-unavailable")
-        close = page.locator('[data-thoth-scsb-twd-empty-close="true"]')
-        if close.count() != 1 or not close.first.is_visible():
-            raise RuntimeError("empty-result-close-unavailable")
-        close.first.click()
-        page.wait_for_function(
-            """() => {
+        with error_step('SCSB-05-308-001'):
+            tagged = page.evaluate(cls._twd_empty_result_close_script())
+        if not isinstance(tagged, dict):
+            raise with_error_code(RuntimeError('empty-result-close-unavailable'), 'SCSB-05-309-001')
+        if tagged.get('ok') is not True:
+            raise with_error_code(RuntimeError('empty-result-close-unavailable'), next((code for code in ('SCSB-05-613-001', 'SCSB-05-613-002', 'SCSB-05-613-003',) if tagged.get("_diagnostic") == code), 'SCSB-05-309-002'))
+        with error_step('SCSB-05-310-001'):
+            close = page.locator('[data-thoth-scsb-twd-empty-close="true"]')
+        with error_step('SCSB-05-311-001'):
+            if close.count() != 1:
+                raise with_error_code(RuntimeError('empty-result-close-unavailable'), 'SCSB-05-311-001')
+        with error_step('SCSB-05-311-002'):
+            if not close.first.is_visible():
+                raise with_error_code(RuntimeError('empty-result-close-unavailable'), 'SCSB-05-311-002')
+        with error_step('SCSB-05-312-001'):
+            close.first.click()
+        with error_step('SCSB-05-313-001'):
+            page.wait_for_function(
+                """() => {
                 const close = document.querySelector('[data-thoth-scsb-twd-empty-close="true"]');
                 return !close || close.offsetParent === null;
             }""",
-            timeout=120000,
-        )
+                timeout=120000,
+            )
         _log("[twd_inq] empty result → closed")
 
     @staticmethod
@@ -1215,7 +1344,7 @@ class ScsbCrawler(BankCrawler):
         return r"""() => {
             const visible = (el) => el && el.offsetParent !== null;
             const scope = window.__thothScsbTwdResultScope;
-            if (!visible(scope)) return {error: true, pagination: false};
+            if (!visible(scope)) return {error: true, pagination: false, _diagnostic: 'SCSB-05-614-001'};
             const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const disabled = (el) => el.closest('[disabled],[aria-disabled="true"],.disabled');
             const current = (el) => el.closest('[aria-current="page"],.active');
@@ -1259,8 +1388,10 @@ class ScsbCrawler(BankCrawler):
         }"""
 
     @staticmethod
-    def _parse_twd_inquiry_records(text: str) -> tuple[list[dict], bool]:
+    def _parse_twd_inquiry_records(text: str, *, diagnostics: list[str] | None = None) -> tuple[list[dict], bool]:
         """解析完整交易 DOM；raw preview 的 8 KB 上限不得截斷入庫資料。"""
+        diagnostics = [] if diagnostics is None else diagnostics
+        diagnostics.clear()
         records = []
         candidate_count = 0
 
@@ -1278,30 +1409,40 @@ class ScsbCrawler(BankCrawler):
             candidate_count += 1
             cols = line.split("\t")
             if len(cols) not in (5, 6):
+                if not diagnostics:
+                    diagnostics[:] = ['SCSB-05-600-001']
                 continue
             date_str = cols[0].strip()
             if not re.match(r"^\d{3,4}/\d{2}/\d{2}$", date_str):
+                if not diagnostics:
+                    diagnostics[:] = ['SCSB-05-600-002']
                 continue
             year, month, day = (int(part) for part in date_str.split("/"))
             canonical_year = year + 1911 if year < 1000 else year
             try:
                 date(canonical_year, month, day)
             except ValueError:
+                if not diagnostics:
+                    diagnostics[:] = ['SCSB-05-600-003']
                 continue
             date_str = f"{canonical_year:04d}/{month:02d}/{day:02d}"
             summary = cols[1].strip()
             expense = _parse_money(cols[2].strip())
             deposit = _parse_money(cols[3].strip())
             balance = _parse_money(cols[4].strip())
-            if (
-                not summary
-                or balance in (None, "")
-                or expense is None
-                or deposit is None
-                or bool(expense) == bool(deposit)
-                or (expense and expense.startswith("-"))
-                or (deposit and deposit.startswith("-"))
-            ):
+            rejected = (
+                'SCSB-05-600-004' if not summary else
+                'SCSB-05-600-005' if balance in (None, "") else
+                'SCSB-05-600-006' if expense is None else
+                'SCSB-05-600-007' if deposit is None else
+                'SCSB-05-600-008' if bool(expense) == bool(deposit) else
+                'SCSB-05-600-009' if expense and expense.startswith("-") else
+                'SCSB-05-600-010' if deposit and deposit.startswith("-") else
+                None
+            )
+            if rejected:
+                if not diagnostics:
+                    diagnostics[:] = [rejected]
                 continue
 
             records.append({
@@ -1333,13 +1474,13 @@ class ScsbCrawler(BankCrawler):
             "connection timed out", "gateway timeout", "request timeout",
             "連線逾時", "登入逾時", "重新登入", "please log in",
         )):
-            raise ValueError("statement month page error")
+            raise with_error_code(ValueError('statement month page error'), 'SCSB-06-300-001')
         required_labels = (
             "Current Period Total Amount Due",
             "Current Period Total Minimum Amount Due",
         )
         if not all(label in text for label in required_labels):
-            raise ValueError("incomplete statement month summary")
+            raise with_error_code(ValueError('incomplete statement month summary'), 'SCSB-06-301-001')
 
         def grab(label: str) -> int | None:
             start = text.find(label)
@@ -1354,13 +1495,15 @@ class ScsbCrawler(BankCrawler):
                 value,
             )
             if not match:
-                raise ValueError("invalid statement month amount")
+                raise with_error_code(ValueError('invalid statement month amount'), {'Current Period Total Amount Due': 'SCSB-07-440-001', 'Current Period Total Minimum Amount Due': 'SCSB-07-450-001'}[label])
             try:
                 amount = Decimal(value.replace("NT$", "").replace(",", "").strip())
             except InvalidOperation as exc:
-                raise ValueError("invalid statement month amount") from exc
-            if not amount.is_finite() or amount != amount.to_integral_value():
-                raise ValueError("fractional statement month amount")
+                raise with_error_code(ValueError('invalid statement month amount'), {'Current Period Total Amount Due': 'SCSB-07-441-001', 'Current Period Total Minimum Amount Due': 'SCSB-07-451-001'}[label]) from exc
+            if not amount.is_finite():
+                raise with_error_code(ValueError('fractional statement month amount'), {'Current Period Total Amount Due': 'SCSB-07-442-001', 'Current Period Total Minimum Amount Due': 'SCSB-07-452-001'}[label])
+            if amount != amount.to_integral_value():
+                raise with_error_code(ValueError('fractional statement month amount'), {'Current Period Total Amount Due': 'SCSB-07-442-002', 'Current Period Total Minimum Amount Due': 'SCSB-07-452-002'}[label])
             return int(amount)
 
         due = grab("Current Period Total Amount Due")
@@ -1389,7 +1532,7 @@ class ScsbCrawler(BankCrawler):
                         && text.includes(leafText)) return text;
                 }
             }
-            return null;
+            return {_diagnostic: 'scope-unavailable'};
         }"""
 
     @staticmethod
@@ -1443,12 +1586,11 @@ class ScsbCrawler(BankCrawler):
                     && (child.innerText || '').trim() === text));
             const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.card-title')]
                 .filter(el => visible(el) && (el.innerText || '').trim() === '帳單查詢及繳款');
-            return {
-                ok: headings.length === 1
-                    && exact('帳單結帳日').length === 1
-                    && exact('帳單訊息').length === 1
-                    && exact('信用卡前期餘額').length === 1,
-            };
+            const diagnostic = headings.length !== 1 ? 'SCSB-06-710-001' :
+                exact('帳單結帳日').length !== 1 ? 'SCSB-06-710-002' :
+                exact('帳單訊息').length !== 1 ? 'SCSB-06-710-003' :
+                exact('信用卡前期餘額').length !== 1 ? 'SCSB-06-710-004' : null;
+            return diagnostic ? {ok: false, _diagnostic: diagnostic} : {ok: true};
         }"""
 
     @staticmethod
@@ -1490,23 +1632,31 @@ class ScsbCrawler(BankCrawler):
     ) -> list[dict]:
         """Submit and validate one bank-supported (at most six-month) window."""
         self._apply_twd_period_controls(page, period)
-        page.wait_for_timeout(500)
-        period_check = page.evaluate(
-            self._twd_inquiry_period_verification_script(), period,
-        )
+        with error_step('SCSB-05-314-001'):
+            page.wait_for_timeout(500)
+        with error_step('SCSB-05-315-001'):
+            period_check = page.evaluate(
+                self._twd_inquiry_period_verification_script(), period,
+            )
         if not period_check.get("ok"):
-            raise RuntimeError("lookback-period-not-applied")
+            raise with_error_code(RuntimeError('lookback-period-not-applied'), next((code for code in ('SCSB-05-611-001', 'SCSB-05-611-002', 'SCSB-05-611-003',) if period_check.get("_diagnostic") == code), 'SCSB-05-316-001'))
 
-        page.wait_for_timeout(1500)
+        with error_step('SCSB-05-317-001'):
+            page.wait_for_timeout(1500)
         expected = {**period, "account_no": account_no}
-        page.evaluate(self._twd_inquiry_prepare_result_wait_script(), expected)
-        account_select = page.locator(selector)
-        account_count = account_select.count()
-        current_index = (
-            account_select.evaluate("el => el.selectedIndex")
-            if account_count == 1 else None
-        )
-        current_value = account_select.input_value() if account_count == 1 else None
+        with error_step('SCSB-05-318-001'):
+            page.evaluate(self._twd_inquiry_prepare_result_wait_script(), expected)
+        with error_step('SCSB-05-319-001'):
+            account_select = page.locator(selector)
+        with error_step('SCSB-05-320-001'):
+            account_count = account_select.count()
+        with error_step('SCSB-05-321-001'):
+            current_index = (
+                account_select.evaluate("el => el.selectedIndex")
+                if account_count == 1 else None
+            )
+        with error_step('SCSB-05-322-001'):
+            current_value = account_select.input_value() if account_count == 1 else None
         identity_match = (
             current_index == selected_index and current_value == selected_value
         )
@@ -1514,65 +1664,84 @@ class ScsbCrawler(BankCrawler):
             "[twd_inq] account control "
             f"count={account_count} identity_match={identity_match}"
         )
-        if account_count != 1 or not identity_match:
-            raise RuntimeError("account-control-reverted")
-        confirm_buttons = page.locator(
-            "button:visible, a:visible, [role=button]:visible",
-        ).filter(
-            has_text=re.compile(r"^\s*(?:Confirm|查詢|確認|Search)\s*$", re.I),
-        )
-        if confirm_buttons.count() != 1 or not confirm_buttons.first.is_visible():
-            raise RuntimeError("query-submit-unavailable")
-        with page.expect_request(
-            lambda request: self._is_twd_query_request(request),
-            timeout=120000,
-        ) as request_info:
-            confirm_buttons.first.click()
+        if account_count != 1:
+            raise with_error_code(RuntimeError('account-control-reverted'), 'SCSB-05-323-001')
+        if not identity_match:
+            raise with_error_code(RuntimeError('account-control-reverted'), 'SCSB-05-323-002')
+        with error_step('SCSB-05-324-001'):
+            confirm_buttons = page.locator(
+                "button:visible, a:visible, [role=button]:visible",
+            ).filter(
+                has_text=re.compile(r"^\s*(?:Confirm|查詢|確認|Search)\s*$", re.I),
+            )
+        with error_step('SCSB-05-325-001'):
+            if confirm_buttons.count() != 1:
+                raise with_error_code(RuntimeError('query-submit-unavailable'), 'SCSB-05-325-001')
+        with error_step('SCSB-05-325-002'):
+            if not confirm_buttons.first.is_visible():
+                raise with_error_code(RuntimeError('query-submit-unavailable'), 'SCSB-05-325-002')
+        with error_step('SCSB-05-327-001'):  # noqa: SIM117
+            with page.expect_request(
+                lambda request: self._is_twd_query_request(request),
+                timeout=120000,
+            ) as request_info:
+                with error_step('SCSB-05-326-001'):
+                    confirm_buttons.first.click()
         _log("[twd_inq] click Confirm → native")
         try:
-            query_request = request_info.value
-            query_response = query_request.response()
+            with error_step('SCSB-05-135-001'):
+                query_request = request_info.value
+            with error_step('SCSB-05-328-001'):
+                query_response = query_request.response()
             _log("[twd_inq] response captured")
-            response_ok = query_response is not None and query_response.ok
+            with error_step('SCSB-05-136-001'):
+                response_ok = query_response is not None and query_response.ok
             _log(f"[twd_inq] response ok={bool(response_ok)}")
         except Exception as error:
             _log(f"[twd_inq] response boundary failed: {type(error).__name__}")
             raise
         if not response_ok:
-            raise RuntimeError("query-submit-unavailable")
+            raise with_error_code(RuntimeError('query-submit-unavailable'), 'SCSB-05-329-001')
         _log("[twd_inq] waiting for bound result")
         try:
-            page.wait_for_function(
-                self._twd_inquiry_result_ready_script(),
-                arg=expected,
-                timeout=120000,
-            )
+            with error_step('SCSB-05-330-001'):
+                page.wait_for_function(
+                    self._twd_inquiry_result_ready_script(),
+                    arg=expected,
+                    timeout=120000,
+                )
         except Exception as error:
             _log(f"[twd_inq] result wait failed: {type(error).__name__}")
             raise
-        if not page.evaluate(self._twd_inquiry_result_ready_script(), expected):
-            raise RuntimeError("query-result-stale")
-        result_state = page.evaluate(self._twd_inquiry_result_state_script())
+        with error_step('SCSB-05-332-001'):
+            if not page.evaluate(self._twd_inquiry_result_ready_script(), expected):
+                raise with_error_code(RuntimeError('query-result-stale'), 'SCSB-05-331-001')
+        with error_step('SCSB-05-333-001'):
+            result_state = page.evaluate(self._twd_inquiry_result_state_script())
         _log(
             "[twd_inq] result state "
             f"error={bool(result_state.get('error'))} "
             f"error_code={result_state.get('error_code') or 'none'} "
             f"pagination={bool(result_state.get('pagination'))}"
         )
-        if result_state.get("error") or result_state.get("pagination"):
-            raise RuntimeError("query-result-incomplete")
+        if result_state.get('error'):
+            raise with_error_code(RuntimeError('query-result-incomplete'), 'SCSB-05-614-001' if result_state.get('_diagnostic') == 'SCSB-05-614-001' else {'system_error': 'SCSB-05-334-010', 'busy': 'SCSB-05-334-011', 'retry': 'SCSB-05-334-012', 'timeout': 'SCSB-05-334-013', 'session': 'SCSB-05-334-014', 'failed': 'SCSB-05-334-015'}.get(result_state.get('error_code'), 'SCSB-05-334-001'))
+        if result_state.get('pagination'):
+            raise with_error_code(RuntimeError('query-result-incomplete'), 'SCSB-05-334-002')
 
-        extracted = page.evaluate(self._twd_inquiry_extract_result_script(), expected)
+        with error_step('SCSB-05-335-001'):
+            extracted = page.evaluate(self._twd_inquiry_extract_result_script(), expected)
         if not extracted.get("ok"):
-            raise RuntimeError("query-result-unbound")
+            raise with_error_code(RuntimeError('query-result-unbound'), next((code for code in ('SCSB-05-612-001', 'SCSB-05-612-002', 'SCSB-05-612-003', 'SCSB-05-612-004', 'SCSB-05-612-005',) if extracted.get("_diagnostic") == code), 'SCSB-05-336-001'))
         result_text = extracted.get("text") or ""
-        records, parse_complete = self._parse_twd_inquiry_records(result_text)
-        if (
-            not parse_complete
-            or len(records) != extracted.get("row_count")
-            or (not records and not extracted.get("empty"))
-        ):
-            raise RuntimeError("partial-transaction-table")
+        diagnostics: list[str] = []
+        records, parse_complete = self._parse_twd_inquiry_records(result_text, diagnostics=diagnostics)
+        if not parse_complete:
+            raise with_error_code(RuntimeError('partial-transaction-table'), next(iter(diagnostics), 'SCSB-05-337-001'))
+        if len(records) != extracted.get('row_count'):
+            raise with_error_code(RuntimeError('partial-transaction-table'), 'SCSB-05-337-002')
+        if not records and (not extracted.get('empty')):
+            raise with_error_code(RuntimeError('partial-transaction-table'), 'SCSB-05-337-003')
         # Query bounds do not override the dates reported by the bank.
         for record in records:
             record["account_no"] = account_no
@@ -1580,18 +1749,27 @@ class ScsbCrawler(BankCrawler):
 
     def _collect_twd_account(self, page, selector: str, account_no: str) -> dict:
         """查一個 SCSB 台幣帳戶；長區間切成銀行允許的六個月窗口。"""
-        page.select_option(selector, value=account_no)
-        page.wait_for_timeout(1500)
-        account_select = page.locator(selector)
-        if account_select.count() != 1:
-            raise RuntimeError("account-control-unavailable")
-        selected_index = account_select.evaluate("el => el.selectedIndex")
-        selected_value = account_select.input_value()
-        if (
-            not isinstance(selected_index, int) or selected_index < 0
-            or not isinstance(selected_value, str) or not selected_value
-        ):
-            raise RuntimeError("account-control-unavailable")
+        with error_step('SCSB-05-338-001'):
+            page.select_option(selector, value=account_no)
+        with error_step('SCSB-05-339-001'):
+            page.wait_for_timeout(1500)
+        with error_step('SCSB-05-340-001'):
+            account_select = page.locator(selector)
+        with error_step('SCSB-05-342-001'):
+            if account_select.count() != 1:
+                raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-341-001')
+        with error_step('SCSB-05-343-001'):
+            selected_index = account_select.evaluate("el => el.selectedIndex")
+        with error_step('SCSB-05-344-001'):
+            selected_value = account_select.input_value()
+        if not isinstance(selected_index, int):
+            raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-345-001')
+        if selected_index < 0:
+            raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-345-002')
+        if not isinstance(selected_value, str):
+            raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-345-003')
+        if not selected_value:
+            raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-345-004')
         full_history = getattr(self, "full_history", True)
         as_of = date.today()
         cursor_start = None
@@ -1601,16 +1779,17 @@ class ScsbCrawler(BankCrawler):
                 floor=self._one_year_floor(as_of),
                 domain="twd_transactions",
             )
-        period = page.evaluate(
-            self._twd_inquiry_period_script(
-                full_history=full_history,
-                end_date=as_of,
-                start_date=cursor_start,
-            ),
-        )
+        with error_step('SCSB-05-346-001'):
+            period = page.evaluate(
+                self._twd_inquiry_period_script(
+                    full_history=full_history,
+                    end_date=as_of,
+                    start_date=cursor_start,
+                ),
+            )
         _log(f"[twd_inq] period → {period}")
         if not period.get("ok"):
-            raise RuntimeError(period.get("error") or "lookback-period-unavailable")
+            raise with_error_code(RuntimeError(period.get('error') or 'lookback-period-unavailable'), next((code for code in ('SCSB-05-616-001', 'SCSB-05-616-002', 'SCSB-05-616-003', 'SCSB-05-616-004') if period.get('_diagnostic') == code), {'custom-period-controls-missing': 'SCSB-05-347-002', 'incremental-start-unavailable': 'SCSB-05-347-003', 'invalid-period-limit': 'SCSB-05-347-004'}.get(period.get('error'), 'SCSB-05-347-001')))
 
         all_records: list[dict] = []
         coverage_windows: list[dict] = []
@@ -1644,11 +1823,15 @@ class ScsbCrawler(BankCrawler):
     ) -> dict:
         """進入 SCSB 台幣交易明細頁，逐一查完所有帳戶。"""
         try:
-            ret = page.evaluate(self._twd_inquiry_nav_script())
+            with error_step('SCSB-05-348-001'):
+                ret = page.evaluate(self._twd_inquiry_nav_script())
             _log(f"[twd_inq] JS sequence ok={bool(ret and ret.get('ok'))}")
-            if not isinstance(ret, dict) or ret.get("ok") is not True:
-                raise RuntimeError("twd-inquiry-navigation-failed")
-            page.wait_for_function(r"""expected => {
+            if not isinstance(ret, dict):
+                raise with_error_code(RuntimeError('twd-inquiry-navigation-failed'), 'SCSB-05-349-001')
+            if ret.get('ok') is not True:
+                raise with_error_code(RuntimeError('twd-inquiry-navigation-failed'), next((code for code in ('SCSB-05-610-001', 'SCSB-05-610-002',) if ret.get("_diagnostic") == code), 'SCSB-05-349-002'))
+            with error_step('SCSB-05-350-001'):
+                page.wait_for_function(r"""expected => {
                 if (location.origin !== 'https://ebank.scsb.com.tw'
                     || location.pathname !== '/twde/twde/page'
                     || location.hash !== '#/twde/qr/01/01') {
@@ -1663,7 +1846,8 @@ class ScsbCrawler(BankCrawler):
             }""", arg=sorted(expected_accounts), timeout=120000)
             _log("[twd_inq] owned route and expected account controls ready")
 
-            selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
+            with error_step('SCSB-05-351-001'):
+                selects = page.evaluate("""() => [...document.querySelectorAll('select')].map(s => ({
                 id: s.id, name: s.name,
                 options: [...s.options].map(o => ({value: o.value}))
             }))""")
@@ -1688,9 +1872,9 @@ class ScsbCrawler(BankCrawler):
                     seen_accounts.add(account_no)
                     targets.append((selector, account_no))
             if not targets:
-                raise RuntimeError("account-control-unavailable")
+                raise with_error_code(RuntimeError('account-control-unavailable'), 'SCSB-05-352-001')
             if seen_accounts != expected_accounts:
-                raise RuntimeError("account-inventory-incomplete")
+                raise with_error_code(RuntimeError('account-inventory-incomplete'), 'SCSB-05-353-001')
 
             account_results = []
             all_records = []
@@ -1713,7 +1897,7 @@ class ScsbCrawler(BankCrawler):
             return result
         except Exception as error:
             _log(f"[twd_inq] ❌ 整段失敗: {type(error).__name__}")
-            raise RuntimeError("SCSB TWD inquiry failed") from None
+            raise with_error_code(RuntimeError('SCSB TWD inquiry failed'), exception_error_id(error, bank="scsb") or 'SCSB-05-354-001') from None
 
     def _collect_credit_card_inquiry(self, page) -> dict:
         """SCSB 信用卡明細 — 真實中文三層 accordion 後抓多個 leaf。
@@ -1738,17 +1922,26 @@ class ScsbCrawler(BankCrawler):
             stage = "navigate"
             try:
                 for menu_label in ("信用卡", "信用卡帳務", leaf_text):
-                    control = page.locator("button.accordion-button:visible").filter(
-                        has_text=re.compile(rf"^\s*{re.escape(menu_label)}\s*$"),
-                    )
-                    if control.count() != 1 or not control.first.is_visible():
-                        raise RuntimeError("card-leaf-navigation-failed")
-                    classes = control.first.get_attribute("class") or ""
+                    with error_step({('unbilled', '信用卡'): 'SCSB-06-500-001', ('unbilled', '信用卡帳務'): 'SCSB-06-520-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-540-001', ('current', '信用卡'): 'SCSB-06-560-001', ('current', '信用卡帳務'): 'SCSB-06-580-001', ('current', '即時消費紀錄'): 'SCSB-06-600-001', ('statement', '信用卡'): 'SCSB-06-620-001', ('statement', '信用卡帳務'): 'SCSB-06-640-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-660-001'}[(key, menu_label)]):
+                        control = page.locator("button.accordion-button:visible").filter(
+                            has_text=re.compile(rf"^\s*{re.escape(menu_label)}\s*$"),
+                        )
+                    with error_step({('unbilled', '信用卡'): 'SCSB-06-501-001', ('unbilled', '信用卡帳務'): 'SCSB-06-521-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-541-001', ('current', '信用卡'): 'SCSB-06-561-001', ('current', '信用卡帳務'): 'SCSB-06-581-001', ('current', '即時消費紀錄'): 'SCSB-06-601-001', ('statement', '信用卡'): 'SCSB-06-621-001', ('statement', '信用卡帳務'): 'SCSB-06-641-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-661-001'}[(key, menu_label)]):
+                        if control.count() != 1:
+                            raise with_error_code(RuntimeError('card-leaf-navigation-failed'), {('unbilled', '信用卡'): 'SCSB-06-501-001', ('unbilled', '信用卡帳務'): 'SCSB-06-521-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-541-001', ('current', '信用卡'): 'SCSB-06-561-001', ('current', '信用卡帳務'): 'SCSB-06-581-001', ('current', '即時消費紀錄'): 'SCSB-06-601-001', ('statement', '信用卡'): 'SCSB-06-621-001', ('statement', '信用卡帳務'): 'SCSB-06-641-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-661-001'}[(key, menu_label)])
+                    with error_step({('unbilled', '信用卡'): 'SCSB-06-502-001', ('unbilled', '信用卡帳務'): 'SCSB-06-522-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-542-001', ('current', '信用卡'): 'SCSB-06-562-001', ('current', '信用卡帳務'): 'SCSB-06-582-001', ('current', '即時消費紀錄'): 'SCSB-06-602-001', ('statement', '信用卡'): 'SCSB-06-622-001', ('statement', '信用卡帳務'): 'SCSB-06-642-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-662-001'}[(key, menu_label)]):
+                        if not control.first.is_visible():
+                            raise with_error_code(RuntimeError('card-leaf-navigation-failed'), {('unbilled', '信用卡'): 'SCSB-06-502-001', ('unbilled', '信用卡帳務'): 'SCSB-06-522-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-542-001', ('current', '信用卡'): 'SCSB-06-562-001', ('current', '信用卡帳務'): 'SCSB-06-582-001', ('current', '即時消費紀錄'): 'SCSB-06-602-001', ('statement', '信用卡'): 'SCSB-06-622-001', ('statement', '信用卡帳務'): 'SCSB-06-642-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-662-001'}[(key, menu_label)])
+                    with error_step({('unbilled', '信用卡'): 'SCSB-06-503-001', ('unbilled', '信用卡帳務'): 'SCSB-06-523-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-543-001', ('current', '信用卡'): 'SCSB-06-563-001', ('current', '信用卡帳務'): 'SCSB-06-583-001', ('current', '即時消費紀錄'): 'SCSB-06-603-001', ('statement', '信用卡'): 'SCSB-06-623-001', ('statement', '信用卡帳務'): 'SCSB-06-643-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-663-001'}[(key, menu_label)]):
+                        classes = control.first.get_attribute("class") or ""
                     if menu_label == leaf_text or "collapsed" in classes:
-                        control.first.click()
-                        page.wait_for_timeout(1500)
+                        with error_step({('unbilled', '信用卡'): 'SCSB-06-504-001', ('unbilled', '信用卡帳務'): 'SCSB-06-524-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-544-001', ('current', '信用卡'): 'SCSB-06-564-001', ('current', '信用卡帳務'): 'SCSB-06-584-001', ('current', '即時消費紀錄'): 'SCSB-06-604-001', ('statement', '信用卡'): 'SCSB-06-624-001', ('statement', '信用卡帳務'): 'SCSB-06-644-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-664-001'}[(key, menu_label)]):
+                            control.first.click()
+                        with error_step({('unbilled', '信用卡'): 'SCSB-06-505-001', ('unbilled', '信用卡帳務'): 'SCSB-06-525-001', ('unbilled', '未出帳消費明細'): 'SCSB-06-545-001', ('current', '信用卡'): 'SCSB-06-565-001', ('current', '信用卡帳務'): 'SCSB-06-585-001', ('current', '即時消費紀錄'): 'SCSB-06-605-001', ('statement', '信用卡'): 'SCSB-06-625-001', ('statement', '信用卡帳務'): 'SCSB-06-645-001', ('statement', '帳單查詢及繳款'): 'SCSB-06-665-001'}[(key, menu_label)]):
+                            page.wait_for_timeout(1500)
                 stage = "wait"
-                page.wait_for_function("""([route, leafText]) => {
+                with error_step({'unbilled': 'SCSB-06-317-001', 'current': 'SCSB-06-318-001', 'statement': 'SCSB-06-319-001'}[key]):
+                    page.wait_for_function("""([route, leafText]) => {
                     if (location.pathname !== '/card/card/page' || location.hash !== `#${route}`) {
                         return false;
                     }
@@ -1759,20 +1952,27 @@ class ScsbCrawler(BankCrawler):
                 }""", arg=[route, leaf_text], timeout=120000)
                 _log(f"[card_inq:{key}] navigation ok")
                 stage = "settle"
-                page.wait_for_timeout(8000)
-                page.wait_for_timeout(1500)
+                with error_step({'unbilled': 'SCSB-06-320-001', 'current': 'SCSB-06-321-001', 'statement': 'SCSB-06-322-001'}[key]):
+                    page.wait_for_timeout(8000)
+                with error_step({'unbilled': 'SCSB-06-323-001', 'current': 'SCSB-06-324-001', 'statement': 'SCSB-06-325-001'}[key]):
+                    page.wait_for_timeout(1500)
 
                 stage = "read"
                 leaf_result: dict = {"nav": {"ok": True}}
                 try:
-                    leaf_result["text"] = page.evaluate(
-                        self._card_leaf_scope_text_script(), leaf_text,
-                    ) or ""
-                except Exception:
-                    raise RuntimeError("card-leaf-read-failed") from None
+                    with error_step({'unbilled': 'SCSB-06-326-001', 'current': 'SCSB-06-327-001', 'statement': 'SCSB-06-328-001'}[key]):
+                        leaf_result["text"] = page.evaluate(
+                            self._card_leaf_scope_text_script(), leaf_text,
+                        ) or ""
+                except Exception as source_error:
+                    raise with_error_code(RuntimeError('card-leaf-read-failed'), exception_error_id(source_error, bank="scsb") or {'unbilled': 'SCSB-06-329-001', 'current': 'SCSB-06-330-001', 'statement': 'SCSB-06-331-001'}[key]) from None
                 stage = "identity"
+                scope_error_id = None
+                if leaf_result['text'] == {'_diagnostic': 'scope-unavailable'}:
+                    scope_error_id = {'unbilled': 'SCSB-06-740-001', 'current': 'SCSB-06-741-001', 'statement': 'SCSB-06-742-001'}[key]
+                    leaf_result['text'] = ''
                 if leaf_text.lower() not in leaf_result["text"].lower():
-                    raise RuntimeError("card-leaf-identity-unverified")
+                    raise with_error_code(RuntimeError('card-leaf-identity-unverified'), scope_error_id or {'unbilled': 'SCSB-06-332-001', 'current': 'SCSB-06-333-001', 'statement': 'SCSB-06-334-001'}[key])
 
                 # 若有 date input 就填表 + Confirm（同 twd_inq）
                 stage = "form"
@@ -1780,7 +1980,8 @@ class ScsbCrawler(BankCrawler):
                     try:
                         from datetime import datetime, timedelta
                         start_dt = (datetime.now() - timedelta(days=30)).strftime("%Y/%m/%d")
-                        date_inputs = page.evaluate("""(leafText) => {
+                        with error_step({'unbilled': 'SCSB-06-335-001', 'current': 'SCSB-06-336-001', 'statement': 'SCSB-06-337-001'}[key]):
+                            date_inputs = page.evaluate("""(leafText) => {
                             const visible = (el) => el && el.offsetParent !== null;
                             const leaves = [...document.querySelectorAll('body *')].filter(el =>
                                 visible(el) && (el.textContent || '').trim() === leafText
@@ -1807,31 +2008,42 @@ class ScsbCrawler(BankCrawler):
                             if not input_data.get("value") and input_data.get("id")
                         ]
                         filled_date = not pending_date_inputs
+                        date_error_id = None
                         for di in pending_date_inputs:
                             sel = f"#{di['id']}"
                             try:
-                                page.click(sel)
-                                page.wait_for_timeout(200)
-                                page.keyboard.press("Control+A")
-                                page.keyboard.press("Delete")
-                                page.keyboard.type(start_dt, delay=50)
-                                page.evaluate(
-                                    "(sel) => { const el=document.querySelector(sel); if(el){"
-                                    "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                                    "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                                    "  el.blur(); } }",
-                                    sel,
-                                )
-                                page.wait_for_timeout(300)
+                                with error_step({'unbilled': 'SCSB-06-338-001', 'current': 'SCSB-06-339-001', 'statement': 'SCSB-06-340-001'}[key]):
+                                    page.click(sel)
+                                with error_step({'unbilled': 'SCSB-06-341-001', 'current': 'SCSB-06-342-001', 'statement': 'SCSB-06-343-001'}[key]):
+                                    page.wait_for_timeout(200)
+                                with error_step({'unbilled': 'SCSB-06-344-001', 'current': 'SCSB-06-345-001', 'statement': 'SCSB-06-346-001'}[key]):
+                                    page.keyboard.press("Control+A")
+                                with error_step({'unbilled': 'SCSB-06-347-001', 'current': 'SCSB-06-348-001', 'statement': 'SCSB-06-349-001'}[key]):
+                                    page.keyboard.press("Delete")
+                                with error_step({'unbilled': 'SCSB-06-350-001', 'current': 'SCSB-06-351-001', 'statement': 'SCSB-06-352-001'}[key]):
+                                    page.keyboard.type(start_dt, delay=50)
+                                with error_step({'unbilled': 'SCSB-06-353-001', 'current': 'SCSB-06-354-001', 'statement': 'SCSB-06-355-001'}[key]):
+                                    page.evaluate(
+                                        "(sel) => { const el=document.querySelector(sel); if(el){"
+                                        "  el.dispatchEvent(new Event('input', {bubbles:true}));"
+                                        "  el.dispatchEvent(new Event('change', {bubbles:true}));"
+                                        "  el.blur(); } }",
+                                        sel,
+                                    )
+                                with error_step({'unbilled': 'SCSB-06-356-001', 'current': 'SCSB-06-357-001', 'statement': 'SCSB-06-358-001'}[key]):
+                                    page.wait_for_timeout(300)
                                 filled_date = True
+                                date_error_id = None
                                 break
-                            except Exception:
+                            except Exception as date_error:
+                                date_error_id = exception_error_id(date_error, bank='scsb')
                                 continue
                         if not filled_date:
-                            raise RuntimeError("card-query-date-unavailable")
+                            raise with_error_code(RuntimeError('card-query-date-unavailable'), date_error_id or {'unbilled': 'SCSB-06-359-001', 'current': 'SCSB-06-360-001', 'statement': 'SCSB-06-361-001'}[key])
                         if date_inputs:
                             before_confirm = leaf_result["text"]
-                            clicked = page.evaluate("""(leafText) => {
+                            with error_step({'unbilled': 'SCSB-06-362-001', 'current': 'SCSB-06-363-001', 'statement': 'SCSB-06-364-001'}[key]):
+                                clicked = page.evaluate("""(leafText) => {
                                 const visible = (el) => el && el.offsetParent !== null;
                                 const leaves = [...document.querySelectorAll('body *')].filter(el =>
                                     visible(el) && (el.textContent || '').trim() === leafText
@@ -1845,17 +2057,22 @@ class ScsbCrawler(BankCrawler):
                                             || /Data Time|Transaction Date|Current Period Total|no .*transaction|no .*statement|查無|目前無新增交易|交易尚未入帳|帳單結帳日|帳單訊息|信用卡前期餘額/i.test(text))) continue;
                                         const matches = [...scope.querySelectorAll('button,a')].filter(el =>
                                             visible(el) && /^(Confirm|查詢|確認|Search)$/i.test((el.innerText || '').trim()));
-                                        if (matches.length !== 1) return null;
+                                        if (matches.length !== 1) return {_diagnostic: 1};
                                         matches[0].click();
                                         return true;
                                     }
                                 }
-                                return null;
+                                return {_diagnostic: 2};
                             }""", leaf_text)
+                            confirm_error_id = None
+                            if isinstance(clicked, dict) and type(clicked.get('_diagnostic')) is int and clicked['_diagnostic'] in (1, 2):
+                                confirm_error_id = {'current': {1: 'SCSB-06-750-001', 2: 'SCSB-06-750-002'}, 'statement': {1: 'SCSB-06-751-001', 2: 'SCSB-06-751-002'}}[key][clicked['_diagnostic']]
+                                clicked = None
                             if not clicked:
-                                raise RuntimeError("card-query-submit-unavailable")
+                                raise with_error_code(RuntimeError('card-query-submit-unavailable'), confirm_error_id or {'unbilled': 'SCSB-06-365-001', 'current': 'SCSB-06-366-001', 'statement': 'SCSB-06-367-001'}[key])
                             _log(f"[card_inq:{key}] Confirm clicked")
-                            page.wait_for_function(r"""([before, scopeName, leafText]) => {
+                            with error_step({'unbilled': 'SCSB-06-368-001', 'current': 'SCSB-06-369-001', 'statement': 'SCSB-06-370-001'}[key]):
+                                page.wait_for_function(r"""([before, scopeName, leafText]) => {
                                 const visible = (el) => el && el.offsetParent !== null;
                                 const exactLeaf = [...document.querySelectorAll('body *')].filter(el =>
                                     visible(el) && (el.textContent || '').trim() === leafText
@@ -1880,22 +2097,27 @@ class ScsbCrawler(BankCrawler):
                                     : /帳單查詢及繳款[\s\S]*(?:(?:Data Time|資料時間)[\s\S]*20\d{2}\/(?:0[1-9]|1[0-2])|(?:查無.*帳單|no .*statement))/i.test(text);
                                 return text !== before && ready;
                             }""", arg=[before_confirm, key, leaf_text], timeout=120000)
-                            leaf_result["text_final"] = page.evaluate(
-                                self._card_leaf_scope_text_script(), leaf_text,
-                            ) or ""
-                    except Exception:
-                        raise RuntimeError("card-query-form-failed") from None
+                            with error_step({'unbilled': 'SCSB-06-371-001', 'current': 'SCSB-06-372-001', 'statement': 'SCSB-06-373-001'}[key]):
+                                leaf_result["text_final"] = page.evaluate(
+                                    self._card_leaf_scope_text_script(), leaf_text,
+                                ) or ""
+                            if leaf_result.get('text_final') == {'_diagnostic': 'scope-unavailable'}:
+                                leaf_result['text_final'] = ''
+                    except Exception as source_error:
+                        raise with_error_code(RuntimeError('card-query-form-failed'), exception_error_id(source_error, bank="scsb") or {'unbilled': 'SCSB-06-374-001', 'current': 'SCSB-06-375-001', 'statement': 'SCSB-06-376-001'}[key]) from None
 
                 # 2026-06-13 升級：Statement Inquiry 加月份 tab 迭代抓帳單
                 # SCSB 顯示「2026/05 / 2026/04 / 2026/03」3 個月份 tab，點切換每月帳單
                 stage = "statement"
                 if key == "statement":
+                    month_scope_error_id = None
                     try:
                         leaf_text_now = leaf_result.get("text", "")
                         statement_text = leaf_result.get("text_final") or leaf_text_now
                         month_tabs = self._statement_month_tabs(statement_text)
                         _log(f"[card_inq:{key}] month_tab_count={len(month_tabs)}")
-                        statement_state = page.evaluate(self._card_statement_state_script())
+                        with error_step({'unbilled': 'SCSB-06-377-001', 'current': 'SCSB-06-378-001', 'statement': 'SCSB-06-379-001'}[key]):
+                            statement_state = page.evaluate(self._card_statement_state_script())
                         statement_summary = (
                             isinstance(statement_state, dict)
                             and statement_state.get("ok") is True
@@ -1903,31 +2125,37 @@ class ScsbCrawler(BankCrawler):
                         if not month_tabs and not statement_summary and not re.search(
                             r"查無.*帳單|no .*statement", statement_text, re.I,
                         ):
-                            raise RuntimeError("statement-month-tabs-unavailable")
+                            raise with_error_code(RuntimeError('statement-month-tabs-unavailable'), next((code for code in ('SCSB-06-710-001', 'SCSB-06-710-002', 'SCSB-06-710-003', 'SCSB-06-710-004',) if statement_state.get("_diagnostic") == code), 'SCSB-06-382-001') if isinstance(statement_state, dict) else {'unbilled': 'SCSB-06-380-001', 'current': 'SCSB-06-381-001', 'statement': 'SCSB-06-382-001'}[key])
                         _log(f"[card_inq:{key}] 月份 tabs: {month_tabs}")
 
                         # 每個月份點 tab + dump
-                        month_targets = {
-                            month: page.evaluate(
-                                self._statement_month_target_script(), [month, leaf_text],
-                            )
-                            for month in month_tabs
-                        }
+                        with error_step({'unbilled': 'SCSB-06-383-001', 'current': 'SCSB-06-384-001', 'statement': 'SCSB-06-385-001'}[key]):
+                            month_targets = {
+                                month: page.evaluate(
+                                    self._statement_month_target_script(), [month, leaf_text],
+                                )
+                                for month in month_tabs
+                            }
                         if any(
                             not isinstance(target, dict) or target.get("ok") is not True
                             for target in month_targets.values()
                         ):
-                            raise RuntimeError("statement-month-tab-unavailable")
+                            raise with_error_code(RuntimeError('statement-month-tab-unavailable'), {'unbilled': 'SCSB-06-386-001', 'current': 'SCSB-06-387-001', 'statement': 'SCSB-06-388-001'}[key])
                         panel_selectors = [
                             target.get("panel") for target in month_targets.values()
                             if target.get("panel")
                         ]
                         months_data = []
                         for mo in month_tabs:
+                            month_scope_error_id = None
                             target = month_targets[mo]
 
+                            month_error_id = None
                             def click_month():
-                                return page.evaluate("""([month, leafText]) => {
+                                nonlocal month_error_id
+                                month_error_id = None
+                                with error_step({'unbilled': 'SCSB-06-389-001', 'current': 'SCSB-06-390-001', 'statement': 'SCSB-06-391-001'}[key]):
+                                    clicked = page.evaluate("""([month, leafText]) => {
                                     const visible = (el) => el && el.offsetParent !== null;
                                     const leaves = [...document.querySelectorAll('body *')].filter(el =>
                                         visible(el) && (el.textContent || '').trim() === leafText
@@ -1938,34 +2166,44 @@ class ScsbCrawler(BankCrawler):
                                             if (['MAIN', 'HTML'].includes(scope.tagName)) continue;
                                             const matches = [...scope.querySelectorAll('button,a,li')].filter(el =>
                                                 visible(el) && (el.textContent || '').trim() === month);
-                                            if (matches.length !== 1) return false;
+                                            if (matches.length !== 1) return {_diagnostic: 1};
                                             matches[0].click();
                                             return true;
                                         }
                                     }
-                                    return false;
+                                    return {_diagnostic: 2};
                                 }""", [mo, leaf_text])
+                                if isinstance(clicked, dict) and type(clicked.get('_diagnostic')) is int and clicked['_diagnostic'] in (1, 2):
+                                    month_error_id = ({1: 'SCSB-06-730-001', 2: 'SCSB-06-730-002'} if panel_selector else {1: 'SCSB-06-731-001', 2: 'SCSB-06-731-002'}).get(clicked['_diagnostic'])
+                                    return False
+                                return clicked
 
                             panel_selector = target.get("panel")
-                            if panel_selectors.count(panel_selector) != 1:
-                                panel_selector = None
+                            with error_step({'unbilled': 'SCSB-06-392-001', 'current': 'SCSB-06-393-001', 'statement': 'SCSB-06-394-001'}[key]):
+                                if panel_selectors.count(panel_selector) != 1:
+                                    panel_selector = None
                             if panel_selector:
                                 if not click_month():
-                                    raise RuntimeError("statement-month-tab-unavailable")
+                                    raise with_error_code(RuntimeError('statement-month-tab-unavailable'), month_error_id or {'unbilled': 'SCSB-06-395-001', 'current': 'SCSB-06-396-001', 'statement': 'SCSB-06-397-001'}[key])
                             else:
-                                with page.expect_request(
-                                    lambda request, month=mo: self._is_statement_month_request(
-                                        request, month,
-                                    ),
-                                    timeout=120000,
-                                ) as month_request_info:
-                                    if not click_month():
-                                        raise RuntimeError("statement-month-tab-unavailable")
-                                month_response = month_request_info.value.response()
-                                if month_response is None or month_response.ok is not True:
-                                    raise RuntimeError("statement-month-query-failed")
+                                with error_step({'unbilled': 'SCSB-06-401-001', 'current': 'SCSB-06-402-001', 'statement': 'SCSB-06-403-001'}[key]):  # noqa: SIM117
+                                    with page.expect_request(
+                                        lambda request, month=mo: self._is_statement_month_request(
+                                            request, month,
+                                        ),
+                                        timeout=120000,
+                                    ) as month_request_info:
+                                        if not click_month():
+                                            raise with_error_code(RuntimeError('statement-month-tab-unavailable'), month_error_id or {'unbilled': 'SCSB-06-398-001', 'current': 'SCSB-06-399-001', 'statement': 'SCSB-06-400-001'}[key])
+                                with error_step({'unbilled': 'SCSB-06-404-001', 'current': 'SCSB-06-405-001', 'statement': 'SCSB-06-406-001'}[key]):
+                                    month_response = month_request_info.value.response()
+                                if month_response is None:
+                                    raise with_error_code(RuntimeError('statement-month-query-failed'), {'unbilled': 'SCSB-06-407-001', 'current': 'SCSB-06-408-001', 'statement': 'SCSB-06-409-001'}[key])
+                                if month_response.ok is not True:
+                                    raise with_error_code(RuntimeError('statement-month-query-failed'), {'unbilled': 'SCSB-06-407-002', 'current': 'SCSB-06-408-002', 'statement': 'SCSB-06-409-002'}[key])
 
-                            page.wait_for_function("""([month, leafText]) => {
+                            with error_step({'unbilled': 'SCSB-06-410-001', 'current': 'SCSB-06-411-001', 'statement': 'SCSB-06-412-001'}[key]):
+                                page.wait_for_function("""([month, leafText]) => {
                                 const visible = (el) => el && el.offsetParent !== null;
                                 const leaves = [...document.querySelectorAll('body *')].filter(el =>
                                     visible(el) && (el.textContent || '').trim() === leafText
@@ -1986,18 +2224,24 @@ class ScsbCrawler(BankCrawler):
                             }""", arg=[mo, leaf_text], timeout=120000)
 
                             if panel_selector:
-                                page.wait_for_function("""(selector) => {
+                                with error_step({'unbilled': 'SCSB-06-413-001', 'current': 'SCSB-06-414-001', 'statement': 'SCSB-06-415-001'}[key]):
+                                    page.wait_for_function("""(selector) => {
                                     const panel = document.querySelector(selector);
                                     return panel && panel.offsetParent !== null;
                                 }""", arg=panel_selector, timeout=120000)
-                                mo_text = page.evaluate(
-                                    "(selector) => document.querySelector(selector)?.innerText || ''",
-                                    panel_selector,
-                                )
+                                with error_step({'unbilled': 'SCSB-06-416-001', 'current': 'SCSB-06-417-001', 'statement': 'SCSB-06-418-001'}[key]):
+                                    mo_text = page.evaluate(
+                                        "(selector) => document.querySelector(selector)?.innerText || ''",
+                                        panel_selector,
+                                    )
                             else:
-                                mo_text = page.evaluate(
-                                    self._card_leaf_scope_text_script(), leaf_text,
-                                ) or ""
+                                with error_step({'unbilled': 'SCSB-06-419-001', 'current': 'SCSB-06-420-001', 'statement': 'SCSB-06-421-001'}[key]):
+                                    mo_text = page.evaluate(
+                                        self._card_leaf_scope_text_script(), leaf_text,
+                                    ) or ""
+                                if mo_text == {'_diagnostic': 'scope-unavailable'}:
+                                    month_scope_error_id = 'SCSB-06-743-001'
+                                    mo_text = ''
                             months_data.append({
                                 "month": mo,
                                 **self._statement_month_summary(mo_text),
@@ -2005,19 +2249,20 @@ class ScsbCrawler(BankCrawler):
                             _log(f"[card_inq:{key}] {mo} tab click OK, text len={len(mo_text)}")
                         if month_tabs:
                             leaf_result["months"] = months_data
-                    except Exception:
-                        raise RuntimeError("statement-month-collection-failed") from None
+                    except Exception as source_error:
+                        raise with_error_code(RuntimeError('statement-month-collection-failed'), month_scope_error_id or exception_error_id(source_error, bank="scsb") or {'unbilled': 'SCSB-06-422-001', 'current': 'SCSB-06-423-001', 'statement': 'SCSB-06-424-001'}[key]) from None
 
                 stage = "parse"
                 source_text = leaf_result.get("text_final") or leaf_result.get("text") or ""
                 if _scsb_page_error(source_text):
-                    raise RuntimeError("card-leaf-page-error")
+                    raise with_error_code(RuntimeError('card-leaf-page-error'), {'unbilled': 'SCSB-06-425-001', 'current': 'SCSB-06-426-001', 'statement': 'SCSB-06-427-001'}[key])
                 if key in ("unbilled", "current"):
                     rows, complete = _scsb_parse_card_rows(source_text, scope=key)
-                    table_state = (
-                        page.evaluate(self._card_leaf_table_state_script(), leaf_text)
-                        if key == "current" else None
-                    )
+                    with error_step({'unbilled': 'SCSB-06-428-001', 'current': 'SCSB-06-429-001', 'statement': 'SCSB-06-430-001'}[key]):
+                        table_state = (
+                            page.evaluate(self._card_leaf_table_state_script(), leaf_text)
+                            if key == "current" else None
+                        )
                     structural_empty = (
                         isinstance(table_state, dict)
                         and table_state.get("ok") is True
@@ -2030,6 +2275,10 @@ class ScsbCrawler(BankCrawler):
                             and table_state.get("ok") is True
                             and table_state.get("row_count") == len(rows)
                         )
+                    )
+                    table_reason = (
+                        next((code for key, code in (('heading_count', 'SCSB-06-720-001'), ('visible_table_count', 'SCSB-06-720-002'), ('matching_table_count', 'SCSB-06-720-003')) if key in table_state and table_state.get(key) != 1), 'SCSB-06-720-004' if table_state.get('ok') is True and table_state.get('row_count') != len(rows) else None)
+                        if key == "current" and isinstance(table_state, dict) else None
                     )
                     if key == "current" and isinstance(table_state, dict):
                         _log(
@@ -2061,24 +2310,29 @@ class ScsbCrawler(BankCrawler):
                         and isinstance(table_state.get("row_count"), int)
                         and table_state["row_count"] > 0
                     )
-                    if current_table_has_rows and (
-                        not rows or not complete or not rows_bound
-                    ):
-                        raise RuntimeError("card-transaction-scope-incomplete")
+                    if current_table_has_rows:
+                        if not rows:
+                            raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), 'SCSB-06-432-001')
+                        if not complete:
+                            raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), 'SCSB-06-432-002')
+                        if not rows_bound:
+                            raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), table_reason or 'SCSB-06-432-003')
                     if rows:
-                        if not complete or not rows_bound:
-                            raise RuntimeError("card-transaction-scope-incomplete")
+                        if not complete:
+                            raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), {'unbilled': 'SCSB-06-434-001', 'current': 'SCSB-06-435-001', 'statement': 'SCSB-06-436-001'}[key])
+                        if not rows_bound:
+                            raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), table_reason or {'unbilled': 'SCSB-06-434-002', 'current': 'SCSB-06-435-002', 'statement': 'SCSB-06-436-002'}[key])
                         leaf_result["rows"] = rows
                     elif empty_authoritative:
                         leaf_result["empty"] = True
                     else:
-                        raise RuntimeError("card-transaction-scope-incomplete")
+                        raise with_error_code(RuntimeError('card-transaction-scope-incomplete'), {'unbilled': 'SCSB-06-437-001', 'current': 'SCSB-06-438-001', 'statement': 'SCSB-06-439-001'}[key])
                 leaf_result.pop("text", None)
                 leaf_result.pop("text_final", None)
                 result["leaves"][key] = leaf_result
-            except Exception:
+            except Exception as source_error:
                 _log(f"[card_inq:{key}] failed stage={stage}")
-                raise RuntimeError("SCSB credit-card inquiry failed") from None
+                raise with_error_code(RuntimeError('SCSB credit-card inquiry failed'), exception_error_id(source_error, bank="scsb") or {'unbilled': 'SCSB-06-440-001', 'current': 'SCSB-06-441-001', 'statement': 'SCSB-06-442-001'}[key]) from None
 
         return result
 

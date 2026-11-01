@@ -10,6 +10,7 @@ import pytest
 
 from backend.banks.sinopac import SinopacCrawler
 from backend.core.base import ResponseCollector, _safe_collect_guard
+from backend.core.error_codes import code_details
 from tests.test_bank_login_lifecycle import _run
 from tests.test_sinopac_loan import FIXTURE, _LoanPage, _repayment
 
@@ -82,10 +83,22 @@ def test_loan_rejections_reach_safe_sink(monkeypatch, tmp_path, capsys, guard):
     monkeypatch.setattr(crawler, "logout", logout)
 
     result, _ = _run(monkeypatch, tmp_path, crawler, None)
-    assert result["error"] == f"collect_failed: RuntimeError: code=collect_history: guard={guard}"
+    source_id = dict(zip(LOAN_GUARDS, (
+        "SINOPAC-05-203-001", "SINOPAC-05-208-001", "SINOPAC-05-211-001",
+        "SINOPAC-05-215-001", "SINOPAC-05-223-001", "SINOPAC-05-225-001",
+        "SINOPAC-05-230-001", "SINOPAC-05-233-001", "SINOPAC-05-238-001",
+        "SINOPAC-05-160-003",
+    )))[guard]
+    action, reason = code_details(source_id, bank="sinopac")
+    expected_error = (
+        f"[{source_id}] {action}：{reason} | "
+        f"collect_failed: RuntimeError: code=collect_history: guard={guard}"
+    )
+    assert result["error"] == expected_error
     stderr = capsys.readouterr().err
     assert f"guard={guard}" in stderr
     assert "PRIVATE-CUSTOMER" not in repr(result) + stderr
+    assert f"[sinopac][collect] raise → {expected_error}; details withheld" in stderr
     assert "Traceback" not in stderr
     assert page.urls == ["https://mma.sinopac.com/mma/bank/easy_index_loan/mma_detail.aspx"]
     expected_queries = int(guard not in LOAN_GUARDS[:3])

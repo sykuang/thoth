@@ -747,7 +747,11 @@ def test_shared_login_unknown_modal_blocks_before_submission(monkeypatch) -> Non
 def test_collect_and_following_helpers_keep_protected_ast_contract() -> None:
     current_source = Path(esun_module.__file__).read_text()
 
-    tree = ast.parse(current_source)
+    from tests.test_esun_protected_source_projection import project_esun_tree
+
+    # Closed-site JS/unwrap/state projection, backed by joined native runtime
+    # proofs; both original digests below remain the read-only 16f2d4b values.
+    tree = project_esun_tree(current_source)
     crawler = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "EsunCrawler"
     )

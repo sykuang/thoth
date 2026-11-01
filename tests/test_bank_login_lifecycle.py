@@ -258,7 +258,8 @@ def test_staged_login_happy_path_settles_before_collect(monkeypatch, tmp_path):
     )
     labels = iter(("pre-submit", "post-submit", "authenticated", "settle"))
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         assert bank == "staged"
         assert phase in CheckpointPhase
         crawler.events.append(f"checkpoint:{next(labels)}")
@@ -1385,7 +1386,8 @@ def test_exhausted_clickable_rule_becomes_classifier_only_shadow(monkeypatch, tm
     crawler = _StagedCrawler(name="staged", rules=(rule,))
     rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         rules_seen.append(rules)
         if len(rules_seen) == 1:
             return CheckpointOutcome(
@@ -1447,7 +1449,8 @@ def test_protocol_resubmit_allows_exactly_one_second_submission(monkeypatch, tmp
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         rules_seen.append(rules)
         return next(pending)
 
@@ -1484,7 +1487,8 @@ def test_exhausted_captcha_classifier_becomes_unknown_shadow(monkeypatch, tmp_pa
     crawler = _StagedCrawler(name="staged", rules=(rule,))
     rules_seen: list[tuple[LoginCheckpointRule, ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         rules_seen.append(rules)
         if phase is CheckpointPhase.PRE_SUBMIT:
             return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
@@ -1680,7 +1684,8 @@ def test_phase_ineligible_captcha_rule_cannot_authorize_resubmit(monkeypatch, tm
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         rules_seen.append(tuple(item.name for item in rules))
         return next(pending)
 
@@ -1735,7 +1740,8 @@ def test_settle_notice_is_dismissed_before_collect(monkeypatch, tmp_path):
         )
     )
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         phases.append(phase)
         return next(pending)
 
@@ -1952,7 +1958,8 @@ def test_rules_keep_order_and_twelve_action_budget_is_enforced(monkeypatch, tmp_
     )
     rules_seen: list[tuple[tuple[str, CheckpointKind], ...]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         assert bank == "staged"
         assert all(rule.bank == bank for rule in rules)
         rules_seen.append(tuple((rule.name, rule.kind) for rule in rules))
@@ -1995,7 +2002,8 @@ def test_twelve_actions_still_leave_room_for_successful_login(monkeypatch, tmp_p
     )
     calls: list[tuple[CheckpointPhase, tuple[str, ...]]] = []
 
-    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None):
+    def evaluate(page, *, bank, phase, rules, is_authenticated, is_scope_owned=None, can_act=None, _auth_probe_ids=None):
+        assert type(_auth_probe_ids) is list and _auth_probe_ids == []
         assert bank == "staged"
         assert all(rule.bank == bank for rule in rules)
         names = tuple(rule.name for rule in rules)

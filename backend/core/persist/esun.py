@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step, with_error_code
 from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -22,55 +23,64 @@ _TWD_INTEGER_TOKEN = re.compile(r"-?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)")
 def _esun_twd_integer(raw, *, non_negative: bool) -> int | None:
     if raw is None:
         return None
-    if not isinstance(raw, (str, int)) or isinstance(raw, bool):
-        raise ValueError("invalid E.SUN TWD transaction amount")
+    if not isinstance(raw, (str, int)):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-001')
+    elif isinstance(raw, bool):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-002')
     if isinstance(raw, str) and _TWD_INTEGER_TOKEN.fullmatch(raw) is None:
-        raise ValueError("invalid E.SUN TWD transaction amount")
+        raise with_error_code(ValueError("invalid E.SUN TWD transaction amount"), 'ESUN-08-001-007')
     try:
-        value = Decimal(str(raw).replace(",", ""))
+        with error_step('ESUN-08-001-010'):
+            value = Decimal(str(raw).replace(",", ""))
     except (InvalidOperation, ValueError):
-        raise ValueError("invalid E.SUN TWD transaction amount") from None
-    if (
-        not value.is_finite()
-        or value != value.to_integral_value()
-        or not _PG_INTEGER_MIN <= value <= _PG_INTEGER_MAX
-        or non_negative and value < 0
-    ):
-        raise ValueError("invalid E.SUN TWD transaction amount")
-    return int(value)
+        raise with_error_code(ValueError("invalid E.SUN TWD transaction amount"), 'ESUN-08-001-008') from None
+    if not value.is_finite():
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-003')
+    elif value != value.to_integral_value():
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-004')
+    elif not _PG_INTEGER_MIN <= value <= _PG_INTEGER_MAX:
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-005')
+    elif non_negative and value < 0:
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction amount'), 'ESUN-08-001-006')
+    with error_step('ESUN-08-001-009'):
+        return int(value)
 
 
 def _validated_esun_twd_row(row: dict, *, unknown_account_date: bool = False) -> dict:
     account_no = row.get("account_no")
     txn_datetime = row.get("datetime")
     account_date = row.get("account_date")
-    if (
-        not isinstance(account_no, str)
-        or re.fullmatch(r"\d{13}", account_no) is None
-        or not isinstance(txn_datetime, str)
-        or not (account_date is None if unknown_account_date else isinstance(account_date, str))
-        or not isinstance(row.get("desc"), str)
-        or not row["desc"].strip()
-    ):
-        raise ValueError("invalid E.SUN TWD transaction row")
+    if not isinstance(account_no, str):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-001')
+    elif re.fullmatch('\\d{13}', account_no) is None:
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-002')
+    elif not isinstance(txn_datetime, str):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-003')
+    elif not (account_date is None if unknown_account_date else isinstance(account_date, str)):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-004')
+    elif not isinstance(row.get('desc'), str):
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-005')
+    elif not row['desc'].strip():
+        raise with_error_code(ValueError('invalid E.SUN TWD transaction row'), 'ESUN-08-002-006')
     txn_format = "%Y-%m-%d %H:%M:%S" if " " in txn_datetime else "%Y-%m-%d"
     try:
-        parsed_txn = datetime.strptime(txn_datetime, txn_format)
+        with error_step('ESUN-08-002-011'):
+            parsed_txn = datetime.strptime(txn_datetime, txn_format)
         if unknown_account_date:
             parsed_account = None
         else:
             assert isinstance(account_date, str)
-            parsed_account = datetime.strptime(account_date, "%Y-%m-%d")
+            with error_step('ESUN-08-002-012'):
+                parsed_account = datetime.strptime(account_date, "%Y-%m-%d")
     except ValueError:
-        raise ValueError("invalid E.SUN TWD transaction date") from None
-    if (
-        parsed_txn.strftime(txn_format) != txn_datetime
-        or parsed_account is not None and parsed_account.strftime("%Y-%m-%d") != account_date
-    ):
-        raise ValueError("noncanonical E.SUN TWD transaction date")
+        raise with_error_code(ValueError("invalid E.SUN TWD transaction date"), 'ESUN-08-002-009') from None
+    if parsed_txn.strftime(txn_format) != txn_datetime:
+        raise with_error_code(ValueError('noncanonical E.SUN TWD transaction date'), 'ESUN-08-002-007')
+    elif parsed_account is not None and parsed_account.strftime('%Y-%m-%d') != account_date:
+        raise with_error_code(ValueError('noncanonical E.SUN TWD transaction date'), 'ESUN-08-002-008')
     money = (row.get("expend"), row.get("income"))
     if sum(value is not None for value in money) != 1:
-        raise ValueError("invalid E.SUN TWD transaction direction")
+        raise with_error_code(ValueError("invalid E.SUN TWD transaction direction"), 'ESUN-08-002-010')
     for field in ("expend", "income", "balance"):
         value = row.get(field)
         if value is None and field != "balance":
@@ -86,28 +96,35 @@ def _parse_esun_twd_txn_results(results: list[dict]) -> list[dict]:
     time_token = r"\d{1,2}:\d{2}:\d{2}"
     for result in results or []:
         if not isinstance(result, dict):
-            raise ValueError("invalid E.SUN TWD transaction result")
+            raise with_error_code(ValueError("invalid E.SUN TWD transaction result"), 'ESUN-08-003-013')
         account_no = result.get("account_no")
-        if not isinstance(account_no, str) or re.fullmatch(r"\d{13}", account_no) is None:
-            raise ValueError("invalid E.SUN TWD transaction account")
+        if not isinstance(account_no, str):
+            raise with_error_code(ValueError('invalid E.SUN TWD transaction account'), 'ESUN-08-003-001')
+        elif re.fullmatch('\\d{13}', account_no) is None:
+            raise with_error_code(ValueError('invalid E.SUN TWD transaction account'), 'ESUN-08-003-002')
         snapshot = result.get("snapshot")
         if not isinstance(snapshot, dict):
-            raise ValueError("invalid E.SUN TWD transaction snapshot")
+            raise with_error_code(ValueError("invalid E.SUN TWD transaction snapshot"), 'ESUN-08-003-014')
         has_grid = snapshot.get("hasGrid")
         grid_rows = snapshot.get("gridRows")
         grid_text = snapshot.get("gridText")
         if has_grid is False:
-            if grid_rows != [] or grid_text != "":
-                raise ValueError("inconsistent empty E.SUN TWD structured rows")
+            if grid_rows != []:
+                raise with_error_code(ValueError('inconsistent empty E.SUN TWD structured rows'), 'ESUN-08-003-003')
+            elif grid_text != '':
+                raise with_error_code(ValueError('inconsistent empty E.SUN TWD structured rows'), 'ESUN-08-003-004')
             continue
-        if has_grid is not True or not isinstance(grid_rows, list) or not grid_rows:
-            raise ValueError("invalid E.SUN TWD structured rows")
+        if has_grid is not True:
+            raise with_error_code(ValueError('invalid E.SUN TWD structured rows'), 'ESUN-08-003-005')
+        elif not isinstance(grid_rows, list):
+            raise with_error_code(ValueError('invalid E.SUN TWD structured rows'), 'ESUN-08-003-006')
+        elif not grid_rows:
+            raise with_error_code(ValueError('invalid E.SUN TWD structured rows'), 'ESUN-08-003-007')
         for cells in grid_rows:
-            if (
-                not isinstance(cells, list)
-                or not all(isinstance(cell, str) and cell == cell.strip() for cell in cells)
-            ):
-                raise ValueError("invalid E.SUN TWD structured row")
+            if not isinstance(cells, list):
+                raise with_error_code(ValueError('invalid E.SUN TWD structured row'), 'ESUN-08-003-008')
+            elif not all((isinstance(cell, str) and cell == cell.strip() for cell in cells)):
+                raise with_error_code(ValueError('invalid E.SUN TWD structured row'), 'ESUN-08-003-009')
             combined = re.fullmatch(rf"({date_token})\s+({time_token})", cells[0]) if cells else None
             if combined:
                 txn_date, txn_time = combined.groups()
@@ -122,19 +139,26 @@ def _parse_esun_twd_txn_results(results: list[dict]) -> list[dict]:
                 account_date = cells[1]
                 desc_index = 2
             else:
-                raise ValueError("invalid E.SUN TWD structured date columns")
+                raise with_error_code(ValueError("invalid E.SUN TWD structured date columns"), 'ESUN-08-003-015')
             if len(cells) < desc_index + 4:
-                raise ValueError("invalid E.SUN TWD structured columns")
+                raise with_error_code(ValueError("invalid E.SUN TWD structured columns"), 'ESUN-08-003-016')
             desc = cells[desc_index]
             expend_raw = cells[desc_index + 1] or None
             income_raw = cells[desc_index + 2] or None
             balance_raw = cells[desc_index + 3]
-            if not desc or (expend_raw is None) == (income_raw is None) or not balance_raw:
-                raise ValueError("invalid E.SUN TWD structured money columns")
-            parsed_date = datetime.strptime(txn_date.removeprefix("*"), "%Y/%m/%d")
-            parsed_account_date = datetime.strptime(account_date.removeprefix("*"), "%Y/%m/%d")
+            if not desc:
+                raise with_error_code(ValueError('invalid E.SUN TWD structured money columns'), 'ESUN-08-003-010')
+            elif (expend_raw is None) == (income_raw is None):
+                raise with_error_code(ValueError('invalid E.SUN TWD structured money columns'), 'ESUN-08-003-011')
+            elif not balance_raw:
+                raise with_error_code(ValueError('invalid E.SUN TWD structured money columns'), 'ESUN-08-003-012')
+            with error_step('ESUN-08-003-017'):
+                parsed_date = datetime.strptime(txn_date.removeprefix("*"), "%Y/%m/%d")
+            with error_step('ESUN-08-003-018'):
+                parsed_account_date = datetime.strptime(account_date.removeprefix("*"), "%Y/%m/%d")
             if txn_time is not None:
-                parsed_time = datetime.strptime(txn_time, "%H:%M:%S")
+                with error_step('ESUN-08-003-020'):
+                    parsed_time = datetime.strptime(txn_time, "%H:%M:%S")
                 txn_datetime = f"{parsed_date:%Y-%m-%d} {parsed_time:%H:%M:%S}"
             else:
                 txn_datetime = f"{parsed_date:%Y-%m-%d}"
@@ -148,62 +172,79 @@ def _parse_esun_twd_txn_results(results: list[dict]) -> list[dict]:
                     counterparty_acct = bank_match.group(2).strip() or None
                 elif re.search(r"\d", memo) and "/" in memo:
                     counterparty_acct = memo
-            out.append(_validated_esun_twd_row({
-                "account_no": account_no,
-                "datetime": txn_datetime,
-                "account_date": f"{parsed_account_date:%Y-%m-%d}",
-                "desc": desc,
-                "expend": _esun_twd_integer(expend_raw, non_negative=True),
-                "income": _esun_twd_integer(income_raw, non_negative=True),
-                "balance": _esun_twd_integer(balance_raw, non_negative=False),
-                "counterparty_bank": counterparty_bank,
-                "counterparty_acct": counterparty_acct,
-                "memo": memo,
-            }))
+            with error_step('ESUN-08-003-019'):
+                out.append(_validated_esun_twd_row({
+                    "account_no": account_no,
+                    "datetime": txn_datetime,
+                    "account_date": f"{parsed_account_date:%Y-%m-%d}",
+                    "desc": desc,
+                    "expend": _esun_twd_integer(expend_raw, non_negative=True),
+                    "income": _esun_twd_integer(income_raw, non_negative=True),
+                    "balance": _esun_twd_integer(balance_raw, non_negative=False),
+                    "counterparty_bank": counterparty_bank,
+                    "counterparty_acct": counterparty_acct,
+                    "memo": memo,
+                }))
     return out
 
 
 def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
     coverage = data.get("history_coverage")
     results = data.get("twd_txn_results")
-    if not isinstance(coverage, dict) or not isinstance(results, list):
-        raise ValueError("invalid E.SUN TWD history result coverage")
+    if not isinstance(coverage, dict):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-001')
+    elif not isinstance(results, list):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-002')
     domains = coverage.get("domains")
-    if not isinstance(domains, list) or len(domains) != 1:
-        raise ValueError("invalid E.SUN TWD history result coverage")
+    if not isinstance(domains, list):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-003')
+    elif len(domains) != 1:
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-004')
     domain = domains[0]
-    if not isinstance(domain, dict) or domain.get("domain") != "twd_transactions":
-        raise ValueError("invalid E.SUN TWD history result coverage")
+    if not isinstance(domain, dict):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-005')
+    elif domain.get('domain') != 'twd_transactions':
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-006')
     expected = domain.get("expected")
     windows = domain.get("windows")
-    if not isinstance(expected, list) or not isinstance(windows, list):
-        raise ValueError("invalid E.SUN TWD history result coverage")
+    if not isinstance(expected, list):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-007')
+    elif not isinstance(windows, list):
+        raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-008')
     expected_ids = [item.get("identity") for item in expected if isinstance(item, dict)]
     window_ids = [item.get("identity") for item in windows if isinstance(item, dict)]
     result_ids = [item.get("account_no") for item in results if isinstance(item, dict)]
     if not expected_ids:
         empty_window = domain.get("empty_window")
-        if (
-            expected != []
-            or windows != []
-            or results != []
-            or not isinstance(empty_window, dict)
-            or empty_window.get("status") != "explicit_empty"
-            or empty_window.get("pages") != 1
-        ):
-            raise ValueError("invalid E.SUN TWD zero-identity coverage")
+        if expected != []:
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-009')
+        elif windows != []:
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-010')
+        elif results != []:
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-011')
+        elif not isinstance(empty_window, dict):
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-012')
+        elif empty_window.get('status') != 'explicit_empty':
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-013')
+        elif empty_window.get('pages') != 1:
+            raise with_error_code(ValueError('invalid E.SUN TWD zero-identity coverage'), 'ESUN-08-004-014')
         return []
-    if (
-        len(expected_ids) != len(expected)
-        or len(set(expected_ids)) != len(expected_ids)
-        or len(window_ids) != len(windows)
-        or len(set(window_ids)) != len(window_ids)
-        or len(result_ids) != len(results)
-        or len(set(result_ids)) != len(result_ids)
-        or set(expected_ids) != set(window_ids)
-        or set(expected_ids) != set(result_ids)
-    ):
-        raise ValueError("mismatched E.SUN TWD history identities")
+    if len(expected_ids) != len(expected):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-015')
+    elif len(set(expected_ids)) != len(expected_ids):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-016')
+    elif len(window_ids) != len(windows):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-017')
+    elif len(set(window_ids)) != len(window_ids):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-018')
+    elif len(result_ids) != len(results):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-019')
+    elif len(set(result_ids)) != len(result_ids):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-020')
+    elif set(expected_ids) != set(window_ids):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-021')
+    elif set(expected_ids) != set(result_ids):
+        raise with_error_code(ValueError('mismatched E.SUN TWD history identities'), 'ESUN-08-004-022')
     expected_by_id = {item["identity"]: item for item in expected}
     result_by_id = {item["account_no"]: item for item in results}
     parsed: list[dict] = []
@@ -212,72 +253,108 @@ def _validated_esun_twd_results_for_coverage(data: dict) -> list[dict]:
         result = result_by_id[identity]
         snapshot = result.get("snapshot")
         expected_window = expected_by_id[identity]
-        if (
-            not isinstance(snapshot, dict)
-            or window.get("pages") != 1
-            or window.get("start") != expected_window.get("start")
-            or window.get("end") != expected_window.get("end")
-            or result.get("start") != window.get("start")
-            or result.get("end") != window.get("end")
-            or result.get("status") != window.get("status")
-        ):
-            raise ValueError("invalid E.SUN TWD history result coverage")
-        if snapshot.get("busy") is not False or snapshot.get("evidenceFresh") is not True:
-            raise ValueError("invalid E.SUN TWD result state")
+        if not isinstance(snapshot, dict):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-023')
+        elif window.get('pages') != 1:
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-024')
+        elif window.get('start') != expected_window.get('start'):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-025')
+        elif window.get('end') != expected_window.get('end'):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-026')
+        elif result.get('start') != window.get('start'):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-027')
+        elif result.get('end') != window.get('end'):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-028')
+        elif result.get('status') != window.get('status'):
+            raise with_error_code(ValueError('invalid E.SUN TWD history result coverage'), 'ESUN-08-004-029')
+        if snapshot.get('busy') is not False:
+            raise with_error_code(ValueError('invalid E.SUN TWD result state'), 'ESUN-08-004-030')
+        elif snapshot.get('evidenceFresh') is not True:
+            raise with_error_code(ValueError('invalid E.SUN TWD result state'), 'ESUN-08-004-031')
         pager = snapshot.get("pager")
-        if (
-            not isinstance(pager, dict)
-            or set(pager) != {"present", "actionableNext"}
-            or pager.get("present") is not False
-            or type(pager.get("actionableNext")) is not int
-            or pager["actionableNext"] != 0
-        ):
-            raise ValueError("invalid E.SUN TWD history pagination")
+        if not isinstance(pager, dict):
+            raise with_error_code(ValueError('invalid E.SUN TWD history pagination'), 'ESUN-08-004-032')
+        elif set(pager) != {'present', 'actionableNext'}:
+            raise with_error_code(ValueError('invalid E.SUN TWD history pagination'), 'ESUN-08-004-033')
+        elif pager.get('present') is not False:
+            raise with_error_code(ValueError('invalid E.SUN TWD history pagination'), 'ESUN-08-004-034')
+        elif type(pager.get('actionableNext')) is not int:
+            raise with_error_code(ValueError('invalid E.SUN TWD history pagination'), 'ESUN-08-004-035')
+        elif pager['actionableNext'] != 0:
+            raise with_error_code(ValueError('invalid E.SUN TWD history pagination'), 'ESUN-08-004-036')
         status = window.get("status")
-        date.fromisoformat(window["start"])
-        date.fromisoformat(window["end"])
+        with error_step('ESUN-08-004-058'):
+            date.fromisoformat(window["start"])
+        with error_step('ESUN-08-004-059'):
+            date.fromisoformat(window["end"])
         if status == "complete":
-            rows = _parse_esun_twd_txn_results([result])
+            with error_step('ESUN-08-004-060'):
+                rows = _parse_esun_twd_txn_results([result])
             row_count = snapshot.get("gridRowCount")
             total_count = snapshot.get("totalCount")
             grid_candidate_count = snapshot.get("gridCandidateCount")
             grid_rows = snapshot.get("gridRows")
-            if (
-                type(row_count) is not int
-                or row_count <= 0
-                or total_count is not None
-                and (type(total_count) is not int or total_count != row_count)
-                or type(grid_candidate_count) is not int
-                or grid_candidate_count != 1
-                or snapshot.get("emptyMarker") is not None
-                or not isinstance(grid_rows, list)
-                or len(grid_rows) != row_count
-                or len(rows) != row_count
-            ):
-                raise ValueError("invalid E.SUN TWD complete result coverage")
+            if type(row_count) is not int:
+                raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-037')
+            elif row_count <= 0:
+                raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-038')
+            else:
+                if total_count is not None:
+                    if type(total_count) is not int:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-062')
+                    elif total_count != row_count:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-061')
+                    elif type(grid_candidate_count) is not int:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-040')
+                    elif grid_candidate_count != 1:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-041')
+                    elif snapshot.get('emptyMarker') is not None:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-042')
+                    elif not isinstance(grid_rows, list):
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-043')
+                    elif len(grid_rows) != row_count:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-044')
+                    elif len(rows) != row_count:
+                        raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-045')
+                elif type(grid_candidate_count) is not int:
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-040')
+                elif grid_candidate_count != 1:
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-041')
+                elif snapshot.get('emptyMarker') is not None:
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-042')
+                elif not isinstance(grid_rows, list):
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-043')
+                elif len(grid_rows) != row_count:
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-044')
+                elif len(rows) != row_count:
+                    raise with_error_code(ValueError('invalid E.SUN TWD complete result coverage'), 'ESUN-08-004-045')
             parsed.extend(rows)
         elif status == "explicit_empty":
             grid_candidate_count = snapshot.get("gridCandidateCount")
-            if (
-                snapshot.get("hasGrid") is not False
-                or type(grid_candidate_count) is not int
-                or grid_candidate_count != 0
-                or snapshot.get("gridText", "") != ""
-                or snapshot.get("gridRows") != []
-                or type(snapshot.get("gridRowCount")) is not int
-                or snapshot["gridRowCount"] != 0
-                or type(snapshot.get("totalCount")) is not int
-                or snapshot["totalCount"] != 0
-                or snapshot.get("emptyMarker") not in {
-                    "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
-                }
-                or _parse_esun_twd_txn_results([
-                    {**result, "snapshot": {**snapshot, "gridText": snapshot.get("gridText", "")}}
-                ]) != []
-            ):
-                raise ValueError("invalid E.SUN TWD empty result coverage")
+            if snapshot.get('hasGrid') is not False:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-046')
+            elif type(grid_candidate_count) is not int:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-047')
+            elif grid_candidate_count != 0:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-048')
+            elif snapshot.get('gridText', '') != '':
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-049')
+            elif snapshot.get('gridRows') != []:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-050')
+            elif type(snapshot.get('gridRowCount')) is not int:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-051')
+            elif snapshot['gridRowCount'] != 0:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-052')
+            elif type(snapshot.get('totalCount')) is not int:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-053')
+            elif snapshot['totalCount'] != 0:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-054')
+            elif snapshot.get('emptyMarker') not in {'查無交易資料', '查無資料', '無交易明細', '查無符合資料！'}:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-055')
+            elif _parse_esun_twd_txn_results([{**result, 'snapshot': {**snapshot, 'gridText': snapshot.get('gridText', '')}}]) != []:
+                raise with_error_code(ValueError('invalid E.SUN TWD empty result coverage'), 'ESUN-08-004-056')
         else:
-            raise ValueError("invalid E.SUN TWD history status")
+            raise with_error_code(ValueError("invalid E.SUN TWD history status"), 'ESUN-08-004-057')
     return parsed
 
 
@@ -285,40 +362,50 @@ def _validated_esun_spa_rows(data: dict) -> list[dict]:
     """Accept normalized rows only under independently supplied window coverage."""
     coverage = data.get("history_coverage")
     rows = data.get("twd_txns")
-    if not isinstance(rows, list) or not isinstance(coverage, dict):
-        raise ValueError("unsupported E.SUN normalized TWD payload")
+    if not isinstance(rows, list):
+        raise with_error_code(ValueError('unsupported E.SUN normalized TWD payload'), 'ESUN-08-005-001')
+    elif not isinstance(coverage, dict):
+        raise with_error_code(ValueError('unsupported E.SUN normalized TWD payload'), 'ESUN-08-005-002')
     mode = coverage.get("mode")
     if not isinstance(mode, str):
-        raise ValueError("invalid E.SUN SPA history mode")
-    validate_history_coverage(
-        coverage, expected_mode=mode,
-        expected_domains=frozenset({"twd_transactions"}),
-    )
+        raise with_error_code(ValueError("invalid E.SUN SPA history mode"), 'ESUN-08-005-009')
+    with error_step('ESUN-08-005-013'):
+        validate_history_coverage(
+            coverage, expected_mode=mode,
+            expected_domains=frozenset({"twd_transactions"}),
+        )
     domains = coverage["domains"]
-    if len(domains) != 1 or "twd_txn_results" in data:
-        raise ValueError("ambiguous E.SUN TWD history payload")
+    if len(domains) != 1:
+        raise with_error_code(ValueError('ambiguous E.SUN TWD history payload'), 'ESUN-08-005-003')
+    elif 'twd_txn_results' in data:
+        raise with_error_code(ValueError('ambiguous E.SUN TWD history payload'), 'ESUN-08-005-004')
     domain = domains[0]
     expected = domain["expected"]
     windows = domain["windows"]
     identities = {item["identity"] for item in expected}
     if any(re.fullmatch(r"\d{13}", identity) is None for identity in identities):
-        raise ValueError("invalid E.SUN SPA TWD identity")
+        raise with_error_code(ValueError("invalid E.SUN SPA TWD identity"), 'ESUN-08-005-010')
     validated = []
     complete_accounts = Counter(window["identity"] for window in windows if window["status"] == "complete")
     seen = Counter()
     for original in rows:
-        if not isinstance(original, dict) or "account_date" not in original:
-            raise ValueError("invalid E.SUN SPA TWD row")
-        row = _validated_esun_twd_row(dict(original), unknown_account_date=True)
-        if row["balance"] is None or row["account_no"] not in identities:
-            raise ValueError("invalid E.SUN SPA TWD row")
+        if not isinstance(original, dict):
+            raise with_error_code(ValueError('invalid E.SUN SPA TWD row'), 'ESUN-08-005-005')
+        elif 'account_date' not in original:
+            raise with_error_code(ValueError('invalid E.SUN SPA TWD row'), 'ESUN-08-005-006')
+        with error_step('ESUN-08-005-014'):
+            row = _validated_esun_twd_row(dict(original), unknown_account_date=True)
+        if row['balance'] is None:
+            raise with_error_code(ValueError('invalid E.SUN SPA TWD row'), 'ESUN-08-005-007')
+        elif row['account_no'] not in identities:
+            raise with_error_code(ValueError('invalid E.SUN SPA TWD row'), 'ESUN-08-005-008')
         # Rows are flattened across queries; dates cannot recover window provenance.
         if row["account_no"] not in complete_accounts:
-            raise ValueError("E.SUN SPA TWD row lacks complete account coverage")
+            raise with_error_code(ValueError("E.SUN SPA TWD row lacks complete account coverage"), 'ESUN-08-005-011')
         seen[row["account_no"]] += 1
         validated.append(row)
     if any(seen[identity] < count for identity, count in complete_accounts.items()):
-        raise ValueError("E.SUN SPA TWD complete window lacks rows")
+        raise with_error_code(ValueError("E.SUN SPA TWD complete window lacks rows"), 'ESUN-08-005-012')
     return validated
 
 
@@ -331,19 +418,22 @@ def persist_esun(
     """
     error = data.get("error")
     if error is not None and not (type(error) is str and error == ""):
-        raise ValueError("E.SUN collection result contains an error")
+        raise with_error_code(ValueError("E.SUN collection result contains an error"), 'ESUN-08-006-001')
     if "twd_txns" in data and data.get("history_coverage") is None:
-        raise ValueError("unsupported E.SUN normalized TWD payload")
+        raise with_error_code(ValueError("unsupported E.SUN normalized TWD payload"), 'ESUN-08-006-002')
 
     today = datetime.now().strftime("%Y-%m-%d")
     delta: dict = {"bank": "esun"}
     delta["scope"] = "structured"
     if "twd_txns" in data:
-        twd_rows = _validated_esun_spa_rows(data)
+        with error_step('ESUN-08-006-009'):
+            twd_rows = _validated_esun_spa_rows(data)
     elif data.get("history_coverage") is not None:
-        twd_rows = _validated_esun_twd_results_for_coverage(data)
+        with error_step('ESUN-08-006-025'):
+            twd_rows = _validated_esun_twd_results_for_coverage(data)
     else:
-        twd_rows = _parse_esun_twd_txn_results(data.get("twd_txn_results") or [])
+        with error_step('ESUN-08-006-026'):
+            twd_rows = _parse_esun_twd_txn_results(data.get("twd_txn_results") or [])
 
     # --- accounts ---
     raw_accounts = data.get("accounts") or []
@@ -355,54 +445,61 @@ def persist_esun(
             continue
         category = a.get("category") or ""
         currency = a.get("currency") or "TWD"
-        balance = float(a.get("balance") or 0)
+        with error_step('ESUN-08-006-010'):
+            balance = float(a.get("balance") or 0)
         # esun classifier 對「臺幣綜存」等非標準 keyword 會 fallback unknown，
         # 這時用 currency 直接判 deposit (TWD) / fx_deposit (其他)
         pt = account_classify.classify_account("esun", {**a, "currency": currency})
         if pt == account_classify.ProductType.UNKNOWN:
             pt = (account_classify.ProductType.DEPOSIT if currency == "TWD"
                   else account_classify.ProductType.FX_DEPOSIT)
-        accts.append({
-            "account_no": acct_no,
-            "currency": currency,
-            "branch": None,
-            "nickname": category or None,
-            "type": category or None,
-            "product_type": pt,
-            "raw_balance": _num_real(a.get("balance")),
-            "raw_balance_date": today,
-        })
+        with error_step('ESUN-08-006-011'):
+            accts.append({
+                "account_no": acct_no,
+                "currency": currency,
+                "branch": None,
+                "nickname": category or None,
+                "type": category or None,
+                "product_type": pt,
+                "raw_balance": _num_real(a.get("balance"), _codes=('SYS-08-001-001', 'ESUN-08-830-002', 'SYS-08-001-003', 'ESUN-08-830-004', 'ESUN-08-830-005', 'ESUN-08-830-006', 'SYS-08-001-007', 'ESUN-08-830-008', 'ESUN-08-830-009', 'ESUN-08-830-010')),
+                "raw_balance_date": today,
+            })
         if currency == "TWD":
             twd_total += balance
     if accts:
-        store.upsert_accounts(accts, commit=commit)
+        with error_step('ESUN-08-006-012'):
+            store.upsert_accounts(accts, commit=commit)
         delta["accounts"] = len(accts)
     if accts:
-        store.upsert_balance_history([{
-            "snapshotDate": today,
-            "twdBalance": twd_total if twd_total > 0 else None,
-            "fxBalance": None,
-        }], commit=commit)
+        with error_step('ESUN-08-006-013'):
+            store.upsert_balance_history([{
+                "snapshotDate": today,
+                "twdBalance": twd_total if twd_total > 0 else None,
+                "fxBalance": None,
+            }], commit=commit)
         delta["balance_days"] = 1
-        store.put_daily_metric("balance_latest", {
-            "twd": twd_total,
-            "n_accounts": len(accts),
-            "by_currency": {a.get("currency"): a.get("balance") for a in raw_accounts},
-        }, today, commit=commit)
+        with error_step('ESUN-08-006-014'):
+            store.put_daily_metric("balance_latest", {
+                "twd": twd_total,
+                "n_accounts": len(accts),
+                "by_currency": {a.get("currency"): a.get("balance") for a in raw_accounts},
+            }, today, commit=commit)
 
     # --- TWD deposit transactions (FAO01002 存款交易明細查詢) ---
     if twd_rows:
-        delta["twd_txn_new"] = store.upsert_twd_txns(
-            twd_rows, rules=rules, commit=commit,
-            suppress_history_cursor=data.get("history_coverage") is not None,
-        )
+        with error_step('ESUN-08-006-015'):
+            delta["twd_txn_new"] = store.upsert_twd_txns(
+                twd_rows, rules=rules, commit=commit,
+                suppress_history_cursor=data.get("history_coverage") is not None,
+            )
 
     # --- card_summary（信用卡額度/點數/截止日）---
     # Step 2 (2026-06-14): card_summary 是整戶層, 套到 card_transactions 出現的所有卡 (ESun 通常 1 張卡).
     # 民國年 '115/06/29' → '2026-06-29' 用 _roc_to_west.
     card_summary = data.get("card_summary") or {}
     if card_summary:
-        store.put_daily_metric("esun_card_summary", card_summary, today, commit=commit)
+        with error_step('ESUN-08-006-016'):
+            store.put_daily_metric("esun_card_summary", card_summary, today, commit=commit)
         delta["card_summary"] = card_summary
 
     # --- card_quota（信用卡額度查詢頁，2026-06-18 新增 B 路線）---
@@ -412,12 +509,15 @@ def persist_esun(
             k: v for k, v in card_quota_raw.items()
             if k != "raw_text_sample"
         }
-        store.put_daily_metric("esun_card_quota", safe_card_quota, today, commit=commit)
+        with error_step('ESUN-08-006-017'):
+            store.put_daily_metric("esun_card_quota", safe_card_quota, today, commit=commit)
         delta["card_quota"] = safe_card_quota
 
     # ESun cards UPSERT (從 card_transactions 拿卡號, 套整戶層 limit/due)
-    esun_limit = _num_to_float(card_summary.get("credit_limit_twd"))
-    esun_due = _roc_to_west(card_summary.get("payment_due_date_roc"))
+    with error_step('ESUN-08-006-003'):
+        esun_limit = _num_to_float(card_summary.get("credit_limit_twd"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-831-008', 'ESUN-08-831-009', 'ESUN-08-831-010'))
+    with error_step('ESUN-08-006-004'):
+        esun_due = _roc_to_west(card_summary.get("payment_due_date_roc"))
 
     # 2026-06-18 升級 (B 路線)：used_credit 改為直接抓「信用卡額度查詢」頁原生欄位
     # (data.card_quota.used_credit_twd)，因為原本 sum 已入帳會少算未入帳 + 上期未繳，
@@ -429,9 +529,11 @@ def persist_esun(
     # `quota_used is not None` 而非 truthy check，否則 0 / 負值會誤走 fallback。
     card_quota = data.get("card_quota") or {}
     quota_used_raw = card_quota.get("used_credit_twd")
-    quota_used: float | None = _num_to_float(quota_used_raw) if quota_used_raw is not None else None
+    with error_step('ESUN-08-006-005'):
+        quota_used: float | None = _num_to_float(quota_used_raw, _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-832-008', 'ESUN-08-832-009', 'ESUN-08-832-010')) if quota_used_raw is not None else None
     # 如果額度查詢頁有抓到「歸戶信用額度」，優先用它（比帳單頁 card_summary 新）
-    quota_limit = _num_to_float(card_quota.get("credit_limit_twd"))
+    with error_step('ESUN-08-006-006'):
+        quota_limit = _num_to_float(card_quota.get("credit_limit_twd"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-833-008', 'ESUN-08-833-009', 'ESUN-08-833-010'))
     if quota_limit:
         esun_limit = quota_limit
 
@@ -440,7 +542,8 @@ def persist_esun(
     esun_used_total = 0.0
     for t in data.get("card_transactions") or []:
         if t.get("status") == "已入帳":
-            amt = _num_to_float(t.get("billed_amount"))
+            with error_step('ESUN-08-006-027'):
+                amt = _num_to_float(t.get("billed_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-834-008', 'ESUN-08-834-009', 'ESUN-08-834-010'))
             if amt:
                 esun_used_total += amt
     sum_used: float | None = esun_used_total if esun_used_total > 0 else None
@@ -452,7 +555,8 @@ def persist_esun(
     esun_stmt: str | None = None
     if esun_due:
         try:
-            due_dt = datetime.strptime(esun_due, "%Y-%m-%d")
+            with error_step('ESUN-08-006-028'):
+                due_dt = datetime.strptime(esun_due, "%Y-%m-%d")
             stmt_dt = due_dt - timedelta(days=30)
             esun_stmt = stmt_dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
@@ -467,8 +571,10 @@ def persist_esun(
     card_bills_list = data.get("card_bills") or []
     if card_bills_list and isinstance(card_bills_list[0], dict):
         latest_bill = card_bills_list[0]
-        esun_bill_due = _num_to_float(latest_bill.get("due_amount"))
-        esun_last_pay_amt = _num_to_float(latest_bill.get("paid_amount"))
+        with error_step('ESUN-08-006-018'):
+            esun_bill_due = _num_to_float(latest_bill.get("due_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-835-008', 'ESUN-08-835-009', 'ESUN-08-835-010'))
+        with error_step('ESUN-08-006-019'):
+            esun_last_pay_amt = _num_to_float(latest_bill.get("paid_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-836-008', 'ESUN-08-836-009', 'ESUN-08-836-010'))
         # 2026-06-22 v2: 不再 sentinel paid=0 → None. 0 是合法值.
         # card_events 靠 last_payment_date is None gate 通知.
 
@@ -481,7 +587,8 @@ def persist_esun(
     pay_records = pay_history.get("records") if isinstance(pay_history, dict) else None
     if pay_records:
         latest_pay = pay_records[0]  # 新→舊排序, [0] 是最新
-        amt = _num_to_float(latest_pay.get("paid_amount"))
+        with error_step('ESUN-08-006-020'):
+            amt = _num_to_float(latest_pay.get("paid_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'ESUN-08-837-008', 'ESUN-08-837-009', 'ESUN-08-837-010'))
         date = latest_pay.get("post_date")
         if amt is not None and date:
             esun_last_pay_amt = amt
@@ -512,15 +619,17 @@ def persist_esun(
             "last_payment_date": esun_last_pay_date,
         }
     if esun_seen_cards:
-        store.upsert_cards(list(esun_seen_cards.values()), commit=commit)
+        with error_step('ESUN-08-006-021'):
+            store.upsert_cards(list(esun_seen_cards.values()), commit=commit)
 
     # --- card_bills（帳單月份列表）---
     card_bills = data.get("card_bills") or []
     if card_bills:
-        store.put_daily_metric(
-            "esun_card_bills", {"bills": card_bills, "count": len(card_bills)}, today,
-            commit=commit,
-        )
+        with error_step('ESUN-08-006-022'):
+            store.put_daily_metric(
+                "esun_card_bills", {"bills": card_bills, "count": len(card_bills)}, today,
+                commit=commit,
+            )
         delta["card_bills"] = len(card_bills)
 
     # --- card_transactions（消費明細）— 入正規 schema ---
@@ -542,7 +651,8 @@ def persist_esun(
         billed_cur = t.get("billed_currency") or "TWD"
         is_foreign = consume_cur and consume_cur not in ("TWD", billed_cur)
         desc = t.get("merchant")
-        amt = int(t.get("billed_amount") or 0)
+        with error_step('ESUN-08-006-023'):
+            amt = int(t.get("billed_amount") or 0)
         # 2026-06-20 (root cause: 帳戶 tab 玉山卡顯示「使用額度 0」):
         # cards.card_no 是 '****0001', 但這裡若寫 raw '0000-XXXX-XXXX-0001'
         # → bill_summary SQL `WHERE card_no = ?` join 不到 → bill_due_amount=0 假象.
@@ -576,12 +686,14 @@ def persist_esun(
             )
             billed_txns.append(row)
     if billed_txns:
-        n = store.upsert_card_billed(billed_txns, rules=rules)
+        with error_step('ESUN-08-006-024'):
+            n = store.upsert_card_billed(billed_txns, rules=rules)
         delta["card_billed_new"] = n
     # collector 必須明示兩個期間皆成功提交且看到結果 frame；只看到 [] 不足以證明零筆。
-    n = store.refresh_card_pending(
-        "unbilled", pending_txns, rules=rules,
-        fetch_ok=data.get("card_transactions_ok") is True, commit=commit)
+    with error_step('ESUN-08-006-007'):
+        n = store.refresh_card_pending(
+            "unbilled", pending_txns, rules=rules,
+            fetch_ok=data.get("card_transactions_ok") is True, commit=commit)
     delta["card_unbilled"] = n
     if card_txns:
         delta["card_transactions"] = len(card_txns)
@@ -593,5 +705,6 @@ def persist_esun(
     delta.setdefault("card_unbilled", 0)
     delta.setdefault("card_current", 0)
 
-    store.log_sync(delta, commit=commit)
+    with error_step('ESUN-08-006-008'):
+        store.log_sync(delta, commit=commit)
     return delta

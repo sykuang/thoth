@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import bank_error_id, error_step, with_error_code
 from typing import Any
 
 from backend.core.base import validate_card_bill_facts, validate_history_coverage
@@ -45,22 +46,25 @@ def _validate_history_coverage_before_persist(coverage):
     if coverage is None:
         return
     if not isinstance(coverage, dict):
-        raise ValueError("invalid history coverage")
+        raise with_error_code(ValueError("invalid history coverage"), 'SYS-08-010-003')
     domains = coverage.get("domains")
     mode = coverage.get("mode")
-    if not isinstance(domains, list) or not isinstance(mode, str):
-        raise ValueError("invalid history coverage")
+    if not isinstance(domains, list):
+        raise with_error_code(ValueError('invalid history coverage'), 'SYS-08-010-001')
+    elif not isinstance(mode, str):
+        raise with_error_code(ValueError('invalid history coverage'), 'SYS-08-010-002')
     domain_names = frozenset(
         name
         for domain in domains
         if isinstance(domain, dict)
         if isinstance(name := domain.get("domain"), str)
     )
-    validate_history_coverage(
-        coverage,
-        expected_mode=mode,
-        expected_domains=domain_names,
-    )
+    with error_step('SYS-08-010-004'):
+        validate_history_coverage(
+            coverage,
+            expected_mode=mode,
+            expected_domains=domain_names,
+        )
 
 
 def persist_collected(bank, data, store, rules=None):
@@ -68,14 +72,16 @@ def persist_collected(bank, data, store, rules=None):
     try:
         target = PERSISTERS[bank]
     except KeyError as exc:
-        raise ValueError(f"unknown bank persist: {bank!r}") from exc
+        raise with_error_code(ValueError(f"unknown bank persist: {bank!r}"), 'SYS-08-011-001') from exc
     coverage = data.get("history_coverage")
     if bank in {"esun", "fubon", "hsbc", "rakuten", "sinopac", "taishin", "ubot"} and coverage is None:
-        raise ValueError(f"{bank} persistence requires history coverage")
-    _validate_history_coverage_before_persist(coverage)
+        raise with_error_code(ValueError(f"{bank} persistence requires history coverage"), bank_error_id(bank, '08-800-002'))
+    with error_step(bank_error_id(bank, '08-800-003')):
+        _validate_history_coverage_before_persist(coverage)
     facts_ok = data.get("card_bill_facts_ok")
     facts = data.get("card_bill_facts") or []
-    validate_card_bill_facts(facts, facts_ok=facts_ok)
+    with error_step(bank_error_id(bank, '08-800-004')):
+        validate_card_bill_facts(facts, facts_ok=facts_ok)
     persist = globals()[target] if isinstance(target, str) else target
     barrier: Any = CardBillWriteBarrier(store)
     atomic = bank in {"esun", "hsbc", "rakuten", "sinopac", "taishin", "ubot"}
@@ -83,29 +89,36 @@ def persist_collected(bank, data, store, rules=None):
         if atomic:
             # Nest adapter savepoints even before the first DML; the existing
             # final commit/rollback also closes this boundary.
-            store.begin_transaction()
-            delta = persist(data, barrier, rules=rules, commit=False)
+            with error_step(bank_error_id(bank, '08-800-007')):
+                store.begin_transaction()
+            with error_step(bank_error_id(bank, '08-800-008')):
+                delta = persist(data, barrier, rules=rules, commit=False)
         else:
-            delta = persist(data, barrier, rules=rules)
-        applied = apply_card_bill_facts(
-            store,
-            facts_ok=facts_ok,
-            facts=facts,
-            commit=not atomic,
-        )
+            with error_step(bank_error_id(bank, '08-800-009')):
+                delta = persist(data, barrier, rules=rules)
+        with error_step(bank_error_id(bank, '08-800-005')):
+            applied = apply_card_bill_facts(
+                store,
+                facts_ok=facts_ok,
+                facts=facts,
+                commit=not atomic,
+            )
         if data.get("card_bill_facts_ok") is not None:
             delta["card_bill_facts_applied"] = applied
-        store.record_history_coverage_cursors(
-            data.get("history_coverage"),
-            commit=not atomic,
-            replace=bank in {"esun", "rakuten", "taishin"} and coverage.get("mode") == "full",
-        )
+        with error_step(bank_error_id(bank, '08-800-006')):
+            store.record_history_coverage_cursors(
+                data.get("history_coverage"),
+                commit=not atomic,
+                replace=bank in {"esun", "rakuten", "taishin"} and coverage.get("mode") == "full",
+            )
         if atomic:
-            store.commit()
+            with error_step(bank_error_id(bank, '08-800-010')):
+                store.commit()
         return delta
     except Exception:
         if atomic:
-            store.conn.rollback()
+            with error_step(bank_error_id(bank, '08-800-011')):
+                store.conn.rollback()
         raise
 
 __all__ = [

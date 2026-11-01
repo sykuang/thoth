@@ -1,6 +1,6 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 import re
@@ -8,6 +8,8 @@ from typing import Any
 
 from patchright.sync_api import TimeoutError as PatchrightTimeoutError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from backend.core.error_codes import BANKS, code_details, error_step, exception_error_id, with_error_code
 
 
 class CheckpointPhase(StrEnum):
@@ -69,23 +71,37 @@ _MAX_LOCATOR_MATCHES = 500
 
 
 @contextmanager
-def bounded_login_inspection(page: Any):
-    page.set_default_timeout(_LOGIN_INSPECTION_TIMEOUT_MS)
+def bounded_login_inspection(page: Any, *, bank: str | None = None):
+    with error_step(_checkpoint_code(bank, "SYS-03-986-001")):
+        page.set_default_timeout(_LOGIN_INSPECTION_TIMEOUT_MS)
     try:
         yield
     finally:
-        page.set_default_timeout(_BROWSER_DEFAULT_TIMEOUT_MS)
+        with error_step(_checkpoint_code(bank, "SYS-03-986-002")):
+            page.set_default_timeout(_BROWSER_DEFAULT_TIMEOUT_MS)
+
+
+def _checkpoint_operand(bank: str | None, error_id: str | None, operation: Callable[[], Any]) -> Any:
+    if error_id is None:
+        return operation()
+    with error_step(_checkpoint_code(bank, error_id)):
+        return operation()
 
 
 def bounded_locator_matches(
-    locator: Any, *, first_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
+    locator: Any, *, first_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS,
+    bank: str | None = None, error_ids: tuple[str, str] | None = None,
 ) -> Iterator[Any]:
     seen_handles: list[Any] = []
     for index in range(_MAX_LOCATOR_MATCHES + 1):
         try:
-            candidate = locator.nth(index)
-            handle = candidate.element_handle(
-                timeout=first_timeout_ms if index == 0 else _LOCATOR_SNAPSHOT_TIMEOUT_MS
+            candidate = _checkpoint_operand(
+                bank, error_ids[0] if error_ids else None, lambda: locator.nth(index),
+            )
+            handle = _checkpoint_operand(
+                bank, error_ids[1] if error_ids else None, lambda: candidate.element_handle(
+                    timeout=first_timeout_ms if index == 0 else _LOCATOR_SNAPSHOT_TIMEOUT_MS
+                ),
             )
         except (IndexError, StopIteration, TimeoutError, PatchrightTimeoutError, PlaywrightTimeoutError):
             return
@@ -116,12 +132,20 @@ class LoginCheckpointRule:
     max_actions: int = 1
     first_match_timeout_ms: int = _LOCATOR_SNAPSHOT_TIMEOUT_MS
     require_exclusive_action: bool = False
+    error_id: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def is_clickable(self) -> bool:
         return self.kind in _CLICKABLE_RULE_KINDS
 
     def __post_init__(self) -> None:
+        if self.error_id is not None and (
+            type(self.bank) is not str
+            or type(self.error_id) is not str
+            or not self.error_id.startswith(self.bank.upper() + "-03-")
+            or code_details(self.error_id, bank=self.bank) is None
+        ):
+            object.__setattr__(self, "error_id", None)
         if (
             not self.name.strip()
             or not self.bank.strip()
@@ -175,13 +199,17 @@ class LoginBudget:
         if any(
             type(value) is not int
             for value in (*submission_state, self.reloads)
-        ) or self.reloads not in (0, 1) or submission_state not in {
+        ):
+            raise with_error_code(ValueError("invalid login budget"), "SYS-03-983-002")
+        if self.reloads not in (0, 1):
+            raise with_error_code(ValueError("invalid login budget"), "SYS-03-983-003")
+        if submission_state not in {
             (0, 0, 0),
             (1, 0, 0),
             (2, 1, 0),
             (2, 0, 1),
         }:
-            raise ValueError("invalid login budget")
+            raise with_error_code(ValueError("invalid login budget"), "SYS-03-983-004")
 
 
 @dataclass(frozen=True)
@@ -190,6 +218,102 @@ class CheckpointOutcome:
     rule_name: str | None = None
     action_label: str | None = None
     interaction: str | None = None
+    error_id: str | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Metadata is a closed registered ID, never DOM text or a callable value.
+        if self.error_id is not None and code_details(self.error_id) is None:
+            object.__setattr__(self, "error_id", None)
+
+
+def _checkpoint_code(bank: str | None, error_id: str) -> str:
+    if type(bank) is str and bank in BANKS:
+        return bank.upper() + error_id[3:]
+    return error_id
+
+
+def _blocked_checkpoint(
+    error_id: str, *, bank: str | None = None,
+    rule: LoginCheckpointRule | None = None, error: Exception | None = None,
+    _auth_probe_id=None,
+) -> CheckpointOutcome:
+    if rule is not None:
+        bank = rule.bank
+    # Closed native observation producers, not all registered IDs of this bank.
+    auth_producers = {
+        'hsbc': (
+            'HSBC-03-500-001', 'HSBC-03-500-002', 'HSBC-03-500-003', 'HSBC-03-500-004',
+            'HSBC-03-510-001', 'HSBC-03-510-002', 'HSBC-03-510-003', 'HSBC-03-510-004',
+            'HSBC-03-520-001', 'HSBC-03-520-002', 'HSBC-03-520-003', 'HSBC-03-520-004',
+            'HSBC-03-540-001', 'HSBC-03-540-002',
+        ),
+        'scsb': (
+            'SCSB-03-500-001', 'SCSB-03-500-002', 'SCSB-03-500-003', 'SCSB-03-500-004',
+            'SCSB-03-540-001', 'SCSB-03-540-002',
+        ),
+        'esun': (
+            'ESUN-03-400-001', 'ESUN-03-401-100', 'ESUN-03-401-101', 'ESUN-03-401-102',
+            'ESUN-03-402-001', 'ESUN-03-403-001', 'ESUN-03-404-100', 'ESUN-03-404-101',
+            'ESUN-03-404-102', 'ESUN-03-405-001', 'ESUN-03-406-001', 'ESUN-03-407-100',
+            'ESUN-03-407-101', 'ESUN-03-407-102', 'ESUN-03-407-103', 'ESUN-03-407-104',
+            'ESUN-03-407-105', 'ESUN-03-407-106', 'ESUN-03-407-107', 'ESUN-03-407-108',
+            'ESUN-03-408-001',
+        ),
+        'ubot': (
+            'UBOT-03-400-001',
+        ),
+        'sinopac': (
+            'SINOPAC-03-200-001', 'SINOPAC-03-202-001', 'SINOPAC-03-203-001', 'SINOPAC-03-204-201',
+            'SINOPAC-03-204-202', 'SINOPAC-03-204-203', 'SINOPAC-03-205-001', 'SINOPAC-03-206-001',
+            'SINOPAC-03-207-201', 'SINOPAC-03-207-202', 'SINOPAC-03-208-001', 'SINOPAC-03-209-001',
+            'SINOPAC-03-210-201', 'SINOPAC-03-210-202',
+        ),
+        'fubon': (
+            'FUBON-03-200-001', 'FUBON-03-201-001', 'FUBON-03-202-001', 'FUBON-03-203-001',
+            'FUBON-03-205-001', 'FUBON-03-206-001', 'FUBON-03-207-001', 'FUBON-03-208-001',
+            'FUBON-03-208-301', 'FUBON-03-208-302', 'FUBON-03-209-001', 'FUBON-03-210-001',
+            'FUBON-03-210-301', 'FUBON-03-210-302',
+        ),
+        'dbs': (
+            'DBS-03-014-002', 'DBS-03-014-003', 'DBS-03-014-004', 'DBS-03-700-002',
+            'DBS-03-700-003', 'DBS-03-700-004', 'DBS-03-701-002', 'DBS-03-701-003',
+            'DBS-03-701-004', 'DBS-03-702-002', 'DBS-03-702-003', 'DBS-03-702-004',
+            'DBS-03-016-001', 'DBS-03-703-001', 'DBS-03-704-001', 'DBS-03-705-001',
+        ),
+        'scb': (
+            'SCB-03-010-001', 'SCB-03-700-001', 'SCB-03-701-001', 'SCB-03-702-001',
+            'SCB-03-012-001',
+        ),
+        'taishin': (
+            'TAISHIN-03-006-001', 'TAISHIN-03-707-001', 'TAISHIN-03-708-001', 'TAISHIN-03-709-001',
+            'TAISHIN-03-008-001',
+        ),
+        'rakuten': (
+            'RAKUTEN-03-003-001',
+        ),
+        'linebank': (
+            'LINEBANK-03-008-001',
+        ),
+        'ctbc': (
+            'CTBC-03-010-001', 'CTBC-03-011-001',
+        ),
+        'cathay': (
+            'CATHAY-03-010-001', 'CATHAY-03-011-001',
+        ),
+    }
+    if (rule is None and error is None
+            and error_id in ("SYS-03-988-001", "SYS-03-988-002")
+            and type(bank) is str and type(_auth_probe_id) is str
+            and _auth_probe_id in auth_producers.get(bank, ())
+            and code_details(_auth_probe_id, bank=bank) is not None):
+        selected_id = _auth_probe_id
+    else:
+        selected_id = _checkpoint_code(bank, error_id)
+    return CheckpointOutcome(
+        CheckpointKind.UNKNOWN_BLOCKER,
+        rule_name=rule.name if rule is not None else None,
+        error_id=exception_error_id(error) or selected_id,
+    )
 
 
 def validate_login_checkpoint_outcome(
@@ -207,7 +331,9 @@ def validate_login_checkpoint_outcome(
     else:
         rule = rules_by_name.get(outcome.rule_name or "")
         valid = rule is not None and rule.kind is outcome.kind
-    return outcome if valid else CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    return outcome if valid else CheckpointOutcome(
+        CheckpointKind.UNKNOWN_BLOCKER, error_id=outcome.error_id or "SYS-03-989-001",
+    )
 
 
 def _action_selected(action: Any) -> bool:
@@ -246,28 +372,40 @@ def _evaluate_rule(
     matched = []
     visible_container_count = 0
     visible_blocker_count = 0
-    for scope in scopes:
-        if rule.require_exclusive_action:
-            blockers = scope.locator(
-                "dialog[open], [role='dialog'], [aria-modal='true'], .modal.show, .modal.in"
-            )
-            visible_blocker_count += sum(
-                item.is_visible() for item in bounded_locator_matches(blockers)
-            )
-        containers = scope.locator(rule.container_selector)
-        for container in bounded_locator_matches(
-            containers, first_timeout_ms=rule.first_match_timeout_ms
-        ):
-            if not container.is_visible():
-                continue
-            visible_container_count += 1
-            nested = container.locator(rule.container_selector)
-            if any(item.is_visible() for item in bounded_locator_matches(nested)):
-                continue
-            fingerprint = _matching_body_fingerprint(container, rule.required_body_pattern)
-            if fingerprint is None:
-                continue
-            matched.append((container, fingerprint))
+    with error_step(_checkpoint_code(rule.bank, "SYS-03-970-001")):
+        for scope in scopes:
+            if rule.require_exclusive_action:
+                with error_step(_checkpoint_code(rule.bank, "SYS-03-970-011")):
+                    blockers = scope.locator(
+                        "dialog[open], [role='dialog'], [aria-modal='true'], .modal.show, .modal.in"
+                    )
+                visible_blocker_count += _checkpoint_operand(rule.bank, "SYS-03-970-014", lambda: sum(
+                    item.is_visible() for item in bounded_locator_matches(
+                        blockers, bank=rule.bank, error_ids=("SYS-03-970-012", "SYS-03-970-013"),
+                    )
+                ))
+            with error_step(_checkpoint_code(rule.bank, "SYS-03-970-015")):
+                containers = scope.locator(rule.container_selector)
+            for container in bounded_locator_matches(
+                containers, first_timeout_ms=rule.first_match_timeout_ms,
+                bank=rule.bank, error_ids=("SYS-03-970-016", "SYS-03-970-017"),
+            ):
+                if _checkpoint_operand(rule.bank, "SYS-03-970-018", lambda: not container.is_visible()):
+                    continue
+                visible_container_count += 1
+                with error_step(_checkpoint_code(rule.bank, "SYS-03-970-019")):
+                    nested = container.locator(rule.container_selector)
+                if _checkpoint_operand(rule.bank, "SYS-03-970-022", lambda: any(
+                    item.is_visible() for item in bounded_locator_matches(
+                        nested, bank=rule.bank, error_ids=("SYS-03-970-020", "SYS-03-970-021"),
+                    )
+                )):
+                    continue
+                with error_step(_checkpoint_code(rule.bank, "SYS-03-970-002")):
+                    fingerprint = _matching_body_fingerprint(container, rule.required_body_pattern)
+                if fingerprint is None:
+                    continue
+                matched.append((container, fingerprint))
 
     if not matched:
         return None
@@ -276,20 +414,24 @@ def _evaluate_rule(
             rule.kind,
             rule_name=rule.name,
             interaction=_interaction(rule.kind),
+            error_id=(rule.error_id if rule.kind not in (
+                CheckpointKind.CAPTCHA_RETRY, CheckpointKind.STARTUP_RECOVERY,
+            ) else None),
         )
     if rule.kind in {CheckpointKind.DISMISSIBLE_NOTICE, CheckpointKind.DUPLICATE_SESSION}:
         for container, _ in matched:
-            form_controls = container.locator(
-                "input, select, textarea, [contenteditable]:not([contenteditable='false'])"
-            )
-            if any(
-                rule.kind is CheckpointKind.DUPLICATE_SESSION or item.is_visible()
-                for item in bounded_locator_matches(form_controls)
-            ):
-                return CheckpointOutcome(
-                    CheckpointKind.UNKNOWN_BLOCKER,
-                    rule_name=rule.name,
-                )
+            with error_step(_checkpoint_code(rule.bank, "SYS-03-971-002")):
+                with error_step(_checkpoint_code(rule.bank, "SYS-03-971-011")):
+                    form_controls = container.locator(
+                        "input, select, textarea, [contenteditable]:not([contenteditable='false'])"
+                    )
+                if _checkpoint_operand(rule.bank, "SYS-03-971-014", lambda: any(
+                    rule.kind is CheckpointKind.DUPLICATE_SESSION or item.is_visible()
+                    for item in bounded_locator_matches(
+                        form_controls, bank=rule.bank, error_ids=("SYS-03-971-012", "SYS-03-971-013"),
+                    )
+                )):
+                    return _blocked_checkpoint("SYS-03-971-001", rule=rule)
 
     eligible = []
     visible_actions = 0
@@ -300,79 +442,89 @@ def _evaluate_rule(
     }
     for container, fingerprint in matched:
         if rule.require_exclusive_action:
-            native_actions = container.locator(
-                "button, a[href], input, select, textarea, summary, [role=button]"
-            )
-            visible_actions += sum(
-                item.is_visible() for item in bounded_locator_matches(native_actions)
-            )
-        actions = container.locator(rule.action_selector)
-        for action in bounded_locator_matches(
-            actions, first_timeout_ms=rule.first_match_timeout_ms
-        ):
-            if not action.is_visible():
-                continue
-            if not rule.require_exclusive_action:
-                visible_actions += 1
-            if action_labels:
-                label = action_labels.get(" ".join(action.inner_text().split()))
-                if label is None:
+            with error_step(_checkpoint_code(rule.bank, "SYS-03-972-006")):
+                with error_step(_checkpoint_code(rule.bank, "SYS-03-972-011")):
+                    native_actions = container.locator(
+                        "button, a[href], input, select, textarea, summary, [role=button]"
+                    )
+                visible_actions += _checkpoint_operand(rule.bank, "SYS-03-972-014", lambda: sum(
+                    item.is_visible() for item in bounded_locator_matches(
+                        native_actions, bank=rule.bank, error_ids=("SYS-03-972-012", "SYS-03-972-013"),
+                    )
+                ))
+        with error_step(_checkpoint_code(rule.bank, "SYS-03-972-007")):
+            with error_step(_checkpoint_code(rule.bank, "SYS-03-972-015")):
+                actions = container.locator(rule.action_selector)
+            for action in bounded_locator_matches(
+                actions, first_timeout_ms=rule.first_match_timeout_ms,
+                bank=rule.bank, error_ids=("SYS-03-972-016", "SYS-03-972-017"),
+            ):
+                if _checkpoint_operand(rule.bank, "SYS-03-972-018", lambda: not action.is_visible()):
                     continue
-            else:
-                label = None
-            eligible.append((container, fingerprint, action, label))
-    if (
-        len(eligible) != 1
-        or (
-            rule.require_exclusive_action
-            and (
-                visible_container_count != 1
-                or visible_blocker_count != 1
-                or visible_actions != 1
-            )
-        )
-    ):
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+                if not rule.require_exclusive_action:
+                    visible_actions += 1
+                if action_labels:
+                    with error_step(_checkpoint_code(rule.bank, "SYS-03-972-019")):
+                        label = action_labels.get(" ".join(action.inner_text().split()))
+                    if label is None:
+                        continue
+                else:
+                    label = None
+                eligible.append((container, fingerprint, action, label))
+    if len(eligible) == 0:
+        return _blocked_checkpoint("SYS-03-972-001", rule=rule)
+    if len(eligible) != 1:
+        return _blocked_checkpoint("SYS-03-972-002", rule=rule)
+    if rule.require_exclusive_action:
+        if visible_container_count != 1:
+            return _blocked_checkpoint("SYS-03-972-003", rule=rule)
+        if visible_blocker_count != 1:
+            return _blocked_checkpoint("SYS-03-972-004", rule=rule)
+        if visible_actions != 1:
+            return _blocked_checkpoint("SYS-03-972-005", rule=rule)
 
     container, fingerprint, action, label = eligible[0]
     # Native form submissions bypass the reducer's credential budget, even
     # when the submit button targets a form outside the visible notice.
-    native_action = getattr(action, "evaluate", None)
-    if (rule.kind in {CheckpointKind.DUPLICATE_SESSION, CheckpointKind.DISMISSIBLE_NOTICE}
-            and native_action is not None and native_action(
-                "el => (el instanceof HTMLButtonElement || el instanceof HTMLInputElement)"
-                " && el.form !== null && ['submit', 'image'].includes(el.type)"
-            )):
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
-    was_enabled = action.is_enabled()
-    was_selected = _action_selected(action)
+    with error_step(_checkpoint_code(rule.bank, "SYS-03-973-002")):
+        native_action = getattr(action, "evaluate", None)
+        if (rule.kind in {CheckpointKind.DUPLICATE_SESSION, CheckpointKind.DISMISSIBLE_NOTICE}
+                and native_action is not None and native_action(
+                    "el => (el instanceof HTMLButtonElement || el instanceof HTMLInputElement)"
+                    " && el.form !== null && ['submit', 'image'].includes(el.type)"
+                )):
+            return _blocked_checkpoint("SYS-03-973-001", rule=rule)
+    with error_step(_checkpoint_code(rule.bank, "SYS-03-974-001")):
+        was_enabled = action.is_enabled()
+    with error_step(_checkpoint_code(rule.bank, "SYS-03-974-002")):
+        was_selected = _action_selected(action)
     try:
         if can_act is not None and not can_act():
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
-    except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+            return _blocked_checkpoint("SYS-03-975-001", rule=rule)
+    except Exception as error:
+        return _blocked_checkpoint("SYS-03-975-002", rule=rule, error=error)
     try:
         action.click()
-    except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+    except Exception as error:
+        return _blocked_checkpoint("SYS-03-976-001", rule=rule, error=error)
     try:
         container.wait_for(state="hidden", timeout=500)
         progressed = True
     except (TimeoutError, PatchrightTimeoutError, PlaywrightTimeoutError):
         try:
             progressed = (
-                not container.is_visible()
-                or not action.is_visible()
-                or (was_enabled and not action.is_enabled())
-                or (not was_selected and _action_selected(action))
-                or _matching_body_fingerprint(container, None) != fingerprint
+                _checkpoint_operand(rule.bank, "SYS-03-978-011", lambda: not container.is_visible())
+                or _checkpoint_operand(rule.bank, "SYS-03-978-012", lambda: not action.is_visible())
+                or _checkpoint_operand(rule.bank, "SYS-03-978-013", lambda: bool(was_enabled and not action.is_enabled()))
+                or _checkpoint_operand(rule.bank, "SYS-03-978-014", lambda: bool(not was_selected and _action_selected(action)))
+                or _checkpoint_operand(rule.bank, "SYS-03-978-015", lambda: _matching_body_fingerprint(container, None) != fingerprint)
             )
-        except Exception:
-            progressed = False
-    except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        except Exception as error:
+            return _blocked_checkpoint("SYS-03-978-001", rule=rule, error=error)
+    except Exception as error:
+        return _blocked_checkpoint("SYS-03-977-001", rule=rule, error=error)
     if not progressed:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        return _blocked_checkpoint("SYS-03-978-002", rule=rule)
     return CheckpointOutcome(
         rule.kind,
         rule_name=rule.name,
@@ -390,32 +542,36 @@ def _evaluate_login_checkpoint(
     is_authenticated: Callable[[Any], bool],
     is_scope_owned: Callable[[Any], bool] | None = None,
     can_act: Callable[[], bool] | None = None,
+    _auth_probe_ids=None,
 ) -> CheckpointOutcome:
+    inspection_error_id = "SYS-03-987-002"
     try:
         if any(rule.bank != bank for rule in rules):
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+            return _blocked_checkpoint("SYS-03-987-001", bank=bank)
+        inspection_error_id = "SYS-03-984-001"
         if (
             phase is not CheckpointPhase.POST_SUBMIT_SETTLE
             and is_authenticated(page)
         ):
             return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
         scopes = [page]
+        inspection_error_id = "SYS-03-985-001"
         if is_scope_owned is not None:
             scopes.extend(
                 frame
                 for frame in page.frames
                 if frame is not page.main_frame and is_scope_owned(frame)
             )
-    except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+    except Exception as error:
+        return _blocked_checkpoint(inspection_error_id, bank=bank, error=error)
 
     for rule in rules:
         if phase not in rule.phases:
             continue
         try:
             outcome = _evaluate_rule(scopes, rule, can_act)
-        except Exception:
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, rule_name=rule.name)
+        except Exception as error:
+            return _blocked_checkpoint("SYS-03-979-001", rule=rule, error=error)
         if outcome:
             return outcome
 
@@ -423,14 +579,21 @@ def _evaluate_login_checkpoint(
         try:
             if is_authenticated(page):
                 return CheckpointOutcome(CheckpointKind.AUTHENTICATED)
-        except Exception:
-            return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
-    fallback = (
-        CheckpointKind.READY_FOR_CREDENTIALS
-        if phase is CheckpointPhase.PRE_SUBMIT
-        else CheckpointKind.UNKNOWN_BLOCKER
+        except Exception as error:
+            return _blocked_checkpoint("SYS-03-984-002", bank=bank, error=error)
+    if phase is CheckpointPhase.PRE_SUBMIT:
+        return CheckpointOutcome(CheckpointKind.READY_FOR_CREDENTIALS)
+    return _blocked_checkpoint(
+        "SYS-03-988-002" if phase is CheckpointPhase.POST_SUBMIT_SETTLE else "SYS-03-988-001",
+        bank=bank,
+        _auth_probe_id=(
+            _auth_probe_ids.pop() if (
+                (phase is CheckpointPhase.POST_SUBMIT or phase is CheckpointPhase.POST_SUBMIT_SETTLE)
+                and type(_auth_probe_ids) is list and len(_auth_probe_ids) == 1
+            )
+            else None
+        ),
     )
-    return CheckpointOutcome(fallback)
 
 
 def evaluate_login_checkpoint(
@@ -442,22 +605,29 @@ def evaluate_login_checkpoint(
     is_authenticated: Callable[[Any], bool],
     is_scope_owned: Callable[[Any], bool] | None = None,
     can_act: Callable[[], bool] | None = None,
+    _auth_probe_ids=None,
 ) -> CheckpointOutcome:
-    if any(rule.bank != bank for rule in rules):
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
     try:
-        with bounded_login_inspection(page):
-            return _evaluate_login_checkpoint(
-                page,
-                bank=bank,
-                phase=phase,
-                rules=rules,
-                is_authenticated=is_authenticated,
-                is_scope_owned=is_scope_owned,
-                can_act=can_act,
-            )
-    except Exception:
-        return CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER)
+        with error_step(_checkpoint_code(bank, "SYS-03-987-002")):
+            if any(rule.bank != bank for rule in rules):
+                return _blocked_checkpoint("SYS-03-987-001", bank=bank)
+        try:
+            with bounded_login_inspection(page, bank=bank):
+                return _evaluate_login_checkpoint(
+                    page,
+                    bank=bank,
+                    phase=phase,
+                    rules=rules,
+                    is_authenticated=is_authenticated,
+                    is_scope_owned=is_scope_owned,
+                    can_act=can_act,
+                    _auth_probe_ids=_auth_probe_ids,
+                )
+        except Exception as error:
+            return _blocked_checkpoint("SYS-03-986-003", bank=bank, error=error)
+    finally:
+        if type(_auth_probe_ids) is list:
+            _auth_probe_ids.clear()
 
 
 class LoginCheckpointTerminal(RuntimeError):
@@ -479,6 +649,7 @@ class LoginCheckpointTerminal(RuntimeError):
             f"protocol_resubmits={budget.protocol_resubmits}, "
             f"captcha_resubmits={budget.captcha_resubmits}, reloads={budget.reloads}"
         )
+        with_error_code(self, outcome.error_id)
 
 
 class LoginCheckpointBlocked(LoginCheckpointTerminal):
@@ -513,30 +684,34 @@ def reduce_login_checkpoint(
     ):
         return phase, budget
     if outcome.kind is CheckpointKind.READY_FOR_CREDENTIALS:
-        if phase is not CheckpointPhase.PRE_SUBMIT or budget.credential_submissions != 0:
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+        if phase is not CheckpointPhase.PRE_SUBMIT:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-980-001")
+        if budget.credential_submissions != 0:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-980-002")
         return CheckpointPhase.POST_SUBMIT, replace(budget, credential_submissions=1)
     if outcome.kind is CheckpointKind.PROTOCOL_RESUBMIT:
-        if (
-            phase is not CheckpointPhase.POST_SUBMIT
-            or budget.credential_submissions != 1
-            or budget.protocol_resubmits >= 1
-            or not outcome.rule_name
-        ):
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+        if phase is not CheckpointPhase.POST_SUBMIT:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-981-001")
+        if budget.credential_submissions != 1:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-981-002")
+        if budget.protocol_resubmits >= 1:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-981-003")
+        if not outcome.rule_name:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-981-004")
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
             protocol_resubmits=1,
         )
     if outcome.kind is CheckpointKind.CAPTCHA_RETRY:
-        if (
-            phase is not CheckpointPhase.POST_SUBMIT
-            or budget.credential_submissions != 1
-            or budget.captcha_resubmits >= 1
-            or not outcome.rule_name
-        ):
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+        if phase is not CheckpointPhase.POST_SUBMIT:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-982-001")
+        if budget.credential_submissions != 1:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-982-002")
+        if budget.captcha_resubmits >= 1:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-982-003")
+        if not outcome.rule_name:
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-982-004")
         return CheckpointPhase.POST_SUBMIT, replace(
             budget,
             credential_submissions=2,
@@ -544,6 +719,6 @@ def reduce_login_checkpoint(
         )
     if outcome.kind is CheckpointKind.STARTUP_RECOVERY:
         if budget.reloads >= 1:
-            raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+            raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-983-001")
         return CheckpointPhase.PRE_SUBMIT, replace(budget, reloads=1)
-    raise LoginCheckpointBlocked(budget, outcome, phase=phase)
+    raise with_error_code(LoginCheckpointBlocked(budget, outcome, phase=phase), "SYS-03-989-002")

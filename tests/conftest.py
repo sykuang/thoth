@@ -81,6 +81,8 @@ def _reset_bankstore_migration_cache():
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """完全 isolated server.sqlite + fresh JWT secret + fresh Fernet key per test。"""
+    # The test supplies every setting; never import a developer's local dotenv.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
     monkeypatch.setenv("BANK_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET", "test-secret-32+bytes-padding-padding-padding!")
     monkeypatch.setenv("SERVER_FERNET_KEY", Fernet.generate_key().decode())

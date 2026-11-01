@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from backend.core.error_codes import error_step
 from datetime import datetime
 
 from backend.core import account_classify
@@ -11,15 +12,17 @@ from backend.core.store import BankStore
 from backend.core.persist._common import _num_real, _num_to_float, _slash_date_to_iso
 
 
-def _dbs_money(value) -> float | None:
+def _dbs_money(value, *, _codes: tuple[str, ...] | None = None) -> float | None:
     """DBS money object / scalar → float | None."""
     if isinstance(value, dict):
         for key in ("balance", "domesticCurrencyBalance", "displayBalance", "amount", "value"):
-            n = _num_to_float(value.get(key))
+            with error_step(_codes[9] if _codes is not None and len(_codes) > 9 else 'DBS-08-001-002'):
+                n = _num_to_float(value.get(key), _codes=_codes)
             if n is not None:
                 return n
         return None
-    return _num_to_float(value)
+    with error_step(_codes[9] if _codes is not None and len(_codes) > 9 else 'DBS-08-001-001'):
+        return _num_to_float(value, _codes=_codes)
 
 
 def _dbs_date(value) -> str | None:
@@ -31,7 +34,8 @@ def _dbs_date(value) -> str | None:
     s = str(value).strip()
     if "T" in s:
         s = s.split("T", 1)[0]
-    return _slash_date_to_iso(s)
+    with error_step('DBS-08-002-001'):
+        return _slash_date_to_iso(s)
 
 
 def _parse_dbs_twd_transactions(apis: dict, account_by_global_id: dict[str, str]) -> list[dict]:
@@ -54,12 +58,14 @@ def _parse_dbs_twd_transactions(apis: dict, account_by_global_id: dict[str, str]
                 continue
             post_date = None
             for key in ("accountingDate", "postingDate", "postDate", "valueDate", "bookingDate", "transactionDate", "txnDate", "date"):
-                post_date = _dbs_date(t.get(key))
+                with error_step('DBS-08-003-001'):
+                    post_date = _dbs_date(t.get(key))
                 if post_date:
                     break
             txn_date = None
             for key in ("transactionDate", "txnDate", "effectiveDate", "valueDate", "postingDate", "accountingDate", "date"):
-                txn_date = _dbs_date(t.get(key))
+                with error_step('DBS-08-003-002'):
+                    txn_date = _dbs_date(t.get(key))
                 if txn_date:
                     break
             desc = None
@@ -74,22 +80,26 @@ def _parse_dbs_twd_transactions(apis: dict, account_by_global_id: dict[str, str]
                     break
             amount = None
             for key in ("transactionAmount", "amount", "txnAmount", "originalAmount"):
-                amount = _dbs_money(t.get(key))
+                with error_step('DBS-08-003-003'):
+                    amount = _dbs_money(t.get(key), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-830-008', 'DBS-08-830-009', 'DBS-08-830-010'))
                 if amount is not None:
                     break
             debit = None
             for key in ("debitAmount", "withdrawalAmount", "outAmount"):
-                debit = _dbs_money(t.get(key))
+                with error_step('DBS-08-003-004'):
+                    debit = _dbs_money(t.get(key), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-831-008', 'DBS-08-831-009', 'DBS-08-831-010'))
                 if debit is not None:
                     break
             credit = None
             for key in ("creditAmount", "depositAmount", "inAmount"):
-                credit = _dbs_money(t.get(key))
+                with error_step('DBS-08-003-005'):
+                    credit = _dbs_money(t.get(key), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-832-008', 'DBS-08-832-009', 'DBS-08-832-010'))
                 if credit is not None:
                     break
             balance = None
             for key in ("balance", "accountBalance", "runningBalance", "availableBalance", "balanceAfterTransaction"):
-                balance = _dbs_money(t.get(key))
+                with error_step('DBS-08-003-006'):
+                    balance = _dbs_money(t.get(key), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-833-008', 'DBS-08-833-009', 'DBS-08-833-010'))
                 if balance is not None:
                     break
             direction = " ".join(str(t.get(k) or "") for k in (
@@ -154,14 +164,17 @@ def persist_dbs(data: dict, store: BankStore, rules: list[dict] | None = None) -
         cc = (lib_resp.get("creditCard") or {})
         pay = cc.get("paymentDetails") or {}
         dbs_due = pay.get("dueDate")  # dashboard fallback, ISO 格式
-        dbs_used = _num_to_float(pay.get("amount"))  # paymentDetails.amount 是整戶應繳
+        with error_step('DBS-08-004-003'):
+            dbs_used = _num_to_float(pay.get("amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-834-008', 'DBS-08-834-009', 'DBS-08-834-010'))  # paymentDetails.amount 是整戶應繳
         # 2026-07-02: 使用者指出 DBS 要登入後點「繳卡費」才看得到最近一期帳單金額。
         # paymentDetails.alreadyPaid 只是 dashboard summary，沒有繳款日，不能生成
         # last_payment_*；card fee page 也只是當期應繳/截止日，不是歷史繳款紀錄。
         card_fee = data.get("dbs_card_fee_page") or {}
-        dbs_bill_due = _num_to_float(card_fee.get("bill_due_amount"))
+        with error_step('DBS-08-004-004'):
+            dbs_bill_due = _num_to_float(card_fee.get("bill_due_amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-835-008', 'DBS-08-835-009', 'DBS-08-835-010'))
         if dbs_bill_due is None:
-            dbs_bill_due = _num_to_float(pay.get("amount"))
+            with error_step('DBS-08-004-010'):
+                dbs_bill_due = _num_to_float(pay.get("amount"), _codes=('SYS-08-001-001', 'SYS-08-001-002', 'SYS-08-001-003', 'SYS-08-001-004', 'SYS-08-001-005', 'SYS-08-001-006', 'SYS-08-001-007', 'DBS-08-836-008', 'DBS-08-836-009', 'DBS-08-836-010'))
         dbs_due = card_fee.get("payment_due_date") or dbs_due
         dbs_last_pay_amt = None
 
@@ -195,7 +208,8 @@ def persist_dbs(data: dict, store: BankStore, rules: list[dict] | None = None) -
                 # last_payment_date 不寫 — DBS API 無此欄
             })
         if cards:
-            store.upsert_cards(cards)
+            with error_step('DBS-08-004-011'):
+                store.upsert_cards(cards)
 
         if pay:
             billing_metric = {
@@ -206,7 +220,8 @@ def persist_dbs(data: dict, store: BankStore, rules: list[dict] | None = None) -
                 "currency": card_fee.get("currency") or pay.get("currency"),
                 "source": "card_fee_page" if card_fee else "liabilities.paymentDetails",
             }
-            store.put_daily_metric("dbs_card_billing_summary", billing_metric, today)
+            with error_step('DBS-08-004-012'):
+                store.put_daily_metric("dbs_card_billing_summary", billing_metric, today)
 
     # === B. 帳戶 (assets.casa.accounts) ===
     ast_hits = apis.get("assets") or []
@@ -228,22 +243,24 @@ def persist_dbs(data: dict, store: BankStore, rules: list[dict] | None = None) -
             bal_obj = a.get("availableBalance") or {}
             currency = bal_obj.get("currency") or "TWD"
             try:
-                domestic_bal = float(bal_obj.get("domesticCurrencyBalance") or 0)
+                with error_step('DBS-08-004-016'):
+                    domestic_bal = float(bal_obj.get("domesticCurrencyBalance") or 0)
             except (TypeError, ValueError):
                 domestic_bal = 0.0
             # raw_balance 存「原幣 balance」（不是 domesticCurrencyBalance）
             # 配合 portfolio router 走 fx_service 換 TWD，避免雙重計算
             raw = {**a, "currency": currency}
-            accts.append({
-                "account_no": acct_no,
-                "currency": currency,
-                "branch": None,
-                "nickname": a.get("schemeName"),
-                "type": a.get("schemeType"),
-                "product_type": account_classify.classify_account("dbs", raw),
-                "raw_balance": _num_real(bal_obj.get("balance")),
-                "raw_balance_date": today,
-            })
+            with error_step('DBS-08-004-013'):
+                accts.append({
+                    "account_no": acct_no,
+                    "currency": currency,
+                    "branch": None,
+                    "nickname": a.get("schemeName"),
+                    "type": a.get("schemeType"),
+                    "product_type": account_classify.classify_account("dbs", raw),
+                    "raw_balance": _num_real(bal_obj.get("balance"), _codes=('SYS-08-001-001', 'DBS-08-837-002', 'SYS-08-001-003', 'DBS-08-837-004', 'DBS-08-837-005', 'DBS-08-837-006', 'SYS-08-001-007', 'DBS-08-837-008', 'DBS-08-837-009', 'DBS-08-837-010')),
+                    "raw_balance_date": today,
+                })
             twd_total += domestic_bal
     # 貸款帳戶：liabilities[0].resp.loan — 使用者鐵律：所有爬蟲都該處理貸款
     liab_hits = apis.get("liabilities") or []
@@ -265,64 +282,75 @@ def persist_dbs(data: dict, store: BankStore, rules: list[dict] | None = None) -
                 # loan balance defensive：試 outstanding 或 balance 結構
                 bal_raw = (ln.get("outstandingBalance") or ln.get("balance")
                            or (ln.get("availableBalance", {}) or {}).get("balance"))
-                accts.append({
-                    "account_no": acct_no,
-                    "currency": ln.get("currency") or "TWD",
-                    "branch": None,
-                    "nickname": ln.get("schemeName") or "DBS 貸款",
-                    "type": ln.get("schemeType") or "loan",
-                    "product_type": account_classify.classify_account("dbs", raw),
-                    "raw_balance": _num_real(bal_raw),
-                    "raw_balance_date": today,
-                })
+                with error_step('DBS-08-004-017'):
+                    accts.append({
+                        "account_no": acct_no,
+                        "currency": ln.get("currency") or "TWD",
+                        "branch": None,
+                        "nickname": ln.get("schemeName") or "DBS 貸款",
+                        "type": ln.get("schemeType") or "loan",
+                        "product_type": account_classify.classify_account("dbs", raw),
+                        "raw_balance": _num_real(bal_raw, _codes=('SYS-08-001-001', 'DBS-08-838-002', 'SYS-08-001-003', 'DBS-08-838-004', 'DBS-08-838-005', 'DBS-08-838-006', 'SYS-08-001-007', 'DBS-08-838-008', 'DBS-08-838-009', 'DBS-08-838-010')),
+                        "raw_balance_date": today,
+                    })
     if accts:
-        store.upsert_accounts(accts)
-        store.upsert_balance_history([{
-            "snapshotDate": today,
-            "twdBalance": twd_total if twd_total else None,
-            "fxBalance": None,
-        }])
+        with error_step('DBS-08-004-005'):
+            store.upsert_accounts(accts)
+        with error_step('DBS-08-004-006'):
+            store.upsert_balance_history([{
+                "snapshotDate": today,
+                "twdBalance": twd_total if twd_total else None,
+                "fxBalance": None,
+            }])
         delta["balance_days"] = 1
-        store.put_daily_metric("dbs_balance_latest",
-                                {"twd": twd_total, "n_accounts": len(accts)}, today)
+        with error_step('DBS-08-004-007'):
+            store.put_daily_metric("dbs_balance_latest",
+                                    {"twd": twd_total, "n_accounts": len(accts)}, today)
 
     # === C. 存款交易明細 (overview 帳戶 row drilldown) ===
-    twd_rows = _parse_dbs_twd_transactions(apis, account_by_global_id)
+    with error_step('DBS-08-004-001'):
+        twd_rows = _parse_dbs_twd_transactions(apis, account_by_global_id)
     if twd_rows:
-        delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules)
+        with error_step('DBS-08-004-008'):
+            delta["twd_txn_new"] = store.upsert_twd_txns(twd_rows, rules=rules)
     for hit in apis.get("inquiry") or []:
         url = hit.get("url") or ""
         resp = hit.get("resp") or {}
         if "historical-summary/inquiry" in url:
-            store.put_daily_metric("dbs_twd_historical_summary", {
-                "request": hit.get("req_body"),
-                "historicalSummaries": resp.get("historicalSummaries") or [],
-            }, today)
+            with error_step('DBS-08-004-014'):
+                store.put_daily_metric("dbs_twd_historical_summary", {
+                    "request": hit.get("req_body"),
+                    "historicalSummaries": resp.get("historicalSummaries") or [],
+                }, today)
         elif "transactions-history/inquiry" in url:
-            store.put_daily_metric("dbs_twd_transactions_history", {
-                "request": hit.get("req_body"),
-                "pageInfo": resp.get("pageInfo") or {},
-                "count": len(resp.get("transactions") or []),
-            }, today)
+            with error_step('DBS-08-004-018'):
+                store.put_daily_metric("dbs_twd_transactions_history", {
+                    "request": hit.get("req_body"),
+                    "pageInfo": resp.get("pageInfo") or {},
+                    "count": len(resp.get("transactions") or []),
+                }, today)
 
     # === D. customer-profile → daily_metrics ===
     cp_hits = apis.get("customer-profile") or []
     if cp_hits:
         cp_resp = cp_hits[0].get("resp") or {}
         if isinstance(cp_resp, dict):
-            store.put_daily_metric("dbs_customer_profile_keys", {
-                "keys": sorted(cp_resp.keys()),
-            }, today)
+            with error_step('DBS-08-004-015'):
+                store.put_daily_metric("dbs_customer_profile_keys", {
+                    "keys": sorted(cp_resp.keys()),
+                }, today)
 
     # === D. endpoint 地圖 dump ===
     eps = data.get("_all_endpoints") or []
     if eps:
-        store.put_daily_metric("dbs_endpoints", {"endpoints": eps}, today)
+        with error_step('DBS-08-004-009'):
+            store.put_daily_metric("dbs_endpoints", {"endpoints": eps}, today)
 
     delta.setdefault("balance_days", 0)
     delta.setdefault("twd_txn_new", 0)
     delta["card_billed_new"] = cc_new
     delta["card_unbilled"] = 0
     delta["card_current"] = 0  # 第一輪 dashboard 無逐筆明細，需點信用卡 menu
-    store.log_sync(delta)
+    with error_step('DBS-08-004-002'):
+        store.log_sync(delta)
     return delta

@@ -52,7 +52,8 @@ def test_cli_private_json_failure_preserves_previous_file(tmp_path, monkeypatch)
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
-def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch):
+@pytest.mark.parametrize("boundary", ["inner", "public"])
+def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch, capsys, boundary):
     from cli import cli
 
     class FakeCrawler:
@@ -89,10 +90,26 @@ def test_cli_configures_both_cursors_and_validates_before_persist(monkeypatch):
         cli, "_write_private_json",
         lambda *_args, **_kwargs: pytest.fail("invalid payload must not be written"),
     )
+    from backend.core import persist
+    monkeypatch.setattr(
+        persist, "persist_collected",
+        lambda *_args, **_kwargs: pytest.fail("invalid coverage must not be persisted"),
+    )
     monkeypatch.setenv("BANK_CRAWLER_HISTORY_MODE", "full")
 
-    with pytest.raises(ValueError, match="history coverage"):
-        cli.cmd_sync(SimpleNamespace(bank="sinopac", headless=True))
+    args = SimpleNamespace(bank="sinopac", headless=True)
+    if boundary == "inner":
+        with pytest.raises(ValueError, match="history coverage"):
+            cli._cmd_sync(args)
+    else:
+        assert cli.cmd_sync(args) == 1
+        output = capsys.readouterr()
+        assert output.out == (
+            "[sync] 失敗: [SINOPAC-07-985-005] 歷史覆蓋合約：覆蓋證據不是物件"
+            " | sync_failed:ValueError\n"
+        )
+        assert "invalid history coverage" not in output.out + output.err
+        assert "Traceback" not in output.out + output.err
 
     assert set(crawler.cursor_domains) == {
         "twd_transactions", "card_billed_transactions", "account_transactions",

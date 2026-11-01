@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.core.base import validate_history_coverage, write_private_json
 from backend.core.store import BankStore
+from backend.core.error_codes import bank_error_id, error_step
+from backend.core.sync_errors import raise_crawler_failure, safe_failure_message
 
 BANKS = {"cathay", "ubot", "hsbc", "ctbc", "sinopac", "scsb", "esun", "taishin", "fubon", "dbs", "scb", "linebank", "rakuten"}
 
@@ -36,78 +38,61 @@ def _remove_private_json(path: Path) -> None:
 
 
 def _get_crawler(bank: str):
-    if bank == "cathay":
-        from backend.banks.cathay import CathayCrawler, BASE
-        return CathayCrawler(), f"{BASE}/mybank/"
-    if bank == "ubot":
-        from backend.banks.ubot import UbotCrawler, BASE
-        return UbotCrawler(), BASE
-    if bank == "hsbc":
-        from backend.banks.hsbc import HsbcCrawler, BASE
-        return HsbcCrawler(), BASE
-    if bank == "ctbc":
-        from backend.banks.ctbc import CtbcCrawler, BASE
-        return CtbcCrawler(), BASE
-    if bank == "sinopac":
-        from backend.banks.sinopac import SinopacCrawler, BASE
-        return SinopacCrawler(), BASE
-    if bank == "scsb":
-        from backend.banks.scsb import ScsbCrawler, BASE
-        return ScsbCrawler(), BASE
-    if bank == "esun":
-        from backend.banks.esun import EsunCrawler, BASE
-        return EsunCrawler(), BASE
-    if bank == "taishin":
-        from backend.banks.taishin import TaishinCrawler, BASE
-        return TaishinCrawler(), BASE
-    if bank == "fubon":
-        from backend.banks.fubon import FubonCrawler, BASE
-        return FubonCrawler(), BASE
-    if bank == "dbs":
-        from backend.banks.dbs import DbsCrawler, BASE
-        return DbsCrawler(), BASE
-    if bank == "scb":
-        from backend.banks.scb import ScbCrawler, BASE
-        return ScbCrawler(), BASE
-    if bank == "linebank":
-        from backend.banks.linebank import LinebankCrawler, BASE
-        return LinebankCrawler(), BASE
-    if bank == "rakuten":
-        from backend.banks.rakuten import RakutenCrawler, BASE
-        return RakutenCrawler(), BASE
-    raise SystemExit(f"未支援的銀行: {bank}（目前支援: {sorted(BANKS)}）")
+    if bank not in BANKS:
+        raise SystemExit(f"未支援的銀行: {bank}（目前支援: {sorted(BANKS)}）")
+    with error_step(bank_error_id(bank, "00-001-001")):
+        cls_name = f"{bank.capitalize()}Crawler"
+        mod = __import__(f"backend.banks.{bank}", fromlist=[cls_name, "BASE"])
+        crawler_cls, base_url = getattr(mod, cls_name), mod.BASE
+    with error_step(bank_error_id(bank, "00-002-001")):
+        crawler = crawler_cls()
+    return crawler, f"{base_url}/mybank/" if bank == "cathay" else base_url
 
 
 def cmd_sync(args):
+    try:
+        return _cmd_sync(args)
+    except Exception as exc:
+        print(f"[sync] 失敗: {safe_failure_message(exc, args.bank)}")
+        return 1
+
+
+def _cmd_sync(args):
     raw = Path(__file__).resolve().parents[1] / "backend" / "data" / f"{args.bank}_collected.json"
     # E.SUN and Rakuten history is customer-bearing; canonical DB only.
     if args.bank in {"esun", "rakuten"}:
-        _remove_private_json(raw)
+        with error_step(bank_error_id(args.bank, "09-007-001")):
+            _remove_private_json(raw)
     crawler, login_url = _get_crawler(args.bank)
     print(f"[sync] {args.bank} 登入抓取中…（headless={args.headless}）", file=sys.stderr)
-    store = BankStore(args.bank)
+    with error_step(bank_error_id(args.bank, "00-003-001")):
+        store = BankStore(args.bank)
     try:
-        crawler.configure_transaction_cursor(
-            "twd_transactions", store.latest_twd_transaction_dates(),
-        )
-        crawler.configure_transaction_cursor(
-            "account_transactions",
-            getattr(store, "latest_account_transaction_dates", lambda: {})(),
-        )
-        crawler.configure_transaction_cursor(
-            "card_billed_transactions", store.latest_card_transaction_dates(),
-        )
-        result = crawler.run(login_url=login_url, headless=args.headless)
+        with error_step(bank_error_id(args.bank, "00-004-001")):
+            crawler.configure_transaction_cursor(
+                "twd_transactions", store.latest_twd_transaction_dates(),
+            )
+        with error_step(bank_error_id(args.bank, "00-005-001")):
+            crawler.configure_transaction_cursor(
+                "account_transactions",
+                getattr(store, "latest_account_transaction_dates", lambda: {})(),
+            )
+        with error_step(bank_error_id(args.bank, "00-006-001")):
+            crawler.configure_transaction_cursor(
+                "card_billed_transactions", store.latest_card_transaction_dates(),
+            )
+        with error_step(bank_error_id(args.bank, "09-900-001")):
+            result = crawler.run(login_url=login_url, headless=args.headless)
         if result.get("error"):
-            print("[sync] 失敗: crawler_failed")
-            return 1
+            raise_crawler_failure(crawler, result)
         data = result.get("data", {})
         if crawler.HISTORY_COVERAGE_REQUIRED:
-            validate_history_coverage(
-                data.get("history_coverage"),
-                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
-                expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
-            )
+            with error_step(bank_error_id(args.bank, "07-950-001")):
+                validate_history_coverage(
+                    data.get("history_coverage"),
+                    expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
+                    expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
+                )
 
 
         # 2026-07-28: CLI 原本 13 個分支全都沒傳 rules → category/subcategory 永遠 NULL,
@@ -118,17 +103,28 @@ def cmd_sync(args):
         # 工具, 沒 rule 就等於整個 taxonomy 失效, 不該靜默降級。
         from backend.server import rules_repo
         from backend.server.seed_rules import DEFAULT_RULES
-        rules = rules_repo.list_rules(user_id=1, enabled_only=True)
+        with error_step(bank_error_id(args.bank, "09-006-001")):
+            rules = rules_repo.list_rules(user_id=1, enabled_only=True)
         if not rules:
             rules = sorted(DEFAULT_RULES, key=lambda r: -r.get("priority", 100))
         from backend.core.persist import persist_collected
 
-        delta = persist_collected(args.bank, data, store, rules=rules)
+        with error_step(bank_error_id(args.bank, "08-900-001")):
+            delta = persist_collected(args.bank, data, store, rules=rules)
         if args.bank not in {"esun", "rakuten"}:
-            _write_private_json(raw, result)
-        stats = store.stats()
-    finally:
-        store.close()
+            with error_step(bank_error_id(args.bank, "09-005-001")):
+                _write_private_json(raw, result)
+        with error_step(bank_error_id(args.bank, "08-910-001")):
+            stats = store.stats()
+    except BaseException:
+        try:
+            store.close()
+        except Exception:
+            pass  # Cleanup must not replace the original action ID.
+        raise
+    else:
+        with error_step(bank_error_id(args.bank, "08-920-001")):
+            store.close()
 
     print("\n===== 增量同步結果 =====")
     print(f"  台幣交易    本次新增 {delta.get('twd_txn_new', 0)} 筆")

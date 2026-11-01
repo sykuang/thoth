@@ -71,10 +71,16 @@ def test_collect_error_is_sanitized_before_serialization(crawler, error, capsys)
     crawler.payload.error = error
     crawler.payload.to_dict = Mock(side_effect=AssertionError('must not serialize'))
     result = crawler.run('offline')
-    assert result['error'] == 'collect_failed: ValueError: code=collect_contract'
+    assert result['error'] == (
+        '[CATHAY-07-900-002] 結果驗證：回傳內容帶有失敗標記 | '
+        'collect_failed: ValueError: code=collect_contract'
+    )
     assert 'data' not in result
     assert set(result) == {'error', 'collect_diagnostics'}
-    assert result['collect_diagnostics'] == {'exception': 'ValueError', 'code': 'collect_contract'}
+    assert result['collect_diagnostics'] == {
+        'exception': 'ValueError', 'code': 'collect_contract',
+        'error_id': 'CATHAY-07-900-002',
+    }
     crawler.payload.to_dict.assert_not_called()
     crawler.logout.assert_called_once()
     assert 'synthetic sentinel' not in repr(result) + capsys.readouterr().err
@@ -116,10 +122,19 @@ def test_consumers_stop_before_coverage_persist_and_cursor_write(monkeypatch, cr
         with pytest.raises(RuntimeError) as caught:
             sync_runner._dispatch_crawler_and_persist('cathay', 1)
         text = str(caught.value)
+        assert text == 'crawler_failed'
+        assert type(caught.value) is sync_runner._CollectDiagnosticError
+        assert caught.value.diagnostics == {
+            'exception': 'ValueError', 'code': 'collect_contract',
+            'error_id': 'CATHAY-07-900-002',
+        }
     else:
         assert cli.cmd_sync(SimpleNamespace(bank='cathay', headless=True)) == 1
         text = capsys.readouterr().out
-    assert 'crawler_failed' in text
+        assert text == (
+            '[sync] 失敗: [CATHAY-07-900-002] 結果驗證：回傳內容帶有失敗標記 | '
+            'collect_failed: ValueError: code=collect_contract\n'
+        )
     assert 'synthetic sentinel' not in text
     coverage_call.assert_not_called()
     persist_call.assert_not_called()

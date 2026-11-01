@@ -96,7 +96,7 @@ def test_extraction_rechecks_changed_header_semantics_after_binding(page):
         "{ cell.textContent = headers[index]; })", BAD_HEADERS,
     )
     extracted = page.evaluate(ScsbCrawler._twd_inquiry_extract_result_script(), EXPECTED)
-    assert extracted == {"ok": False, "empty": False, "row_count": 0, "text": ""}
+    assert extracted == {"ok": False, "empty": False, "row_count": 0, "text": "", "_diagnostic": "SCSB-05-612-005"}
 
 
 @pytest.mark.parametrize("headers", [
@@ -145,7 +145,7 @@ def test_hidden_header_cannot_attest_reversed_visible_directions(page, hidden_st
     }""")
     assert page.evaluate(
         ScsbCrawler._twd_inquiry_extract_result_script(), EXPECTED,
-    ) == {"ok": False, "empty": False, "row_count": 0, "text": ""}
+    ) == {"ok": False, "empty": False, "row_count": 0, "text": "", "_diagnostic": "SCSB-05-612-005"}
 
 
 @pytest.fixture

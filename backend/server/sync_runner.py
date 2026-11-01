@@ -6,7 +6,7 @@ Phase 1 — Sync runner（背景 thread + sync_jobs state machine）。
   - `run_sync_job(user_id, bank, headless)` 同步 INSERT queued、開 daemon thread、立刻回 job_id
   - thread 跑 `_exec_sync(job_id)`：UPDATE running → 取 user_id+bank → 設 env BANK_CRAWLER_USER_ID
     → dispatch 對應 BankCrawler & persist_* → UPDATE done|failed
-  - 任何 exception 都 catch、寫 error_msg、status=failed（thread 不該炸到外面）
+  - 一般失敗寫 error_msg/status=failed；儲存本身失敗時安全回報，不偽造終態
 
 WebSocket 推播留給 T1.8；Phase 1 只有 polling /sync/jobs/{id}。
 
@@ -23,6 +23,11 @@ import os
 import sys
 import threading
 
+from backend.core.error_codes import bank_error_id, error_step
+from backend.core.sync_errors import (
+    CollectDiagnosticError as _CollectDiagnosticError,  # noqa: F401 - compatibility export for existing callers
+    raise_crawler_failure, safe_failure_message,
+)
 from backend.server import sync_batches_repo, sync_jobs_repo
 from backend.server.dashboard_cache import clear_dashboard_cache
 
@@ -58,8 +63,9 @@ def _load_crawler(bank: str):
         mod_name, cls_name = _CRAWLER_MODULE_MAP[bank]
     except KeyError:
         raise ValueError(f"unknown bank: {bank!r}") from None
-    mod = __import__(mod_name, fromlist=[cls_name, "BASE"])
-    return mod, getattr(mod, cls_name)
+    with error_step(bank_error_id(bank, "00-001-001")):
+        mod = __import__(mod_name, fromlist=[cls_name, "BASE"])
+        return mod, getattr(mod, cls_name)
 
 
 def _required_history_domains(bank: str) -> frozenset[str]:
@@ -80,20 +86,18 @@ class _PersistenceError(RuntimeError):
     """Identify only the persist call boundary; retain the original cause."""
 
 
-class _CollectDiagnosticError(RuntimeError):
-    """Carry only validated collect metadata to the job failure boundary."""
-
-    def __init__(self, crawler: object, diagnostics: dict[str, str]):
-        super().__init__("crawler_failed")
-        self.crawler = crawler
-        self.diagnostics = diagnostics
-
-
 def _launch_job(job_id: int) -> None:
     mode = os.environ.get("SYNC_EXECUTION_MODE", "inprocess").strip().lower()
     if mode == "external":
         return
-    threading.Thread(target=_exec_sync, args=(job_id,), daemon=True).start()
+
+    def execute(queued_job_id: int) -> None:
+        try:
+            _exec_sync(queued_job_id)
+        except Exception as exc:
+            print(f"[sync] {safe_failure_message(exc, None)}; details withheld", file=sys.stderr)
+
+    threading.Thread(target=execute, args=(job_id,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +209,7 @@ def reconcile_batch_fanout(
 def _exec_sync(job_id: int) -> bool:
     """thread entry：UPDATE running → dispatch → UPDATE done|failed。
 
-    所有 exception 都 catch；thread 不該炸到外面。
+    一般同步失敗寫回狀態；終態儲存錯誤向外傳遞，由執行入口安全收尾。
 
     L5-1: 若 job 有 account_id, 設 BANK_CRAWLER_ACCOUNT_ID env (新路徑);
           否則 fallback to legacy BANK_CRAWLER_USER_ID env (老路徑)。
@@ -275,42 +279,24 @@ def _exec_sync(job_id: int) -> bool:
                 else:
                     os.environ["BANK_CRAWLER_HISTORY_MODE"] = old_history_mode
     except Exception as e:
-        if type(e) is _CollectDiagnosticError:
-            error = "sync_failed:RuntimeError"
-            try:
-                from backend.core.base import (
-                    _format_collect_diagnostics, _validated_collect_diagnostics,
-                )
-                diagnostics = _validated_collect_diagnostics(e.crawler, e.diagnostics)
-                if diagnostics:
-                    error = _format_collect_diagnostics(diagnostics)
-            except Exception:
-                pass  # Invalid carrier/import must not expose arbitrary error text.
-        elif type(e) is _PersistenceError:
-            from backend.core.base import _safe_exception_type
-
-            cause = e.__cause__
-            family = _safe_exception_type(cause) if cause is not None else "Exception"
-            error = f"sync_failed:{family}: phase=persistence"
-            print(f"[sync] {error}; details withheld", file=sys.stderr)
-        else:
-            error = "sync_failed:Exception"
-            try:
-                from backend.core.base import _safe_exception_type
-
-                error = f"sync_failed:{_safe_exception_type(e)}"
-            except ImportError:
-                pass  # Even a crawler import failure must retain the safe sink.
+        error = safe_failure_message(e, bank, persistence=type(e) is _PersistenceError)
+        print(f"[sync] {error}; details withheld", file=sys.stderr)
 
     # 3. 寫回 DB
     if error is None:
         # Persist 已落地後先清 process-local aggregate cache；frontend 看見 done
         # 才會 refetch，不能讓 refetch 又拿到同步前的 30 秒舊值。
-        clear_dashboard_cache(user_id)
-        sync_jobs_repo.mark_done(
-            job_id,
-            json.dumps(summary, ensure_ascii=False) if summary else "{}",
-        )
+        try:
+            with error_step(bank_error_id(bank, "09-001-001")):
+                clear_dashboard_cache(user_id)
+            with error_step(bank_error_id(bank, "09-002-001")):
+                summary_json = json.dumps(summary, ensure_ascii=False) if summary else "{}"
+            with error_step(bank_error_id(bank, "09-003-001")):
+                sync_jobs_repo.mark_done(job_id, summary_json)
+        except Exception as exc:
+            error = safe_failure_message(exc, bank)
+
+    if error is None:
         # L11 (2026-06-22): push notification on sync success.
         # 失敗一律吞 — push 失敗絕不該擋 sync 結果寫回。
         # 2026-06-23: batch_id 為非 None → skip 個別 sync_done, 改走 batch summary
@@ -332,7 +318,8 @@ def _exec_sync(job_id: int) -> bool:
                 user_id, bank, type(exc).__name__,
             )
     else:
-        sync_jobs_repo.mark_failed(job_id, error[:8000])
+        with error_step(bank_error_id(bank, "09-004-001")):
+            sync_jobs_repo.mark_failed(job_id, error[:8000])
         # 失敗一律個別推 — 失敗不能漏 (使用者同意), batch 內也照推
         _send_sync_notification(
             user_id=user_id, bank=bank, ok=False, error_brief=_brief_error(error),
@@ -634,8 +621,15 @@ def _format_sync_summary(summary: dict | None) -> str:
 
 
 def _brief_error(error: str) -> str:
-    """錯誤字串太長,只取第一行 100 字。"""
+    """Budget optional details to 100 chars, never slice registered identity/copy."""
+    from backend.core.error_codes import format_error_id
+
     first_line = error.split("\n", 1)[0]
+    if first_line.startswith("["):
+        error_id, separator, _ = first_line[1:].partition("]")
+        prefix = format_error_id(error_id) if separator else None
+        if prefix:
+            return prefix if len(prefix) >= 100 else first_line[:100]
     return first_line[:100]
 
 
@@ -699,55 +693,57 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
     except Exception:
         rules = None
 
-    mod, crawler_cls = _load_crawler(bank)
-    base_url = mod.BASE
+    with error_step(bank_error_id(bank, "00-001-001")):
+        mod, crawler_cls = _load_crawler(bank)
+        base_url = mod.BASE
 
-    crawler = crawler_cls()
+    with error_step(bank_error_id(bank, "00-002-001")):
+        crawler = crawler_cls()
     # cathay 特例（cli 也是這樣寫）
     login_url = f"{base_url}/mybank/" if bank == "cathay" else base_url
 
     source_account_id = os.environ.get("BANK_CRAWLER_ACCOUNT_ID")
-    store = BankStore(
-        bank,
-        user_id=user_id,
-        source_account_id=int(source_account_id) if source_account_id else None,
-    )
+    with error_step(bank_error_id(bank, "00-003-001")):
+        store = BankStore(
+            bank,
+            user_id=user_id,
+            source_account_id=int(source_account_id) if source_account_id else None,
+        )
     try:
-        crawler.configure_transaction_cursor(
-            "twd_transactions", store.latest_twd_transaction_dates(),
-        )
-        crawler.configure_transaction_cursor(
-            "account_transactions",
-            getattr(store, "latest_account_transaction_dates", lambda: {})(),
-        )
-        crawler.configure_transaction_cursor(
-            "card_billed_transactions", store.latest_card_transaction_dates(),
-        )
-        result = crawler.run(login_url=login_url, headless=headless)
+        with error_step(bank_error_id(bank, "00-004-001")):
+            crawler.configure_transaction_cursor(
+                "twd_transactions", store.latest_twd_transaction_dates(),
+            )
+        with error_step(bank_error_id(bank, "00-005-001")):
+            crawler.configure_transaction_cursor(
+                "account_transactions",
+                getattr(store, "latest_account_transaction_dates", lambda: {})(),
+            )
+        with error_step(bank_error_id(bank, "00-006-001")):
+            crawler.configure_transaction_cursor(
+                "card_billed_transactions", store.latest_card_transaction_dates(),
+            )
+        with error_step(bank_error_id(bank, "09-900-001")):
+            result = crawler.run(login_url=login_url, headless=headless)
         if result.get("error"):
-            diagnostics = result.get("collect_diagnostics")
-            if diagnostics is not None:
-                from backend.core.base import _validated_collect_diagnostics
-
-                validated = _validated_collect_diagnostics(crawler, diagnostics)
-                if validated:
-                    raise _CollectDiagnosticError(crawler, validated)
-            raise RuntimeError("crawler_failed")
+            raise_crawler_failure(crawler, result)
         data = result.get("data", {})
         coverage_summary = None
         if crawler.HISTORY_COVERAGE_REQUIRED:
             from backend.core.base import validate_history_coverage
 
-            coverage_summary = validate_history_coverage(
-                data.get("history_coverage"),
-                expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
-                expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
-            )
+            with error_step(bank_error_id(bank, "07-950-001")):
+                coverage_summary = validate_history_coverage(
+                    data.get("history_coverage"),
+                    expected_mode=os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full"),
+                    expected_domains=crawler.HISTORY_COVERAGE_DOMAINS,
+                )
 
         from backend.core.persist import persist_collected
 
         try:
-            delta = persist_collected(bank, data, store, rules=rules)
+            with error_step(bank_error_id(bank, "08-900-001")):
+                delta = persist_collected(bank, data, store, rules=rules)
         except Exception as exc:
             raise _PersistenceError("persistence_failed") from exc
         from backend.server.auto_debit_payments import apply_auto_debit_payments
@@ -758,7 +754,8 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
             )
         except Exception as exc:  # derived facts never fail an otherwise persisted sync
             print(f"[sync][{bank}] auto-debit derivation skipped: {type(exc).__name__}", file=sys.stderr)
-        stats = store.stats()
+        with error_step(bank_error_id(bank, "08-910-001")):
+            stats = store.stats()
     except BaseException:
         try:
             store.close()
@@ -766,7 +763,8 @@ def _dispatch_crawler_and_persist(bank: str, user_id: int, headless: bool = True
             pass  # Keep the primary failure, especially its validated diagnostic.
         raise
     else:
-        store.close()
+        with error_step(bank_error_id(bank, "08-920-001")):
+            store.close()
 
     return {
         "delta": delta,

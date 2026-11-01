@@ -39,6 +39,7 @@ from backend.core.card_bills import (
 )
 from backend.core.creds import UbotCreds
 from backend.core.captcha import solve_captcha, wait_captcha_stable
+from backend.core.error_codes import error_step, with_error_code, exception_error_id
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
@@ -131,29 +132,45 @@ _OPTIONAL_PASSWORD_PATTERN = re.compile(
 )
 
 
-def _unique_visible_enabled_exact(page, selector: str, label: str):
+def _unique_visible_enabled_exact(page, selector: str, label: str, *, error_ids=(
+    'UBOT-06-400-001', 'UBOT-06-401-001', 'UBOT-06-402-001',
+    'UBOT-06-403-100', 'UBOT-06-403-101', 'UBOT-06-403-102',
+    'UBOT-06-403-001', 'UBOT-06-450-001', 'UBOT-06-450-002',
+), failure=None):
+    # Only a required caller supplies this bounded, per-call diagnostic slot.
+    if failure is not None:
+        failure.clear()
     try:
-        candidates = page.locator(selector)
+        with error_step(error_ids[0]):
+            candidates = page.locator(selector)
         matches = []
-        for index in range(candidates.count()):
-            candidate = candidates.nth(index)
+        for index in range(error_step(error_ids[1])(lambda: candidates.count())()):
+            with error_step(error_ids[2]):
+                candidate = candidates.nth(index)
             if (
-                candidate.is_visible()
-                and candidate.is_enabled()
-                and " ".join(candidate.inner_text().split()) == label
+                error_step(error_ids[3])(lambda: candidate.is_visible())()
+                and error_step(error_ids[4])(lambda: candidate.is_enabled())()
+                and error_step(error_ids[6])(lambda: " ".join(error_step(error_ids[5])(lambda: candidate.inner_text())().split()))() == label
             ):
                 matches.append(candidate)
+        if failure is not None and len(matches) != 1:
+            failure[:] = [error_ids[7] if not matches else error_ids[8]]
         return matches[0] if len(matches) == 1 else None
-    except Exception:
+    except Exception as error:
+        if failure is not None:
+            from backend.core.error_codes import exception_error_id
+            failure[:] = [exception_error_id(error, bank='ubot')]
         return None
 
 
 def _any_visible(page, selector: str) -> bool:
-    candidates = page.locator(selector)
-    return any(
-        candidates.nth(index).is_visible()
-        for index in range(candidates.count())
-    )
+    with error_step('UBOT-06-404-001'):
+        candidates = page.locator(selector)
+    with error_step('UBOT-06-405-001'):
+        return any(
+            error_step('UBOT-06-405-101')(lambda: error_step('UBOT-06-405-100')(lambda: candidates.nth(index))().is_visible())()
+            for index in range(error_step('UBOT-06-405-102')(lambda: candidates.count())())
+        )
 
 
 class UbotLoginError(RuntimeError):
@@ -345,7 +362,7 @@ class UbotCrawler(BankCrawler):
     @staticmethod
     def _history_windows(start: date, end: date) -> list[tuple[date, date]]:
         if start > end:
-            raise RuntimeError("ubot-twd-history-range")
+            raise with_error_code(RuntimeError('ubot-twd-history-range'), 'UBOT-05-400-001')
         windows = []
         cursor = start
         while cursor <= end:
@@ -362,39 +379,64 @@ class UbotCrawler(BankCrawler):
         floor = self._history_floor(end)
         cursor = self.transaction_start_for(identity)
         if isinstance(cursor, date) and cursor > end:
-            raise RuntimeError("ubot-twd-history-cursor")
+            raise with_error_code(RuntimeError('ubot-twd-history-cursor'), 'UBOT-05-401-001')
         if mode == "full" or (mode == "incremental" and cursor is None):
             return floor, end
-        if mode != "incremental" or not isinstance(cursor, date):
-            raise RuntimeError("ubot-twd-history-mode")
+        if mode != "incremental":
+            raise with_error_code(RuntimeError('ubot-twd-history-mode'), 'UBOT-05-402-001')
+        if not isinstance(cursor, date):
+            raise with_error_code(RuntimeError('ubot-twd-history-mode'), 'UBOT-05-402-002')
         overlap = cursor - timedelta(days=7)
         return max(floor, overlap.replace(day=1)), end
 
     @classmethod
     def _validate_twd_form(cls, snapshot, *, as_of: date) -> list[dict]:
         error = "ubot-twd-history-form"
-        if not isinstance(snapshot, dict) or set(snapshot) != {"selects", "search_buttons"}:
-            raise RuntimeError(error)
+        if not isinstance(snapshot, dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-04-400-001')
+        if set(snapshot) != {"selects", "search_buttons"}:
+            raise with_error_code(RuntimeError(error), 'UBOT-04-400-002')
         selects = snapshot["selects"]
-        if (
-            not isinstance(selects, list) or len(selects) != 2
-            or type(snapshot["search_buttons"]) is not int
-            or snapshot["search_buttons"] != 1
-        ):
-            raise RuntimeError(error)
-        for select in selects:
-            if (
-                not isinstance(select, dict) or set(select) != {"enabled", "options"}
-                or select["enabled"] is not True
-            ):
-                raise RuntimeError(error)
-            if not isinstance(select["options"], list) or any(
-                not isinstance(option, dict) or set(option) != {"text", "value"}
-                or not isinstance(option["text"], str)
-                or not isinstance(option["value"], str)
-                for option in select["options"]
-            ):
-                raise RuntimeError(error)
+        if not isinstance(selects, list):
+            raise with_error_code(RuntimeError(error), 'UBOT-04-401-001')
+        if len(selects) != 2:
+            raise with_error_code(RuntimeError(error), 'UBOT-04-401-002')
+        if type(snapshot["search_buttons"]) is not int:
+            raise with_error_code(RuntimeError(error), 'UBOT-04-401-003')
+        if snapshot["search_buttons"] != 1:
+            raise with_error_code(RuntimeError(error), 'UBOT-04-401-004')
+        for select_index, select in enumerate(selects):
+            codes = (
+                ('UBOT-04-450-001', 'UBOT-04-450-002', 'UBOT-04-450-003', 'UBOT-04-450-004', 'UBOT-04-450-005', 'UBOT-04-450-006', 'UBOT-04-450-007', 'UBOT-04-450-008')
+                if select_index == 0 else
+                ('UBOT-04-451-001', 'UBOT-04-451-002', 'UBOT-04-451-003', 'UBOT-04-451-004', 'UBOT-04-451-005', 'UBOT-04-451-006', 'UBOT-04-451-007', 'UBOT-04-451-008')
+            )
+            if not isinstance(select, dict):
+                raise with_error_code(RuntimeError(error), codes[0])
+            if set(select) != {"enabled", "options"}:
+                raise with_error_code(RuntimeError(error), codes[1])
+            if select["enabled"] is not True:
+                raise with_error_code(RuntimeError(error), codes[2])
+            if not isinstance(select["options"], list):
+                raise with_error_code(RuntimeError(error), codes[3])
+            rejection = None
+
+            def invalid_option(option):
+                nonlocal rejection
+                if not isinstance(option, dict):
+                    rejection = codes[4]
+                elif set(option) != {"text", "value"}:
+                    rejection = codes[5]
+                elif not isinstance(option["text"], str):
+                    rejection = codes[6]
+                elif not isinstance(option["value"], str):
+                    rejection = codes[7]
+                else:
+                    return False
+                return True
+
+            if any(invalid_option(option) for option in select["options"]):
+                raise with_error_code(RuntimeError(error), rejection)
 
         period_labels = [option["text"] for option in selects[1]["options"]]
         months = []
@@ -403,15 +445,15 @@ class UbotCrawler(BankCrawler):
             months.append(f"{cursor.month}月份")
             cursor = (cursor - timedelta(days=1)).replace(day=1)
         if period_labels != ["當日", "最近一週", "最近一月", *months, "自選日期"]:
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'UBOT-04-402-001')
 
         account_options = selects[0]["options"]
         if len(account_options) < 2:
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'UBOT-04-403-001')
         placeholder = account_options[0]
         pattern = re.compile(r"(?<!\d)(\d{3})-(\d{2})-(\d{7})(?!\d)")
         if placeholder != {"text": "請選擇帳號", "value": ""}:
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), 'UBOT-04-404-001')
         inventory = []
         identities: set[str] = set()
         labels: set[str] = set()
@@ -419,11 +461,18 @@ class UbotCrawler(BankCrawler):
             label = option["text"]
             matches = pattern.findall(label)
             identity = "".join(matches[0]) if len(matches) == 1 else ""
-            if (
-                not label or label != label.strip() or not option["value"]
-                or len(matches) != 1 or identity in identities or label in labels
-            ):
-                raise RuntimeError(error)
+            if not label:
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-001')
+            if label != label.strip():
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-002')
+            if not option["value"]:
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-003')
+            if len(matches) != 1:
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-004')
+            if identity in identities:
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-005')
+            if label in labels:
+                raise with_error_code(RuntimeError(error), 'UBOT-04-407-006')
             identities.add(identity)
             labels.add(label)
             inventory.append({
@@ -432,28 +481,32 @@ class UbotCrawler(BankCrawler):
         return inventory
 
     @staticmethod
-    def _strict_slash_date(value, error: str) -> date:
-        if not isinstance(value, str) or re.fullmatch(r"\d{4}/\d{2}/\d{2}", value) is None:
-            raise RuntimeError(error)
+    def _strict_slash_date(value, error: str, *, error_ids=('UBOT-07-400-001', 'UBOT-07-400-002', 'UBOT-07-402-001')) -> date:
+        if not isinstance(value, str):
+            raise with_error_code(RuntimeError(error), error_ids[0])
+        if re.fullmatch(r"\d{4}/\d{2}/\d{2}", value) is None:
+            raise with_error_code(RuntimeError(error), error_ids[1])
         try:
             return datetime.strptime(value, "%Y/%m/%d").date()
         except ValueError:
-            raise RuntimeError(error) from None
+            raise with_error_code(RuntimeError(error), error_ids[2]) from None
 
     @staticmethod
-    def _strict_twd_amount(value, error: str) -> None:
+    def _strict_twd_amount(value, error: str, *, error_ids=('UBOT-05-403-001', 'UBOT-05-404-001', 'UBOT-05-427-001', 'UBOT-05-405-001', 'UBOT-05-405-002')) -> None:
         if not isinstance(value, str):
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), error_ids[0])
         if value in {"", "-"}:
             return
         if re.fullmatch(r"[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)", value) is None:
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), error_ids[1])
         try:
             amount = Decimal(value.replace(",", ""))
         except InvalidOperation:
-            raise RuntimeError(error) from None
-        if not amount.is_finite() or abs(amount) > Decimal("2147483647"):
-            raise RuntimeError(error)
+            raise with_error_code(RuntimeError(error), error_ids[2]) from None
+        if not amount.is_finite():
+            raise with_error_code(RuntimeError(error), error_ids[3])
+        if abs(amount) > Decimal("2147483647"):
+            raise with_error_code(RuntimeError(error), error_ids[4])
 
     @staticmethod
     def _nttotal_claims_more_pages(total) -> bool:
@@ -514,24 +567,58 @@ class UbotCrawler(BankCrawler):
         parsed = urlparse(hit.url)
         raw = urlparse(hit.raw_url or hit.url)
         expected_path = "/MyBank/IBKB010102"
-        if (
-            parsed.scheme != "https" or raw.scheme != "https"
-            or parsed.hostname != "www.ubot.com.tw" or raw.hostname != "www.ubot.com.tw"
-            or parsed.port not in (None, 443) or raw.port not in (None, 443)
-            or any(value is not None for value in (
+        if parsed.scheme != "https":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-001')
+        if raw.scheme != "https":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-002')
+        if parsed.hostname != "www.ubot.com.tw":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-003')
+        if raw.hostname != "www.ubot.com.tw":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-004')
+        if parsed.port not in (None, 443):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-005')
+        if raw.port not in (None, 443):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-006')
+        if any(value is not None for value in (
                 parsed.username, parsed.password, raw.username, raw.password,
-            ))
-            or parsed.path != expected_path or raw.path != expected_path
-            or parsed.params or raw.params or parsed.query or raw.query
-            or parsed.fragment or raw.fragment
-            or hit.method != "POST" or hit.status != 200 or hit.redirected
-            or hit.main_frame_request is not True
-            or type(hit.request_sequence) is not int or hit.request_sequence <= after_sequence
-            or type(hit.body_size) is not int or not 0 < hit.body_size <= 5_000_000
-            or hit.content_type.split(";", 1)[0].strip().lower() != "application/json"
-            or not isinstance(hit.req_body, (str, dict))
-        ):
-            raise RuntimeError(error)
+            )):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-007')
+        if parsed.path != expected_path:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-008')
+        if raw.path != expected_path:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-009')
+        if parsed.params:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-010')
+        if raw.params:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-011')
+        if parsed.query:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-012')
+        if raw.query:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-013')
+        if parsed.fragment:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-014')
+        if raw.fragment:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-015')
+        if hit.method != "POST":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-016')
+        if hit.status != 200:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-017')
+        if hit.redirected:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-018')
+        if hit.main_frame_request is not True:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-019')
+        if type(hit.request_sequence) is not int:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-020')
+        if hit.request_sequence <= after_sequence:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-021')
+        if type(hit.body_size) is not int:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-022')
+        if not 0 < hit.body_size <= 5_000_000:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-023')
+        if hit.content_type.split(";", 1)[0].strip().lower() != "application/json":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-024')
+        if not isinstance(hit.req_body, (str, dict)):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-406-025')
         expected_form = {"acctNo", "beginDate", "endDate", "sessionId", "sid"}
         if isinstance(hit.req_body, dict):
             form = (
@@ -544,72 +631,91 @@ class UbotCrawler(BankCrawler):
             try:
                 pairs = parse_qsl(hit.req_body, keep_blank_values=True, strict_parsing=True)
             except ValueError:
-                raise RuntimeError(error) from None
+                raise with_error_code(RuntimeError(error), 'UBOT-05-428-001') from None
             form: dict[str, list[str]] = {}
             for key, value in pairs:
                 form.setdefault(key, []).append(value)
-        if (
-            set(form) != expected_form or any(len(values) != 1 for values in form.values())
-            or form["acctNo"] != [identity]
-            or form["beginDate"] != [start.strftime("%Y%m%d")]
-            or form["endDate"] != [end.strftime("%Y%m%d")]
-            or not form["sessionId"][0] or not form["sid"][0]
-        ):
-            raise RuntimeError(error)
+        if set(form) != expected_form:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-001')
+        if any(len(values) != 1 for values in form.values()):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-002')
+        if form["acctNo"] != [identity]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-003')
+        if form["beginDate"] != [start.strftime("%Y%m%d")]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-004')
+        if form["endDate"] != [end.strftime("%Y%m%d")]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-005')
+        if not form["sessionId"][0]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-006')
+        if not form["sid"][0]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-407-007')
 
         payload = hit.resp_json
-        if not isinstance(payload, dict) or set(payload) != {"RespCode", "RespBody"}:
-            raise RuntimeError(error)
+        if not isinstance(payload, dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-408-001')
+        if set(payload) != {"RespCode", "RespBody"}:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-408-002')
         code = payload["RespCode"]
         body = payload["RespBody"]
-        if (
-            not isinstance(code, dict)
-            or set(code) != {"RtnCode", "RtnDesc", "SvcName", "Time"}
-            or any(not isinstance(value, str) for value in code.values())
-            or code.get("SvcName") != "IBKB010102"
-            or re.search(
+        if not isinstance(code, dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-409-001')
+        if set(code) != {"RtnCode", "RtnDesc", "SvcName", "Time"}:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-409-002')
+        if any(not isinstance(value, str) for value in code.values()):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-409-003')
+        if code.get("SvcName") != "IBKB010102":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-409-004')
+        if re.search(
                 r"(?:登入|失效|逾時|錯誤|error|timeout|session|expired|reauth|log\s*in)",
                 code.get("RtnDesc", ""), re.I,
-            )
-        ):
-            raise RuntimeError(error)
+            ):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-409-005')
         if code["RtnCode"] == "UB112":
             if body != {}:
-                raise RuntimeError(error)
+                raise with_error_code(RuntimeError(error), 'UBOT-05-415-001')
             return {"records": [], "status": "explicit_empty", "rows": 0}
-        if (
-            code["RtnCode"] != "0000" or not isinstance(body, dict)
-            or set(body) != {"Account", "NTDetailList", "NTTotal"}
-            or body["Account"] != identity or not isinstance(body["NTDetailList"], list)
-            or not body["NTDetailList"]
-            or not isinstance(body["NTTotal"], dict)
-            or cls._nttotal_claims_more_pages(body["NTTotal"])
-        ):
-            raise RuntimeError(error)
+        if code["RtnCode"] != "0000":
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-001')
+        if not isinstance(body, dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-002')
+        if set(body) != {"Account", "NTDetailList", "NTTotal"}:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-003')
+        if body["Account"] != identity:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-004')
+        if not isinstance(body["NTDetailList"], list):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-005')
+        if not body["NTDetailList"]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-006')
+        if not isinstance(body["NTTotal"], dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-007')
+        if cls._nttotal_claims_more_pages(body["NTTotal"]):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-410-008')
         row_keys = {
             "AccountDate", "Balance", "Expenditure", "Income", "PS", "Summary",
             "TraDate", "TraSum", "TraTime",
         }
         rows = body["NTDetailList"]
         for row in rows:
-            if not isinstance(row, dict) or set(row) != row_keys:
-                raise RuntimeError(error)
+            if not isinstance(row, dict):
+                raise with_error_code(RuntimeError(error), 'UBOT-05-416-001')
+            if set(row) != row_keys:
+                raise with_error_code(RuntimeError(error), 'UBOT-05-416-002')
             if any(not isinstance(row[key], str) for key in row_keys):
-                raise RuntimeError(error)
-            cls._strict_slash_date(row["TraDate"], error)
-            cls._strict_slash_date(row["AccountDate"], error)
+                raise with_error_code(RuntimeError(error), 'UBOT-05-417-001')
+            cls._strict_slash_date(row["TraDate"], error, error_ids=('UBOT-05-600-001', 'UBOT-05-600-002', 'UBOT-05-600-003'))
+            cls._strict_slash_date(row["AccountDate"], error, error_ids=('UBOT-05-601-001', 'UBOT-05-601-002', 'UBOT-05-601-003'))
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", row["TraTime"]) is None:
-                raise RuntimeError(error)
+                raise with_error_code(RuntimeError(error), 'UBOT-05-418-001')
             try:
                 datetime.strptime(row["TraTime"], "%H:%M:%S")
             except ValueError:
-                raise RuntimeError(error) from None
+                raise with_error_code(RuntimeError(error), 'UBOT-05-429-001') from None
             if any(len(row[key]) > 2_000 for key in ("Summary", "TraSum", "PS")):
-                raise RuntimeError(error)
-            for key in ("Expenditure", "Income", "Balance"):
-                cls._strict_twd_amount(row[key], error)
+                raise with_error_code(RuntimeError(error), 'UBOT-05-419-001')
+            for key, error_ids in zip(("Expenditure", "Income", "Balance"), (('UBOT-05-610-001', 'UBOT-05-610-002', 'UBOT-05-610-003', 'UBOT-05-610-004', 'UBOT-05-610-005'), ('UBOT-05-611-001', 'UBOT-05-611-002', 'UBOT-05-611-003', 'UBOT-05-611-004', 'UBOT-05-611-005'), ('UBOT-05-612-001', 'UBOT-05-612-002', 'UBOT-05-612-003', 'UBOT-05-612-004', 'UBOT-05-612-005'))):
+                cls._strict_twd_amount(row[key], error, error_ids=error_ids)
             if row["Expenditure"] not in {"", "-"} and row["Income"] not in {"", "-"}:
-                raise RuntimeError(error)
+                raise with_error_code(RuntimeError(error), 'UBOT-05-420-001')
         return {"records": rows, "status": "complete", "rows": len(rows)}
 
     @staticmethod
@@ -619,20 +725,32 @@ class UbotCrawler(BankCrawler):
             "visible_tables", "visible_rows", "pagers", "busy", "dialogs",
             "stale_tables", "quiet_ms",
         }
-        if (
-            not isinstance(state, dict) or set(state) != keys
-            or any(type(state[key]) is not int or state[key] < 0 for key in keys)
-            or state["pagers"] or state["busy"] or state["dialogs"]
-            or state["stale_tables"] or state["quiet_ms"] < 2_000
-        ):
-            raise RuntimeError(error)
+        if not isinstance(state, dict):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-001')
+        if set(state) != keys:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-002')
+        if any(type(state[key]) is not int or state[key] < 0 for key in keys):
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-003')
+        if state["pagers"]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-004')
+        if state["busy"]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-005')
+        if state["dialogs"]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-006')
+        if state["stale_tables"]:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-007')
+        if state["quiet_ms"] < 2_000:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-411-008')
         expected = (2, rows + 1) if status == "complete" else (0, 0)
-        if rows < 0 or (state["visible_tables"], state["visible_rows"]) != expected:
-            raise RuntimeError(error)
+        if rows < 0:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-412-001')
+        if (state["visible_tables"], state["visible_rows"]) != expected:
+            raise with_error_code(RuntimeError(error), 'UBOT-05-412-002')
 
     @staticmethod
     def _twd_form_snapshot(page):
-        return page.evaluate(r"""() => {
+        with error_step('UBOT-05-430-001'):
+            return page.evaluate(r"""() => {
           const visible = e => {
             if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) return false;
             for (let node = e; node; node = node.parentElement) {
@@ -659,7 +777,8 @@ class UbotCrawler(BankCrawler):
 
     @staticmethod
     def _mark_twd_dom_boundary(page) -> None:
-        page.evaluate(r"""() => {
+        with error_step('UBOT-05-431-001'):
+            page.evaluate(r"""() => {
           if (window.__thothUbotHistoryObserver) window.__thothUbotHistoryObserver.disconnect();
           window.__thothUbotHistoryBoundary = new Map(
             [...document.querySelectorAll('table')].map(table => [table, table.innerHTML])
@@ -710,7 +829,8 @@ class UbotCrawler(BankCrawler):
         state = None
         quiet_candidate_at = None
         for elapsed in range(500, 10_001, 500):
-            page.wait_for_timeout(500)
+            with error_step('UBOT-05-432-001'):
+                page.wait_for_timeout(500)
             state = cls._twd_dom_snapshot(page)
             if (
                 elapsed >= 5_000 and isinstance(state, dict)
@@ -726,7 +846,8 @@ class UbotCrawler(BankCrawler):
 
     @staticmethod
     def _twd_dom_snapshot(page):
-        return page.evaluate(r"""() => {
+        with error_step('UBOT-05-433-001'):
+            return page.evaluate(r"""() => {
           const visible = e => {
             if (!e || !(e.offsetWidth || e.offsetHeight || e.getClientRects().length)) return false;
             for (let node = e; node; node = node.parentElement) {
@@ -795,11 +916,11 @@ class UbotCrawler(BankCrawler):
         as_of = as_of or datetime.now(ZoneInfo("Asia/Taipei")).date()
         def ensure_no_dialog() -> None:
             if getattr(self, "_shared_dialog_blocked", False):
-                raise RuntimeError("ubot-twd-history-dialog")
+                raise with_error_code(RuntimeError('ubot-twd-history-dialog'), 'UBOT-07-401-001')
 
         mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
         if mode not in {"full", "incremental"}:
-            raise RuntimeError("ubot-twd-history-mode")
+            raise with_error_code(RuntimeError('ubot-twd-history-mode'), 'UBOT-05-413-001')
         endpoint = "IBKB010102"
         response_before = len(collector.by_endpoint(endpoint))
         issued_before = collector.issued_count(endpoint)
@@ -833,34 +954,43 @@ class UbotCrawler(BankCrawler):
                     self._twd_form_snapshot(page), as_of=as_of,
                 )
                 if current_inventory != inventory_with_index:
-                    raise RuntimeError("ubot-twd-history-inventory-changed")
-                selects = page.query_selector_all("select")
+                    raise with_error_code(RuntimeError('ubot-twd-history-inventory-changed'), 'UBOT-05-421-001')
+                with error_step('UBOT-05-440-001'):
+                    selects = page.query_selector_all("select")
                 if len(selects) != 2:
-                    raise RuntimeError("ubot-twd-history-form")
-                selects[0].select_option(index=item["index"])
-                page.wait_for_timeout(500)
-                selects[1].select_option(label=f"{window_start.month}月份")
-                page.wait_for_timeout(500)
-                button = _unique_visible_enabled_exact(page, "button", "搜尋")
+                    raise with_error_code(RuntimeError('ubot-twd-history-form'), 'UBOT-05-422-001')
+                with error_step('UBOT-05-434-001'):
+                    selects[0].select_option(index=item["index"])
+                with error_step('UBOT-05-435-001'):
+                    page.wait_for_timeout(500)
+                with error_step('UBOT-05-436-001'):
+                    selects[1].select_option(label=f"{window_start.month}月份")
+                with error_step('UBOT-05-437-001'):
+                    page.wait_for_timeout(500)
+                button_failure = []
+                button = _unique_visible_enabled_exact(page, "button", "搜尋", error_ids=(
+                    'UBOT-05-450-001', 'UBOT-05-450-002', 'UBOT-05-450-003', 'UBOT-05-450-004', 'UBOT-05-450-005', 'UBOT-05-450-006', 'UBOT-05-450-007', 'UBOT-05-450-008', 'UBOT-05-450-009',
+                ), failure=button_failure)
                 if button is None:
-                    raise RuntimeError("ubot-twd-history-form")
+                    raise with_error_code(RuntimeError('ubot-twd-history-form'), button_failure[0] if button_failure else 'UBOT-05-423-001')
 
                 before = len(collector.by_endpoint(endpoint))
                 request_boundary = collector.request_sequence
                 window_issued_before = collector.issued_count(endpoint)
                 ensure_no_dialog()
                 self._mark_twd_dom_boundary(page)
-                button.click(timeout=8000)
+                with error_step('UBOT-05-438-001'):
+                    button.click(timeout=8000)
                 for _ in range(60):
                     if len(collector.by_endpoint(endpoint)) > before:
                         break
-                    page.wait_for_timeout(500)
+                    with error_step('UBOT-05-439-001'):
+                        page.wait_for_timeout(500)
                 hits = collector.by_endpoint(endpoint)[before:]
-                if (
-                    len(hits) != 1
-                    or collector.issued_count(endpoint) - window_issued_before != 1
-                ):
-                    raise RuntimeError("ubot-twd-history-response-cardinality")
+                if len(hits) != 1:
+                    raise with_error_code(RuntimeError('ubot-twd-history-response-cardinality'), 'UBOT-05-424-001')
+                if collector.issued_count(endpoint) - window_issued_before != 1:
+                    raise with_error_code(RuntimeError('ubot-twd-history-response-cardinality'), 'UBOT-05-424-002')
                 ensure_no_dialog()
                 validated = self._validate_history_hit(
                     hits[0], identity=item["identity"], start=window_start,
@@ -868,10 +998,10 @@ class UbotCrawler(BankCrawler):
                 )
                 body_size = hits[0].body_size
                 if type(body_size) is not int:
-                    raise RuntimeError("ubot-twd-history-byte-budget")
+                    raise with_error_code(RuntimeError('ubot-twd-history-byte-budget'), 'UBOT-05-425-001')
                 operation_bytes += body_size
                 if operation_bytes > 5_000_000:
-                    raise RuntimeError("ubot-twd-history-byte-budget")
+                    raise with_error_code(RuntimeError('ubot-twd-history-byte-budget'), 'UBOT-05-426-001')
                 ensure_no_dialog()
                 self._validate_twd_dom(
                     self._wait_for_twd_dom_settle(page), status=validated["status"],
@@ -899,13 +1029,14 @@ class UbotCrawler(BankCrawler):
 
         fresh_hits = collector.by_endpoint(endpoint)[response_before:]
         fresh_sizes = [hit.body_size for hit in fresh_hits if type(hit.body_size) is int]
-        if (
-            len(fresh_hits) != expected_queries
-            or collector.issued_count(endpoint) - issued_before != expected_queries
-            or len(fresh_sizes) != len(fresh_hits)
-            or operation_bytes != sum(fresh_sizes)
-        ):
-            raise RuntimeError("ubot-twd-history-operation-cardinality")
+        if len(fresh_hits) != expected_queries:
+            raise with_error_code(RuntimeError('ubot-twd-history-operation-cardinality'), 'UBOT-05-414-001')
+        if collector.issued_count(endpoint) - issued_before != expected_queries:
+            raise with_error_code(RuntimeError('ubot-twd-history-operation-cardinality'), 'UBOT-05-414-002')
+        if len(fresh_sizes) != len(fresh_hits):
+            raise with_error_code(RuntimeError('ubot-twd-history-operation-cardinality'), 'UBOT-05-414-003')
+        if operation_bytes != sum(fresh_sizes):
+            raise with_error_code(RuntimeError('ubot-twd-history-operation-cardinality'), 'UBOT-05-414-004')
         ensure_no_dialog()
         coverage = {
             "mode": mode,
@@ -921,17 +1052,24 @@ class UbotCrawler(BankCrawler):
         )
         return {"results": results, "inventory": inventory, "coverage": coverage}
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
         """正向訊號：URL 在內銀區 + innerText >= 500 + 命中 >= 2 個菜單字 + 無 login form。
 
         取代「#sid 不在 = 已登入」negative-only 訊號（內銀區頁面本來就沒 #sid）。
         詳見 wiki/concepts/bank-crawler-login-positive-signal-rule.md
         """
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             if not self._exact_https_origin_allowed(page.url, self.CREDENTIAL_HOSTS):
                 return False
-            r = page.evaluate(JS_LOGGED_IN_POSITIVE)
-        except Exception:
+            with error_step('UBOT-03-400-001'):
+                r = page.evaluate(JS_LOGGED_IN_POSITIVE)
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='ubot')
+                if error_id in ('UBOT-03-400-001',):
+                    _auth_probe_ids[:] = [error_id]
             return False
         if isinstance(r, dict):
             return bool(r.get("ok"))
@@ -943,20 +1081,25 @@ class UbotCrawler(BankCrawler):
 
     def prepare_login_page(self, page) -> None:
         try:
-            page.wait_for_timeout(8000)
+            with error_step('UBOT-01-400-001'):
+                page.wait_for_timeout(8000)
         except Exception:
             return
         if self._logged_in(page):
             return
 
-        opener = _unique_visible_enabled_exact(page, "button, a", "網銀登入")
+        opener = _unique_visible_enabled_exact(page, "button, a", "網銀登入", error_ids=(
+            'UBOT-01-450-001', 'UBOT-01-450-002', 'UBOT-01-450-003', 'UBOT-01-450-004', 'UBOT-01-450-005', 'UBOT-01-450-006', 'UBOT-01-450-007', 'UBOT-01-450-008', 'UBOT-01-450-009',
+        ))
         if opener is not None:
             try:
-                opener.click()
+                with error_step('UBOT-01-401-001'):
+                    opener.click()
             except Exception:
                 return
         try:
-            page.wait_for_timeout(2500)
+            with error_step('UBOT-01-402-001'):
+                page.wait_for_timeout(2500)
         except Exception:
             return
 
@@ -971,25 +1114,33 @@ class UbotCrawler(BankCrawler):
             page,
             "a, button, [role=tab]",
             "個人用戶登入",
+            error_ids=('UBOT-01-451-001', 'UBOT-01-451-002', 'UBOT-01-451-003', 'UBOT-01-451-004', 'UBOT-01-451-005', 'UBOT-01-451-006', 'UBOT-01-451-007', 'UBOT-01-451-008', 'UBOT-01-451-009'),
         )
         if tab is not None:
             try:
-                tab.click()
+                with error_step('UBOT-01-403-001'):
+                    tab.click()
             except Exception:
                 return
         try:
-            page.wait_for_timeout(800)
+            with error_step('UBOT-01-404-001'):
+                page.wait_for_timeout(800)
         except Exception:
             return
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
         return (
             LoginCheckpointRule(
                 name="ubot-password-change-required",
+                error_id="UBOT-03-050-001",
                 bank="ubot",
                 phases=all_phases,
                 kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
@@ -998,6 +1149,7 @@ class UbotCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="ubot-otp-required",
+                error_id="UBOT-03-055-001",
                 bank="ubot",
                 phases=all_phases,
                 kind=CheckpointKind.OTP_REQUIRED,
@@ -1006,6 +1158,7 @@ class UbotCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="ubot-password-change-optional",
+                error_id="UBOT-03-060-001",
                 bank="ubot",
                 phases=_POST_PHASES,
                 kind=CheckpointKind.PASSWORD_CHANGE_OPTIONAL,
@@ -1023,6 +1176,7 @@ class UbotCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="ubot-unknown-modal",
+                error_id="UBOT-03-065-001",
                 bank="ubot",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -1030,6 +1184,7 @@ class UbotCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="ubot-login-form-still-visible",
+                error_id="UBOT-03-070-001",
                 bank="ubot",
                 phases=_POST_PHASES,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -1039,77 +1194,118 @@ class UbotCrawler(BankCrawler):
 
     def submit_credentials_once(self, page) -> None:
         try:
-            page.wait_for_selector(SEL_SID, state="visible", timeout=10000)
-            for selector, value, wait in (
+            with error_step('UBOT-02-410-001'):
+                page.wait_for_selector(SEL_SID, state="visible", timeout=10000)
+            for field_index, (selector, value, wait) in enumerate((
                 (SEL_SID, self.creds.national_id, 150),
                 (SEL_NICK, self.creds.user_code, 150),
                 (SEL_PWD, self.creds.password, 200),
-            ):
-                candidates = page.locator(selector)
-                if candidates.count() != 1:
-                    raise UbotLoginError("登入欄位無法安全填寫；未送出登入")
-                field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
-                    raise UbotLoginError("登入欄位無法安全填寫；未送出登入")
-                field.click()
-                field.click(click_count=3)
-                page.keyboard.press("Backspace")
-                page.keyboard.type(value, delay=80)
-                page.wait_for_timeout(wait)
-                if len(field.input_value()) != len(value):
-                    raise UbotLoginError("登入欄位輸入長度不符；未送出登入")
-        except Exception:
-            raise UbotLoginError("登入欄位無法安全填寫；未送出登入") from None
+            )):
+                codes = (
+                    ('UBOT-02-010-001', 'UBOT-02-015-001', 'UBOT-02-020-001', 'UBOT-02-025-001', 'UBOT-02-030-001', 'UBOT-02-035-001', 'UBOT-02-040-001', 'UBOT-02-045-001', 'UBOT-02-050-001', 'UBOT-02-055-001', 'UBOT-02-060-001'),
+                    ('UBOT-02-110-001', 'UBOT-02-115-001', 'UBOT-02-120-001', 'UBOT-02-125-001', 'UBOT-02-130-001', 'UBOT-02-135-001', 'UBOT-02-140-001', 'UBOT-02-145-001', 'UBOT-02-150-001', 'UBOT-02-155-001', 'UBOT-02-160-001'),
+                    ('UBOT-02-210-001', 'UBOT-02-215-001', 'UBOT-02-220-001', 'UBOT-02-225-001', 'UBOT-02-230-001', 'UBOT-02-235-001', 'UBOT-02-240-001', 'UBOT-02-245-001', 'UBOT-02-250-001', 'UBOT-02-255-001', 'UBOT-02-260-001'),
+                )[field_index]
+                rejection_codes = (
+                    ('UBOT-02-015-002', 'UBOT-02-025-002', 'UBOT-02-030-002', 'UBOT-02-060-002'),
+                    ('UBOT-02-115-002', 'UBOT-02-125-002', 'UBOT-02-130-002', 'UBOT-02-160-002'),
+                    ('UBOT-02-215-002', 'UBOT-02-225-002', 'UBOT-02-230-002', 'UBOT-02-260-002'),
+                )[field_index]
+                with error_step(codes[0]):
+                    candidates = page.locator(selector)
+                with error_step(codes[1]):
+                    if candidates.count() != 1:
+                        raise with_error_code(UbotLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[0])
+                with error_step(codes[2]):
+                    field = candidates.nth(0)
+                with error_step(codes[3]):
+                    if not field.is_visible():
+                        raise with_error_code(UbotLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[1])
+                with error_step(codes[4]):
+                    if not field.is_enabled():
+                        raise with_error_code(UbotLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[2])
+                with error_step(codes[5]):
+                    field.click()
+                with error_step(codes[6]):
+                    field.click(click_count=3)
+                with error_step(codes[7]):
+                    page.keyboard.press("Backspace")
+                with error_step(codes[8]):
+                    page.keyboard.type(value, delay=80)
+                with error_step(codes[9]):
+                    page.wait_for_timeout(wait)
+                with error_step(codes[10]):
+                    if len(field.input_value()) != len(value):
+                        raise with_error_code(UbotLoginError("登入欄位輸入長度不符；未送出登入"), rejection_codes[3])
+        except Exception as error:
+            raise with_error_code(UbotLoginError("登入欄位無法安全填寫；未送出登入"), exception_error_id(error, bank="ubot") or 'UBOT-02-406-001') from None
 
         captcha = self._ocr_with_regen(page, max_attempts=1)
         if not captcha:
-            raise UbotLoginError(
-                "圖形驗證碼 OCR 失敗；未送出登入",
-                safe_code="captcha_ocr_failed",
-            )
+            raise with_error_code(UbotLoginError('圖形驗證碼 OCR 失敗；未送出登入', safe_code="captcha_ocr_failed"), 'UBOT-02-400-001')
         try:
-            candidates = page.locator(SEL_CAPTCHA)
-            if candidates.count() != 1:
-                raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            field = candidates.nth(0)
-            if not field.is_visible() or not field.is_enabled():
-                raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入")
-            field.click()
-            field.click(click_count=3)
-            page.keyboard.press("Backspace")
-            page.keyboard.type(captcha, delay=80)
-            page.wait_for_timeout(200)
-            if len(field.input_value()) != len(captcha):
-                raise UbotLoginError("驗證碼欄位輸入長度不符；未送出登入")
-        except Exception:
-            raise UbotLoginError("驗證碼欄位無法安全填寫；未送出登入") from None
+            with error_step('UBOT-02-411-001'):
+                candidates = page.locator(SEL_CAPTCHA)
+            with error_step('UBOT-02-412-001'):
+                if candidates.count() != 1:
+                    raise with_error_code(UbotLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'UBOT-02-402-001')
+            with error_step('UBOT-02-413-001'):
+                field = candidates.nth(0)
+            with error_step('UBOT-02-414-001'):
+                if not field.is_visible():
+                    raise with_error_code(UbotLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'UBOT-02-403-001')
+            with error_step('UBOT-02-415-001'):
+                if not field.is_enabled():
+                    raise with_error_code(UbotLoginError('驗證碼欄位無法安全填寫；未送出登入'), 'UBOT-02-403-002')
+            with error_step('UBOT-02-416-001'):
+                field.click()
+            with error_step('UBOT-02-417-001'):
+                field.click(click_count=3)
+            with error_step('UBOT-02-418-001'):
+                page.keyboard.press("Backspace")
+            with error_step('UBOT-02-419-001'):
+                page.keyboard.type(captcha, delay=80)
+            with error_step('UBOT-02-420-001'):
+                page.wait_for_timeout(200)
+            with error_step('UBOT-02-421-001'):
+                if len(field.input_value()) != len(captcha):
+                    raise with_error_code(UbotLoginError('驗證碼欄位輸入長度不符；未送出登入'), 'UBOT-02-404-001')
+        except Exception as error:
+            raise with_error_code(UbotLoginError("驗證碼欄位無法安全填寫；未送出登入"), exception_error_id(error, bank="ubot") or 'UBOT-02-407-001') from None
 
+        button_failure = []
         button = _unique_visible_enabled_exact(
             page,
             "button",
             "登入",
+            error_ids=('UBOT-02-450-001', 'UBOT-02-450-002', 'UBOT-02-450-003', 'UBOT-02-450-004', 'UBOT-02-450-005', 'UBOT-02-450-006', 'UBOT-02-450-007', 'UBOT-02-450-008', 'UBOT-02-450-009'),
+            failure=button_failure,
         )
         if button is None:
-            raise UbotLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            raise with_error_code(UbotLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), button_failure[0] if button_failure else 'UBOT-02-401-001')
         try:
-            classes = (button.get_attribute("class") or "").split()
+            with error_step('UBOT-02-422-001'):
+                classes = (button.get_attribute("class") or "").split()
             if "disabled" in classes:
-                raise UbotLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+                raise with_error_code(UbotLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'UBOT-02-405-001')
         except UbotLoginError:
             raise
-        except Exception:
-            raise UbotLoginError("無法安全確認登入按鈕；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(UbotLoginError("無法安全確認登入按鈕；未送出登入"), exception_error_id(error, bank="ubot") or 'UBOT-02-408-001') from None
 
         _log("[login] 送出 login attempt=1")
         try:
-            button.click(timeout=8000)
-        except Exception:
-            raise UbotLoginError("登入送出狀態不明；禁止自動重試") from None
+            with error_step('UBOT-02-423-001'):
+                button.click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(UbotLoginError("登入送出狀態不明；禁止自動重試"), exception_error_id(error, bank="ubot") or 'UBOT-02-409-001') from None
 
         try:
-            page.wait_for_timeout(6000)
+            with error_step('UBOT-02-424-001'):
+                page.wait_for_timeout(6000)
             for _ in range(20):
-                page.wait_for_timeout(1000)
+                with error_step('UBOT-02-425-001'):
+                    page.wait_for_timeout(1000)
                 if self._logged_in(page) or _any_visible(page, ".modal.show"):
                     return
         except Exception:
@@ -1142,12 +1338,15 @@ class UbotCrawler(BankCrawler):
                 page,
                 "div,a,span,button,i",
                 "重新產生",
+                error_ids=('UBOT-02-451-001', 'UBOT-02-451-002', 'UBOT-02-451-003', 'UBOT-02-451-004', 'UBOT-02-451-005', 'UBOT-02-451-006', 'UBOT-02-451-007', 'UBOT-02-451-008', 'UBOT-02-451-009'),
             )
             if refresh is None:
                 return None
             try:
-                refresh.click()
-                page.wait_for_timeout(2000)
+                with error_step('UBOT-02-426-001'):
+                    refresh.click()
+                with error_step('UBOT-02-427-001'):
+                    page.wait_for_timeout(2000)
             except Exception:
                 return None
         return None
@@ -1196,8 +1395,16 @@ class UbotCrawler(BankCrawler):
 
     # ---------- collect 輔助 ----------
     def _goto(self, page, route: str, wait: int = 6000):
-        page.evaluate(f"location.hash='#{route}'")
-        page.wait_for_timeout(wait)
+        codes = {'/A0101001': ('UBOT-04-700-001', 'UBOT-04-701-001'),
+         '/B0101001': ('UBOT-05-702-001', 'UBOT-05-703-001'),
+         '/F0101001': ('UBOT-06-704-001', 'UBOT-06-705-001'),
+         '/F0201001': ('UBOT-06-706-001', 'UBOT-06-707-001'),
+         '/F0301001': ('UBOT-06-708-001', 'UBOT-06-709-001'),
+         '/F0801001': ('UBOT-06-710-001', 'UBOT-06-711-001')}.get(route, ('UBOT-06-406-001', 'UBOT-06-407-001'))
+        with error_step(codes[0]):
+            page.evaluate(f"location.hash='#{route}'")
+        with error_step(codes[1]):
+            page.wait_for_timeout(wait)
 
     @staticmethod
     def _latest_body(collector: ResponseCollector, endpoint: str):
@@ -1220,12 +1427,14 @@ class UbotCrawler(BankCrawler):
             date_list = body0.get("DateList", []) or []
         if not date_list:
             # 沒攔到就點「最近一期」觸發一次
-            page.evaluate(
-                "(() => { const b=[...document.querySelectorAll('button,a,li,div')].filter(e=>e.offsetParent!==null)"
-                ".find(x=>/最近一期/.test((x.textContent||'').trim()) && (x.textContent||'').trim().length<8);"
-                " if(b) b.click(); })()",
-            )
-            page.wait_for_timeout(6000)
+            with error_step('UBOT-06-408-001'):
+                page.evaluate(
+                    "(() => { const b=[...document.querySelectorAll('button,a,li,div')].filter(e=>e.offsetParent!==null)"
+                    ".find(x=>/最近一期/.test((x.textContent||'').trim()) && (x.textContent||'').trim().length<8);"
+                    " if(b) b.click(); })()",
+                )
+            with error_step('UBOT-06-409-001'):
+                page.wait_for_timeout(6000)
             body = self._latest_body(collector, "IBKF020102")
             if body:
                 results.append(body)
@@ -1233,13 +1442,15 @@ class UbotCrawler(BankCrawler):
         # 逐期點按鈕（按鈕文字 = yyyy/mm 或「最近一期」對應第一個）
         for i, dt in enumerate(date_list):
             label = "最近一期" if i == 0 else dt
-            page.evaluate(
-                "((lbl) => { const b=[...document.querySelectorAll('button,a,li,div')].filter(e=>e.offsetParent!==null)"
-                ".find(x=>(x.textContent||'').trim()===lbl && (x.textContent||'').trim().length<10);"
-                " if(b){ b.click(); return true;} return false; })",
-                label,
-            )
-            page.wait_for_timeout(6000)
+            with error_step('UBOT-06-410-001'):
+                page.evaluate(
+                    "((lbl) => { const b=[...document.querySelectorAll('button,a,li,div')].filter(e=>e.offsetParent!==null)"
+                    ".find(x=>(x.textContent||'').trim()===lbl && (x.textContent||'').trim().length<10);"
+                    " if(b){ b.click(); return true;} return false; })",
+                    label,
+                )
+            with error_step('UBOT-06-411-001'):
+                page.wait_for_timeout(6000)
             body = self._latest_body(collector, "IBKF020102")
             if body and body not in results:
                 results.append(body)

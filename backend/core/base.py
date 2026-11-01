@@ -30,6 +30,11 @@ from scrapling.fetchers import StealthyFetcher
 from patchright.sync_api import TimeoutError as PatchrightTimeoutError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from backend.core.error_codes import (
+    BANKS as _ERROR_BANKS,
+    bank_bound_error_id, bank_error_id, code_details, error_step, exception_error_id,
+    format_error_id, with_error_code,
+)
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointOutcome,
@@ -340,10 +345,66 @@ def _safe_collect_marker(crawler: object, allowlist: str, field: str) -> str | N
     return None
 
 
+def _diagnostic_bank(crawler: object) -> str | None:
+    """Read only the base instance state, without adapter descriptors/hooks."""
+    try:
+        state = BankCrawler.__dict__["__dict__"].__get__(crawler, BankCrawler)
+    except BaseException:
+        return None
+    bank = _safe_state_value(state, "name")
+    return bank if type(bank) is str and bank in _ERROR_BANKS else None
+
+
+def _validated_failure_diagnostics(crawler: object, value: object) -> dict[str, str]:
+    if type(value) is not dict or len(value) not in (2, 3) or any(
+        type(key) is not str or key not in {"exception", "error_id", "phase"} for key in value
+    ):
+        return {}
+    family = value.get("exception")
+    error_id = value.get("error_id")
+    bank = _diagnostic_bank(crawler)
+    if bank is None or type(error_id) is not str or type(family) is not str or family not in {
+        *(label for _, label in _SAFE_EXCEPTION_TYPES), "Exception",
+    } or code_details(error_id, bank=bank) is None:
+        return {}
+    error_id = bank_bound_error_id(bank, error_id) or error_id
+    result = {"exception": family, "error_id": error_id}
+    if "phase" in value:
+        phase = value["phase"]
+        if type(phase) is not str or phase not in {"pre_submit", "post_submit", "post_submit_settle"}:
+            return {}
+        result["phase"] = phase
+    return result
+
+
+def _format_failure_diagnostics(value: dict[str, str]) -> str:
+    # Callers must validate the carrier first; descriptions come from the catalog.
+    message = format_error_id(value.get("error_id"))
+    if message is None:
+        return "sync_failed:Exception"
+    phase = f" | phase={value['phase']}" if "phase" in value else ""
+    return f"{message} ({value['exception']}){phase}"
+
+
+def _failure_diagnostics(crawler: object, error: BaseException, fallback: str) -> dict[str, str]:
+    bank = _diagnostic_bank(crawler)
+    error_id = exception_error_id(error, bank=bank) if bank is not None else None
+    if error_id is None:
+        error_id = bank_error_id(bank, fallback)
+    diagnostics = {
+        "exception": _safe_exception_type(error), "error_id": error_id,
+    }
+    if _exception_inherits(error, LoginCheckpointBlocked, LoginInteractionRequired):
+        phase = _safe_state_value(_base_exception_state(error), "phase")
+        if type(phase) is CheckpointPhase:
+            diagnostics["phase"] = phase.value
+    return _validated_failure_diagnostics(crawler, diagnostics)
+
+
 def _validated_collect_diagnostics(crawler: object, value: object) -> dict[str, str]:
     """Reconstruct the closed collection metadata at each result/job boundary."""
-    if type(value) is not dict or len(value) > 5 or any(
-        type(key) is not str or key not in {'exception', 'code', 'phase', 'gate', 'guard'}
+    if type(value) is not dict or len(value) > 6 or any(
+        type(key) is not str or key not in {'exception', 'code', 'phase', 'gate', 'guard', 'error_id'}
         for key in value
     ):
         return {}
@@ -365,6 +426,10 @@ def _validated_collect_diagnostics(crawler: object, value: object) -> dict[str, 
             matched = next((known for known in allowed if raw == known), None)
             if matched is not None:
                 clean[key] = matched
+    error_id = value.get('error_id')
+    bank = _diagnostic_bank(crawler)
+    if bank is not None and type(error_id) is str and code_details(error_id, bank=bank) is not None:
+        clean['error_id'] = bank_bound_error_id(bank, error_id) or error_id
     return clean if 'exception' in clean and 'code' in clean else {}
 
 
@@ -374,6 +439,9 @@ def _format_collect_diagnostics(value: dict[str, str]) -> str:
     for key in ('guard', 'phase', 'gate'):
         if key in value:
             message += f": {key}={value[key]}"
+    registered = format_error_id(value.get('error_id'))
+    if registered is not None:
+        message = f"{registered} | {message}"
     return message
 
 
@@ -389,6 +457,11 @@ def _collect_failure_diagnostics(crawler: object, exc: BaseException) -> dict[st
     guard = _safe_collect_guard(exc, _class_collect_guard_allowlist(crawler))
     if guard is not None:
         values['guard'] = guard
+    bank = _diagnostic_bank(crawler)
+    if bank is not None:
+        error_id = exception_error_id(exc, bank=bank)
+        if error_id is not None:
+            values['error_id'] = error_id
     return _validated_collect_diagnostics(crawler, values)
 
 
@@ -1098,29 +1171,35 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$")
 
 
-def _require_iso_date(value: Any, *, path: str) -> None:
+def _require_iso_date(value: Any, *, path: str, _codes: tuple[str, ...] = ('SYS-07-980-001', 'SYS-07-980-002', 'SYS-07-980-003')) -> None:
     if value in (None, ""):
         return
-    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
-        raise ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}")
+    if not isinstance(value, str):
+        raise with_error_code(ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}"), _codes[0])
+    if not _ISO_DATE_RE.match(value):
+        raise with_error_code(ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}"), _codes[1])
     try:
         date.fromisoformat(value)
     except ValueError as exc:
-        raise ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}") from exc
+        raise with_error_code(ValueError(f"{path} must be IsoDate YYYY-MM-DD, got {value!r}"), _codes[2]) from exc
 
 
-def _require_iso_date_or_datetime(value: Any, *, path: str) -> None:
+def _require_iso_date_or_datetime(value: Any, *, path: str, _codes: tuple[str, ...] = ('SYS-07-981-001', 'SYS-07-981-002', 'SYS-07-981-003', 'SYS-07-981-004', 'SYS-07-981-005')) -> None:
     if value in (None, ""):
         return
-    if not isinstance(value, str) or not (_ISO_DATE_RE.match(value) or _ISO_DATETIME_RE.match(value)):
-        raise ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}")
+    if not isinstance(value, str):
+        raise with_error_code(ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}"), _codes[0])
+    if not (_ISO_DATE_RE.match(value) or _ISO_DATETIME_RE.match(value)):
+        raise with_error_code(ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}"), _codes[1])
     try:
         offset = re.search(r"[+-](\d{2}):?(\d{2})$", value)
-        if offset and (int(offset.group(1)) > 23 or int(offset.group(2)) > 59):
-            raise ValueError
+        if offset and int(offset.group(1)) > 23:
+            raise with_error_code(ValueError(), _codes[2])
+        if offset and int(offset.group(2)) > 59:
+            raise with_error_code(ValueError(), _codes[3])
         (datetime.fromisoformat if "T" in value or " " in value else date.fromisoformat)(value)
     except ValueError as exc:
-        raise ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}") from exc
+        raise with_error_code(ValueError(f"{path} must be IsoDate/ISO datetime, got {value!r}"), _codes[4]) from exc
 
 
 _CARD_BILL_FACT_FIELDS = frozenset({
@@ -1132,58 +1211,85 @@ _CARD_BILL_FACT_FIELDS = frozenset({
 def validate_card_bill_facts(facts: list[NormalizedCardBillFact], *, facts_ok: bool | None) -> None:
     """Validate canonical remaining-due facts at the collector seam."""
     if facts_ok is True and not facts:
-        raise ValueError("card_bill_facts_ok=True requires at least one fact")
+        raise with_error_code(ValueError("card_bill_facts_ok=True requires at least one fact"), "SYS-07-983-001")
     if facts and facts_ok is not True:
-        raise ValueError("card_bill_facts require card_bill_facts_ok=True")
+        raise with_error_code(ValueError("card_bill_facts require card_bill_facts_ok=True"), "SYS-07-983-002")
     scopes: set[str] = set()
     card_nos: set[str] = set()
-    for i, fact in enumerate(facts):
+    with error_step("SYS-07-984-001"):
+        indexed_facts = enumerate(facts)
+    for i, fact in indexed_facts:
         if not isinstance(fact, dict):
-            raise ValueError(f"card_bill_facts[{i}] must be a dict")
+            raise with_error_code(ValueError(f"card_bill_facts[{i}] must be a dict"), "SYS-07-983-003")
         unknown = set(fact) - _CARD_BILL_FACT_FIELDS
         if unknown:
-            raise ValueError(f"card_bill_facts[{i}] has unknown fields: {sorted(unknown)}")
+            with error_step("SYS-07-984-006"):
+                raise with_error_code(ValueError(f"card_bill_facts[{i}] has unknown fields: {sorted(unknown)}"), "SYS-07-983-004")
         scope = fact.get("scope")
-        if scope not in {"bank", "card"}:
-            raise ValueError(f"card_bill_facts[{i}].scope must be 'bank' or 'card'")
+        with error_step("SYS-07-984-002"):
+            if scope not in {"bank", "card"}:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].scope must be 'bank' or 'card'"), "SYS-07-983-005")
         scopes.add(scope)
         card_no = fact.get("card_no")
         if scope == "card":
-            if not isinstance(card_no, str) or not card_no.strip():
-                raise ValueError(f"card_bill_facts[{i}].card_no is required for card scope")
+            if not isinstance(card_no, str):
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].card_no is required for card scope"), "SYS-07-983-006")
+            if not card_no.strip():
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].card_no is required for card scope"), "SYS-07-983-007")
             if card_no in card_nos:
-                raise ValueError(f"card_bill_facts[{i}].card_no is duplicated")
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].card_no is duplicated"), "SYS-07-983-008")
             card_nos.add(card_no)
         elif card_no not in (None, ""):
-            raise ValueError(f"card_bill_facts[{i}].card_no is forbidden for bank scope")
+            raise with_error_code(ValueError(f"card_bill_facts[{i}].card_no is forbidden for bank scope"), "SYS-07-983-009")
         status = fact.get("status")
-        if status not in {"paid", "unpaid", "no_payment_required"}:
-            raise ValueError(f"card_bill_facts[{i}].status is not canonical")
+        with error_step("SYS-07-984-003"):
+            if status not in {"paid", "unpaid", "no_payment_required"}:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].status is not canonical"), "SYS-07-983-010")
         remaining = fact.get("remaining_due")
-        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
-                or not math.isfinite(float(remaining)) or remaining < 0
-                or remaining > 100_000_000):
-            raise ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative")
-        if (status == "unpaid") != (remaining > 0):
-            raise ValueError(f"card_bill_facts[{i}] status conflicts with remaining_due")
+        if isinstance(remaining, bool):
+            raise with_error_code(ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative"), "SYS-07-983-011")
+        if not isinstance(remaining, (int, float)):
+            raise with_error_code(ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative"), "SYS-07-983-012")
+        with error_step("SYS-07-984-004"):
+            if not math.isfinite(float(remaining)):
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative"), "SYS-07-983-013")
+        if remaining < 0:
+            raise with_error_code(ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative"), "SYS-07-983-014")
+        if remaining > 100_000_000:
+            raise with_error_code(ValueError(f"card_bill_facts[{i}].remaining_due must be finite and non-negative"), "SYS-07-983-015")
+        unpaid = status == "unpaid"
+        if unpaid != (remaining > 0):
+            if unpaid:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}] status conflicts with remaining_due"), "SYS-07-983-016")
+            raise with_error_code(ValueError(f"card_bill_facts[{i}] status conflicts with remaining_due"), "SYS-07-983-017")
         payment_amount = fact.get("last_payment_amount")
         payment_date = fact.get("last_payment_date")
         if (payment_amount is None) != (payment_date is None):
-            raise ValueError(f"card_bill_facts[{i}] last payment must be an atomic pair")
-        if payment_amount is not None and (
-            isinstance(payment_amount, bool)
-            or not isinstance(payment_amount, (int, float))
-            or not math.isfinite(float(payment_amount))
-            or payment_amount < 0
-            or payment_amount > 100_000_000
+            if payment_amount is None:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}] last payment must be an atomic pair"), "SYS-07-983-018")
+            raise with_error_code(ValueError(f"card_bill_facts[{i}] last payment must be an atomic pair"), "SYS-07-983-019")
+        if payment_amount is not None:
+            if isinstance(payment_amount, bool):
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"), "SYS-07-983-020")
+            if not isinstance(payment_amount, (int, float)):
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"), "SYS-07-983-021")
+            with error_step("SYS-07-984-005"):
+                if not math.isfinite(float(payment_amount)):
+                    raise with_error_code(ValueError(f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"), "SYS-07-983-022")
+            if payment_amount < 0:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"), "SYS-07-983-023")
+            if payment_amount > 100_000_000:
+                raise with_error_code(ValueError(f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"), "SYS-07-983-024")
+        for key, codes in (
+            ("statement_close_date", ("SYS-07-983-101", "SYS-07-983-102", "SYS-07-983-103")),
+            ("payment_due_date", ("SYS-07-983-104", "SYS-07-983-105", "SYS-07-983-106")),
+            ("last_payment_date", ("SYS-07-983-107", "SYS-07-983-108", "SYS-07-983-109")),
         ):
-            raise ValueError(
-                f"card_bill_facts[{i}].last_payment_amount must be finite and non-negative"
-            )
-        for key in ("statement_close_date", "payment_due_date", "last_payment_date"):
-            _require_iso_date(fact.get(key), path=f"card_bill_facts[{i}].{key}")
-    if len(scopes) > 1 or ("bank" in scopes and len(facts) > 1):
-        raise ValueError("card_bill_facts must be one bank fact or card-scoped facts")
+            _require_iso_date(fact.get(key), path=f"card_bill_facts[{i}].{key}", _codes=codes)
+    if len(scopes) > 1:
+        raise with_error_code(ValueError("card_bill_facts must be one bank fact or card-scoped facts"), "SYS-07-983-025")
+    if "bank" in scopes and len(facts) > 1:
+        raise with_error_code(ValueError("card_bill_facts must be one bank fact or card-scoped facts"), "SYS-07-983-026")
 
 
 HISTORY_DOMAINS = frozenset({
@@ -1191,13 +1297,15 @@ HISTORY_DOMAINS = frozenset({
 })
 
 
-def _history_date(value: Any, error: str) -> date:
-    if not isinstance(value, str) or not _ISO_DATE_RE.fullmatch(value):
-        raise ValueError(error)
+def _history_date(value: Any, error: str, *, _codes: tuple[str, ...] = ('SYS-07-982-001', 'SYS-07-982-002', 'SYS-07-982-003')) -> date:
+    if not isinstance(value, str):
+        raise with_error_code(ValueError(error), _codes[0])
+    if not _ISO_DATE_RE.fullmatch(value):
+        raise with_error_code(ValueError(error), _codes[1])
     try:
         return date.fromisoformat(value)
     except ValueError:
-        raise ValueError(error) from None
+        raise with_error_code(ValueError(error), _codes[2]) from None
 
 
 def validate_history_coverage(
@@ -1208,18 +1316,24 @@ def validate_history_coverage(
 ) -> dict[str, Any]:
     """Validate complete, contiguous, non-sensitive history evidence."""
     error = "invalid history coverage"
-    if (
-        expected_mode not in {"full", "incremental"}
-        or not isinstance(expected_domains, frozenset)
-        or not expected_domains
-        or not expected_domains <= HISTORY_DOMAINS
-    ):
-        raise ValueError(error)
-    if not isinstance(coverage, dict) or coverage.get("mode") != expected_mode:
-        raise ValueError(error)
+    with error_step("SYS-07-985-013"):
+        if expected_mode not in {"full", "incremental"}:
+            raise with_error_code(ValueError(error), "SYS-07-985-001")
+    if not isinstance(expected_domains, frozenset):
+        raise with_error_code(ValueError(error), "SYS-07-985-002")
+    if not expected_domains:
+        raise with_error_code(ValueError(error), "SYS-07-985-003")
+    if not expected_domains <= HISTORY_DOMAINS:
+        raise with_error_code(ValueError(error), "SYS-07-985-004")
+    if not isinstance(coverage, dict):
+        raise with_error_code(ValueError(error), "SYS-07-985-005")
+    if coverage.get("mode") != expected_mode:
+        raise with_error_code(ValueError(error), "SYS-07-985-006")
     domains = coverage.get("domains")
-    if not isinstance(domains, list) or not domains:
-        raise ValueError(error)
+    if not isinstance(domains, list):
+        raise with_error_code(ValueError(error), "SYS-07-985-007")
+    if not domains:
+        raise with_error_code(ValueError(error), "SYS-07-985-008")
 
     domain_names: list[str] = []
     identity_count = 0
@@ -1228,33 +1342,39 @@ def validate_history_coverage(
     ends: list[date] = []
     for domain in domains:
         if not isinstance(domain, dict):
-            raise ValueError(error)
+            raise with_error_code(ValueError(error), "SYS-07-985-009")
         name = domain.get("domain")
         expected = domain.get("expected")
         windows = domain.get("windows")
-        if (
-            name not in HISTORY_DOMAINS
-            or not isinstance(expected, list)
-            or not isinstance(windows, list)
-        ):
-            raise ValueError(error)
+        with error_step("SYS-07-985-014"):
+            if name not in HISTORY_DOMAINS:
+                raise with_error_code(ValueError(error), "SYS-07-985-010")
+        if not isinstance(expected, list):
+            raise with_error_code(ValueError(error), "SYS-07-985-011")
+        if not isinstance(windows, list):
+            raise with_error_code(ValueError(error), "SYS-07-985-012")
 
         if not expected:
             empty_window = domain.get("empty_window")
-            if not isinstance(empty_window, dict) or windows:
-                raise ValueError(error)
+            if not isinstance(empty_window, dict):
+                raise with_error_code(ValueError(error), "SYS-07-986-001")
+            if windows:
+                raise with_error_code(ValueError(error), "SYS-07-986-002")
             try:
-                empty_start = _history_date(empty_window["start"], error)
-                empty_end = _history_date(empty_window["end"], error)
-            except (KeyError, TypeError, ValueError):
-                raise ValueError(error) from None
-            if (
-                empty_start > empty_end
-                or empty_window.get("status") != "explicit_empty"
-                or type(empty_window.get("pages")) is not int
-                or empty_window["pages"] < 1
-            ):
-                raise ValueError(error)
+                with error_step("SYS-07-986-003"):
+                    empty_start = _history_date(empty_window["start"], error, _codes=("SYS-07-986-101", "SYS-07-986-102", "SYS-07-986-103"))
+                with error_step("SYS-07-986-004"):
+                    empty_end = _history_date(empty_window["end"], error, _codes=("SYS-07-986-104", "SYS-07-986-105", "SYS-07-986-106"))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise with_error_code(ValueError(error), exception_error_id(exc)) from None
+            if empty_start > empty_end:
+                raise with_error_code(ValueError(error), "SYS-07-986-005")
+            if empty_window.get("status") != "explicit_empty":
+                raise with_error_code(ValueError(error), "SYS-07-986-006")
+            if type(empty_window.get("pages")) is not int:
+                raise with_error_code(ValueError(error), "SYS-07-986-007")
+            if empty_window["pages"] < 1:
+                raise with_error_code(ValueError(error), "SYS-07-986-008")
             domain_names.append(name)
             window_count += 1
             starts.append(empty_start)
@@ -1264,19 +1384,23 @@ def validate_history_coverage(
         expected_ranges: dict[str, tuple[date, date]] = {}
         for item in expected:
             if not isinstance(item, dict):
-                raise ValueError(error)
+                raise with_error_code(ValueError(error), "SYS-07-987-001")
             identity = item.get("identity")
             try:
-                expected_start = _history_date(item["start"], error)
-                expected_end = _history_date(item["end"], error)
-            except (KeyError, TypeError, ValueError):
-                raise ValueError(error) from None
-            if (
-                not isinstance(identity, str) or not identity.strip()
-                or identity in expected_ranges
-                or expected_start > expected_end
-            ):
-                raise ValueError(error)
+                with error_step("SYS-07-987-002"):
+                    expected_start = _history_date(item["start"], error, _codes=("SYS-07-987-101", "SYS-07-987-102", "SYS-07-987-103"))
+                with error_step("SYS-07-987-003"):
+                    expected_end = _history_date(item["end"], error, _codes=("SYS-07-987-104", "SYS-07-987-105", "SYS-07-987-106"))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise with_error_code(ValueError(error), exception_error_id(exc)) from None
+            if not isinstance(identity, str):
+                raise with_error_code(ValueError(error), "SYS-07-987-004")
+            if not identity.strip():
+                raise with_error_code(ValueError(error), "SYS-07-987-005")
+            if identity in expected_ranges:
+                raise with_error_code(ValueError(error), "SYS-07-987-006")
+            if expected_start > expected_end:
+                raise with_error_code(ValueError(error), "SYS-07-987-007")
             expected_ranges[identity] = (expected_start, expected_end)
 
         by_identity: dict[str, list[tuple[date, date]]] = {
@@ -1284,35 +1408,45 @@ def validate_history_coverage(
         }
         for window in windows:
             if not isinstance(window, dict):
-                raise ValueError(error)
+                raise with_error_code(ValueError(error), "SYS-07-988-001")
             identity = window.get("identity")
-            if identity not in by_identity:
-                raise ValueError(error)
+            with error_step("SYS-07-988-009"):
+                if identity not in by_identity:
+                    raise with_error_code(ValueError(error), "SYS-07-988-002")
             try:
-                start = _history_date(window["start"], error)
-                end = _history_date(window["end"], error)
-            except (KeyError, TypeError, ValueError):
-                raise ValueError(error) from None
-            if (
-                start > end
-                or window.get("status") not in {"complete", "explicit_empty"}
-                or type(window.get("pages")) is not int
-                or window["pages"] < 1
-            ):
-                raise ValueError(error)
+                with error_step("SYS-07-988-003"):
+                    start = _history_date(window["start"], error, _codes=("SYS-07-988-101", "SYS-07-988-102", "SYS-07-988-103"))
+                with error_step("SYS-07-988-004"):
+                    end = _history_date(window["end"], error, _codes=("SYS-07-988-104", "SYS-07-988-105", "SYS-07-988-106"))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise with_error_code(ValueError(error), exception_error_id(exc)) from None
+            if start > end:
+                raise with_error_code(ValueError(error), "SYS-07-988-005")
+            with error_step("SYS-07-988-010"):
+                if window.get("status") not in {"complete", "explicit_empty"}:
+                    raise with_error_code(ValueError(error), "SYS-07-988-006")
+            if type(window.get("pages")) is not int:
+                raise with_error_code(ValueError(error), "SYS-07-988-007")
+            if window["pages"] < 1:
+                raise with_error_code(ValueError(error), "SYS-07-988-008")
             by_identity[identity].append((start, end))
 
         for identity, (expected_start, expected_end) in expected_ranges.items():
             identity_windows = sorted(by_identity[identity])
-            if not identity_windows or identity_windows[0][0] != expected_start:
-                raise ValueError(error)
+            if not identity_windows:
+                raise with_error_code(ValueError(error), "SYS-07-989-001")
+            if identity_windows[0][0] != expected_start:
+                raise with_error_code(ValueError(error), "SYS-07-989-002")
             covered_end = identity_windows[0][1]
             for start, end in identity_windows[1:]:
-                if start != covered_end + timedelta(days=1):
-                    raise ValueError(error)
+                with error_step("SYS-07-989-008"):
+                    if start != covered_end + timedelta(days=1):
+                        if start > covered_end:
+                            raise with_error_code(ValueError(error), "SYS-07-989-003")
+                        raise with_error_code(ValueError(error), "SYS-07-989-004")
                 covered_end = end
             if covered_end != expected_end:
-                raise ValueError(error)
+                raise with_error_code(ValueError(error), "SYS-07-989-005")
             starts.append(expected_start)
             ends.append(expected_end)
 
@@ -1320,8 +1454,10 @@ def validate_history_coverage(
         identity_count += len(expected_ranges)
         window_count += len(windows)
 
-    if len(domain_names) != len(set(domain_names)) or set(domain_names) != expected_domains:
-        raise ValueError(error)
+    if len(domain_names) != len(set(domain_names)):
+        raise with_error_code(ValueError(error), "SYS-07-989-006")
+    if set(domain_names) != expected_domains:
+        raise with_error_code(ValueError(error), "SYS-07-989-007")
 
     return {
         "ok": True,
@@ -1509,21 +1645,32 @@ class BankCollectResult:
 
     def _validate_normalized_dates(self) -> None:
         for i, a in enumerate(self.accounts):
-            _require_iso_date(a.get("raw_balance_date"), path=f"accounts[{i}].raw_balance_date")
+            _require_iso_date(a.get("raw_balance_date"), path=f"accounts[{i}].raw_balance_date", _codes=("SYS-07-980-101", "SYS-07-980-102", "SYS-07-980-103"))
         for i, c in enumerate(self.cards):
-            for key in ("statement_close_date", "payment_due_date", "last_payment_date"):
-                _require_iso_date(c.get(key), path=f"cards[{i}].{key}")
+            for key, codes in (
+                ("statement_close_date", ("SYS-07-980-104", "SYS-07-980-105", "SYS-07-980-106")),
+                ("payment_due_date", ("SYS-07-980-107", "SYS-07-980-108", "SYS-07-980-109")),
+                ("last_payment_date", ("SYS-07-980-110", "SYS-07-980-111", "SYS-07-980-112")),
+            ):
+                _require_iso_date(c.get(key), path=f"cards[{i}].{key}", _codes=codes)
         for i, t in enumerate(self.twd_txns):
-            _require_iso_date_or_datetime(t.get("datetime"), path=f"twd_txns[{i}].datetime")
-            _require_iso_date(t.get("account_date"), path=f"twd_txns[{i}].account_date")
+            _require_iso_date_or_datetime(t.get("datetime"), path=f"twd_txns[{i}].datetime", _codes=("SYS-07-981-101", "SYS-07-981-102", "SYS-07-981-103", "SYS-07-981-104", "SYS-07-981-105"))
+            _require_iso_date(t.get("account_date"), path=f"twd_txns[{i}].account_date", _codes=("SYS-07-980-113", "SYS-07-980-114", "SYS-07-980-115"))
         for i, t in enumerate(self.card_billed_txns):
-            for key in ("bill_date", "date", "post_date"):
-                _require_iso_date(t.get(key), path=f"card_billed_txns[{i}].{key}")
+            for key, codes in (
+                ("bill_date", ("SYS-07-980-116", "SYS-07-980-117", "SYS-07-980-118")),
+                ("date", ("SYS-07-980-119", "SYS-07-980-120", "SYS-07-980-121")),
+                ("post_date", ("SYS-07-980-122", "SYS-07-980-123", "SYS-07-980-124")),
+            ):
+                _require_iso_date(t.get(key), path=f"card_billed_txns[{i}].{key}", _codes=codes)
         for i, t in enumerate(self.card_pending_txns):
-            for key in ("date", "post_date"):
-                _require_iso_date(t.get(key), path=f"card_pending_txns[{i}].{key}")
+            for key, codes in (
+                ("date", ("SYS-07-980-125", "SYS-07-980-126", "SYS-07-980-127")),
+                ("post_date", ("SYS-07-980-128", "SYS-07-980-129", "SYS-07-980-130")),
+            ):
+                _require_iso_date(t.get(key), path=f"card_pending_txns[{i}].{key}", _codes=codes)
         for i, r in enumerate(self.balance_history):
-            _require_iso_date(r.get("snapshotDate"), path=f"balance_history[{i}].snapshotDate")
+            _require_iso_date(r.get("snapshotDate"), path=f"balance_history[{i}].snapshotDate", _codes=("SYS-07-980-131", "SYS-07-980-132", "SYS-07-980-133"))
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize non-empty contract fields for existing persist adapters."""
@@ -1797,41 +1944,47 @@ class BankCrawler(ABC):
                   file=_sys.stderr)
             page.reload()
             self.prepare_login_page(page)
-            if (getattr(self, "_shared_dialog_blocked", False)
+            if ((dialog_blocked := bool(getattr(self, "_shared_dialog_blocked", False)))
                     or not self._credential_origin_allowed(page)):
+                reduce_login_checkpoint(
+                    CheckpointPhase.PRE_SUBMIT,
+                    LoginBudget(),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, error_id=bank_error_id(
+                        _diagnostic_bank(self), "03-940-005" if dialog_blocked else "03-940-006")),
+                )
+
+    def _shared_login(self, page) -> bool:
+        if not self._credential_origin_allowed(page):
+            with self._error_step("01-960-001"):
                 reduce_login_checkpoint(
                     CheckpointPhase.PRE_SUBMIT,
                     LoginBudget(),
                     CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
                 )
-
-    def _shared_login(self, page) -> bool:
+        with self._error_step("01-950-001"):
+            self.prepare_login_page(page)
         if not self._credential_origin_allowed(page):
-            reduce_login_checkpoint(
-                CheckpointPhase.PRE_SUBMIT,
-                LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-            )
-        self.prepare_login_page(page)
-        if not self._credential_origin_allowed(page):
-            reduce_login_checkpoint(
-                CheckpointPhase.PRE_SUBMIT,
-                LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-            )
+            with self._error_step("01-960-002"):
+                reduce_login_checkpoint(
+                    CheckpointPhase.PRE_SUBMIT,
+                    LoginBudget(),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
         rules = self.login_checkpoint_rules()
         if len({rule.name for rule in rules}) != len(rules):
-            reduce_login_checkpoint(
-                CheckpointPhase.PRE_SUBMIT,
-                LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-            )
+            with self._error_step("03-950-001"):
+                reduce_login_checkpoint(
+                    CheckpointPhase.PRE_SUBMIT,
+                    LoginBudget(),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
         if any(rule.bank != self.name for rule in rules):
-            reduce_login_checkpoint(
-                CheckpointPhase.PRE_SUBMIT,
-                LoginBudget(),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-            )
+            with self._error_step("03-950-002"):
+                reduce_login_checkpoint(
+                    CheckpointPhase.PRE_SUBMIT,
+                    LoginBudget(),
+                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                )
 
         action_counts = {rule.name: 0 for rule in rules}
         phase = CheckpointPhase.PRE_SUBMIT
@@ -1842,17 +1995,19 @@ class BankCrawler(ABC):
 
         for _ in range(max_steps):
             if getattr(self, "_shared_dialog_blocked", False):
-                reduce_login_checkpoint(
-                    phase,
-                    budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-                )
+                with self._error_step("03-940-001"):
+                    reduce_login_checkpoint(
+                        phase,
+                        budget,
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    )
             if not self._credential_origin_allowed(page):
-                reduce_login_checkpoint(
-                    phase,
-                    budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-                )
+                with self._error_step("03-940-002"):
+                    reduce_login_checkpoint(
+                        phase,
+                        budget,
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    )
             active_rules = tuple(
                 rule
                 if (
@@ -1888,33 +2043,55 @@ class BankCrawler(ABC):
                 for rule in rules
                 if phase in rule.phases
             )
-            outcome = evaluate_login_checkpoint(
-                page,
-                bank=self.name,
-                phase=phase,
-                rules=active_rules,
-                is_authenticated=self.is_authenticated,
-                is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
-                can_act=lambda: (
-                    not getattr(self, "_shared_dialog_blocked", False)
-                    and self._credential_origin_allowed(page)
-                    and not getattr(self, "_shared_dialog_blocked", False)
-                ),
-            )
+            auth_probe_ids: list[str] = []
+
+            def authenticate(page):
+                auth_probe_ids.clear()
+                missing = object()
+                previous = self.__dict__.get("_login_auth_probe_ids", missing)
+                setattr(self, "_login_auth_probe_ids", auth_probe_ids)
+                try:
+                    return self.is_authenticated(page)
+                finally:
+                    if previous is missing:
+                        delattr(self, "_login_auth_probe_ids")
+                    else:
+                        setattr(self, "_login_auth_probe_ids", previous)
+
+            try:
+                with self._error_step("03-920-001"):
+                    outcome = evaluate_login_checkpoint(
+                        page,
+                        bank=self.name,
+                        phase=phase,
+                        rules=active_rules,
+                        is_authenticated=authenticate,
+                        _auth_probe_ids=auth_probe_ids,
+                        is_scope_owned=lambda frame: self._frame_origin_allowed(page, frame),
+                        can_act=lambda: (
+                            not getattr(self, "_shared_dialog_blocked", False)
+                            and self._credential_origin_allowed(page)
+                            and not getattr(self, "_shared_dialog_blocked", False)
+                        ),
+                    )
+            finally:
+                auth_probe_ids.clear()
             if not self._credential_origin_allowed(page):
-                reduce_login_checkpoint(
-                    phase,
-                    budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-                )
+                with self._error_step("03-940-003"):
+                    reduce_login_checkpoint(
+                        phase,
+                        budget,
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    )
             active_rules_by_name = {rule.name: rule for rule in active_rules}
             outcome = validate_login_checkpoint_outcome(outcome, active_rules)
             if getattr(self, "_shared_dialog_blocked", False):
-                reduce_login_checkpoint(
-                    phase,
-                    budget,
-                    CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
-                )
+                with self._error_step("03-940-004"):
+                    reduce_login_checkpoint(
+                        phase,
+                        budget,
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                    )
             next_phase, next_budget = reduce_login_checkpoint(phase, budget, outcome)
 
             if (
@@ -1925,22 +2102,26 @@ class BankCrawler(ABC):
             if next_budget.credential_submissions == budget.credential_submissions + 1:
                 if next_budget.captcha_resubmits == budget.captcha_resubmits + 1:
                     self.prepare_captcha_resubmit(page)
-                if (getattr(self, "_shared_dialog_blocked", False)
+                if ((dialog_blocked := bool(getattr(self, "_shared_dialog_blocked", False)))
                         or not self._credential_origin_allowed(page)):
                     reduce_login_checkpoint(
                         phase,
                         budget,
-                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                        CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, error_id=bank_error_id(
+                            _diagnostic_bank(self), "03-940-007" if dialog_blocked else "03-940-008")),
                     )
                 submit_page = page
                 if self.name == "esun":
                     def ensure_submission_origin() -> None:
-                        if (getattr(self, "_shared_dialog_blocked", False)
-                                or not self._credential_origin_allowed(page)
+                        origin_rejected = False
+                        if ((dialog_blocked := bool(getattr(self, "_shared_dialog_blocked", False)))
+                                or (origin_rejected := not self._credential_origin_allowed(page))
                                 or getattr(self, "_shared_dialog_blocked", False)):
                             reduce_login_checkpoint(
                                 phase, budget,
-                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, error_id=bank_error_id(
+                                    _diagnostic_bank(self), "03-940-009" if dialog_blocked else
+                                    "03-940-010" if origin_rejected else "03-940-011")),
                             )
                     submit_page = _OriginGuardProxy(page, ensure_submission_origin)
                 self._submit_with_captcha_reloads(page, submit_page)
@@ -1957,7 +2138,8 @@ class BankCrawler(ABC):
         reduce_login_checkpoint(
             phase,
             budget,
-            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+            CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, error_id=bank_error_id(
+                _diagnostic_bank(self), "03-960-001")),
         )
         return False  # pragma: no cover - reducer always raises
 
@@ -2079,16 +2261,21 @@ class BankCrawler(ABC):
             **fetch_kwargs,
         )
 
+    def _error_step(self, suffix: str):
+        """Use a registered shared operation without changing its browser action."""
+        return error_step(bank_error_id(_diagnostic_bank(self), suffix))
+
     def _make_collector(self, page) -> ResponseCollector:
         return ResponseCollector(host_filter=self._host_filter())
 
     def _ensure_collect_origin(self, page) -> None:
-        if (getattr(self, "_shared_dialog_blocked", False)
+        if ((dialog_blocked := bool(getattr(self, "_shared_dialog_blocked", False)))
                 or not self._credential_origin_allowed(page)):
             reduce_login_checkpoint(
                 CheckpointPhase.POST_SUBMIT_SETTLE,
                 LoginBudget(credential_submissions=1),
-                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER),
+                CheckpointOutcome(CheckpointKind.UNKNOWN_BLOCKER, error_id=bank_error_id(
+                    _diagnostic_bank(self), "07-970-001" if dialog_blocked else "07-970-002")),
             )
 
     def _validate_collect_publication(self, collector) -> None:
@@ -2117,20 +2304,31 @@ class BankCrawler(ABC):
             if callback_entered:
                 result.pop("data", None)
                 result.pop("collect_diagnostics", None)
+                result.pop("failure_diagnostics", None)
                 result["error"] = "browser_callback_repeated"
+                failure = _failure_diagnostics(self, RuntimeError("browser_callback_repeated"), "07-930-001")
+                if failure:
+                    result["failure_diagnostics"] = failure
                 return page
             callback_entered = True
             try:
-                collector = self._make_collector(page)
-                collector.attach(page)
+                with self._error_step("01-920-001"):
+                    collector = self._make_collector(page)
+                with self._error_step("01-930-001"):
+                    collector.attach(page)
                 self.collector = collector  # 讓 login() 能用攔截到的 API（如 captcha base64）
                 self._shared_dialog_blocked = False
-                self.attach_shared_dialog_handler(page)
+                with self._error_step("01-940-001"):
+                    self.attach_shared_dialog_handler(page)
             except Exception as e:
                 if collector is not None:
                     with contextlib.suppress(Exception):
                         collector.detach(page)
                 result["error"] = f"{_safe_exception_type(e)}: browser setup failed"
+                failure = _failure_diagnostics(self, e, "01-900-001")
+                if failure:
+                    result["failure_diagnostics"] = failure
+                    result["error"] = _format_failure_diagnostics(failure)
                 return page
             logged_in = False
             data = None
@@ -2166,6 +2364,7 @@ class BankCrawler(ABC):
                                 outcome_state = {}
                             kind = _safe_state_value(outcome_state, "kind")
                             kind_label = _safe_checkpoint_kind_label(kind)
+
                             raw_budget = _safe_state_value(exception_state, "budget")
                             budget = LoginBudget()
                             if type(raw_budget) is LoginBudget:
@@ -2201,6 +2400,10 @@ class BankCrawler(ABC):
                             msg = f"{exception_type}: code=captcha_ocr_failed"
                         else:
                             msg = f"{exception_type}: login failed"
+                        failure = _failure_diagnostics(self, e, "03-900-001")
+                        if failure:
+                            result["failure_diagnostics"] = failure
+                            msg = f"{_format_failure_diagnostics(failure)} | {msg}"
                         print(
                             f"[{self.name}][login] raise → {msg}; details withheld",
                             file=_sys.stderr,
@@ -2210,6 +2413,10 @@ class BankCrawler(ABC):
 
                 if not ok:
                     result["error"] = "login_failed"
+                    failure = _failure_diagnostics(self, RuntimeError("login_failed"), "03-910-001")
+                    if failure:
+                        result["failure_diagnostics"] = failure
+                        result["error"] = _format_failure_diagnostics(failure)
                     return page
                 logged_in = True
                 try:
@@ -2222,21 +2429,23 @@ class BankCrawler(ABC):
                     )
                     ensure_collect_origin()
                     if not isinstance(collect_result, BankCollectResult):
-                        raise TypeError(
+                        raise with_error_code(TypeError(
                             f"{self.__class__.__name__}.collect() must return "
                             f"BankCollectResult, got {type(collect_result).__name__}"
-                        )
+                        ), bank_error_id(_diagnostic_bank(self), "07-900-001"))
                     if collect_result.error is not None and not (
                         type(collect_result.error) is str and collect_result.error == ""
                     ):
-                        raise ValueError("collect result reported an error")
+                        raise with_error_code(ValueError("collect result reported an error"), bank_error_id(_diagnostic_bank(self), "07-900-002"))
                     if collect_result.error is None and collect_result.card_bill_facts_ok is None:
-                        raise ValueError(
+                        raise with_error_code(ValueError(
                             f"{self.__class__.__name__}.collect() must publish "
                             "card_bill_facts_ok at the crawler boundary"
-                        )
-                    data = collect_result.to_dict()
-                    self._validate_collect_publication(collector)
+                        ), bank_error_id(_diagnostic_bank(self), "07-900-003"))
+                    with self._error_step("07-910-001"):
+                        data = collect_result.to_dict()
+                    with self._error_step("07-920-001"):
+                        self._validate_collect_publication(collector)
                 except Exception as e:
                     # collect 階段 raise（包含 SCSB/Taishin 等明細查詢 raise）
                     # 一樣寫進 error，但 logged_in 仍 True → finally 會跑 logout。
@@ -2267,7 +2476,8 @@ class BankCrawler(ABC):
                     if data is not None and "error" not in result:
                         # Logout may dispatch a late failure for accepted rows.
                         # Validate before local teardown destroys the receipts.
-                        self._validate_collect_publication(collector)
+                        with self._error_step("07-920-001"):
+                            self._validate_collect_publication(collector)
                 except Exception as e:
                     if result.get("error") == "browser_callback_repeated":
                         return page
@@ -2282,8 +2492,13 @@ class BankCrawler(ABC):
                 finally:
                     if collector is not None:
                         try:
-                            collector.detach(page)
+                            with self._error_step("07-940-001"):
+                                collector.detach(page)
                         except Exception as e:
+                            if "error" not in result:
+                                failure = _failure_diagnostics(self, e, "07-940-001")
+                                if failure:
+                                    result["failure_diagnostics"] = failure
                             result.setdefault("error", f"{_safe_exception_type(e)}: browser cleanup failed")
             if data is not None and "error" not in result:
                 result["data"] = data
@@ -2303,6 +2518,10 @@ class BankCrawler(ABC):
                 page_action=page_action,
                 fetch_kwargs=fetch_kwargs,
             )
+        except Exception as e:
+            if not callback_entered and exception_error_id(e) is None:
+                with_error_code(e, bank_error_id(_diagnostic_bank(self), "01-910-001"))
+            raise
         finally:
             for c in cleanups:
                 with contextlib.suppress(Exception): c()

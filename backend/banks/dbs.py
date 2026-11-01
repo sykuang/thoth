@@ -44,6 +44,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import BankCollectResult, BankCrawler, ResponseCollector
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
+from backend.core.error_codes import error_step, with_error_code, exception_error_id, format_error_id
 from backend.core.creds import DbsCreds
 from backend.core.login_checkpoints import CheckpointKind, CheckpointPhase, LoginCheckpointRule
 
@@ -64,24 +65,38 @@ def _dbs_card_bill_fact(out: dict):
     liability = liabilities[0].get("resp") if liabilities and isinstance(liabilities[0], dict) else {}
     payment = ((liability or {}).get("creditCard") or {}).get("paymentDetails") or {}
     fee = out.get("dbs_card_fee_page") or {}
-    fee_amount = card_bill_money(fee.get("bill_due_amount"))
-    statement_amount = card_bill_money(payment.get("amount"))
-    already_paid = card_bill_money(payment.get("alreadyPaid"))
+    with error_step('DBS-07-001-001'):
+        fee_amount = card_bill_money(fee.get("bill_due_amount"))
+    with error_step('DBS-07-002-001'):
+        statement_amount = card_bill_money(payment.get("amount"))
+    with error_step('DBS-07-003-001'):
+        already_paid = card_bill_money(payment.get("alreadyPaid"))
     fee_due = fee.get("payment_due_date")
     dashboard_due = payment.get("dueDate")
 
     if fee_amount is not None:
-        if already_paid is None or not fee_due or fee_due != dashboard_due:
+        if already_paid is None:
+            with contextlib.suppress(Exception):
+                _log(format_error_id('DBS-06-001-001', bank="dbs"))
+            return None
+        elif not fee_due:
+            with contextlib.suppress(Exception):
+                _log(format_error_id('DBS-06-002-001', bank="dbs"))
+            return None
+        elif fee_due != dashboard_due:
+            with contextlib.suppress(Exception):
+                _log(format_error_id('DBS-06-003-001', bank="dbs"))
             return None
         remaining = max(fee_amount - already_paid, 0)
     elif statement_amount is not None and already_paid is not None:
         remaining = max(statement_amount - already_paid, 0)
     else:
         return None
-    return make_card_bill_fact(
-        remaining_due=remaining,
-        payment_due_date=fee_due or dashboard_due,
-    )
+    with error_step('DBS-07-004-001'):
+        return make_card_bill_fact(
+            remaining_due=remaining,
+            payment_due_date=fee_due or dashboard_due,
+        )
 
 
 class DbsCrawler(BankCrawler):
@@ -95,7 +110,9 @@ class DbsCrawler(BankCrawler):
     def _host_filter(self) -> str:
         return "dbs.com.tw"
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             parsed = urlsplit(page.url or "")
             if (
@@ -119,17 +136,21 @@ class DbsCrawler(BankCrawler):
             body_parts = []
             for scope in scopes:
                 for selector in ("#username", "#password", "#loginbutton"):
-                    candidates = scope.locator(selector)
-                    if any(
-                        candidates.nth(index).is_visible()
-                        for index in range(candidates.count())
-                    ):
-                        return False
-                bodies = scope.locator("body")
-                body_parts.extend(
-                    bodies.nth(index).inner_text()
-                    for index in range(bodies.count())
-                )
+                    with error_step({'#username': 'DBS-03-014-002', '#password': 'DBS-03-014-003', '#loginbutton': 'DBS-03-014-004'}.get(selector, 'DBS-03-014-001')):
+                        candidates = scope.locator(selector)
+                    with error_step('DBS-03-015-001'):
+                        if any(
+                            error_step({'#username': 'DBS-03-700-002', '#password': 'DBS-03-700-003', '#loginbutton': 'DBS-03-700-004'}.get(selector, 'DBS-03-700-001'))(lambda: error_step({'#username': 'DBS-03-701-002', '#password': 'DBS-03-701-003', '#loginbutton': 'DBS-03-701-004'}.get(selector, 'DBS-03-701-001'))(lambda: candidates.nth(index))().is_visible())()
+                            for index in range(error_step({'#username': 'DBS-03-702-002', '#password': 'DBS-03-702-003', '#loginbutton': 'DBS-03-702-004'}.get(selector, 'DBS-03-702-001'))(lambda: candidates.count())())
+                        ):
+                            return False
+                with error_step('DBS-03-016-001'):
+                    bodies = scope.locator("body")
+                with error_step('DBS-03-017-001'):
+                    body_parts.extend(
+                        error_step('DBS-03-703-001')(lambda: error_step('DBS-03-704-001')(lambda: bodies.nth(index))().inner_text())()
+                        for index in range(error_step('DBS-03-705-001')(lambda: bodies.count())())
+                    )
             body = "\n".join(body_parts)
             known_overview = parsed.path.rstrip("/").lower() == "/digitw/overview"
             identity = (
@@ -145,17 +166,29 @@ class DbsCrawler(BankCrawler):
                 r"(?<![A-Za-z])logout(?![A-Za-z])", body, re.IGNORECASE
             ) is not None
             return len(body) >= 300 and logout and identity
-        except Exception:
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='dbs')
+                if error_id in ('DBS-03-014-002', 'DBS-03-014-003', 'DBS-03-014-004', 'DBS-03-700-002',
+                 'DBS-03-700-003', 'DBS-03-700-004', 'DBS-03-701-002', 'DBS-03-701-003',
+                 'DBS-03-701-004', 'DBS-03-702-002', 'DBS-03-702-003', 'DBS-03-702-004',
+                 'DBS-03-016-001', 'DBS-03-703-001', 'DBS-03-704-001', 'DBS-03-705-001'):
+                    _auth_probe_ids[:] = [error_id]
             return False
 
     def login(self, page) -> bool:
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(8000)
+        with error_step('DBS-01-001-001'):
+            page.wait_for_timeout(8000)
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -175,28 +208,33 @@ class DbsCrawler(BankCrawler):
         for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
             rules.append(LoginCheckpointRule(
                 name=f"dbs-otp-required-{suffix}", bank="dbs", phases=all_phases,
+                error_id={'modal': 'DBS-03-050-001', 'dialog': 'DBS-03-055-001'}[suffix],
                 kind=CheckpointKind.OTP_REQUIRED, container_selector=selector,
                 required_body_pattern=otp,
             ))
         for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
             rules.append(LoginCheckpointRule(
                 name=f"dbs-password-change-required-{suffix}", bank="dbs", phases=all_phases,
+                error_id={'modal': 'DBS-03-060-001', 'dialog': 'DBS-03-065-001'}[suffix],
                 kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED, container_selector=selector,
                 required_body_pattern=password,
             ))
         for suffix, selector in (("error", ".error"), ("alert", ".alert"), ("role-alert", "[role='alert']")):
             rules.append(LoginCheckpointRule(
                 name=f"dbs-explicit-login-error-{suffix}", bank="dbs", phases=post,
+                error_id={'error': 'DBS-03-070-001', 'alert': 'DBS-03-075-001', 'role-alert': 'DBS-03-080-001'}[suffix],
                 kind=CheckpointKind.EXPLICIT_LOGIN_ERROR, container_selector=selector,
                 required_body_pattern=error,
             ))
         for suffix, selector in (("modal", ".modal.show"), ("dialog", "[role='dialog']")):
             rules.append(LoginCheckpointRule(
                 name=f"dbs-unknown-{suffix}", bank="dbs", phases=all_phases,
+                error_id={'modal': 'DBS-03-085-001', 'dialog': 'DBS-03-090-001'}[suffix],
                 kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector=selector,
             ))
         rules.append(LoginCheckpointRule(
             name="dbs-login-form-still-visible", bank="dbs", phases=post,
+            error_id='DBS-03-095-001',
             kind=CheckpointKind.UNKNOWN_BLOCKER, container_selector="#username",
         ))
         return tuple(rules)
@@ -207,56 +245,94 @@ class DbsCrawler(BankCrawler):
             ("#password", self.creds.password, 500),
         )
         try:
-            page.wait_for_selector("#username", state="visible", timeout=15000)
-            page.wait_for_selector("#password", state="visible", timeout=5000)
-            page.wait_for_selector("#loginbutton", state="visible", timeout=5000)
+            with error_step('DBS-02-001-001'):
+                page.wait_for_selector("#username", state="visible", timeout=15000)
+            with error_step('DBS-02-002-001'):
+                page.wait_for_selector("#password", state="visible", timeout=5000)
+            with error_step('DBS-02-003-001'):
+                page.wait_for_selector("#loginbutton", state="visible", timeout=5000)
             for selector, value, final_wait in fields:
-                candidates = page.locator(selector)
+                with error_step({'#username': 'DBS-02-017-001', '#password': 'DBS-02-035-001'}[selector]):
+                    candidates = page.locator(selector)
+                with error_step({'#username': 'DBS-02-018-001', '#password': 'DBS-02-036-001'}[selector]):
+                    if candidates.count() != 1:
+                        raise with_error_code(DbsLoginError('登入欄位無法安全填寫；未送出'), {'#username': 'DBS-02-019-001', '#password': 'DBS-02-037-001'}[selector])
+                with error_step({'#username': 'DBS-02-020-001', '#password': 'DBS-02-038-001'}[selector]):
+                    field = candidates.nth(0)
+                with error_step({'#username': 'DBS-02-021-001', '#password': 'DBS-02-039-001'}[selector]):
+                    with error_step({'#username': 'DBS-02-022-001', '#password': 'DBS-02-040-001'}[selector]):
+                        _error_condition = not field.is_visible()
+                    if _error_condition:
+                        raise with_error_code(DbsLoginError('登入欄位無法安全填寫；未送出'), {'#username': 'DBS-02-023-001', '#password': 'DBS-02-041-001'}[selector])
+                    else:
+                        with error_step({'#username': 'DBS-02-024-001', '#password': 'DBS-02-042-001'}[selector]):
+                            _error_condition = not field.is_enabled()
+                        if _error_condition:
+                            raise with_error_code(DbsLoginError('登入欄位無法安全填寫；未送出'), {'#username': 'DBS-02-023-002', '#password': 'DBS-02-041-002'}[selector])
+                with error_step({'#username': 'DBS-02-025-001', '#password': 'DBS-02-043-001'}[selector]):
+                    field.click()
+                with error_step({'#username': 'DBS-02-026-001', '#password': 'DBS-02-044-001'}[selector]):
+                    page.wait_for_timeout(200)
+                with error_step({'#username': 'DBS-02-027-001', '#password': 'DBS-02-045-001'}[selector]):
+                    field.click(click_count=3)
+                with error_step({'#username': 'DBS-02-028-001', '#password': 'DBS-02-046-001'}[selector]):
+                    page.wait_for_timeout(100)
+                with error_step({'#username': 'DBS-02-029-001', '#password': 'DBS-02-047-001'}[selector]):
+                    page.keyboard.press("Backspace")
+                with error_step({'#username': 'DBS-02-030-001', '#password': 'DBS-02-048-001'}[selector]):
+                    page.wait_for_timeout(100)
+                with error_step({'#username': 'DBS-02-031-001', '#password': 'DBS-02-049-001'}[selector]):
+                    page.keyboard.type(value, delay=80)
+                with error_step({'#username': 'DBS-02-032-001', '#password': 'DBS-02-050-001'}[selector]):
+                    page.wait_for_timeout(final_wait)
+                with error_step({'#username': 'DBS-02-033-001', '#password': 'DBS-02-051-001'}[selector]):
+                    if len(field.input_value()) != len(value):
+                        raise with_error_code(DbsLoginError('登入欄位輸入長度不符；未送出'), {'#username': 'DBS-02-034-001', '#password': 'DBS-02-052-001'}[selector])
+        except DbsLoginError:
+            raise
+        except Exception as error:
+            raise with_error_code(DbsLoginError('登入欄位無法安全填寫；未送出'), exception_error_id(error, bank="dbs") or 'DBS-02-004-001') from None
+
+        try:
+            with error_step('DBS-02-005-001'):
+                candidates = page.locator("#loginbutton")
+            with error_step('DBS-02-006-001'):
                 if candidates.count() != 1:
-                    raise DbsLoginError("登入欄位無法安全填寫；未送出")
-                field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
-                    raise DbsLoginError("登入欄位無法安全填寫；未送出")
-                field.click()
-                page.wait_for_timeout(200)
-                field.click(click_count=3)
-                page.wait_for_timeout(100)
-                page.keyboard.press("Backspace")
-                page.wait_for_timeout(100)
-                page.keyboard.type(value, delay=80)
-                page.wait_for_timeout(final_wait)
-                if len(field.input_value()) != len(value):
-                    raise DbsLoginError("登入欄位輸入長度不符；未送出")
+                    raise with_error_code(DbsLoginError('找不到唯一且可操作的登入按鈕；未送出'), 'DBS-02-007-001')
+            with error_step('DBS-02-008-001'):
+                submit = candidates.nth(0)
+            with error_step('DBS-02-009-001'):
+                with error_step('DBS-02-010-001'):
+                    _error_condition = not submit.is_visible()
+                if _error_condition:
+                    raise with_error_code(DbsLoginError('找不到唯一且可操作的登入按鈕；未送出'), 'DBS-02-011-001')
+                else:
+                    with error_step('DBS-02-012-001'):
+                        _error_condition = not submit.is_enabled()
+                    if _error_condition:
+                        raise with_error_code(DbsLoginError('找不到唯一且可操作的登入按鈕；未送出'), 'DBS-02-011-002')
+                    else:
+                        with error_step('DBS-02-013-001'):
+                            _error_condition = ' '.join(submit.inner_text().split()) != '登入'
+                        if _error_condition:
+                            raise with_error_code(DbsLoginError('找不到唯一且可操作的登入按鈕；未送出'), 'DBS-02-011-003')
         except DbsLoginError:
             raise
-        except Exception:
-            raise DbsLoginError("登入欄位無法安全填寫；未送出") from None
+        except Exception as error:
+            raise with_error_code(DbsLoginError('無法安全確認登入按鈕；未送出'), exception_error_id(error, bank="dbs") or 'DBS-02-014-001') from None
 
         try:
-            candidates = page.locator("#loginbutton")
-            if candidates.count() != 1:
-                raise DbsLoginError("找不到唯一且可操作的登入按鈕；未送出")
-            submit = candidates.nth(0)
-            if (
-                not submit.is_visible()
-                or not submit.is_enabled()
-                or " ".join(submit.inner_text().split()) != "登入"
-            ):
-                raise DbsLoginError("找不到唯一且可操作的登入按鈕；未送出")
-        except DbsLoginError:
-            raise
-        except Exception:
-            raise DbsLoginError("無法安全確認登入按鈕；未送出") from None
+            with error_step('DBS-02-015-001'):
+                submit.click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(DbsLoginError('送出狀態不明；禁止自動重試'), exception_error_id(error, bank="dbs") or 'DBS-02-016-001') from None
 
         try:
-            submit.click(timeout=8000)
-        except Exception:
-            raise DbsLoginError("送出狀態不明；禁止自動重試") from None
-
-        try:
-            page.wait_for_timeout(3000)
+            with error_step('DBS-03-001-001'):
+                page.wait_for_timeout(3000)
             for _ in range(20):
-                page.wait_for_timeout(1000)
+                with error_step('DBS-03-002-001'):
+                    page.wait_for_timeout(1000)
                 if self._logged_in(page):
                     return
                 scopes = [
@@ -267,14 +343,16 @@ class DbsCrawler(BankCrawler):
                     for selector in (
                         ".modal.show", "[role='dialog']", ".error", ".alert", "[role='alert']",
                     ):
-                        candidates = scope.locator(selector)
-                        if any(
-                            candidates.nth(index).is_visible()
-                            for index in range(candidates.count())
-                        ):
-                            return
-        except Exception:
-            raise DbsLoginError("狀態無法安全確認；禁止自動重試") from None
+                        with error_step({'.modal.show': 'DBS-03-003-001', "[role='dialog']": 'DBS-03-004-001', '.error': 'DBS-03-005-001', '.alert': 'DBS-03-006-001', "[role='alert']": 'DBS-03-007-001'}[selector]):
+                            candidates = scope.locator(selector)
+                        with error_step({'.modal.show': 'DBS-03-008-001', "[role='dialog']": 'DBS-03-009-001', '.error': 'DBS-03-010-001', '.alert': 'DBS-03-011-001', "[role='alert']": 'DBS-03-012-001'}[selector]):
+                            if any(
+                                error_step({'.modal.show': 'DBS-03-706-002', "[role='dialog']": 'DBS-03-706-003', '.error': 'DBS-03-706-004', '.alert': 'DBS-03-706-005', "[role='alert']": 'DBS-03-706-006'}[selector])(lambda: error_step({'.modal.show': 'DBS-03-707-002', "[role='dialog']": 'DBS-03-707-003', '.error': 'DBS-03-707-004', '.alert': 'DBS-03-707-005', "[role='alert']": 'DBS-03-707-006'}[selector])(lambda: candidates.nth(index))().is_visible())()
+                                for index in range(error_step({'.modal.show': 'DBS-03-708-002', "[role='dialog']": 'DBS-03-708-003', '.error': 'DBS-03-708-004', '.alert': 'DBS-03-708-005', "[role='alert']": 'DBS-03-708-006'}[selector])(lambda: candidates.count())())
+                            ):
+                                return
+        except Exception as error:
+            raise with_error_code(DbsLoginError('狀態無法安全確認；禁止自動重試'), exception_error_id(error, bank="dbs") or 'DBS-03-013-001') from None
 
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """DBS collect 第一輪：dump 登入後 URL + page text + endpoint 地圖。
@@ -282,7 +360,8 @@ class DbsCrawler(BankCrawler):
         TODO 第二輪（見檔案頂端 docstring）: 點信用卡 menu / 帳戶 → 抓 billed_txn / casa 交易明細
         """
         out: dict = {}
-        page.wait_for_timeout(8000)
+        with error_step('DBS-06-004-001'):
+            page.wait_for_timeout(8000)
 
         debug_dir = _debug_dir()
         with contextlib.suppress(Exception):
@@ -290,21 +369,28 @@ class DbsCrawler(BankCrawler):
 
         out["initial_url"] = page.url
         try:
-            out["title"] = page.title()
-        except Exception:
+            with error_step('DBS-04-001-001'):
+                out["title"] = page.title()
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-005-001', bank="dbs"))
             out["title"] = ""
 
         # dump 主 page text（DBS 是純 SPA，無 frameset）
         try:
-            txt = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
-        except Exception:
+            with error_step('DBS-04-002-001'):
+                txt = page.evaluate("() => (document.body.innerText || '').slice(0, 15000)") or ""
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-006-001', bank="dbs"))
             txt = ""
         out["home_text"] = txt
         _log(f"[dbs][collect] home text_len={len(txt)}")
 
         # dump 主 page 內所有 link/button text（找 menu）
         try:
-            nav_items = page.evaluate("""() => {
+            with error_step('DBS-04-003-001'):
+                nav_items = page.evaluate("""() => {
                 const out = [];
                 for (const el of document.querySelectorAll('a, button, [role=button], [role=link]')) {
                     if (el.offsetParent === null) continue;
@@ -320,7 +406,9 @@ class DbsCrawler(BankCrawler):
                 }
                 return out;
             }""")
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-007-001', bank="dbs"))
             nav_items = []
         out["nav_items"] = nav_items[:80]
         _log(f"[dbs][collect] nav items: {len(nav_items)}（含 menu/button）")
@@ -350,7 +438,8 @@ class DbsCrawler(BankCrawler):
                 "displayAccountNumber": acct_display,
                 "tail": acct_tail,
             }
-            click_result = page.evaluate(r"""({acctName, acctTail}) => {
+            with error_step('DBS-05-001-001'):
+                click_result = page.evaluate(r"""({acctName, acctTail}) => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
@@ -402,16 +491,19 @@ class DbsCrawler(BankCrawler):
                 f"[dbs][twd] drilldown click={clicked} "
                 f"candidate_count={candidate_count}"
             )
-            page.wait_for_timeout(9000)
+            with error_step('DBS-05-002-001'):
+                page.wait_for_timeout(9000)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "01_twd_account_detail.png"), full_page=True)
-            detail_text = page.evaluate("() => (document.body.innerText || '').slice(0, 40000)") or ""
+            with error_step('DBS-05-003-001'):
+                detail_text = page.evaluate("() => (document.body.innerText || '').slice(0, 40000)") or ""
             out["twd_account_detail_url"] = page.url
             out["twd_account_detail_text"] = detail_text
             out["twd_account_detail_api_endpoints"] = sorted({
                 h.endpoint for h in collector.hits[before_detail_hit_count:] if h.resp_json is not None
             })
-            out["twd_account_detail_controls"] = page.evaluate(r"""() => {
+            with error_step('DBS-05-004-001'):
+                out["twd_account_detail_controls"] = page.evaluate(r"""() => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
@@ -435,7 +527,8 @@ class DbsCrawler(BankCrawler):
             month_clicks = []
             for label in ("七月", "六月", "五月"):
                 try:
-                    clicked = page.evaluate(r"""(wanted) => {
+                    with error_step('DBS-05-005-001'):
+                        clicked = page.evaluate(r"""(wanted) => {
                         const visible = (el) => {
                             const r = el.getBoundingClientRect();
                             const st = getComputedStyle(el);
@@ -450,13 +543,17 @@ class DbsCrawler(BankCrawler):
                         }
                         return {clicked: false, text: wanted};
                     }""", label)
-                    page.wait_for_timeout(2500)
+                    with error_step('DBS-05-006-001'):
+                        page.wait_for_timeout(2500)
                     month_clicks.append({"label": label, **(clicked or {})})
-                except Exception:
+                except Exception as _action_error:
+                    with contextlib.suppress(Exception):
+                        _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-008-001', bank="dbs"))
                     month_clicks.append({"label": label, "clicked": False, "error": "probe_failed"})
             def _click_other_months_and_probe() -> dict:
                 try:
-                    probe = page.evaluate(r"""() => {
+                    with error_step('DBS-05-014-001'):
+                        probe = page.evaluate(r"""() => {
                         const visible = (el) => {
                             const r = el.getBoundingClientRect();
                             const st = getComputedStyle(el);
@@ -471,16 +568,21 @@ class DbsCrawler(BankCrawler):
                         }
                         return {clicked: false, reason: 'not_found'};
                     }""") or {"clicked": False}
-                    page.wait_for_timeout(1000)
+                    with error_step('DBS-05-015-001'):
+                        page.wait_for_timeout(1000)
                     return probe
-                except Exception:
+                except Exception as _action_error:
+                    with contextlib.suppress(Exception):
+                        _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-05-016-001', bank="dbs"))
                     return {"clicked": False, "error": "probe_failed"}
 
             other_probe = _click_other_months_and_probe()
-            page.wait_for_timeout(1500)
+            with error_step('DBS-05-007-001'):
+                page.wait_for_timeout(1500)
             with contextlib.suppress(Exception):
                 page.screenshot(path=str(debug_dir / "02_other_months.png"), full_page=True)
-            other_probe["controls_after_click"] = page.evaluate(r"""() => {
+            with error_step('DBS-05-008-001'):
+                other_probe["controls_after_click"] = page.evaluate(r"""() => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
@@ -516,7 +618,8 @@ class DbsCrawler(BankCrawler):
                     other_month_clicks.append({"year": year, "month": month_label, "clicked": False, "error": probe})
                     continue
                 try:
-                    target = page.evaluate(r"""({year, monthLabel}) => {
+                    with error_step('DBS-05-009-001'):
+                        target = page.evaluate(r"""({year, monthLabel}) => {
                         const visible = (el) => {
                             const r = el.getBoundingClientRect();
                             const st = getComputedStyle(el);
@@ -544,8 +647,10 @@ class DbsCrawler(BankCrawler):
                     }""", {"year": year, "monthLabel": month_label}) or {"found": False}
                     before_hits = len([h for h in collector.hits if h.endpoint == "inquiry" and h.resp_json is not None])
                     if target.get("found"):
-                        page.mouse.click(float(target["x"]), float(target["y"]))
-                    page.wait_for_timeout(3000)
+                        with error_step('DBS-05-010-001'):
+                            page.mouse.click(float(target["x"]), float(target["y"]))
+                    with error_step('DBS-05-011-001'):
+                        page.wait_for_timeout(3000)
                     after_hits = len([h for h in collector.hits if h.endpoint == "inquiry" and h.resp_json is not None])
                     other_month_clicks.append({
                         **target,
@@ -554,7 +659,9 @@ class DbsCrawler(BankCrawler):
                         "api_hits_before": before_hits,
                         "api_hits_after": after_hits,
                     })
-                except Exception:
+                except Exception as _action_error:
+                    with contextlib.suppress(Exception):
+                        _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-009-001', bank="dbs"))
                     other_month_clicks.append({
                         "year": year, "month": month_label,
                         "clicked": False, "error": "probe_failed",
@@ -577,9 +684,13 @@ class DbsCrawler(BankCrawler):
 
             # Return to overview before probing top-nav card-fee shortcut.
             with contextlib.suppress(Exception):
-                page.goto("https://internet-banking.dbs.com.tw/digitw/overview", wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(5000)
-        except Exception:
+                with error_step('DBS-05-012-001'):
+                    page.goto("https://internet-banking.dbs.com.tw/digitw/overview", wait_until="domcontentloaded", timeout=15000)
+                with error_step('DBS-05-013-001'):
+                    page.wait_for_timeout(5000)
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-010-001', bank="dbs"))
             out["twd_account_drilldown_error"] = "probe_failed"
             _log("[dbs][twd] drilldown probe failed; details withheld")
 
@@ -591,7 +702,8 @@ class DbsCrawler(BankCrawler):
         # 這頁是發起繳卡費流程，不是歷史繳款紀錄；只用來補 bill_due/payment_due。
         try:
             before_card_fee_hits = len(collector.hits)
-            card_fee_click = page.evaluate(r"""() => {
+            with error_step('DBS-06-005-001'):
+                card_fee_click = page.evaluate(r"""() => {
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
@@ -617,8 +729,10 @@ class DbsCrawler(BankCrawler):
                 return {clicked: true, target: dump[0], dump};
             }""") or {"clicked": False}
             out["dbs_card_fee_click"] = card_fee_click
-            page.wait_for_timeout(8000)
-            card_fee_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
+            with error_step('DBS-06-006-001'):
+                page.wait_for_timeout(8000)
+            with error_step('DBS-06-007-001'):
+                card_fee_text = page.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
             out["dbs_card_fee_page_text"] = card_fee_text
             out["dbs_card_fee_page"] = self._parse_card_fee_page(card_fee_text)
             out["dbs_card_fee_endpoints"] = sorted({
@@ -633,7 +747,9 @@ class DbsCrawler(BankCrawler):
                 f"parsed={bool(out['dbs_card_fee_page'])} "
                 f"endpoint_count={len(out['dbs_card_fee_endpoints'])}"
             )
-        except Exception:
+        except Exception as _action_error:
+            with contextlib.suppress(Exception):
+                _log(format_error_id(exception_error_id(_action_error, bank="dbs") or 'DBS-07-011-001', bank="dbs"))
             out["dbs_card_fee_error"] = "probe_failed"
             _log("[dbs][card_fee] probe failed; details withheld")
 
@@ -657,7 +773,8 @@ class DbsCrawler(BankCrawler):
         out["api_responses"] = api_responses
         _log(f"[dbs][collect] dump {len(api_responses)} 個 endpoint 的 resp_json")
 
-        publish_card_bill_facts(out, [_dbs_card_bill_fact(out)])
+        with error_step('DBS-07-012-001'):
+            publish_card_bill_facts(out, [_dbs_card_bill_fact(out)])
 
         _log(f"[dbs][collect] 攔到 {len(out['_all_endpoints'])} 個 endpoint")
         return BankCollectResult(**out)

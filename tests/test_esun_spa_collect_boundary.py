@@ -51,7 +51,8 @@ def test_product_run_keeps_strict_error_barrier_and_cleanup(product, monkeypatch
 
     result = crawler.run(BASE, headless=True)
     assert "data" not in result
-    assert result["error"] == "collect_failed: ValueError: code=collect_adapter: phase=spa_entry"
+    assert result["error"] == "[ESUN-05-414-001] 金融資料收集：拒絕條件成立：not isinstance(collector, SpaCollector) | collect_failed: ValueError: code=collect_adapter: phase=spa_entry"
+    assert result["collect_diagnostics"] == {"exception": "ValueError", "code": "collect_adapter", "phase": "spa_entry", "error_id": "ESUN-05-414-001"}
     assert crawler._diagnostic_stage == "collect_validation"
     crawler.logout.assert_called_once_with(page)
     assert {c.args[0] for c in page.remove_listener.call_args_list} == {"request", "requestfailed", "response"}

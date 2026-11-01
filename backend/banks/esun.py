@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.core.base import ApiHit, BankCollectResult, BankCrawler, ResponseCollector, _OriginGuardProxy
 from backend.core.card_bills import card_bill_money, make_card_bill_fact, publish_card_bill_facts
 from backend.core.creds import EsunCreds
+from backend.core.error_codes import error_step, exception_error_id, with_error_code
 from backend.core.login_checkpoints import (
     CheckpointKind,
     CheckpointPhase,
@@ -163,31 +164,45 @@ class EsunCrawler(BankCrawler):
         self._spa_login_baseline = None
         self._esun_spa_phase = None
         self._esun_spa_gate = None
+        detection_failure = None
+
+        def legacy_field(frame, field_index, field):
+            nonlocal detection_failure
+            count = error_step(('ESUN-01-460-002', 'ESUN-01-461-002', 'ESUN-01-462-002')[field_index])(lambda: error_step(('ESUN-01-460-001', 'ESUN-01-461-001', 'ESUN-01-462-001')[field_index])(lambda: frame.locator(_sel(field)))().count())()
+            if count == 1:
+                return True
+            detection_failure = ('ESUN-01-460-003', 'ESUN-01-461-003', 'ESUN-01-462-003')[field_index]
+            return False
+
         # Collector must be attached before login. An empty startup DOM is not
         # evidence of the legacy site; it may be a still-mounting SPA.
         for attempt in range(41):
+            detection_failure = None
             if not self._credential_origin_allowed(page):
-                raise EsunLoginError("登入頁面來源不符；未送出登入")
-            if page.evaluate("() => !!document.querySelector('#layout-content, input[name=pxssword]')") is True:
-                if not self._credential_origin_allowed(page):
-                    raise EsunLoginError("登入頁面來源不符；未送出登入")
-                from backend.banks.esun_spa.capture import SpaCollector
-                return SpaCollector()
-            for frame in page.frames:
-                if (
-                    frame is not page.main_frame
-                    and self._frame_origin_allowed(page, frame)
-                    and (frame.name == "iframe1" or IFRAME_HINT in (urlparse(frame.url or "").path or ""))
-                    and all(frame.locator(_sel(field)).count() == 1 for field in (
-                        FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD
-                    ))
-                ):
+                raise with_error_code(EsunLoginError('登入頁面來源不符；未送出登入'), 'ESUN-01-400-001')
+            with error_step('ESUN-01-404-001'):
+                if page.evaluate("() => !!document.querySelector('#layout-content, input[name=pxssword]')") is True:
                     if not self._credential_origin_allowed(page):
-                        raise EsunLoginError("登入頁面來源不符；未送出登入")
-                    return super()._make_collector(page)
+                        raise with_error_code(EsunLoginError('登入頁面來源不符；未送出登入'), 'ESUN-01-401-001')
+                    from backend.banks.esun_spa.capture import SpaCollector
+                    return SpaCollector()
+            for frame in page.frames:
+                with error_step('ESUN-01-405-001'):
+                    if (
+                        frame is not page.main_frame
+                        and self._frame_origin_allowed(page, frame)
+                        and (frame.name == "iframe1" or IFRAME_HINT in (urlparse(frame.url or "").path or ""))
+                        and all(legacy_field(frame, field_index, field) for field_index, field in enumerate((
+                            FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD
+                        )))
+                    ):
+                        if not self._credential_origin_allowed(page):
+                            raise with_error_code(EsunLoginError('登入頁面來源不符；未送出登入'), 'ESUN-01-402-001')
+                        return super()._make_collector(page)
             if attempt < 40:
-                page.wait_for_timeout(250)
-        raise EsunLoginError("無法確認登入頁面類型；未送出登入")
+                with error_step('ESUN-01-406-001'):
+                    page.wait_for_timeout(250)
+        raise with_error_code(EsunLoginError("無法確認登入頁面類型；未送出登入"), detection_failure or 'ESUN-01-403-001')
 
     def _build_fetch_kwargs(self) -> dict:
         kwargs = super()._build_fetch_kwargs()
@@ -196,51 +211,101 @@ class EsunCrawler(BankCrawler):
         kwargs.setdefault("additional_args", {})["viewport"] = {"width": 1200, "height": 1800}
         return kwargs
 
-    def _find_login_frame(self, page):
+    def _find_login_frame(self, page, *, failure=None):
+        if failure is not None:
+            failure.clear()
         matches = [
             frame for frame in page.frames
-            if self._is_login_frame(page, frame)
+            if self._is_login_frame(page, frame, failure=failure)
         ]
+        if matches and failure is not None:
+            failure.clear()
+            if len(matches) != 1:
+                failure[:] = ['ESUN-02-450-001']
         return matches[0] if len(matches) == 1 else None
 
     @staticmethod
-    def _main_login_form(frame):
+    def _main_login_form(frame, *, failure=None):
+        def unavailable(code):
+            if failure is not None:
+                failure[:] = [code]
+            return None
+
         if frame.parent_frame is not None:
             return None
-        forms = frame.locator(_MAIN_LOGIN_FORM)
-        if forms.count() != 1:
-            return None
-        form = forms.nth(0)
-        for selector in _MAIN_LOGIN_FIELDS:
-            fields = frame.locator(selector)
-            if fields.count() != 1 or not fields.nth(0).is_visible() or not fields.nth(0).is_enabled():
-                return None
-        if form.evaluate("""form => [
-            ['id', 'text', 10], ['userName', 'password', 15], ['pxssword', 'password', 15]
-        ].every(([name, type, max]) => {
-            const nodes = form.querySelectorAll('input[name="' + name + '"]');
-            return nodes.length === 1 && nodes[0].form === form && nodes[0].type === type && nodes[0].maxLength === max;
-        })""") is not True:
-            return None
-        buttons = form.locator('button[type="button"]').filter(has_text=_MAIN_LOGIN_LABEL)
-        if buttons.count() != 1:
-            return None
-        button = buttons.nth(0)
-        if not button.is_visible() or not button.is_enabled():
-            return None
-        if button.evaluate("el => el.form === el.closest('form')") is not True:
-            return None
+        with error_step('ESUN-01-407-001'):
+            forms = frame.locator(_MAIN_LOGIN_FORM)
+        with error_step('ESUN-01-408-001'):
+            count = forms.count()
+            if count != 1:
+                return unavailable('ESUN-01-454-001' if count == 0 else 'ESUN-01-454-002')
+        with error_step('ESUN-01-409-001'):
+            form = forms.nth(0)
+        for field_index, selector in enumerate(_MAIN_LOGIN_FIELDS):
+            with error_step(('ESUN-01-456-001', 'ESUN-01-456-002', 'ESUN-01-456-003')[field_index]):
+                fields = frame.locator(selector)
+            with error_step('ESUN-01-411-001'):
+                if error_step(('ESUN-01-411-100', 'ESUN-01-411-120', 'ESUN-01-411-140')[field_index])(lambda: fields.count())() != 1:
+                    return unavailable(('ESUN-01-450-001', 'ESUN-01-451-001', 'ESUN-01-452-001')[field_index])
+                if not error_step(('ESUN-01-411-102', 'ESUN-01-411-122', 'ESUN-01-411-142')[field_index])(lambda: error_step(('ESUN-01-411-101', 'ESUN-01-411-121', 'ESUN-01-411-141')[field_index])(lambda: fields.nth(0))().is_visible())():
+                    return unavailable(('ESUN-01-450-002', 'ESUN-01-451-002', 'ESUN-01-452-002')[field_index])
+                if not error_step(('ESUN-01-411-104', 'ESUN-01-411-124', 'ESUN-01-411-144')[field_index])(lambda: error_step(('ESUN-01-411-103', 'ESUN-01-411-123', 'ESUN-01-411-143')[field_index])(lambda: fields.nth(0))().is_enabled())():
+                    return unavailable(('ESUN-01-450-003', 'ESUN-01-451-003', 'ESUN-01-452-003')[field_index])
+        with error_step('ESUN-01-412-001'):
+            contract = form.evaluate("""form => {
+            let reason = true;
+            const reasons = [
+                ['ESUN-01-470-001', 'ESUN-01-470-002', 'ESUN-01-470-003', 'ESUN-01-470-004'],
+                ['ESUN-01-471-001', 'ESUN-01-471-002', 'ESUN-01-471-003', 'ESUN-01-471-004'],
+                ['ESUN-01-472-001', 'ESUN-01-472-002', 'ESUN-01-472-003', 'ESUN-01-472-004']
+            ];
+            const check = (ok, code) => {if (!ok) reason = code; return ok;};
+            [
+                ['id', 'text', 10], ['userName', 'password', 15], ['pxssword', 'password', 15]
+            ].every(([name, type, max], index) => {
+                const nodes = form.querySelectorAll('input[name="' + name + '"]');
+                return check(nodes.length === 1, reasons[index][0])
+                    && check(nodes[0].form === form, reasons[index][1])
+                    && check(nodes[0].type === type, reasons[index][2])
+                    && check(nodes[0].maxLength === max, reasons[index][3]);
+            });
+            return reason;
+        }""")
+            if contract is not True:
+                return unavailable(contract if type(contract) is str and contract in (
+                    'ESUN-01-470-001', 'ESUN-01-470-002', 'ESUN-01-470-003', 'ESUN-01-470-004',
+                    'ESUN-01-471-001', 'ESUN-01-471-002', 'ESUN-01-471-003', 'ESUN-01-471-004',
+                    'ESUN-01-472-001', 'ESUN-01-472-002', 'ESUN-01-472-003', 'ESUN-01-472-004',
+                ) else 'ESUN-01-453-001')
+        with error_step('ESUN-01-413-001'):
+            buttons = error_step('ESUN-01-413-101')(lambda: error_step('ESUN-01-413-100')(lambda: form.locator('button[type="button"]'))().filter(has_text=_MAIN_LOGIN_LABEL))()
+        with error_step('ESUN-01-414-001'):
+            count = buttons.count()
+            if count != 1:
+                return unavailable('ESUN-01-455-001' if count == 0 else 'ESUN-01-455-002')
+        with error_step('ESUN-01-415-001'):
+            button = buttons.nth(0)
+        with error_step('ESUN-01-416-001'):
+            if not error_step('ESUN-01-416-100')(lambda: button.is_visible())():
+                return unavailable('ESUN-01-455-003')
+            if not error_step('ESUN-01-416-101')(lambda: button.is_enabled())():
+                return unavailable('ESUN-01-455-004')
+        with error_step('ESUN-01-417-001'):
+            if button.evaluate("el => el.form === el.closest('form')") is not True:
+                return unavailable('ESUN-01-455-005')
         return form
 
-    def _is_login_frame(self, page, frame) -> bool:
+    def _is_login_frame(self, page, frame, *, failure=None) -> bool:
         current = urlparse(frame.url or "")
         return self._frame_origin_allowed(page, frame) and (
             frame.name == "iframe1" or IFRAME_HINT in (current.path or "")
-            or self._main_login_form(frame) is not None
+            or self._main_login_form(frame, failure=failure) is not None
         )
 
-    def _logged_in(self, page) -> bool:
+    def _logged_in(self, page, *, _auth_probe_ids=None) -> bool:
         """Pure one-shot positive check; lifecycle owns all waiting."""
+        if _auth_probe_ids is not None:
+            _auth_probe_ids.clear()
         try:
             current = urlparse(page.url or "")
             if (
@@ -271,31 +336,49 @@ class EsunCrawler(BankCrawler):
                 *_MAIN_LOGIN_FIELDS,
             ))
             for scope in scopes:
-                fields = scope.locator(login_fields_selector)
-                if any(
-                    fields.nth(index).is_visible()
-                    for index in range(fields.count())
-                ):
-                    return False
-            layouts = page.locator("#layout-content")
-            if layouts.count():
-                if layouts.count() != 1 or not layouts.nth(0).is_visible():
-                    return False
-                layout = layouts.nth(0)
-                dashboard = layout.locator(".cpo08003 > .index")
-                return (
-                    page.locator("#layout-content.not-login").count() == 0
-                    and layout.locator(".temp-index:visible").count() == 0
-                    and layout.locator(".cpo08003").count() == 1
-                    and dashboard.count() == 1
-                    and dashboard.nth(0).is_visible()
+                with error_step('ESUN-03-400-001'):
+                    fields = scope.locator(login_fields_selector)
+                with error_step('ESUN-03-401-001'):
+                    if any(
+                        error_step('ESUN-03-401-101')(lambda: error_step('ESUN-03-401-100')(lambda: fields.nth(index))().is_visible())()
+                        for index in range(error_step('ESUN-03-401-102')(lambda: fields.count())())
+                    ):
+                        return False
+            with error_step('ESUN-03-402-001'):
+                layouts = page.locator("#layout-content")
+            with error_step('ESUN-03-403-001'):
+                if layouts.count():
+                    with error_step('ESUN-03-404-001'):
+                        if error_step('ESUN-03-404-100')(lambda: layouts.count())() != 1 or not error_step('ESUN-03-404-102')(lambda: error_step('ESUN-03-404-101')(lambda: layouts.nth(0))().is_visible())():
+                            return False
+                    with error_step('ESUN-03-405-001'):
+                        layout = layouts.nth(0)
+                    with error_step('ESUN-03-406-001'):
+                        dashboard = layout.locator(".cpo08003 > .index")
+                    with error_step('ESUN-03-407-001'):
+                        return (
+                            error_step('ESUN-03-407-101')(lambda: error_step('ESUN-03-407-100')(lambda: page.locator("#layout-content.not-login"))().count())() == 0
+                            and error_step('ESUN-03-407-103')(lambda: error_step('ESUN-03-407-102')(lambda: layout.locator(".temp-index:visible"))().count())() == 0
+                            and error_step('ESUN-03-407-105')(lambda: error_step('ESUN-03-407-104')(lambda: layout.locator(".cpo08003"))().count())() == 1
+                            and error_step('ESUN-03-407-106')(lambda: dashboard.count())() == 1
+                            and error_step('ESUN-03-407-108')(lambda: error_step('ESUN-03-407-107')(lambda: dashboard.nth(0))().is_visible())()
+                        )
+            with error_step('ESUN-03-408-001'):
+                body = "\n".join(
+                    scope.evaluate("() => document.body && document.body.innerText || ''") or ""
+                    for scope in scopes
+                    if scope is page or self._frame_origin_allowed(page, scope)
                 )
-            body = "\n".join(
-                scope.evaluate("() => document.body && document.body.innerText || ''") or ""
-                for scope in scopes
-                if scope is page or self._frame_origin_allowed(page, scope)
-            )
-        except Exception:
+        except Exception as error:
+            if _auth_probe_ids is not None:
+                error_id = exception_error_id(error, bank='esun')
+                if error_id in ('ESUN-03-400-001', 'ESUN-03-401-100', 'ESUN-03-401-101', 'ESUN-03-401-102',
+                 'ESUN-03-402-001', 'ESUN-03-403-001', 'ESUN-03-404-100', 'ESUN-03-404-101',
+                 'ESUN-03-404-102', 'ESUN-03-405-001', 'ESUN-03-406-001', 'ESUN-03-407-100',
+                 'ESUN-03-407-101', 'ESUN-03-407-102', 'ESUN-03-407-103', 'ESUN-03-407-104',
+                 'ESUN-03-407-105', 'ESUN-03-407-106', 'ESUN-03-407-107', 'ESUN-03-407-108',
+                 'ESUN-03-408-001'):
+                    _auth_probe_ids[:] = [error_id]
             return False
 
         keywords = (
@@ -324,10 +407,15 @@ class EsunCrawler(BankCrawler):
         return self._shared_login(page)
 
     def prepare_login_page(self, page) -> None:
-        page.wait_for_timeout(10000)
+        with error_step('ESUN-01-418-001'):
+            page.wait_for_timeout(10000)
 
     def is_authenticated(self, page) -> bool:
-        return self._logged_in(page)
+        auth_probe_ids = getattr(self, "_login_auth_probe_ids", None)
+        return (
+            self._logged_in(page) if auth_probe_ids is None
+            else self._logged_in(page, _auth_probe_ids=auth_probe_ids)
+        )
 
     def login_checkpoint_rules(self) -> tuple[LoginCheckpointRule, ...]:
         all_phases = tuple(CheckpointPhase)
@@ -350,6 +438,7 @@ class EsunCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"esun-otp-required-{suffix}",
+                    error_id={'modal': 'ESUN-03-050-001', 'dialog': 'ESUN-03-055-001'}[suffix],
                     bank="esun",
                     phases=all_phases,
                     kind=CheckpointKind.OTP_REQUIRED,
@@ -364,6 +453,7 @@ class EsunCrawler(BankCrawler):
             *(
                 LoginCheckpointRule(
                     name=f"esun-password-change-required-{suffix}",
+                    error_id={'modal': 'ESUN-03-060-001', 'dialog': 'ESUN-03-065-001'}[suffix],
                     bank="esun",
                     phases=all_phases,
                     kind=CheckpointKind.PASSWORD_CHANGE_REQUIRED,
@@ -377,6 +467,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-spa-duplicate-session",
+                error_id='ESUN-03-800-001',
                 bank="esun",
                 phases=post_settle,
                 kind=CheckpointKind.DUPLICATE_SESSION,
@@ -391,6 +482,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-six-month-password-reminder",
+                error_id='ESUN-03-805-001',
                 bank="esun",
                 phases=post_settle,
                 kind=CheckpointKind.DISMISSIBLE_NOTICE,
@@ -404,6 +496,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-unknown-modal",
+                error_id='ESUN-03-070-001',
                 bank="esun",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -411,6 +504,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-unknown-dialog",
+                error_id='ESUN-03-075-001',
                 bank="esun",
                 phases=all_phases,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -418,6 +512,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-login-form-still-visible",
+                error_id='ESUN-03-080-001',
                 bank="esun",
                 phases=post_settle,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -425,6 +520,7 @@ class EsunCrawler(BankCrawler):
             ),
             LoginCheckpointRule(
                 name="esun-main-login-form-still-visible",
+                error_id='ESUN-03-085-001',
                 bank="esun",
                 phases=post_settle,
                 kind=CheckpointKind.UNKNOWN_BLOCKER,
@@ -437,78 +533,114 @@ class EsunCrawler(BankCrawler):
         collector = getattr(self, "collector", None)
         self._spa_login_baseline = collector.snapshot() if isinstance(collector, SpaCollector) else None
         try:
-            frame = self._find_login_frame(page)
+            frame_failure = []
+            frame = self._find_login_frame(page, failure=frame_failure)
             if frame is not None:
                 native_page = _OriginGuardProxy._unwrap(page)
                 native_frame = _OriginGuardProxy._unwrap(frame)
 
                 def guard_login_frame():
-                    if not self._credential_origin_allowed(native_page) or not self._frame_origin_allowed(native_page, native_frame):
-                        raise EsunLoginError("登入表單來源不符；未送出登入")
+                    if not self._credential_origin_allowed(native_page):
+                        raise with_error_code(EsunLoginError('登入表單來源不符；未送出登入'), 'ESUN-02-403-001')
+                    if not self._frame_origin_allowed(native_page, native_frame):
+                        raise with_error_code(EsunLoginError('登入表單來源不符；未送出登入'), 'ESUN-02-403-002')
 
                 # Compose with the shared origin/dialog guard; keyboard actions
                 # must retain the selected frame guard as well as locators.
                 frame = _OriginGuardProxy(frame, guard_login_frame)
                 page = _OriginGuardProxy(page, guard_login_frame)
             main_form = self._main_login_form(frame) if frame is not None else None
-        except Exception:
-            raise EsunLoginError("無法安全確認登入頁面；未送出登入") from None
+        except Exception as source_error:
+            raise with_error_code(EsunLoginError("無法安全確認登入頁面；未送出登入"), exception_error_id(source_error, bank="esun") or 'ESUN-02-404-001') from None
         if frame is None:
-            raise EsunLoginError("找不到唯一登入頁面；未送出登入") from None
+            raise with_error_code(EsunLoginError('找不到唯一登入頁面；未送出登入'), frame_failure[0] if frame_failure else 'ESUN-02-400-001') from None
         scope = main_form if main_form is not None else frame
         selectors = _MAIN_LOGIN_FIELDS if main_form is not None else tuple(
             _sel(field) for field in (FIELD_NATIONAL_ID, FIELD_USER_CODE, FIELD_PASSWORD)
         )
 
         try:
-            for selector, value, wait in zip(
+            for field_index, (selector, value, wait) in enumerate(zip(
                 selectors,
                 (self.creds.national_id, self.creds.user_code, self.creds.password),
                 (200, 200, 300),
-            ):
-                candidates = scope.locator(selector)
-                if candidates.count() != 1:
-                    raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
-                field = candidates.nth(0)
-                if not field.is_visible() or not field.is_enabled():
-                    raise EsunLoginError("登入欄位無法安全填寫；未送出登入")
-                field.click()
-                field.click(click_count=3)
-                page.keyboard.press("Backspace")
+            )):
+                codes = (
+                    ('ESUN-02-010-001', 'ESUN-02-015-001', 'ESUN-02-020-001', 'ESUN-02-025-001', 'ESUN-02-030-001', 'ESUN-02-035-001', 'ESUN-02-040-001', 'ESUN-02-045-001', 'ESUN-02-050-001', 'ESUN-02-055-001', 'ESUN-02-060-001'),
+                    ('ESUN-02-110-001', 'ESUN-02-115-001', 'ESUN-02-120-001', 'ESUN-02-125-001', 'ESUN-02-130-001', 'ESUN-02-135-001', 'ESUN-02-140-001', 'ESUN-02-145-001', 'ESUN-02-150-001', 'ESUN-02-155-001', 'ESUN-02-160-001'),
+                    ('ESUN-02-210-001', 'ESUN-02-215-001', 'ESUN-02-220-001', 'ESUN-02-225-001', 'ESUN-02-230-001', 'ESUN-02-235-001', 'ESUN-02-240-001', 'ESUN-02-245-001', 'ESUN-02-250-001', 'ESUN-02-255-001', 'ESUN-02-260-001'),
+                )[field_index]
+                rejection_codes = (
+                    ('ESUN-02-015-002', 'ESUN-02-025-002', 'ESUN-02-030-002', 'ESUN-02-060-002'),
+                    ('ESUN-02-115-002', 'ESUN-02-125-002', 'ESUN-02-130-002', 'ESUN-02-160-002'),
+                    ('ESUN-02-215-002', 'ESUN-02-225-002', 'ESUN-02-230-002', 'ESUN-02-260-002'),
+                )[field_index]
+                with error_step(codes[0]):
+                    candidates = scope.locator(selector)
+                with error_step(codes[1]):
+                    if candidates.count() != 1:
+                        raise with_error_code(EsunLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[0])
+                with error_step(codes[2]):
+                    field = candidates.nth(0)
+                with error_step(codes[3]):
+                    if not field.is_visible():
+                        raise with_error_code(EsunLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[1])
+                with error_step(codes[4]):
+                    if not field.is_enabled():
+                        raise with_error_code(EsunLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[2])
+                with error_step(codes[5]):
+                    field.click()
+                with error_step(codes[6]):
+                    field.click(click_count=3)
+                with error_step(codes[7]):
+                    page.keyboard.press("Backspace")
                 for character in value:
-                    page.keyboard.type(character, delay=80)
-                page.wait_for_timeout(wait)
-                if len(field.input_value()) != len(value):
-                    raise EsunLoginError("登入欄位輸入長度不符；未送出登入")
+                    with error_step(codes[8]):
+                        page.keyboard.type(character, delay=80)
+                with error_step(codes[9]):
+                    page.wait_for_timeout(wait)
+                with error_step(codes[10]):
+                    if len(field.input_value()) != len(value):
+                        raise with_error_code(EsunLoginError("登入欄位輸入長度不符；未送出登入"), rejection_codes[3])
         except EsunLoginError:
             raise
-        except Exception:
-            raise EsunLoginError("登入欄位無法安全填寫；未送出登入") from None
+        except Exception as error:
+            raise with_error_code(EsunLoginError("登入欄位無法安全填寫；未送出登入"), exception_error_id(error, bank="esun") or 'ESUN-02-405-001') from None
 
         try:
-            candidates = (
-                main_form.locator('button[type="button"]').filter(has_text=_MAIN_LOGIN_LABEL)
-                if main_form is not None else frame.locator(_sel(LOGIN_BTN_ID))
-            )
-            if candidates.count() != 1:
-                raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
-            button = candidates.nth(0)
-            if not button.is_visible() or not button.is_enabled():
-                raise EsunLoginError("找不到唯一且可操作的登入按鈕；未送出登入")
+            with error_step('ESUN-02-408-001'):
+                candidates = (
+                    error_step('ESUN-02-408-101')(lambda: error_step('ESUN-02-408-100')(lambda: main_form.locator('button[type="button"]'))().filter(has_text=_MAIN_LOGIN_LABEL))()
+                    if main_form is not None else error_step('ESUN-02-408-102')(lambda: frame.locator(_sel(LOGIN_BTN_ID)))()
+                )
+            with error_step('ESUN-02-409-001'):
+                if candidates.count() != 1:
+                    raise with_error_code(EsunLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'ESUN-02-401-001')
+            with error_step('ESUN-02-410-001'):
+                button = candidates.nth(0)
+            with error_step('ESUN-02-411-001'):
+                if not button.is_visible():
+                    raise with_error_code(EsunLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'ESUN-02-402-001')
+            with error_step('ESUN-02-412-001'):
+                if not button.is_enabled():
+                    raise with_error_code(EsunLoginError('找不到唯一且可操作的登入按鈕；未送出登入'), 'ESUN-02-402-002')
         except EsunLoginError:
             raise
-        except Exception:
-            raise EsunLoginError("無法安全確認登入按鈕；未送出登入") from None
+        except Exception as source_error:
+            raise with_error_code(EsunLoginError("無法安全確認登入按鈕；未送出登入"), exception_error_id(source_error, bank="esun") or 'ESUN-02-406-001') from None
 
         try:
-            button.click(timeout=8000)
-        except Exception:
-            raise EsunLoginError("登入送出狀態不明；禁止自動重試") from None
+            with error_step('ESUN-02-413-001'):
+                button.click(timeout=8000)
+        except Exception as error:
+            raise with_error_code(EsunLoginError("登入送出狀態不明；禁止自動重試"), exception_error_id(error, bank="esun") or 'ESUN-02-407-001') from None
 
         try:
-            page.wait_for_timeout(10000)
+            with error_step('ESUN-02-414-001'):
+                page.wait_for_timeout(10000)
             for _ in range(30):
-                page.wait_for_timeout(1000)
+                with error_step('ESUN-02-415-001'):
+                    page.wait_for_timeout(1000)
                 if self._logged_in(page):
                     return
                 scopes = [
@@ -521,12 +653,14 @@ class EsunCrawler(BankCrawler):
                         "[role='dialog']",
                         selectors[0],
                     ):
-                        checkpoints = scope.locator(selector)
-                        if any(
-                            checkpoints.nth(index).is_visible()
-                            for index in range(checkpoints.count())
-                        ):
-                            return
+                        with error_step('ESUN-02-416-001'):
+                            checkpoints = scope.locator(selector)
+                        with error_step('ESUN-02-417-001'):
+                            if any(
+                                error_step('ESUN-02-417-101')(lambda: error_step('ESUN-02-417-100')(lambda: checkpoints.nth(index))().is_visible())()
+                                for index in range(error_step('ESUN-02-417-102')(lambda: checkpoints.count())())
+                            ):
+                                return
         except Exception:
             return
 
@@ -535,53 +669,56 @@ class EsunCrawler(BankCrawler):
         matches = []
         for frame in frames:
             try:
-                if frame.evaluate("""() => Boolean(
+                with error_step('ESUN-05-607-001'):
+                    if frame.evaluate("""() => Boolean(
                     document.querySelector('select[id="fao01002:dract"]') &&
                     document.querySelector('input[name="fao01002:linkCommand"]')
                 )""") is True:
-                    matches.append(frame)
-            except Exception:
-                raise RuntimeError("esun-twd-history-form") from None
+                        matches.append(frame)
+            except Exception as source_error:
+                raise with_error_code(RuntimeError("esun-twd-history-form"), exception_error_id(source_error, bank="esun") or 'ESUN-05-428-001') from None
         if len(matches) != 1:
-            raise RuntimeError("esun-twd-history-form")
+            raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-400-001')
         return matches[0]
 
     @staticmethod
     def _validated_twd_options(options) -> list[dict]:
         if not isinstance(options, list):
-            raise RuntimeError("esun-twd-history-inventory")
+            raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-400-001')
         out = []
         for option in options:
             if not isinstance(option, dict):
-                raise RuntimeError("esun-twd-history-inventory")
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-403-001')
             index = option.get("index")
             text = option.get("text")
             value = option.get("value")
-            if (
-                type(index) is not int
-                or index < 0
-                or not isinstance(text, str)
-                or text != text.strip()
-            ):
-                raise RuntimeError("esun-twd-history-inventory")
+            if type(index) is not int:
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-404-001')
+            if index < 0:
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-404-002')
+            if not isinstance(text, str):
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-404-003')
+            if text != text.strip():
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-404-004')
             if option == {"index": 0, "text": "===請選擇===", "value": ""}:
                 continue
             if not any(marker in text for marker in ("臺幣", "台幣")):
-                raise RuntimeError("esun-twd-history-inventory")
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-405-001')
             matches = re.findall(r"(?<!\d)\d{13}(?!\d)", text or "")
-            if (
-                len(matches) != 1
-                or not isinstance(value, str)
-                or not value
-                or value != value.strip()
-            ):
-                raise RuntimeError("esun-twd-history-inventory")
+            if len(matches) != 1:
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-406-001')
+            if not isinstance(value, str):
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-406-002')
+            if not value:
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-406-003')
+            if value != value.strip():
+                raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-406-004')
             out.append({**option, "identity": matches[0]})
         identities = [row["identity"] for row in out]
         if len(identities) != len(set(identities)):
-            raise RuntimeError("esun-twd-history-inventory")
+            raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-401-001')
         if not identities:
-            raise RuntimeError("esun-twd-history-inventory")
+            raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-04-402-001')
         return out
 
     @staticmethod
@@ -630,17 +767,22 @@ class EsunCrawler(BankCrawler):
         end: date,
     ) -> None:
         parsed_result = urlparse(result_url)
-        if (
-            parsed_result.scheme != "https"
-            or parsed_result.hostname != "ebank.esunbank.com.tw"
-            or parsed_result.port not in (None, 443)
-            or parsed_result.username is not None
-            or parsed_result.password is not None
-            or parsed_result.path != _ESUN_TWD_HISTORY_PATH
-            or parsed_result.query
-            or parsed_result.fragment
-        ):
-            raise RuntimeError("esun-twd-history-transport")
+        if parsed_result.scheme != "https":
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-001')
+        if parsed_result.hostname != "ebank.esunbank.com.tw":
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-002')
+        if parsed_result.port not in (None, 443):
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-003')
+        if parsed_result.username is not None:
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-004')
+        if parsed_result.password is not None:
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-005')
+        if parsed_result.path != _ESUN_TWD_HISTORY_PATH:
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-006')
+        if parsed_result.query:
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-007')
+        if parsed_result.fragment:
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-401-008')
         expected_fields = {
             "fao01002:dract": account_value,
             "fao01002:startDate": start.strftime("%Y/%m/%d"),
@@ -665,15 +807,17 @@ class EsunCrawler(BankCrawler):
                 if all(fields.get(key) == [value] for key, value in expected_fields.items()):
                     matches.append(hit)
         if len(matches) != 1:
-            raise RuntimeError("esun-twd-history-transport")
+            raise with_error_code(RuntimeError('esun-twd-history-transport'), 'ESUN-05-402-001')
 
     @staticmethod
-    def _fresh_twd_result(candidates) -> dict:
+    def _fresh_twd_result(candidates, *, failure_code=None) -> dict:
         if len(candidates) != 1:
-            raise RuntimeError("esun-twd-history-result")
+            raise with_error_code(RuntimeError('esun-twd-history-result'), failure_code or 'ESUN-05-403-001')
         result = candidates[0]
-        if not isinstance(result, dict) or result.get("evidenceFresh") is not True:
-            raise RuntimeError("esun-twd-history-stale-result")
+        if not isinstance(result, dict):
+            raise with_error_code(RuntimeError('esun-twd-history-stale-result'), 'ESUN-05-404-001')
+        if result.get("evidenceFresh") is not True:
+            raise with_error_code(RuntimeError('esun-twd-history-stale-result'), 'ESUN-05-404-002')
         return result
 
     @staticmethod
@@ -685,117 +829,147 @@ class EsunCrawler(BankCrawler):
         end: date,
     ) -> dict:
         if not isinstance(result, dict):
-            raise RuntimeError("esun-twd-history-result")
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-405-001')
         period = result.get("clicked_period")
         submit = result.get("submit")
         snapshot = result.get("snapshot")
         text = result.get("text")
         current = urlparse(result.get("url") or "")
-        if (
-            result.get("account_no") != identity
-            or result.get("selected_identity") != identity
-            or not isinstance(period, dict)
-            or period.get("checked") is not True
-            or period.get("start") != start.strftime("%Y/%m/%d")
-            or period.get("end") != end.strftime("%Y/%m/%d")
-            or not isinstance(submit, dict)
-            or submit.get("clicked") != "visible-query"
-            or current.scheme != "https"
-            or current.hostname != "ebank.esunbank.com.tw"
-            or current.port not in (None, 443)
-            or current.username is not None
-            or current.password is not None
-            or current.path != _ESUN_TWD_HISTORY_PATH
-            or not isinstance(text, str)
-            or _ESUN_TWD_FAILURE_RE.search(text) is not None
-            or re.search(rf"(?<!\d){re.escape(identity)}(?!\d)", text) is None
-            or re.search(
+        if result.get("account_no") != identity:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-001')
+        if result.get("selected_identity") != identity:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-002')
+        if not isinstance(period, dict):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-003')
+        if period.get("checked") is not True:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-004')
+        if period.get("start") != start.strftime("%Y/%m/%d"):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-005')
+        if period.get("end") != end.strftime("%Y/%m/%d"):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-006')
+        if not isinstance(submit, dict):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-007')
+        if submit.get("clicked") != "visible-query":
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-008')
+        if current.scheme != "https":
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-009')
+        if current.hostname != "ebank.esunbank.com.tw":
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-010')
+        if current.port not in (None, 443):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-011')
+        if current.username is not None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-012')
+        if current.password is not None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-013')
+        if current.path != _ESUN_TWD_HISTORY_PATH:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-014')
+        if not isinstance(text, str):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-015')
+        if _ESUN_TWD_FAILURE_RE.search(text) is not None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-016')
+        if re.search(rf"(?<!\d){re.escape(identity)}(?!\d)", text) is None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-017')
+        if re.search(
                 rf"(?<!\d){re.escape(start.strftime('%Y/%m/%d'))}(?!\d)", text,
-            ) is None
-            or re.search(
+            ) is None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-018')
+        if re.search(
                 rf"(?<!\d){re.escape(end.strftime('%Y/%m/%d'))}(?!\d)", text,
-            ) is None
-            or not isinstance(snapshot, dict)
-            or snapshot.get("busy") is not False
-        ):
-            raise RuntimeError("esun-twd-history-result")
+            ) is None:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-019')
+        if not isinstance(snapshot, dict):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-020')
+        if snapshot.get("busy") is not False:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-406-021')
         pager = snapshot.get("pager")
-        if (
-            not isinstance(pager, dict)
-            or set(pager) != {"present", "actionableNext"}
-            or pager.get("present") is not False
-            or type(pager.get("actionableNext")) is not int
-            or pager["actionableNext"] != 0
-            or re.search(r"(?:下一頁|下頁)", text)
-        ):
-            raise RuntimeError("esun-twd-history-result")
+        if not isinstance(pager, dict):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-001')
+        if set(pager) != {"present", "actionableNext"}:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-002')
+        if pager.get("present") is not False:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-003')
+        if type(pager.get("actionableNext")) is not int:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-004')
+        if pager["actionableNext"] != 0:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-005')
+        if re.search(r"(?:下一頁|下頁)", text):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-407-006')
         total_count = snapshot.get("totalCount")
         if total_count is not None and (type(total_count) is not int or total_count < 0):
-            raise RuntimeError("esun-twd-history-result")
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-408-001')
         has_grid = snapshot.get("hasGrid")
         grid_candidate_count = snapshot.get("gridCandidateCount")
         grid_text = snapshot.get("gridText")
-        if (
-            type(has_grid) is not bool
-            or type(grid_candidate_count) is not int
-            or grid_candidate_count != (1 if has_grid else 0)
-            or not isinstance(grid_text, str)
-        ):
-            raise RuntimeError("esun-twd-history-result")
+        if type(has_grid) is not bool:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-409-001')
+        if type(grid_candidate_count) is not int:
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-409-002')
+        if grid_candidate_count != (1 if has_grid else 0):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-409-003')
+        if not isinstance(grid_text, str):
+            raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-409-004')
         if has_grid:
             grid_rows = snapshot.get("gridRows")
             if not isinstance(grid_rows, list):
-                raise RuntimeError("esun-twd-history-result")
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-410-001')
             row_count = snapshot.get("gridRowCount")
-            if (
-                type(row_count) is not int
-                or row_count <= 0
-                or total_count is not None and total_count != row_count
-                or not grid_text.strip()
-                or snapshot.get("emptyMarker") is not None
-            ):
-                raise RuntimeError("esun-twd-history-result")
+            if type(row_count) is not int:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-411-001')
+            if row_count <= 0:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-411-002')
+            if total_count is not None and total_count != row_count:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-411-003')
+            if not grid_text.strip():
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-411-004')
+            if snapshot.get("emptyMarker") is not None:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-411-005')
             from backend.core.persist.esun import _parse_esun_twd_txn_results
 
             try:
                 rows = _parse_esun_twd_txn_results([result])
-            except (TypeError, ValueError):
-                raise RuntimeError("esun-twd-history-result") from None
+            except (TypeError, ValueError) as source_error:
+                raise with_error_code(RuntimeError("esun-twd-history-result"), exception_error_id(source_error, bank="esun") or 'ESUN-05-429-001') from None
             if len(rows) != row_count:
-                raise RuntimeError("esun-twd-history-result")
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-412-001')
             for row in rows:
                 try:
                     date.fromisoformat(str(row["datetime"])[:10])
                     date.fromisoformat(row["account_date"])
                 except (KeyError, TypeError, ValueError):
-                    raise RuntimeError("esun-twd-history-result") from None
+                    raise with_error_code(RuntimeError("esun-twd-history-result"), 'ESUN-05-430-001') from None
                 money = (row.get("expend"), row.get("income"))
-                if (
-                    row.get("account_no") != identity
-                    or not isinstance(row.get("desc"), str)
-                    or not row["desc"].strip()
-                    or not any(value is not None for value in money)
-                    or any(
+                if row.get("account_no") != identity:
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-001')
+                if not isinstance(row.get("desc"), str):
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-002')
+                if not row["desc"].strip():
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-003')
+                if not any(value is not None for value in money):
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-004')
+                if any(
                         value is not None
                         and (type(value) not in (int, float) or not math.isfinite(value) or value < 0)
                         for value in money
-                    )
-                    or type(row.get("balance")) not in (int, float)
-                    or not math.isfinite(row["balance"])
-                ):
-                    raise RuntimeError("esun-twd-history-result")
+                    ):
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-005')
+                if type(row.get("balance")) not in (int, float):
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-006')
+                if not math.isfinite(row["balance"]):
+                    raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-415-007')
             status = "complete"
         else:
-            if (
-                grid_text
-                or snapshot.get("gridRows") != []
-                or snapshot.get("gridRowCount") != 0
-                or total_count != 0
-                or snapshot.get("emptyMarker") not in {
+            if grid_text:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-413-001')
+            if snapshot.get("gridRows") != []:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-413-002')
+            if snapshot.get("gridRowCount") != 0:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-413-003')
+            if total_count != 0:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-413-004')
+            if snapshot.get("emptyMarker") not in {
                     "查無交易資料", "查無資料", "無交易明細", "查無符合資料！",
-                }
-            ):
-                raise RuntimeError("esun-twd-history-result")
+                }:
+                raise with_error_code(RuntimeError('esun-twd-history-result'), 'ESUN-05-413-005')
             status = "explicit_empty"
         return {
             "identity": identity,
@@ -820,14 +994,22 @@ class EsunCrawler(BankCrawler):
         texts = []
         try:
             # Collection may end on a card page; go home first so 交易明細 is reachable.
-            if page.evaluate(click, "個人首頁") is True:
-                page.wait_for_timeout(6000)
-            if page.evaluate(click, "交易明細") is True:
-                page.wait_for_timeout(6000)
-            texts.append(page.evaluate("document.body.innerText") or "")
-            if page.evaluate(click, "外幣") is True:
-                page.wait_for_timeout(2500)
+            with error_step('ESUN-06-414-001'):
+                if page.evaluate(click, "個人首頁") is True:
+                    with error_step('ESUN-06-415-001'):
+                        page.wait_for_timeout(6000)
+            with error_step('ESUN-06-416-001'):
+                if page.evaluate(click, "交易明細") is True:
+                    with error_step('ESUN-06-417-001'):
+                        page.wait_for_timeout(6000)
+            with error_step('ESUN-06-418-001'):
                 texts.append(page.evaluate("document.body.innerText") or "")
+            with error_step('ESUN-06-419-001'):
+                if page.evaluate(click, "外幣") is True:
+                    with error_step('ESUN-06-420-001'):
+                        page.wait_for_timeout(2500)
+                    with error_step('ESUN-06-421-001'):
+                        texts.append(page.evaluate("document.body.innerText") or "")
         except Exception:
             pass
         return self._parse_account_overview([{"url": "", "text_preview": t} for t in texts])
@@ -835,47 +1017,53 @@ class EsunCrawler(BankCrawler):
     def collect(self, page, collector: ResponseCollector) -> BankCollectResult:
         """玉山 collect：解析首頁帳戶總覽 + navigate 信用卡帳單 + endpoint 地圖。"""
         self._diagnostic_stage = "collect_validation"
-        if page.evaluate("() => document.querySelector('#layout-content') !== null") is True:
-            self._esun_spa_phase = 'spa_entry'
-            self._esun_spa_gate = None
-            from backend.banks.esun_spa.capture import SpaCollector
-            from backend.banks.esun_spa.collection import collect_twd
-            if not isinstance(collector, SpaCollector) or not getattr(self, "_spa_login_baseline", None):
-                raise ValueError("SPA collection requires pre-login capture")
-            publication, history = [], collector.publication_checks
-            result = collect_twd(self, page, collector, self._spa_login_baseline,
-                                 _publication=publication, _history=history)
-            self._diagnostic_stage = "collect_validation"
-            self._ensure_collect_origin(page)
-            for prove in publication:
-                prove()
-            # Card diagnostics may leave the TWD DOM: retain historical
-            # response proofs until all event-pumping operations finish.
-            try:
-                from backend.banks.esun_spa.products import collect_products
-                card = collect_products(self, page, collector, self._spa_login_baseline)
-                result.telemetry.update(card.telemetry)
-                result.card_statement_cycle = card.card_statement_cycle
-                result.card_transactions = card.card_transactions
-                result.card_transactions_ok = card.card_transactions_ok
-            except Exception:
-                result.telemetry['esun_spa_products'] = {'status': 'unavailable'}
-            self._esun_spa_phase = 'capture_publication'
-            self._esun_spa_gate = None
-            self._ensure_collect_origin(page)
-            for prove in history:
-                prove()
-            self._esun_spa_phase = 'incomplete_result' if result.error else 'capture_publication'
-            self._diagnostic_stage = "collect_validation"
-            # Live 2026-10-02: the SPA path never published accounts (0 rows). Read the
-            # home overview after every proof has run: TWD tab, then the 外幣 tab.
-            if result.error is None:
-                result.accounts = self._spa_overview_accounts(page)
-                if not result.accounts:
-                    raise RuntimeError("esun-accounts-empty")
-            return result
+        with error_step('ESUN-05-608-001'):
+            if page.evaluate("() => document.querySelector('#layout-content') !== null") is True:
+                self._esun_spa_phase = 'spa_entry'
+                self._esun_spa_gate = None
+                from backend.banks.esun_spa.capture import SpaCollector
+                from backend.banks.esun_spa.collection import collect_twd
+                if not isinstance(collector, SpaCollector):
+                    raise with_error_code(ValueError('SPA collection requires pre-login capture'), 'ESUN-05-414-001')
+                if not getattr(self, "_spa_login_baseline", None):
+                    raise with_error_code(ValueError('SPA collection requires pre-login capture'), 'ESUN-05-414-002')
+                publication, history = [], collector.publication_checks
+                result = collect_twd(self, page, collector, self._spa_login_baseline,
+                                     _publication=publication, _history=history)
+                self._diagnostic_stage = "collect_validation"
+                self._ensure_collect_origin(page)
+                for prove in publication:
+                    prove()
+                # Card diagnostics may leave the TWD DOM: retain historical
+                # response proofs until all event-pumping operations finish.
+                try:
+                    from backend.banks.esun_spa.products import collect_products
+                    card = collect_products(self, page, collector, self._spa_login_baseline)
+                    result.telemetry.update(card.telemetry)
+                    result.card_statement_cycle = card.card_statement_cycle
+                    result.card_transactions = card.card_transactions
+                    result.card_transactions_ok = card.card_transactions_ok
+                except Exception:
+                    result.telemetry['esun_spa_products'] = {'status': 'unavailable'}
+                self._esun_spa_phase = 'capture_publication'
+                self._esun_spa_gate = None
+                self._ensure_collect_origin(page)
+                for prove in history:
+                    prove()
+                self._esun_spa_phase = 'incomplete_result' if result.error else 'capture_publication'
+                self._diagnostic_stage = "collect_validation"
+                # Live 2026-10-02: the SPA path never published accounts (0 rows). Read the
+                # home overview after every proof has run: TWD tab, then the 外幣 tab.
+                if result.error is None:
+                    result.accounts = self._spa_overview_accounts(page)
+                    if not result.accounts:
+                        raise with_error_code(RuntimeError('esun-accounts-empty'), 'ESUN-05-416-001')
+                return result
+        from backend.banks.esun_spa.collection import poll_observation
+
         out: dict = {}
-        page.wait_for_timeout(8000)
+        with error_step('ESUN-05-609-001'):
+            page.wait_for_timeout(8000)
 
         from backend.core.store import _data_root
         debug_dir = _data_root() / "esun_collect"
@@ -884,7 +1072,8 @@ class EsunCrawler(BankCrawler):
         # 第 1 階段：首頁帳戶總覽 dump
         out["final_url"] = page.url
         try:
-            out["main_text"] = (page.evaluate("document.body.innerText") or "")[:5000]
+            with error_step('ESUN-05-610-001'):
+                out["main_text"] = (page.evaluate("document.body.innerText") or "")[:5000]
         except Exception:
             out["main_text"] = ""
 
@@ -893,7 +1082,8 @@ class EsunCrawler(BankCrawler):
             if f == page.main_frame:
                 continue
             try:
-                txt = f.evaluate("() => document.body.innerText.slice(0, 8000)")
+                with error_step('ESUN-05-611-001'):
+                    txt = f.evaluate("() => document.body.innerText.slice(0, 8000)")
                 frames_data.append({
                     "url": f.url[:200],
                     "text_preview": txt,
@@ -918,7 +1108,7 @@ class EsunCrawler(BankCrawler):
                 fr.get("result", {}).get("clicked") for fr in twd_nav.get("frames", [])
             )
             if not twd_clicked:
-                raise RuntimeError("esun-twd-history-navigation")
+                raise with_error_code(RuntimeError("esun-twd-history-navigation"), 'ESUN-05-426-001')
             else:
                 # 對每個臺幣帳戶提交近一個月查詢。玉山 JSF combo 的 visible select
                 # 需要 select_option 讓前端 helper 更新 hidden JSON value；radio label click
@@ -930,26 +1120,31 @@ class EsunCrawler(BankCrawler):
                 submitted_accounts: set[str] = set()
                 query_frame = self._unique_twd_query_frame(page.frames)
                 form_url = urlparse(query_frame.url or "")
-                if (
-                    form_url.scheme != "https"
-                    or form_url.hostname != "ebank.esunbank.com.tw"
-                    or form_url.port not in (None, 443)
-                    or form_url.username is not None
-                    or form_url.password is not None
-                    or form_url.path != _ESUN_TWD_HISTORY_PATH
-                ):
-                    raise RuntimeError("esun-twd-history-form")
-                bank_today_raw = query_frame.evaluate(r"""() =>
+                if form_url.scheme != "https":
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-001')
+                if form_url.hostname != "ebank.esunbank.com.tw":
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-002')
+                if form_url.port not in (None, 443):
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-003')
+                if form_url.username is not None:
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-004')
+                if form_url.password is not None:
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-005')
+                if form_url.path != _ESUN_TWD_HISTORY_PATH:
+                    raise with_error_code(RuntimeError('esun-twd-history-form'), 'ESUN-05-417-006')
+                with error_step('ESUN-05-612-001'):
+                    bank_today_raw = query_frame.evaluate(r"""() =>
                     (document.querySelector('#sysInfo')?.textContent || '')
                         .match(/"today":"(\d{4}\/\d{2}\/\d{2})"/)?.[1] || ''
                 """)
                 try:
                     bank_today = date.fromisoformat(bank_today_raw.replace("/", "-"))
                 except (AttributeError, ValueError):
-                    raise RuntimeError("esun-twd-history-bank-date") from None
+                    raise with_error_code(RuntimeError("esun-twd-history-bank-date"), 'ESUN-05-431-001') from None
                 if query_frame is not None:
                     try:
-                        acct_options = query_frame.evaluate(r"""() => {
+                        with error_step('ESUN-05-613-001'):
+                            acct_options = query_frame.evaluate(r"""() => {
                             const s = document.querySelector('select[id="fao01002:dract"]');
                             if (!s) return [];
                             return [...s.options].map((o, index) => ({
@@ -958,8 +1153,8 @@ class EsunCrawler(BankCrawler):
                                 value: o.value || '',
                             }));
                         }""")
-                    except Exception:
-                        raise RuntimeError("esun-twd-history-inventory") from None
+                    except Exception as source_error:
+                        raise with_error_code(RuntimeError("esun-twd-history-inventory"), exception_error_id(source_error, bank="esun") or 'ESUN-05-432-001') from None
                     validated_options = self._validated_twd_options(acct_options)
                     expected_twd_identities = {
                         option["identity"] for option in validated_options
@@ -969,23 +1164,29 @@ class EsunCrawler(BankCrawler):
                         account_no = opt["identity"]
                         submitted_accounts.add(account_no)
                         try:
-                            query_frame.locator("select[id='fao01002:dract']").select_option(index=int(opt["index"]), timeout=8000)
-                            page.wait_for_timeout(800)
-                            selected = query_frame.evaluate(r"""() => {
+                            with error_step('ESUN-05-614-001'):
+                                error_step('ESUN-05-614-101')(lambda: error_step('ESUN-05-614-100')(lambda: query_frame.locator("select[id='fao01002:dract']"))().select_option(index=int(opt["index"]), timeout=8000))()
+                            with error_step('ESUN-05-615-001'):
+                                page.wait_for_timeout(800)
+                            with error_step('ESUN-05-616-001'):
+                                selected = query_frame.evaluate(r"""() => {
                                 const s = document.querySelector('select[id="fao01002:dract"]');
                                 const o = s?.options[s.selectedIndex];
-                                return s && o ? {
+                                if (!s) return [null, 1];
+                                if (!o) return [null, 2];
+                                return [{
                                     index: s.selectedIndex,
                                     value: s.value || '',
                                     text: (o.textContent || '').trim(),
-                                } : null;
+                                }, 0];
                             }""")
+                            selected, selected_failure = poll_observation(selected, ('ESUN-05-867-001', 'ESUN-05-867-002'))
                             if selected != {
                                 "index": opt["index"],
                                 "value": opt["value"],
                                 "text": opt["text"],
                             }:
-                                raise RuntimeError("esun-twd-history-selected-account")
+                                raise with_error_code(RuntimeError('esun-twd-history-selected-account'), selected_failure or 'ESUN-05-420-001')
                             # FAO01002 retains the latest year. Incremental queries use the
                             # account-scoped cursor with the shared seven-day overlap.
                             history_start, history_end = _esun_history_window(
@@ -995,9 +1196,10 @@ class EsunCrawler(BankCrawler):
                                 "start": history_start.strftime("%Y/%m/%d"),
                                 "end": history_end.strftime("%Y/%m/%d"),
                             }
-                            clicked_period = query_frame.evaluate(r"""(period) => {
+                            with error_step('ESUN-05-617-001'):
+                                clicked_period = query_frame.evaluate(r"""(period) => {
                                 const r = document.querySelector('input[id="fao01002:j_id_intervalrdo4"], input[name="fao01002:intervalrdo"][value="4"]');
-                                if (!r) return {ok: false, error: 'no intervalrdo4'};
+                                if (!r) return [{ok: false, error: 'no intervalrdo4'}, 1];
                                 const label = r.closest('label');
                                 if (label) {
                                     try { label.click(); } catch (e) {}
@@ -1021,21 +1223,28 @@ class EsunCrawler(BankCrawler):
                                     e.value = period.end;
                                     e.dispatchEvent(new Event('change', {bubbles: true}));
                                 }
-                                return {ok: true, checked: r.checked, start: s?.value || '', end: e?.value || ''};
+                                const result = {ok: true, checked: r.checked, start: s?.value || '', end: e?.value || ''};
+                                return [result, !result.checked ? 2 : result.start !== period.start ? 3 : result.end !== period.end ? 4 : 0];
                             }""", expected_period)
+                            clicked_period, period_failure = poll_observation(clicked_period, ('ESUN-05-867-003', 'ESUN-05-867-004', 'ESUN-05-867-005', 'ESUN-05-867-006'))
                             if clicked_period != {"ok": True, "checked": True, **expected_period}:
-                                raise RuntimeError("esun-twd-history-period")
-                            page.wait_for_timeout(500)
-                            sort_selected = query_frame.evaluate(r"""() => {
+                                raise with_error_code(RuntimeError('esun-twd-history-period'), period_failure or 'ESUN-05-421-001')
+                            with error_step('ESUN-05-618-001'):
+                                page.wait_for_timeout(500)
+                            with error_step('ESUN-05-619-001'):
+                                sort_selected = query_frame.evaluate(r"""() => {
                                 const r = document.querySelector('input[id="fao01002:j_id_sort1"], input[name="fao01002:txDateOrder"][value="1"]');
-                                if (!r) return false;
+                                if (!r) return [false, 1];
                                 r.checked = true;
                                 r.dispatchEvent(new Event('change', {bubbles: true}));
-                                return r.checked;
+                                const checked = r.checked;
+                                return [checked, checked ? 0 : 2];
                             }""")
+                            sort_selected, sort_failure = poll_observation(sort_selected, ('ESUN-05-867-007', 'ESUN-05-867-008'))
                             if sort_selected is not True:
-                                raise RuntimeError("esun-twd-history-sort")
-                            stale_evidence = query_frame.evaluate(r"""() => {
+                                raise with_error_code(RuntimeError('esun-twd-history-sort'), sort_failure or 'ESUN-05-422-001')
+                            with error_step('ESUN-05-620-001'):
+                                stale_evidence = query_frame.evaluate(r"""() => {
                                 const selector = '[id="fao01002:grid_DataGridBody"], [id*="fao01002:grid"]';
                                 const evidence = [...document.querySelectorAll(selector)];
                                 const emptyLabels = new Set(['查無交易資料', '查無資料', '無交易明細', '查無符合資料！']);
@@ -1049,19 +1258,21 @@ class EsunCrawler(BankCrawler):
                                 }
                                 return {ok: true, marked: new Set(evidence).size};
                             }""")
-                            if (
-                                not isinstance(stale_evidence, dict)
-                                or stale_evidence.get("ok") is not True
-                                or type(stale_evidence.get("marked")) is not int
-                            ):
-                                raise RuntimeError("esun-twd-history-stale-result")
+                            if not isinstance(stale_evidence, dict):
+                                raise with_error_code(RuntimeError('esun-twd-history-stale-result'), 'ESUN-05-423-001')
+                            if stale_evidence.get("ok") is not True:
+                                raise with_error_code(RuntimeError('esun-twd-history-stale-result'), 'ESUN-05-423-002')
+                            if type(stale_evidence.get("marked")) is not int:
+                                raise with_error_code(RuntimeError('esun-twd-history-stale-result'), 'ESUN-05-423-003')
                             operation_hits: list[ApiHit] = []
                             response_listener = lambda response: self._capture_twd_response(
                                 response, operation_hits,
                             )
-                            page.on("response", response_listener)
+                            with error_step('ESUN-05-621-001'):
+                                page.on("response", response_listener)
                             try:
-                                submit_info = query_frame.evaluate(r"""() => {
+                                with error_step('ESUN-05-622-001'):
+                                    submit_info = query_frame.evaluate(r"""() => {
                                     const visible = (el) => {
                                         const r = el.getBoundingClientRect();
                                         const st = window.getComputedStyle(el);
@@ -1074,8 +1285,9 @@ class EsunCrawler(BankCrawler):
                                             return {clicked: 'visible-query', tag: el.tagName, id: el.id || '', name: el.name || '', text: t};
                                         }
                                     }
-                                    return {clicked: null};
+                                    return [{clicked: null}, 1];
                                 }""")
+                                submit_info, submit_failure = poll_observation(submit_info, ('ESUN-05-867-009',))
                                 if submit_info != {
                                     "clicked": "visible-query",
                                     "tag": submit_info.get("tag"),
@@ -1083,21 +1295,26 @@ class EsunCrawler(BankCrawler):
                                     "name": submit_info.get("name"),
                                     "text": "查詢",
                                 }:
-                                    raise RuntimeError("esun-twd-history-submit")
+                                    raise with_error_code(RuntimeError('esun-twd-history-submit'), submit_failure or 'ESUN-05-424-001')
                                 for _ in range(90):
                                     if operation_hits:
                                         break
-                                    page.wait_for_timeout(100)
+                                    with error_step('ESUN-05-623-001'):
+                                        page.wait_for_timeout(100)
                                 if not operation_hits:
-                                    raise RuntimeError("esun-twd-history-response-timeout")
+                                    raise with_error_code(RuntimeError('esun-twd-history-response-timeout'), 'ESUN-05-425-001')
                             finally:
-                                page.remove_listener("response", response_listener)
+                                with error_step('ESUN-05-624-001'):
+                                    page.remove_listener("response", response_listener)
                             # The response event exposes headers before JSF finishes replacing the result DOM.
-                            page.wait_for_timeout(9000)
+                            with error_step('ESUN-05-625-001'):
+                                page.wait_for_timeout(9000)
                             result_candidates = []
+                            result_failure = None
                             for rf in (query_frame,):
                                 try:
-                                    snap = rf.evaluate(r"""(expected) => {
+                                    with error_step('ESUN-05-626-001'):
+                                        snap = rf.evaluate(r"""(expected) => {
                                         const exactToken = (text, token) => new RegExp(
                                             `(^|\\D)${token}(?!\\d)`
                                         ).test(text);
@@ -1223,9 +1440,14 @@ class EsunCrawler(BankCrawler):
                                     }""", {"identity": account_no, **expected_period})
                                     if snap.get("bound") is True:
                                         result_candidates.append(snap)
-                                except Exception:
-                                    pass
-                            bound_result = self._fresh_twd_result(result_candidates)
+                                        result_failure = None
+                                    else:
+                                        result_failure = 'ESUN-05-867-010'
+                                except Exception as source_error:
+                                    result_failure = exception_error_id(source_error, bank='esun')
+                            bound_result = self._fresh_twd_result(
+                                result_candidates, failure_code=result_failure,
+                            )
                             result_text = bound_result["bodyText"]
                             result_url = bound_result["href"]
                             result_snapshot = {
@@ -1277,14 +1499,14 @@ class EsunCrawler(BankCrawler):
                                 f"[esun][collect][twd] account {account_index}/{len(validated_options)} "
                                 f"submit={submit_info.get('clicked')} text_len={len(result_text)}"
                             )
-                        except Exception:
-                            raise RuntimeError("esun-twd-history-account") from None
+                        except Exception as source_error:
+                            raise with_error_code(RuntimeError("esun-twd-history-account"), exception_error_id(source_error, bank="esun") or 'ESUN-05-433-001') from None
                 if submitted_accounts != expected_twd_identities:
-                    raise RuntimeError("esun-twd-history-inventory")
+                    raise with_error_code(RuntimeError('esun-twd-history-inventory'), 'ESUN-05-418-001')
                 out["twd_txn_results"] = twd_results
                 mode = os.environ.get("BANK_CRAWLER_HISTORY_MODE", "full")
                 if mode not in {"full", "incremental"}:
-                    raise RuntimeError("esun-twd-history-mode")
+                    raise with_error_code(RuntimeError('esun-twd-history-mode'), 'ESUN-05-419-001')
                 out["history_coverage"] = {
                     "mode": mode,
                     "domains": [{
@@ -1293,8 +1515,8 @@ class EsunCrawler(BankCrawler):
                         "windows": coverage_receipts,
                     }],
                 }
-        except Exception:
-            raise RuntimeError("esun-twd-history") from None
+        except Exception as source_error:
+            raise with_error_code(RuntimeError("esun-twd-history"), exception_error_id(source_error, bank="esun") or 'ESUN-05-427-001') from None
 
         # 第 2 階段：navigate 信用卡帳單資訊（hover mega menu，禁用我的最愛）
         # 玉山是 widget 切換（_leftMenuLoadWidget），不是新分頁——點完後 iframe 內 widget 替換
@@ -1302,17 +1524,21 @@ class EsunCrawler(BankCrawler):
             nav_info = self._navigate_credit_card_bill(page, debug_dir)
             out["card_nav_probe"] = nav_info
             # 玉山 widget 載入慢且可能掛新 iframe — 等 10 秒讓 Playwright 註冊新 frame
-            page.wait_for_timeout(10000)
+            with error_step('ESUN-05-627-001'):
+                page.wait_for_timeout(10000)
 
             # debug: 對比 page.frames vs DOM iframe 真實數
             try:
-                dom_iframe_count = page.evaluate("() => document.querySelectorAll('iframe').length")
+                with error_step('ESUN-05-628-001'):
+                    dom_iframe_count = page.evaluate("() => document.querySelectorAll('iframe').length")
                 _log(f"[esun][collect] DOM iframe count={dom_iframe_count} vs page.frames={len(page.frames)}")
                 # 各 frame iframe count
                 for f in page.frames:
                     try:
-                        sub = f.evaluate("() => document.querySelectorAll('iframe').length")
-                        sub_srcs = f.evaluate("() => [...document.querySelectorAll('iframe')].map(e => (e.src || e.id || '').slice(0, 150))")
+                        with error_step('ESUN-05-629-001'):
+                            sub = f.evaluate("() => document.querySelectorAll('iframe').length")
+                        with error_step('ESUN-05-630-001'):
+                            sub_srcs = f.evaluate("() => [...document.querySelectorAll('iframe')].map(e => (e.src || e.id || '').slice(0, 150))")
                         _log(f"[esun][collect][nest] {f.url[:60]} sub_iframes={sub} srcs={sub_srcs[:3]}")
                     except Exception:
                         pass
@@ -1325,8 +1551,10 @@ class EsunCrawler(BankCrawler):
                 try:
                     url = f.url[:200]
                     # 用 textContent（不受 CSS hidden / visibility 影響）+ innerText 兩種對比
-                    txt_inner = f.evaluate("() => document.body.innerText.slice(0, 15000)")
-                    txt_content = f.evaluate("() => document.body.textContent.slice(0, 20000)")
+                    with error_step('ESUN-05-631-001'):
+                        txt_inner = f.evaluate("() => document.body.innerText.slice(0, 15000)")
+                    with error_step('ESUN-05-632-001'):
+                        txt_content = f.evaluate("() => document.body.textContent.slice(0, 20000)")
                     all_frames_meta.append({
                         "url": url,
                         "inner_len": len(txt_inner),
@@ -1348,7 +1576,8 @@ class EsunCrawler(BankCrawler):
                 try:
                     url = f.url[:200]
                     # 改用 textContent 而非 innerText（widget 可能在 overflow:hidden 容器內）
-                    txt = f.evaluate("() => document.body.textContent.slice(0, 30000)")
+                    with error_step('ESUN-05-633-001'):
+                        txt = f.evaluate("() => document.body.textContent.slice(0, 30000)")
                     # 收集真正帶信用卡帳單資料的 frame（嚴格 keyword，排掉只有選單名稱的）
                     if any(k in txt for k in ("歸戶信用額度", "本期繳款截止", "預借現金額度", "e point", "應繳總金額", "ATM 繳款編號")):
                         card_frames.append({
@@ -1373,11 +1602,13 @@ class EsunCrawler(BankCrawler):
                 for bill_index, bill in enumerate(out["card_bills"]):
                     if bill_index:
                         self._navigate_credit_card_bill(page, debug_dir)
-                        page.wait_for_timeout(5000)
+                        with error_step('ESUN-05-634-001'):
+                            page.wait_for_timeout(5000)
                     click_result = None
                     for frame in page.frames:
                         try:
-                            click_result = frame.evaluate(r"""(index) => {
+                            with error_step('ESUN-05-635-001'):
+                                click_result = frame.evaluate(r"""(index) => {
                                 const body = document.body?.textContent || '';
                                 if (!body.includes('帳單月份') || !body.includes('應繳總金額')) return null;
                                 const visible = (el) => {
@@ -1399,13 +1630,15 @@ class EsunCrawler(BankCrawler):
                     if not click_result or not click_result.get("clicked"):
                         bill_details.append({"bill_month": bill.get("bill_month"), "click": click_result})
                         continue
-                    page.wait_for_timeout(7000)
+                    with error_step('ESUN-05-636-001'):
+                        page.wait_for_timeout(7000)
                     detail = None
                     pages = list(page.context.pages)
                     for detail_page in reversed(pages):
                         for frame in detail_page.frames:
                             try:
-                                text = frame.evaluate("() => document.body.textContent.slice(0, 50000)")
+                                with error_step('ESUN-05-637-001'):
+                                    text = frame.evaluate("() => document.body.textContent.slice(0, 50000)")
                                 has_detail_headers = all(marker in text for marker in (
                                     "交易日期", "入帳日期", "本期消費明細：", "本期合計：",
                                 ))
@@ -1425,7 +1658,7 @@ class EsunCrawler(BankCrawler):
                     for popup in pages:
                         if popup != page:
                             with contextlib.suppress(Exception):
-                                popup.close()
+                                error_step('ESUN-05-638-001')(lambda: popup.close())()
                     bill_details.append(detail or {
                         "bill_month": bill.get("bill_month"),
                         "click": click_result,
@@ -1478,7 +1711,8 @@ class EsunCrawler(BankCrawler):
                             })
                             _log(f"[esun][collect] {period_label} 查詢表單未重新載入，跳過")
                             continue
-                    page.wait_for_timeout(5000)
+                    with error_step('ESUN-05-639-001'):
+                        page.wait_for_timeout(5000)
                     form_submitted = self._submit_card_txn_query(page, debug_dir, period_label)
                     period_result = {"period": period_label, "submitted": form_submitted,
                                      "result_seen": False}
@@ -1487,14 +1721,16 @@ class EsunCrawler(BankCrawler):
                         all_periods_ok = False
                         _log(f"[esun][collect] {period_label} 表單未提交，跳過")
                         continue
-                    page.wait_for_timeout(8000)  # 等查詢結果載入
+                    with error_step('ESUN-05-640-001'):
+                        page.wait_for_timeout(8000)  # 等查詢結果載入
 
                     # 從 frame 抽 transactions
                     for f in page.frames:
                         if f == page.main_frame:
                             continue
                         try:
-                            txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                            with error_step('ESUN-05-641-001'):
+                                txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
                             if any(k in txt for k in ("消費日", "請款日", "入帳日", "消費金額", "授權碼", "特店名稱", "消費明細")):
                                 period_result["result_seen"] = True
                                 txns_this_round = self._parse_card_transactions(txt)
@@ -1523,7 +1759,8 @@ class EsunCrawler(BankCrawler):
                         continue
                     try:
                         url = f.url[:200]
-                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        with error_step('ESUN-05-642-001'):
+                            txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
                         if any(k in txt for k in ("消費日", "請款日", "入帳日", "消費金額", "授權碼", "特店名稱", "消費明細")):
                             card_txn_frames.append({
                                 "url": url,
@@ -1561,7 +1798,8 @@ class EsunCrawler(BankCrawler):
                 _log("[esun][collect] 信用卡額度查詢 menu 未點到，跳過")
             else:
                 # 玉山 widget 載入很慢，前次 8 秒不夠 — 拉到 15 秒
-                page.wait_for_timeout(15000)
+                with error_step('ESUN-05-643-001'):
+                    page.wait_for_timeout(15000)
                 quota_frames = []
                 # 收集所有 candidate frame **含 main_frame**，挑「最像額度資料頁」的
                 # 條件：textContent 內**同時**含「已用額度」**和**「可用餘額」+ 數字
@@ -1570,7 +1808,8 @@ class EsunCrawler(BankCrawler):
                 for f in page.frames:  # ← include main_frame (widget 在 main DOM)
                     try:
                         url = f.url[:200]
-                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        with error_step('ESUN-05-644-001'):
+                            txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
                         # strict: 必須**同時**有「已用額度」+「可用餘額」label
                         # menu 列表不可能同時有這兩個 label，自動排除
                         has_both_labels = "已用額度" in txt and "可用餘額" in txt
@@ -1622,13 +1861,15 @@ class EsunCrawler(BankCrawler):
                 _log("[esun][collect] 信用卡繳款明細查詢 menu 未點到，跳過")
             else:
                 # 玉山 widget pattern (跟 quota 同), wait 15s
-                page.wait_for_timeout(15000)
+                with error_step('ESUN-05-645-001'):
+                    page.wait_for_timeout(15000)
                 pay_frames = []
                 # 收 main_frame + 所有 iframe textContent, 留 raw 給明早 PG probe
                 for f in page.frames:
                     try:
                         url = f.url[:200]
-                        txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
+                        with error_step('ESUN-05-646-001'):
+                            txt = f.evaluate("() => document.body.textContent.slice(0, 40000)")
                         if not txt or len(txt.strip()) < 30:
                             continue
                         # 留 raw frame 進 dump, 明早從 daily_metric 撈出來看真實 shape
@@ -2060,8 +2301,9 @@ class EsunCrawler(BankCrawler):
         probe_info = {"label": label, "frames": []}
         for f in page.frames:
             try:
-                result = f.evaluate(
-                    """
+                with error_step('ESUN-06-422-001'):
+                    result = f.evaluate(
+                        """
                     (label) => {
                       const isFavoriteAncestor = (el) => {
                         let cur = el;
@@ -2110,8 +2352,8 @@ class EsunCrawler(BankCrawler):
                       return {clicked: null, dump, fail: 'no_actionable_candidate'};
                     }
                     """,
-                    label,
-                )
+                        label,
+                    )
                 probe_info["frames"].append({"url": f.url[:120], "result": result})
                 _log(f"[esun][collect][nav][{label}] {f.url[:50]} clicked={result and result.get('clicked')!r}")
                 if result and result.get("clicked"):
@@ -2140,7 +2382,8 @@ class EsunCrawler(BankCrawler):
         info = {"strategy": None, "errors": [], "period_label": period_label}
         for f in page.frames:
             try:
-                result = f.evaluate("""
+                with error_step('ESUN-06-423-001'):
+                    result = f.evaluate("""
                     (wanted) => {
                       const log = [];
                       // 結果頁證明「點到同文字 span/div」不代表 radio 真正切換；
