@@ -137,7 +137,7 @@ def _plain_bank_cases():
         (835, "正卡人信用額度\t1000"),
         (836, "正卡人可用額度\t1000"),
         (837, "本期帳單結帳日\t應繳總金額\t最低應繳金額\t繳款截止日\tX\n2026/01/01\t1000\t0\t2026/01/15"),
-        (838, "繳款狀態 自動扣繳帳號\n已繳\t2026/01/01\t1000\t0\tfixture"),
+        (838, "繳款狀態\t最近繳款日期\t已繳金額\t本期帳單剩餘應繳金額\t自動扣繳帳號\n已繳\t2026/01/01\t1000\t0\tfixture"),
     ]:
         add("fubon", number, {"amount_page_text": text})
     add("rakuten", 830, {"twd_txn_results": [{"account_no": "fixture", "accounts": [{"balance": "1000"}], "txDetails": []}]})

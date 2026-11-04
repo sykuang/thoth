@@ -35,7 +35,10 @@ def test_esun_requires_positive_booked_status_in_real_persistence(status, tmp_pa
 @pytest.mark.parametrize("date_fields,booked", [
     ({"postingDate": "2026-06-23"}, True),
     ({"convertDate": "2026-06-23"}, False),
-    ({"beginValueDate": "2026-06-23"}, False),
+    # Cathay's own renderer labels these 入帳起息日, not 折算日.
+    ({"beginValueDate": "2026-06-23"}, True),
+    ({"valueDateTime": "2026-06-23"}, True),
+    ({"currencyExchangeDateTime": "2026-06-23"}, False),
     ({"postingDate": "2026-06-23junk"}, False),
     ({"postingDate": "2026-06-23T00:00:00+08:60"}, False),
     ({"postingDate": "2026-06-23T00:00:00+0860"}, False),

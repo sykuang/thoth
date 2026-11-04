@@ -124,7 +124,11 @@ def test_country_empty_string_normalized_to_none(crawler):
     ({"postingDate": "2026-05-08"}, "booked", "2026-05-08"),
     ({"convertDate": "2026-05-07", "postingDate": "2026-05-08"}, "booked", "2026-05-08"),
     ({"convertDate": "2026-05-07"}, None, None),
-    ({"beginValueDate": "2026-05-07"}, None, None),
+    ({"beginValueDate": "2026-05-07"}, "booked", "2026-05-07"),
+    ({"valueDateTime": "2026-05-07"}, "booked", "2026-05-07"),
+    ({"currencyExchangeDateTime": "2026-05-07"}, None, None),
+    ({"postingDate": "2026-05-08", "beginValueDate": "2026-05-07",
+      "valueDateTime": "2026-05-06"}, "booked", "2026-05-08"),
     ({"postingDate": "2026-05-08T00:00:00"}, "booked", "2026-05-08"),
     ({"postingDate": "2099-01-01"}, "booked", "2099-01-01"),
     *[({"postingDate": f"2026-06-23T00:30:45.123456{offset}"}, "booked", "2026-06-23")

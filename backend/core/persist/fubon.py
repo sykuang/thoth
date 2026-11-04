@@ -581,8 +581,10 @@ def _parse_fubon_credit_card(data: dict) -> dict:
     billing_summary: dict = {}
     if amount_text:
         m = re.search(
-            r"本期帳單結帳日\s*\t\s*應繳總金額\s*\t\s*最低應繳金額\s*\t\s*繳款截止日\s*\t.*?\n"
-            r"(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*([\d,]+)\s*\t\s*([\d,]+)\s*\t\s*([^\t\n]+)",
+            r"(?m)^本期帳單結帳日[^\S\t\r\n]*\t[^\S\t\r\n]*應繳總金額[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"最低應繳金額[^\S\t\r\n]*\t[^\S\t\r\n]*繳款截止日[^\S\t\r\n]*\t[^\r\n]*\r?\n"
+            r"(\d{4}/\d{1,2}/\d{1,2})[^\S\t\r\n]*\t[^\S\t\r\n]*([\d,]+)[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"([\d,]+)[^\S\t\r\n]*\t[^\S\t\r\n]*([^\t\r\n]+)",
             amount_text,
         )
         if m:
@@ -598,8 +600,11 @@ def _parse_fubon_credit_card(data: dict) -> dict:
                 billing_summary["payment_due"] = _norm_west_date(m.group(4).strip())
         # 「無需繳款\t2026/05/05\t0\t0\t台北富邦900047****7012」
         m = re.search(
-            r"繳款狀態.*?自動扣繳帳號.*?\n"
-            r"([^\t\n]+)\s*\t\s*(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*([\d,]+)\s*\t\s*([\d,]+)\s*\t\s*([^\t\n]+)",
+            r"(?m)^繳款狀態[^\S\t\r\n]*\t[^\S\t\r\n]*最近繳款日(?:期)?[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"(?:已繳金額|繳款金額)[^\S\t\r\n]*\t[^\S\t\r\n]*(?:本期帳單剩餘應繳金額|剩餘應繳)"
+            r"[^\S\t\r\n]*\t[^\S\t\r\n]*自動扣繳帳號[^\r\n]*\r?\n"
+            r"([^\t\r\n]+)[^\S\t\r\n]*\t[^\S\t\r\n]*(\d{4}/\d{1,2}/\d{1,2})[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"([\d,]+)[^\S\t\r\n]*\t[^\S\t\r\n]*([\d,]+)[^\S\t\r\n]*\t[^\S\t\r\n]*([^\t\r\n]+)",
             amount_text,
         )
         if m:

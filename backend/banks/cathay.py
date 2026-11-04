@@ -1281,10 +1281,21 @@ class CathayCrawler(BankCrawler):
 
         # 即時消費明細
         with error_step("CATHAY-07-437-001"):
-            cur = self._c(col.latest("C_BILL_Q_CardCurrentConsume"), _code="CATHAY-07-437-001")
+            cur_hit = col.latest("C_BILL_Q_CardCurrentConsume")
+            cur = self._c(cur_hit, _code="CATHAY-07-437-001")
         with error_step("CATHAY-07-438-001"):
             if cur and isinstance(cur, dict):
                 card_tx["current_detail"] = self._parse_consume(cur, _codes=('CATHAY-06-360-001', 'CATHAY-06-360-002', 'CATHAY-06-360-003'))
+            elif cur_hit and cur_hit.status == 200 and isinstance(cur_hit.resp_json, dict):
+                body = cur_hit.resp_json
+                code = body.get("returnCode")
+                # Official client: 0000 succeeds; suffix 702 is NoData.
+                # Only this attested null snapshot may clear old current rows.
+                if (body.get("success") is True and "content" in body
+                        and body["content"] is None and isinstance(code, str)
+                        and (code == "0000" or code.endswith("702"))
+                        and not any(body.get(key) for key in ("error", "errors", "errorCode", "errorMessage"))):
+                    card_tx["current_detail"] = {"currentConsumeDetail": []}
 
         # 帳單彙總（含繳款期限、額度循環）
         with error_step("CATHAY-07-439-001"):
@@ -1430,7 +1441,11 @@ class CathayCrawler(BankCrawler):
             raw_country = t.get("consumeCountry")
             consume_country = raw_country if (raw_country and str(raw_country).strip()) else None
 
-            posting = self._twd_response_date(t.get("postingDate"))
+            # Cathay labels beginValueDate/valueDateTime as 入帳起息日 in its
+            # statement/unbilled renderers. convertDate is only 折算日.
+            posting = self._twd_response_date(
+                t.get("postingDate") or t.get("beginValueDate") or t.get("valueDateTime")
+            )
             post_date = posting.isoformat() if posting is not None else None
 
             return {

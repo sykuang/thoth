@@ -280,16 +280,19 @@ class FubonLoginError(RuntimeError):
 def _fubon_card_bill_fact(amount_text: str):
     with error_step('FUBON-07-298-001'):
         payment = re.search(
-            r"繳款狀態.*?自動扣繳帳號.*?\n"
-            r"([^\t\n]+)\s*\t\s*(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*"
-            r"([\d,]+)\s*\t\s*([\d,]+)\s*\t",
+            r"(?m)^繳款狀態[^\S\t\r\n]*\t[^\S\t\r\n]*最近繳款日(?:期)?[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"(?:已繳金額|繳款金額)[^\S\t\r\n]*\t[^\S\t\r\n]*(?:本期帳單剩餘應繳金額|剩餘應繳)"
+            r"[^\S\t\r\n]*\t[^\S\t\r\n]*自動扣繳帳號[^\r\n]*\r?\n"
+            r"([^\t\r\n]+)[^\S\t\r\n]*\t[^\S\t\r\n]*(\d{4}/\d{1,2}/\d{1,2})[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"([\d,]+)[^\S\t\r\n]*\t[^\S\t\r\n]*([\d,]+)[^\S\t\r\n]*\t",
             amount_text,
         )
     with error_step('FUBON-07-299-001'):
         bill = re.search(
-            r"本期帳單結帳日.*?繳款截止日.*?\n"
-            r"(\d{4}/\d{1,2}/\d{1,2})\s*\t\s*[\d,]+\s*\t\s*[\d,]+"
-            r"\s*\t\s*([^\t\n]+)",
+            r"(?m)^本期帳單結帳日[^\S\t\r\n]*\t[^\S\t\r\n]*應繳總金額[^\S\t\r\n]*\t[^\S\t\r\n]*"
+            r"最低應繳金額[^\S\t\r\n]*\t[^\S\t\r\n]*繳款截止日[^\r\n]*\r?\n"
+            r"(\d{4}/\d{1,2}/\d{1,2})[^\S\t\r\n]*\t[^\S\t\r\n]*[\d,]+[^\S\t\r\n]*\t[^\S\t\r\n]*[\d,]+"
+            r"[^\S\t\r\n]*\t[^\S\t\r\n]*([^\t\r\n]+)",
             amount_text,
         )
     with error_step('FUBON-07-300-001'):
