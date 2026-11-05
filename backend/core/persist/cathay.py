@@ -10,8 +10,78 @@ from math import isfinite
 
 from backend.core import account_classify, classify
 from backend.core.card_status import CathayBillStatus, cathay_bill_status
-from backend.core.store import BankStore
+from backend.core.store import BankStore, _card_batch_evidence, _card_booking_date_valid
 from backend.core.persist._common import _num_real, _num_to_float
+from decimal import Decimal, localcontext
+
+
+def _collected_card_evidence(cc):
+    """Freeze comparison-only observations; native filters/classification stay in order."""
+    evidence = []
+    billed = cc.get("billed_detail") or {}
+    blocks = [(None, [t for txns in billed.values() for t in txns])]
+    for name in ("unbilled_detail", "current_detail"):
+        block = cc.get(name)
+        if (not isinstance(block, dict)
+                or any(block.get(key) for key in ("error", "Error", "errorMessage"))
+                or not any(isinstance(value, list) and (
+                    "consume" in str(key).lower() or (value and isinstance(value[0], dict)
+                    and any(field in value[0] for field in ("amount", "desc", "date"))))
+                    for key, value in block.items())):
+            continue
+        blocks.append((name, [t for value in block.values() if isinstance(value, list) for t in value]))
+    for scope, txns in blocks:
+        real = [t for t in txns if isinstance(t, dict) and isinstance(t.get("desc") or "", str)
+                and ((t.get("amount") is not None or (t.get("desc") or "").strip()) if scope
+                     else (t.get("date") or t.get("post_date")))]
+        with localcontext() as context:
+            # Observations must neither raise a later native error nor leak sticky flags.
+            for signal in context.traps:
+                context.traps[signal] = False
+            admitted = []
+            for raw in real:
+                normalized = _card_batch_evidence([raw])
+                if not normalized:
+                    continue
+                row = normalized[0]
+                if any(raw.get(field) is not None and str(raw[field]).strip() in ("", "-")
+                       for field in ("amount", "consume_amount")):
+                    continue
+                for field in ("amount", "consume_amount"):
+                    if row[field] is None:
+                        continue
+                    currency = row["currency"] if field == "amount" else row["consume_currency"]
+                    number = Decimal(str(raw[field]).replace(",", "").replace(" ", "").strip())
+                    if (len(currency) != 3 or not currency.isascii() or not currency.isalpha()
+                            or (currency == "TWD" and number != number.to_integral_value())
+                            or number != number.quantize(Decimal("0.000001"))
+                            or Decimal(str(row[field])) != number):
+                        break
+                else:
+                    admitted.append((raw, row))
+        # An invalid-money sibling makes the entire pending scope fetch_ok=False.
+        if scope and len(admitted) != len(real):
+            continue
+        for raw, row in admitted:
+            if scope and not (raw.get("booking_status") == "booked"
+                              and _card_booking_date_valid(raw.get("post_date"))):
+                continue
+            # Same keyword table and raw-sign fallback as the later classifier,
+            # without invoking its checkpoint early or trusting stale txn_type.
+            desc = (raw.get("desc") or "").strip()
+            try:
+                sign = float(raw.get("amount")) if raw.get("amount") is not None else 0
+            except (TypeError, ValueError):
+                sign = 0
+            row["txn_type"] = next((kind for words, kind in (
+                (classify.FEE_WAIVER_PHRASE, classify.FEE_WAIVER),
+                (classify.INSTALLMENT_KW, classify.INSTALLMENT), (classify.ANNUAL_FEE_KW, classify.ANNUAL_FEE),
+                (classify.FEE_KW, classify.FEE), (classify.PAYMENT_KW, classify.PAYMENT),
+                (classify.CASHBACK_KW, classify.CASHBACK), (classify.REFUND_KW, classify.REFUND),
+            ) if any(word in desc for word in words)),
+                classify.SPENDING if sign > 0 else classify.REFUND if sign < 0 else classify.UNKNOWN)
+            evidence.append(row)
+    return tuple(evidence)
 
 
 def _payment_date(value) -> str | None:
@@ -276,6 +346,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     # card_no='')，這 row 不是真實交易，是月結頁面的開頭小計。
     # 判定條件：consume_date 跟 post_date 同時 NULL → 一定不是交易（真實刷卡至少有消費日）。
     billed = cc.get("billed_detail") or {}
+    card_evidence = _collected_card_evidence(cc)
     billed_new = 0
     billed_skipped_summary = 0
     billed_skipped_invalid_amount = 0
@@ -300,6 +371,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         with error_step('CATHAY-08-003-019'):
             billed_new += store.upsert_card_billed(
                 real_txns, rules=rules, suppress_history_cursor=data.get("history_coverage") is not None,
+                _batch_txns=card_evidence,
             )
     delta["card_billed_new"] = billed_new
     if billed_skipped_summary:
@@ -348,7 +420,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
         delta["card_unbilled"] = store.refresh_card_pending(
             "unbilled", unb_txns, rules=rules,
             fetch_ok=unb_ok and unb_skipped_invalid_amount == 0,
-            commit=False)
+            commit=False, _batch_txns=card_evidence)
     if unb_skipped:
         delta["card_unbilled_skipped_placeholder"] = unb_skipped
     if unb_skipped_invalid_amount:
@@ -388,7 +460,7 @@ def persist_cathay(data: dict, store: BankStore, rules: list[dict] | None = None
     with error_step('CATHAY-08-003-003'):
         delta["card_current"] = store.refresh_card_pending(
             "current", cur_txns, rules=rules,
-            fetch_ok=cur_ok and cur_skipped_invalid_amount == 0)
+            fetch_ok=cur_ok and cur_skipped_invalid_amount == 0, _batch_txns=card_evidence)
     if cur_skipped:
         delta["card_current_skipped_placeholder"] = cur_skipped
     if cur_skipped_invalid_amount:

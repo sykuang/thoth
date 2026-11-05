@@ -28,7 +28,7 @@ from collections import Counter
 from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import date, datetime, UTC
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, localcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -146,6 +146,42 @@ def _latest_cursor_dates(
     return result
 
 
+def _card_booking_date_valid(post_date) -> bool:
+    return post_date is None or bool(
+        isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
+        and _cursor_date(post_date) is not None
+    )
+
+
+def _card_batch_evidence(txns):
+    """Compare raw sibling money without validating it ahead of its writer.
+
+    Bad evidence cannot prove ownership; its writer still raises the original
+    native-money error at the original checkpoint. Parsing must not leak flags.
+    """
+    evidence = []
+    for txn in txns:
+        row = dict(txn)
+        with localcontext() as context:
+            context.traps[InvalidOperation] = False
+            for field in ("amount", "consume_amount"):
+                value = row.get(field)
+                if value is None or (field == "amount" and str(value).strip() in ("", "-")):
+                    row[field] = None
+                    continue
+                number = Decimal(str(value).replace(",", "").replace(" ", "").strip())
+                if not number.is_finite() or not -9007199254740991 <= number <= 9007199254740991:
+                    break
+                row[field] = int(number) if number == number.to_integral_value() else float(number)
+            else:
+                row["currency"] = str(row.get("currency") or "TWD").strip().upper()
+                if row["consume_amount"] is not None:
+                    row["consume_currency"] = str(row.get("consume_currency") or row["currency"]).strip().upper()
+                row["post_date"] = row.get("post_date") or None
+                evidence.append(row)
+    return evidence
+
+
 def _card_identity_conflicts(left, right) -> bool:
     """Known immutable card evidence vetoes every weaker content-based match."""
     left, right = dict(left), dict(right)
@@ -158,6 +194,12 @@ def _card_identity_conflicts(left, right) -> bool:
         elif field == "consume_amount":
             with error_step('SYS-08-106-001'):
                 a, b = Decimal(str(a)), Decimal(str(b))
+        elif field == "post_date" and not (left.get("native_identity") or right.get("native_identity")):
+            # Legacy midnight serialization equals a calendar date, not arbitrary
+            # times on that date. Native occurrence evidence stays strictly canonical.
+            a, b = (value[:10] if isinstance(value, str)
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T00:00:00)?", value)
+                    and _cursor_date(value) is not None else value for value in (a, b))
         if a != b:
             return True
     return False
@@ -1611,7 +1653,8 @@ class BankStore:
                 ))().fetchall())
 
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None,
-                           *, suppress_history_cursor: bool = False) -> int:
+                           *, suppress_history_cursor: bool = False,
+                           _batch_txns: tuple[dict, ...] = ()) -> int:
         from backend.server.categorizer import categorize_with_excluded
         with error_step('SYS-08-142-013'):
             self._validate_native_card_occurrences(txns)
@@ -1629,6 +1672,26 @@ class BankStore:
                         txn.get("consume_amount"), consume_currency, _codes=(bank_error_id(self.bank, '08-866-001'), bank_error_id(self.bank, '08-866-002'), bank_error_id(self.bank, '08-866-003'), bank_error_id(self.bank, '08-866-004'), bank_error_id(self.bank, '08-866-005'), bank_error_id(self.bank, '08-866-006'), bank_error_id(self.bank, '08-866-007'), bank_error_id(self.bank, '08-866-008'), bank_error_id(self.bank, '08-866-009'), bank_error_id(self.bank, '08-866-010')))
         inserted_count = 0
         now = _now()
+        # Keep the complete source class, including exact-key and later/skipped
+        # siblings. Claimed leftovers cannot prove ownership of a blank card.
+        batch_evidence = tuple(_card_batch_evidence(_batch_txns))
+        incoming_txns = (*txns, *batch_evidence)
+
+        def unique_card_owner(row, txn, candidates):
+            row, txn = dict(row), dict(txn)
+            if row.get("card_no") and txn.get("card_no"):
+                return row["card_no"] == txn["card_no"]
+            blank = row if not row.get("card_no") else txn
+            raw = _pending_raw_key(blank)
+            # ponytail: bounded card batches; index this class if imports grow.
+            owners = {other.get("card_no") for item in (*incoming_txns, *candidates)
+                      if (other := dict(item)).get("card_no")
+                      and _pending_raw_key(other)[:2] == raw[:2]
+                      and str(_pending_raw_key(other)[2] or "").strip(" ") == str(raw[2] or "").strip(" ")
+                      and other.get("consume_amount") == blank.get("consume_amount")
+                      and not _card_identity_conflicts(blank, other)}
+            return len(owners) <= 1
+
         prepared_txns = []
         source_rows = {}
         for original in txns:
@@ -1659,6 +1722,8 @@ class BankStore:
                 with error_step('SYS-08-142-021'):
                     candidates = [row for row in candidates if not _card_identity_conflicts(row, t)]
                 if len(candidates) == 1:
+                    if not unique_card_owner(candidates[0], t, candidates):
+                        continue
                     t["card_no"] = candidates[0]["card_no"]
                 elif len(candidates) > 1:
                     # Bank-level statement row 沒有卡號且舊資料有多個候選時無法安全 join。
@@ -1690,6 +1755,21 @@ class BankStore:
                 for t in txns
             ]
         dedup_keys = _with_occurrence(content_keys)
+
+        def exact_reserved(row):
+            if row["dedup_key"] in dedup_keys:
+                return True
+            # Reserve exact occurrences in the other owning-batch partition too.
+            # Evidence carries the writer's int/float tokens; SQLite REAL affinity
+            # must not turn an integral original-currency key from 3 into 3.0.
+            keys = [_dedup_key(other.get("card_no"), other.get("bill_date"), other.get("date"),
+                               other.get("post_date"), other.get("desc"), other.get("amount"),
+                               other.get("consume_amount"))
+                    for other in batch_evidence if not other.get("native_identity")
+                    and _pending_raw_key(other) == _pending_raw_key(row)
+                    and other.get("consume_amount") == row["consume_amount"]]
+            return row["dedup_key"] in _with_occurrence(keys)
+
         claimed_ids: set[int] = set()
         for t, key in zip(txns, dedup_keys, strict=True):
             post_date = t.get("post_date") or None
@@ -1821,21 +1901,28 @@ class BankStore:
                 # money, a statement row without the card number, or a later statement
                 # (new bill_date) relisting it. Reuse one unclaimed equivalent row instead
                 # of inserting a copy; claimed_ids keeps genuine same-batch repeats apart.
+                # Reserve exact keys for their own occurrences in mixed-format batches.
                 with error_step('SYS-08-198-011'):
                     _error_database_rows_6 = error_step('SYS-08-198-006')(lambda: self.conn.execute('SELECT 1 FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?', (self.user_id, key)))().fetchone() is None
                 if _error_database_rows_6:
                     with error_step('SYS-08-142-059'):
-                        same = [r["id"] for r in error_step('SYS-08-142-034')(lambda: self.conn.execute(
+                        candidates = error_step('SYS-08-142-034')(lambda: self.conn.execute(
                             """SELECT * FROM card_billed_txns
-                           WHERE user_id = ? AND consume_date = ? AND post_date = ?
+                           WHERE user_id = ? AND consume_date = ?
+                             AND (post_date = ? OR post_date = ? || 'T00:00:00'
+                                  OR post_date || 'T00:00:00' = ?)
                              AND amount = ? AND TRIM(description) = TRIM(?)
                              AND consume_amount IS NOT DISTINCT FROM ?
                              AND (COALESCE(card_no, '') = COALESCE(?, '')
                                   OR COALESCE(card_no, '') = '' OR COALESCE(?, '') = '')
                            ORDER BY id""",
-                            (self.user_id, t.get("date"), post_date, t.get("amount"), t.get("desc"),
+                            (self.user_id, t.get("date"), post_date, post_date, post_date, t.get("amount"), t.get("desc"),
                              t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
-                        ))().fetchall() if r["id"] not in claimed_ids and not _card_identity_conflicts(r, t)]
+                        ))().fetchall()
+                        same = [r["id"] for r in candidates
+                                if r["id"] not in claimed_ids and not exact_reserved(r)
+                                and not _card_identity_conflicts(r, t)
+                                and unique_card_owner(r, t, candidates)]
                     if same:
                         record_source(same[0], t)
                         with error_step('SYS-08-142-039'):
@@ -1865,16 +1952,20 @@ class BankStore:
                     blank_candidates = error_step('SYS-08-142-025')(lambda: self.conn.execute(
                         """SELECT * FROM card_billed_txns
                        WHERE user_id = ? AND (card_no IS NULL OR card_no = '')
-                         AND consume_date = ? AND post_date = ?
+                         AND consume_date = ?
+                         AND (post_date = ? OR post_date = ? || 'T00:00:00'
+                              OR post_date || 'T00:00:00' = ?)
                          AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                        (self.user_id, t.get("date"), post_date, t.get("amount"),
+                        (self.user_id, t.get("date"), post_date, post_date, post_date, t.get("amount"),
                          t.get("desc"), t.get("consume_amount")),
                     ))().fetchall()
                 with error_step('SYS-08-142-026'):
                     blank_candidates = [row for row in blank_candidates
-                                        if row["id"] not in claimed_ids and not _card_identity_conflicts(row, t)]
+                                        if row["id"] not in claimed_ids and not exact_reserved(row)
+                                        and not _card_identity_conflicts(row, t)
+                                        and unique_card_owner(row, t, blank_candidates)]
                 if len(blank_candidates) > 1:
                     continue
                 with error_step('SYS-08-142-055'):
@@ -2335,13 +2426,15 @@ class BankStore:
             if not txn.get("card_no"):
                 with error_step('SYS-08-150-020'):
                     cards = error_step('SYS-08-150-014')(lambda: self.conn.execute(
-                        "SELECT card_no FROM card_billed_txns WHERE user_id = ? AND consume_date = ? "
+                        "SELECT * FROM card_billed_txns WHERE user_id = ? AND consume_date = ? "
                         "AND amount = ? AND description = ? AND consume_amount IS NOT DISTINCT FROM ? "
-                        "AND (post_date = ? OR post_date IS NULL)",
+                        "AND (post_date = ? OR post_date = ? || 'T00:00:00' "
+                        "OR post_date || 'T00:00:00' = ? OR post_date IS NULL)",
                         (self.user_id, target["consume_date"], target["amount"], target["description"],
-                         target["consume_amount"], target["post_date"]),
+                         target["consume_amount"], target["post_date"], target["post_date"], target["post_date"]),
                     ))().fetchall()
-                if len({row['card_no'] or '' for row in cards}) > 1:
+                if len({row['card_no'] or '' for row in cards
+                        if not _card_identity_conflicts(row, txn)}) > 1:
                     raise with_error_code(ValueError('ambiguous blank-card booking identity'), 'SYS-08-150-017')
 
         def exact(row):
@@ -2479,11 +2572,19 @@ class BankStore:
                 self._adopted_pending_raw_keys = {}
                 self._unsafe_pending_overlay_identities = set()
                 self._billed_source_rows = {}
+                # Only admitted bookings can compete for historical billed rows.
+                # Pass immutable source observations across both SQL partitions;
+                # call-local leftovers cannot establish blank-card ownership.
+                batch_txns = tuple(dict(txn) for txn in (*billed, *(
+                    txn for txn in pending if fetch_ok is True
+                    and txn.get("booking_status") == "booked"
+                    and _card_booking_date_valid(txn.get("post_date")))))
                 with error_step('SYS-08-153-006'):
-                    billed_n = self.upsert_card_billed(billed, rules=rules) if billed else 0
+                    billed_n = self.upsert_card_billed(billed, rules=rules, _batch_txns=batch_txns) if billed else 0
                 with error_step('SYS-08-153-007'):
                     pending_n = self.refresh_card_pending(
                         scope, pending, rules=rules, fetch_ok=fetch_ok, commit=False,
+                        _batch_txns=batch_txns,
                     )
             if commit:
                 with error_step('SYS-08-153-005'):
@@ -2502,7 +2603,8 @@ class BankStore:
     def refresh_card_pending(self, scope: str, txns: list[dict],
                              rules: list[dict] | None = None,
                              fetch_ok: bool | None = None,
-                             commit: bool = True) -> int:
+                             commit: bool = True, *,
+                             _batch_txns: tuple[dict, ...] = ()) -> int:
         if fetch_ok is not False:
             with error_step('SYS-08-154-003'):
                 self._validate_native_card_occurrences(txns)
@@ -2536,10 +2638,7 @@ class BankStore:
             # Producers attest booking provenance; this boundary accepts only their
             # canonical calendar date (or explicit booked-without-date), never sentinels.
             with error_step('SYS-08-154-005'):
-                valid_date = post_date is None or (
-                    isinstance(post_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", post_date)
-                    and _cursor_date(post_date) is not None
-                )
+                valid_date = _card_booking_date_valid(post_date)
             if not valid_date:
                 txn["post_date"] = None
             (booked if txn.get("booking_status") == "booked" and valid_date else pending).append(txn)
@@ -2558,7 +2657,8 @@ class BankStore:
                 start = len(self._current_billed_ids)
                 new_before = set(self._new_billed_ids)
                 with error_step('SYS-08-154-008'):
-                    self.upsert_card_billed(booked, rules, suppress_history_cursor=True)
+                    self.upsert_card_billed(booked, rules, suppress_history_cursor=True,
+                                            _batch_txns=_batch_txns)
                 target_ids = self._current_billed_ids[start:]
                 self._promote_card_pending_overlays(
                     scope, [self._billed_source_rows[i][0] for i in target_ids], pending,
