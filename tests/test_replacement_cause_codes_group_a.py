@@ -42,6 +42,9 @@ def _esun_login(failure):
         for op, value in [('count', 1), ('nth', node), ('is_visible', True), ('is_enabled', True), ('input_value', 'A')]:
             getattr(node, op).side_effect = lambda *a, r=role, o=op, v=value: action(r, o, v)
         node.click.side_effect = lambda **kw: action(role, 'select' if kw.get('click_count') else 'click')
+        node.element_handle.return_value = SimpleNamespace(
+            type=lambda *a, **k: action(role, 'type'),
+        )
         return action(role, 'locator', node)
 
     page.locator.side_effect = locator

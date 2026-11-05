@@ -582,6 +582,7 @@ class EsunCrawler(BankCrawler):
                         raise with_error_code(EsunLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[0])
                 with error_step(codes[2]):
                     field = candidates.nth(0)
+                    typing_field = field.element_handle()
                 with error_step(codes[3]):
                     if not field.is_visible():
                         raise with_error_code(EsunLoginError('登入欄位無法安全填寫；未送出登入'), rejection_codes[1])
@@ -596,7 +597,7 @@ class EsunCrawler(BankCrawler):
                     page.keyboard.press("Backspace")
                 for character in value:
                     with error_step(codes[8]):
-                        page.keyboard.type(character, delay=80)
+                        typing_field.type(character, delay=80)
                 with error_step(codes[9]):
                     page.wait_for_timeout(wait)
                 with error_step(codes[10]):

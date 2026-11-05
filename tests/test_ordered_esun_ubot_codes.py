@@ -92,6 +92,10 @@ def test_login_field_and_native_suboperation_are_distinct(bank, cls, error):
                 field.is_visible.return_value = field.is_enabled.return_value = True
                 field.click.side_effect = lambda **kw: perform('select' if kw.get('click_count') else 'focus')
                 field.input_value.side_effect = lambda: perform('read', 'A')
+                if bank == 'esun':
+                    field.element_handle.return_value = SimpleNamespace(
+                        type=lambda *a, **k: perform('type'),
+                    )
             page.locator.side_effect = locate
             page.keyboard.press.side_effect = lambda *a, **k: perform('clear')
             page.keyboard.type.side_effect = lambda *a, **k: perform('type')

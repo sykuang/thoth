@@ -400,6 +400,7 @@ def _submit_fixture():
     for selector, field in fields.items():
         field.count.return_value = 1
         field.nth.return_value = field
+        field.element_handle.return_value = SimpleNamespace(type=Mock())
         field.is_visible.return_value = True
         field.is_enabled.return_value = True
         field.input_value.return_value = values[selector]
@@ -438,22 +439,25 @@ def test_submit_requires_unique_frame_fields_lengths_and_action_then_clicks_once
 
     crawler.submit_credentials_once(page)
 
-    for field in fields.values():
+    for field, value in zip(
+        fields.values(), ("ID-PRIVATE", "USER-PRIVATE", "PASSWORD-PRIVATE"), strict=True,
+    ):
         assert field.method_calls == [
             call.count(),
             call.nth(0),
+            call.element_handle(),
             call.is_visible(),
             call.is_enabled(),
             call.click(),
             call.click(click_count=3),
             call.input_value(),
         ]
+        assert field.element_handle.return_value.type.call_args_list == [
+            call(character, delay=80)
+            for character in value
+        ]
     assert page.keyboard.press.call_args_list == [call("Backspace")] * 3
-    assert page.keyboard.type.call_args_list == [
-        call(character, delay=80)
-        for value in ("ID-PRIVATE", "USER-PRIVATE", "PASSWORD-PRIVATE")
-        for character in value
-    ]
+    page.keyboard.type.assert_not_called()
     page.fill.assert_not_called()
     assert page.wait_for_timeout.call_args_list == [
         call(200),
