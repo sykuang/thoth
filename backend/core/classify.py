@@ -168,6 +168,12 @@ def classify_ubot(tx_code: str | None, desc: str | None,
       60 → 借記/一般費用 (fee 或 annual_fee) — 順序敏感: 讓 desc keyword 先判,
            若 desc 是「ANNUAL MEMBERSHIP FEE」歸 annual_fee, 否則保守歸 FEE。
     """
+    return _classify_ubot(tx_code, desc, amount_signed)
+
+
+def _classify_ubot(tx_code: str | None, desc: str | None,
+                   amount_signed: float | int | None) -> str:
+    """Pure computation shared with shadow evidence; public checkpoint stays native."""
     code = (tx_code or "").strip()
     if code == "43":
         return CASHBACK

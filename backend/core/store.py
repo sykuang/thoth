@@ -1652,9 +1652,35 @@ class BankStore:
                     "WHERE user_id = ? AND native_identity IS NOT NULL", (self.user_id,),
                 ))().fetchall())
 
+    def _card_representation_matches(self, row, txn):
+        """Legacy content evidence, never a rewrite of bank values or dedup keys."""
+        row, txn = dict(row), dict(txn)
+        left = row.get("description", row.get("desc")) or ""
+        right = txn.get("description", txn.get("desc")) or ""
+        if (row.get("consume_amount") == txn.get("consume_amount")
+                and left.strip(" ") == right.strip(" ")
+                and not _card_identity_conflicts(row, txn)):
+            return True
+        # UBOT local legacy evidence only. Control-byte origin and historical
+        # zero meaning remain unknown; do not extend this to FX/native identity.
+        if (self.bank != "ubot" or row.get("native_identity") or txn.get("native_identity")
+                or any(str(value or "").strip().upper() != "TWD" for value in (
+                    row.get("currency"), row.get("consume_currency"),
+                    txn.get("currency"), txn.get("consume_currency")))
+                or row.get("consume_amount") not in (None, 0) or txn.get("consume_amount") not in (None, 0)
+                or row.get("consume_amount") != txn.get("consume_amount") and not (
+                    txn.get("bill_date") and row.get("bill_date") in (None, txn["bill_date"])
+                    or row.get("bill_date") and txn.get("booking_status") == "booked")):
+            return False
+        return (left.replace("\x1f", " ").replace("\x1e", " ")
+                == right.replace("\x1f", " ").replace("\x1e", " ")
+                and not _card_identity_conflicts({**row, "consume_amount": None},
+                                                {**txn, "consume_amount": None}))
+
     def upsert_card_billed(self, txns: list[dict], rules: list[dict] | None = None,
                            *, suppress_history_cursor: bool = False,
-                           _batch_txns: tuple[dict, ...] = ()) -> int:
+                           _batch_txns: tuple[dict, ...] = (),
+                           _batch_start: int = 0) -> int:
         from backend.server.categorizer import categorize_with_excluded
         with error_step('SYS-08-142-013'):
             self._validate_native_card_occurrences(txns)
@@ -1687,9 +1713,7 @@ class BankStore:
             owners = {other.get("card_no") for item in (*incoming_txns, *candidates)
                       if (other := dict(item)).get("card_no")
                       and _pending_raw_key(other)[:2] == raw[:2]
-                      and str(_pending_raw_key(other)[2] or "").strip(" ") == str(raw[2] or "").strip(" ")
-                      and other.get("consume_amount") == blank.get("consume_amount")
-                      and not _card_identity_conflicts(blank, other)}
+                      and self._card_representation_matches(blank, other)}
             return len(owners) <= 1
 
         prepared_txns = []
@@ -1731,8 +1755,10 @@ class BankStore:
             prepared_txns.append(t)
         txns = prepared_txns
         recorded_ids = set()
+        assigned_sources = set()
 
         def record_source(target_id, txn):
+            assigned_sources.add(id(txn))
             claimed_ids.add(target_id)
             self._current_billed_ids.append(target_id)
             if target_id not in recorded_ids:
@@ -1754,7 +1780,13 @@ class BankStore:
                            t.get("consume_amount")))
                 for t in txns
             ]
-        dedup_keys = _with_occurrence(content_keys)
+        # UBOT billed blocks are partitions of one source occurrence sequence.
+        # Carry only its position, not another cache or ledger, across writers.
+        prefix = batch_evidence[:_batch_start]
+        prefix_keys = [_dedup_key(other.get("card_no"), other.get("bill_date"), other.get("date"),
+                                  other.get("post_date"), other.get("desc"), other.get("amount"),
+                                  other.get("consume_amount")) for other in prefix]
+        dedup_keys = _with_occurrence([*prefix_keys, *content_keys])[len(prefix_keys):]
 
         def exact_reserved(row):
             if row["dedup_key"] in dedup_keys:
@@ -1771,6 +1803,18 @@ class BankStore:
             return row["dedup_key"] in _with_occurrence(keys)
 
         claimed_ids: set[int] = set()
+        for other in prefix:
+            # Authentic observations identify earlier assignments, including a
+            # relisting whose saved key deliberately retains its original bill.
+            target = next((target_id for target_id, sources in self._billed_source_rows.items()
+                           if target_id not in claimed_ids and any(
+                               source.get("card_no") == other.get("card_no")
+                               and _pending_raw_key(source) == _pending_raw_key(other)
+                               and source.get("post_date") == other.get("post_date")
+                               and self._card_representation_matches(source, other)
+                               for source in sources)), None)
+            if target is not None:
+                claimed_ids.add(target)
         for t, key in zip(txns, dedup_keys, strict=True):
             post_date = t.get("post_date") or None
             native = t.get("native_identity")
@@ -1911,25 +1955,34 @@ class BankStore:
                            WHERE user_id = ? AND consume_date = ?
                              AND (post_date = ? OR post_date = ? || 'T00:00:00'
                                   OR post_date || 'T00:00:00' = ?)
-                             AND amount = ? AND TRIM(description) = TRIM(?)
-                             AND consume_amount IS NOT DISTINCT FROM ?
+                             AND amount = ?
+                             AND ((TRIM(description) = TRIM(?)
+                                   AND consume_amount IS NOT DISTINCT FROM ?) OR ? = 'ubot')
                              AND (COALESCE(card_no, '') = COALESCE(?, '')
                                   OR COALESCE(card_no, '') = '' OR COALESCE(?, '') = '')
                            ORDER BY id""",
                             (self.user_id, t.get("date"), post_date, post_date, post_date, t.get("amount"), t.get("desc"),
-                             t.get("consume_amount"), t.get("card_no"), t.get("card_no")),
+                             t.get("consume_amount"), self.bank, t.get("card_no"), t.get("card_no")),
                         ))().fetchall()
                         same = [r["id"] for r in candidates
                                 if r["id"] not in claimed_ids and not exact_reserved(r)
-                                and not _card_identity_conflicts(r, t)
+                                and self._card_representation_matches(r, t)
                                 and unique_card_owner(r, t, candidates)]
                     if same:
+                        target = next(row for row in candidates if row["id"] == same[0])
+                        authoritative = (self.bank == "ubot" and t.get("bill_date")
+                                         and not target["native_identity"]
+                                         and all(str(value or "").strip().upper() == "TWD" for value in (
+                                             target["currency"], target["consume_currency"],
+                                             t.get("currency"), t.get("consume_currency"))))
                         record_source(same[0], t)
                         with error_step('SYS-08-142-039'):
                             self.conn.execute(
-                                "UPDATE card_billed_txns SET bill_date = COALESCE(bill_date, ?) "
-                                "WHERE user_id = ? AND id = ?",
-                                (t.get("bill_date"), self.user_id, same[0]),
+                                "UPDATE card_billed_txns SET bill_date = COALESCE(bill_date, ?), "
+                                "description = ?, consume_amount = ? WHERE user_id = ? AND id = ?",
+                                (t.get("bill_date"), t.get("desc") if authoritative else target["description"],
+                                 t.get("consume_amount") if authoritative else target["consume_amount"],
+                                 self.user_id, same[0]),
                             )
                         if not suppress_history_cursor:
                             with error_step('SYS-08-142-041'):
@@ -1988,29 +2041,82 @@ class BankStore:
                 with error_step('SYS-08-142-056'):
                     candidates = error_step('SYS-08-142-028')(lambda: self.conn.execute(
                         """SELECT * FROM card_billed_txns
-                       WHERE user_id = ? AND post_date IS NULL
+                       WHERE user_id = ? AND (post_date IS NULL OR ? = 'ubot')
                          AND card_no IS NOT DISTINCT FROM ?
                          AND consume_date = ? AND amount = ? AND description = ?
                          AND consume_amount IS NOT DISTINCT FROM ?
                        ORDER BY id""",
-                        (self.user_id, t.get("card_no"), t.get("date"), t.get("amount"),
+                        (self.user_id, self.bank, t.get("card_no"), t.get("date"), t.get("amount"),
                          t.get("desc"), t.get("consume_amount")),
                     ))().fetchall()
+                # Exact destinations own their sources, even when visited later.
+                existing_rows = candidates
                 with error_step('SYS-08-142-029'):
-                    candidates = [row for row in candidates if row["id"] not in claimed_ids
-                                  and not _card_identity_conflicts(row, t)
+                    candidates = [row for row in candidates if row["post_date"] is None
+                                  and not exact_reserved(row) and not _card_identity_conflicts(row, t)
                                   and (post_date or row["bill_date"] is None
                                        or row["bill_date"] == t.get("bill_date"))]
+                fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
+                          "auto_excluded", "splits_overwrite")
+                ambiguous_edits = ((len(candidates) > 1 or self.bank == "ubot")
+                                   and any(row[field] for row in candidates for field in fields))
+                candidates = [row for row in candidates if row["id"] not in claimed_ids]
                 with error_step('SYS-08-142-057'):
                     existing_key = error_step('SYS-08-142-030')(lambda: self.conn.execute(
                         "SELECT id FROM card_billed_txns WHERE user_id = ? AND dedup_key = ?",
                         (self.user_id, key),
                     ))().fetchone()
-                if len(candidates) > 1:
-                    fields = ("category", "subcategory", "description_overwrite", "tags_overwrite",
-                              "auto_excluded", "splits_overwrite")
-                    if any(row[field] for row in candidates for field in fields):
-                        continue  # No evidence pairs edited repeated purchases with new dates.
+                if ambiguous_edits and candidates and existing_key is None:
+                    if self.bank != "ubot":
+                        record_source(candidates[0]["id"], t)
+                        continue
+                    # One common destination for the complete class preserves edits
+                    # without guessing occurrence ownership. Otherwise discard only
+                    # this class's unpairable edits, never its authoritative facts.
+                    # The owning collection can call us once per billed block.
+                    # Occurrence keys bound overlapping local/batch evidence by max,
+                    # not sum; genuine repeated observations keep separate indices.
+                    batch_keys = _with_occurrence([
+                        _dedup_key(other.get("card_no"), other.get("bill_date"), other.get("date"),
+                                   other.get("post_date"), other.get("desc"), other.get("amount"),
+                                   other.get("consume_amount")) for other in batch_evidence])
+                    source_pairs = [*zip(txns, dedup_keys, strict=True),
+                                    *((other, source_key) for other, source_key
+                                      in zip(batch_evidence, batch_keys, strict=True)
+                                      if source_key not in dedup_keys)]
+                    # A posted semantic relisting owns one source occurrence even
+                    # across blocks and before it is visited; never reserve a whole
+                    # raw-key class merely because one stored sibling matches.
+                    owned_sources = set()
+                    for row in sorted(existing_rows, key=lambda row: row["dedup_key"] not in
+                                      {source_key for _, source_key in source_pairs}):
+                        matches = [(other, source_key) for other, source_key in source_pairs
+                                   if source_key not in owned_sources
+                                   and (source_key == row["dedup_key"]
+                                        or row["post_date"] and other.get("post_date")
+                                        and _pending_raw_key(other) == _pending_raw_key(row)
+                                        and other.get("card_no") == row["card_no"]
+                                        and self._card_representation_matches(row, other))]
+                        if matches:
+                            owned_sources.add(min(matches, key=lambda pair: pair[1] != row["dedup_key"])[1])
+                    sources = [other for other, source_key in source_pairs
+                               if id(other) not in assigned_sources and source_key not in owned_sources
+                               and other.get("card_no") == t.get("card_no")
+                               and _pending_raw_key(other) == _pending_raw_key(t)
+                               and other.get("consume_amount") == t.get("consume_amount")
+                               and not _card_identity_conflicts(candidates[0], other)]
+                    if (len(sources) < len(candidates)
+                            or len({(other.get("post_date"), other.get("bill_date"))
+                                    for other in sources}) != 1):
+                        for row in candidates:
+                            with error_step('SYS-08-142-036'):
+                                self.conn.execute(
+                                    "UPDATE card_billed_txns SET category=NULL, subcategory=NULL, "
+                                    "description_overwrite=NULL, tags_overwrite=NULL, auto_excluded=0, "
+                                    "splits_overwrite=NULL, flow_type=?, income_category=?, "
+                                    "is_subscription=0 WHERE user_id=? AND id=?",
+                                    (*_flow_fields(None, None, None, row["txn_type"]), self.user_id, row["id"]),
+                                )
                 if candidates and existing_key is None:
                     # 同一 canonical row 從「尚無入帳日」升級為銀行真值；原地更新可保留
                     # 使用者分類／備註／拆帳，且避免新 dedup key 造成雙列。
@@ -2455,6 +2561,12 @@ class BankStore:
                 identity = _pending_billed_identity({**source, "native_identity": None})
             with error_step('SYS-08-152-002'):
                 return exact(row) == exact(source) or (
+                    self.bank == "ubot" and not row.get("native_identity")
+                    and not source.get("native_identity") and identity is not None and identity[0] == "local"
+                    and row.get("card_no") == source.get("card_no")
+                    and _pending_raw_key(row)[:2] == _pending_raw_key(source)[:2]
+                    and self._card_representation_matches(row, source)
+                ) or (
                     identity is not None and identity[0] == "fx" and _card_occurrence_matches(row, source)
                 )
 
@@ -2662,7 +2774,8 @@ class BankStore:
                 target_ids = self._current_billed_ids[start:]
                 self._promote_card_pending_overlays(
                     scope, [self._billed_source_rows[i][0] for i in target_ids], pending,
-                    target_ids, set(self._new_billed_ids) - new_before,
+                    target_ids, (set(self._new_billed_ids) if _batch_txns
+                                 else set(self._new_billed_ids) - new_before),
                 )
                 # Explicit promotion must not turn an unknown sibling occurrence
                 # into an implicit historical transition in the legacy reconciler.

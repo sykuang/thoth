@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from backend.core.error_codes import error_step, exception_error_id, with_error_code
 from datetime import date, datetime, timedelta
+from decimal import Decimal, localcontext
 import json
 import re
 from zoneinfo import ZoneInfo
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 from backend.banks.ubot import UbotCrawler
 from backend.core import account_classify, classify
 from backend.core.base import validate_history_coverage
-from backend.core.store import BankStore
+from backend.core.store import BankStore, _card_batch_evidence
 from backend.core.persist._common import (
     _num, _num_real, _num_to_float, _ubot_date, _snapshot_occurrence_ledgers, _restore_occurrence_ledgers,
 )
@@ -254,6 +255,74 @@ def _validate_ubot_history(data: dict, store: BankStore) -> date:
     return as_of
 
 
+def _collected_card_evidence(data):
+    """Reserve raw siblings without running their later native checkpoints."""
+    evidence = []
+    unb = data.get("card_unbilled")
+    blocks = [(False, body) for body in data.get("card_billed") or []]
+    if (isinstance(unb, dict) and isinstance(unb.get("CardList"), list)
+            and not any(unb.get(key) for key in ("error", "Error", "errorMessage"))):
+        blocks.append((True, unb))
+    for pending, body in blocks:
+        if not isinstance(body, dict) or not isinstance(body.get("CardList"), list):
+            continue
+        header = {} if pending else body.get("CardHeader") or {}
+        if not isinstance(header, dict):
+            continue
+        for txn in body["CardList"]:
+            if not isinstance(txn, dict):
+                continue
+            desc, currency = txn.get("txDesc") or "", txn.get("Currency") or "TWD"
+            values = (txn.get("effectiveDate" if pending else "effectDate"),
+                      (txn.get("postingDate") or txn.get("postDate")) if pending else txn.get("postDate"),
+                      None if pending else header.get("stmtDate"))
+            if (not isinstance(desc, str) or not isinstance(currency, str)
+                    or txn.get("cardNo") is not None and not isinstance(txn["cardNo"], (str, int, float))
+                    or not isinstance(txn.get("txCode") or "", str)):
+                continue
+            dates = []
+            for value in values:
+                text = str(value).strip().replace("/", "").replace("-", "") if value else ""
+                try:
+                    dates.append(datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+                                 if len(text) == 8 and text.isdigit() and text != "00000000" else None)
+                except ValueError:
+                    dates.append(None)  # Match native parsing without executing its checkpoint early.
+            consumed, posted, billed = dates
+            if pending and not posted:
+                continue
+            original = txn.get("oriAmt")
+            original = None if original is None or str(original).strip() in ("", "-") else original
+            with localcontext() as context:
+                # Comparison-only admission must not execute native money/classifier
+                # checkpoints, raise future errors, or change caller Decimal state.
+                for signal in context.traps:
+                    context.traps[signal] = False
+                normalized = _card_batch_evidence([{
+                    "card_no": txn.get("cardNo"), "date": consumed, "post_date": posted,
+                    "bill_date": billed, "desc": desc.strip(), "amount": txn.get("txAmt"),
+                    "currency": "TWD", "consume_currency": currency.strip() or "TWD",
+                    "consume_amount": original,
+                }])
+                if not normalized:
+                    continue
+                row = normalized[0]
+                if row["amount"] is not None and not isinstance(row["amount"], int):
+                    continue  # _num admits integral TWD only.
+                if original is not None:
+                    number = Decimal(str(original).replace(",", "").replace(" ", "").strip())
+                    # _num_real's six-place/float proof, then the writer's
+                    # currency/TWD rule. Absence bypasses original-currency parsing.
+                    if (number != number.quantize(Decimal("0.000001"))
+                            or Decimal(str(row["consume_amount"])) != number
+                            or re.fullmatch(r"[A-Z]{3}", row["consume_currency"]) is None
+                            or row["consume_currency"] == "TWD" and number != number.to_integral_value()):
+                        continue
+                row["txn_type"] = classify._classify_ubot(txn.get("txCode"), row["desc"], row["amount"])
+                evidence.append(row)
+    return tuple(evidence)
+
+
 def _persist_ubot(
     data: dict, store: BankStore, rules: list[dict] | None = None, *, as_of: date,
 ) -> dict:
@@ -365,7 +434,9 @@ def _persist_ubot(
     delta["twd_txn_new"] = twd_new
 
     # --- 信用卡已出帳明細（append-only）---
+    batch_txns = _collected_card_evidence(data)
     billed_new = 0
+    batch_start = 0
     for body in data.get("card_billed") or []:
         if not isinstance(body, dict):
             continue
@@ -391,7 +462,10 @@ def _persist_ubot(
                     "txn_type": classify.classify_ubot(t.get("txCode"), desc, amt),
                 })
         with error_step('UBOT-08-005-016'):
-            billed_new += store.upsert_card_billed(rows, rules=rules)
+            billed_new += store.upsert_card_billed(
+                rows, rules=rules, _batch_txns=batch_txns, _batch_start=batch_start,
+            )
+        batch_start += len(rows)
     delta["card_billed_new"] = billed_new
 
     # --- 信用卡未出帳（refresh-by-scope）---
@@ -419,13 +493,13 @@ def _persist_ubot(
                 })
     # fetch_ok: card_unbilled 要是 dict 才算真的抓到未出帳清單。非 dict (None/缺 key)
     # = API 沒回, 此時 unb_rows 空是「假消失」, 不可做消失比對。
+    fetch_ok = (isinstance(unb_raw, dict)
+                and not any(unb_raw.get(key) for key in ("error", "Error", "errorMessage"))
+                and isinstance(unb_raw.get("CardList"), list))
     with error_step('UBOT-08-005-001'):
         delta["card_unbilled"] = store.refresh_card_pending(
-            "unbilled", unb_rows, rules=rules,
-            fetch_ok=(isinstance(unb_raw, dict)
-                      and not any(unb_raw.get(key) for key in ("error", "Error", "errorMessage"))
-                      and isinstance(unb_raw.get("CardList"), list)),
-            commit=False,
+            "unbilled", unb_rows, rules=rules, fetch_ok=fetch_ok,
+            commit=False, _batch_txns=batch_txns,
         )
     delta["card_current"] = 0
 
